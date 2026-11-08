@@ -217,7 +217,10 @@ func TestE2ELinux(t *testing.T) {
 
 	e := &cliflow.Env{T: t, BinDir: "(" + vmName + ")", StateDir: rState, WorkDir: rWork, Tailnet: tailnet, APIKeyFile: rKey,
 		ControlURL: prodControl, Prefix: twdPrefix, Res: res, ClientTagged: true, Slow: slow,
-		UpArgs: []string{"--service"},
+		// twd up's defaults (persistent nodes, as a real install) under
+		// --service: an --ephemeral node that goes offline for a restart
+		// may be removed by control and then can't rejoin (see STATUS L1).
+		UpArgs: []string{"--service"}, Persistent: true,
 		Exec: func(args []string) (string, string, time.Duration, error) {
 			return v.timed(rWork, append([]string{rTwd}, args...)...)
 		},
@@ -504,17 +507,26 @@ func TestE2ELinux(t *testing.T) {
 	}
 	res.Checks["sandbox"] = "INFO sandbox: none (L2 pending); workloads " + strings.Join(sbs, " ")
 
-	e.Down()
-	if so, se, _, err := e.Twd("down", "--service", "--json"); err != nil || !strings.Contains(so, `"serviceRemoved": true`) && !strings.Contains(so, `"serviceRemoved":true`) {
-		t.Fatalf("twd down --service: %v %s %s", err, so, se)
+	// Persistent nodes: purge (kill every object, delete its device), and
+	// remove the unit, in one `twd down`.
+	var dr struct {
+		Killed         []string `json:"killed"`
+		Flushed        int      `json:"devicesDeleted"`
+		ServiceRemoved bool     `json:"serviceRemoved"`
 	}
+	dd := e.MustJSON(&dr, "down", "--purge", "--service")
+	res.Numbers["down_ms"] = msOf(dd)
+	if !dr.ServiceRemoved {
+		t.Fatal("twd down --purge --service: serviceRemoved false")
+	}
+	res.Pass("down", fmt.Sprintf("twd down --purge --service: %d objects purged, %d devices deleted, %v", len(dr.Killed), dr.Flushed, dd.Round(time.Millisecond)))
 	if _, _, err := v.run("test -e "+shq(unit), nil); err == nil {
 		t.Fatalf("twd down --service left %s", unit)
 	}
 	if so, _, _ := v.run(`systemctl --user is-enabled twd.service 2>&1; true`, nil); strings.TrimSpace(so) == "enabled" {
 		t.Fatal("twd.service still enabled after twd down --service")
 	}
-	res.Pass("service_removed", "twd down --service: unit disabled and removed")
+	res.Pass("service_removed", "twd down --purge --service: unit disabled and removed")
 	downDone = true
 	time.Sleep(2 * time.Second)
 }

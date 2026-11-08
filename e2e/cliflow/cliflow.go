@@ -109,6 +109,10 @@ type Env struct {
 	OnPeers func(client *nettest.Node, hc *http.Client, agentIP, mcpIP string)
 	// UpArgs are extra `twd up` flags (e2e-linux: --service).
 	UpArgs []string
+	// Persistent: join nodes non-ephemeral (twd up's default; e2e-linux,
+	// so they rejoin after a service restart). The caller must then stop
+	// with `twd down --purge` (Down doesn't purge).
+	Persistent bool
 	// Slow scales every wait and latency bound (0 or 1 = as is). e2e-linux
 	// sets it for the emulated (qemu TCG) amd64 VM only; the measured
 	// numbers are recorded unscaled.
@@ -328,8 +332,11 @@ func mcpCall(hc *http.Client, ip, tool string, args map[string]any) (map[string]
 func (e *Env) Run() {
 	t, res := e.T, e.Res
 	keyFile := e.APIKeyFile
-	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", keyFile, "--yes", "--ephemeral",
+	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", keyFile, "--yes",
 		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL}
+	if !e.Persistent {
+		upArgs = append(upArgs, "--ephemeral")
+	}
 	if e.TSAPIURL != "" {
 		upArgs = append(upArgs, "--tsapi-url", e.TSAPIURL)
 	}
