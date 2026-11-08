@@ -253,3 +253,92 @@ All compile and `go vet` clean; skip-marked so CI stays green until the fixes la
 | RT-06 | **Fixed**: `--policy-apply` only adds `tag:twd*` tagOwners and twd-sourced grants, refuses any non-additive diff | `internal/policy` hostile table + fuzz tests |
 | RT-07 | **Documented**: kill tier 1 (RST + tombstone) is the fast path; netmap retraction stays a control-plane property | STATUS.md |
 | RT-08 | **Fixed/partial**: `@twd/node` `enforceEgress()` (cooperative); hostd reports `egress unenforced`, refuses Node-tier on multi-tenant hosts; docs say only Landlock/microVM is a boundary | `docs/node-tier.md` |
+
+---
+
+# Pass 2 (live) — 2026-11-08, branch `rt2-live`
+
+Pass 1 worked from code on macOS and ran no live attacks. Pass 2 attacked the
+**merged** system on real Linux. Environment: a dedicated Lima VM
+`twdl-rt2-u24` (Ubuntu 24.04 arm64, kernel 6.8, **Landlock ABI 4**, vz, nested
+virt, mounts nothing), the real `linux-arm64` release built on the Mac
+(`make release`) and installed with `install.sh` as a user would. No personal
+tailnet, no system tailscaled, no policy writes; `twd-dev` / `twdl-*` / the FV
+worktree untouched. The microVM tier could **not** be exercised live: a
+Mac-built release carries no microVM guest (`make vm-assets` is Linux-only and
+needs the Firecracker toolchain + guest image; `twd doctor` confirms
+"this release has no microVM guest … process tier only"). Those verdicts are
+code-grounded and labelled so.
+
+Evidence lives in `security/attacks/`: the pre-existing regression tests
+(`rt01`/`rt02`/`rt03`), plus Pass-2 additions `rt01_cert_attacks_test.go`,
+`rt05_replay_test.go`, `rt06_policy_json_tricks_test.go`,
+`rt_sandbox_linux_test.go` (the Linux escape battery), and the live script
+`rt03_live_mgmt_socket.sh`. The whole `./security/attacks` suite was
+**cross-compiled to linux/arm64 and run inside `twdl-rt2-u24`**: PASS (the
+`//go:build linux` battery only means anything there).
+
+## Verdicts
+
+| ID | Verdict | Live evidence |
+|----|---------|---------------|
+| RT-01 | **HOLDS** | node cert (`internal/nodecert`) signs `lim`; receiver computes `CapMap ∩ lim` (`netd/ingress.go:applyCert` → `internal/caps.Intersect`). Live: a child spawned `lim=[lookup_order]` loses `refund`; a cert for node `nA` is rejected for a re-minted `nB` (stale-cert reuse), an **expired** and a **future-iat** cert are rejected, a forged/other-key cert fails signature, an unparseable/omitting `lim` **fails closed** (empty caps), and a failed cert *fetch* withholds all caps (`netd/ingress.go:76`, `CapsWithheld`). `rt01_*_test.go` PASS on macOS and in the VM. |
+| RT-02 | **HOLDS** | tenant code yields only `tenant_note`/`source:tenant`; `traceID`/`actingFor` are bound to the real request, platform fields dropped, the claim preserved only inside `detail` (`hostd.TenantAuditRecord`). mgmt's ingest (`mgmt.checkAuditSource`) refuses `tenant`+non-note, a `tenant_note` without `source:tenant`, and anything claiming `source:mgmt`. Both raw-POST shapes covered; `rt02_*` PASS live. |
+| RT-03 | **HOLDS (live, real binary)** | Ran the real `twd-mgmt` on its unix socket (SQLite store, no tailnet) and attacked it as a tenant would (`rt03_live_mgmt_socket.sh`): bare same-uid connect → **401 host_token_required**; forged 64-char token → **403 host_token_invalid**; pre-fix `Twd-Host-ID` alone → **401**; even `/v0/healthz` → **401**; the 0600 token file's value → **200**. Socket is `srw-------` in a `drwx------` dir; token file `-rw-------`. On a Landlock host the socket is **doubly** out of reach: the battery shows AF_UNIX connects are refused (EPERM, seccomp) and `~/.twd` is unreadable (EACCES), so a workload can neither open the socket nor read the token. |
+| RT-04 | **PARTIAL (by design; not exploited live)** | Per-object MAC keys are derived (`gen.ObjectMACKey`); a MAC under another object's key does not verify (`rt05_replay_test.go`). The root key still lives in the guest, so a single in-guest V8 escape can still forge siblings in the *same* VM — `isolation:"object"` placement remains the real fix. Not reachable without the microVM tier. |
+| RT-05 | **HOLDS** | `gen.VerifyEgressOnce` + `gen.NonceCache`: a replayed `(class,name,nonce)` inside the skew window is refused, a fresh nonce is accepted, an out-of-skew tuple is refused even with a valid MAC, and a MAC under another object's key fails. `rt05_replay_test.go` PASS live. Residual (documented): the MAC is not bound to *which* egress node originates, latent while the key isn't tenant-visible (workerd tiers). |
+| RT-06 | **HOLDS** | `internal/policy.Check`/`Merge`/`VerifyAdditive` refuse `src:*`, `autogroup:*`, groups, users, non-twd `src` tags, `dst:*`, non-twd `tagOwners`, extra grant fields, and any non-additive result (the base hostile table). Pass-2 adds: a **Unicode-homoglyph** tag (`tag:twԁ-…`) is refused, and a live policy with **duplicate `grants`/`tagOwners` keys** either is refused or stays verifiably additive. See RT2-L1 below for one Low gap. |
+| RT-07 | **HOLDS (documented)** | Not re-measured live this pass. Kill tier 1 (RST + 10 s tombstone) is the fast path; netmap retraction stays a bimodal control-plane property, as STATUS/pass-1 disclose. |
+| RT-08 | **HOLDS on Landlock ABI ≥ 4; cooperative elsewhere (as documented)** | The **live escape battery** (`rt_sandbox_linux_test.go`, run under twd's real tenant profile in the VM) refuses, before any effect: read/list/write outside the instance dir (EACCES), TCP to `1.1.1.1:443`, cloud metadata `169.254.169.254:80`, and another tenant's loopback port (EACCES), `bind` (EACCES), UDP/DNS (EPERM), AF_UNIX to a mgmt-shaped socket and to `tailscaled.sock` (EPERM), `socketpair(AF_UNIX,DGRAM)` (EPERM), `ptrace`/`process_vm_readv`/`kill`/`tgkill`/`kill(-1)` against another process (EPERM). Only the egress-proxy port and the instance dir are reachable. `twd doctor`'s own live Landlock probe agrees. `execve(/bin/cat)` is **allowed by design** (`systemRO` maps `/bin,/usr,/lib` read+execute so runtimes work) and is not an escape: the child inherits Landlock under `no_new_privs` (setuid bits ignored) + the seccomp filter and is confined identically. On macOS (Seatbelt, no TCP confinement) and Linux ABI < 4, egress is cooperative — `twd doctor` warns and hostd refuses a second process-tier tenant without `--insecure-shared-host`. |
+
+## New findings
+
+**RT2-L1 (Low) — `policy.Check` accepts a whitespace-/control-padded twd tag.**
+`okTag` is `strings.HasPrefix(tag, "tag:twd")` with no boundary or
+whitespace check, so a `src`/`tagOwners` entry like `"tag:twd-wl-x "`
+(trailing space, tab or newline) passes `Check`. *Impact is bounded:* the
+accepted string is still inside twd's own `tag:twd*` namespace, a grant to a
+space-padded tag matches no real device, and every policy write is validated
+by Tailscale before apply (BUILD-PLAN safety rule). So this is input-validation
+leniency, not a cross-principal widening. *Fix:* require a boundary after the
+prefix (exact `tag:twd` or `tag:twd-…`) and reject tags containing
+whitespace/control characters. Regression: `TestRT2L1_CheckAcceptsWhitespacePaddedTag`
+(skip-marked). No Critical/High/Medium new findings.
+
+## Residual risk by tier
+
+- **macOS process (Seatbelt).** Files and unix sockets are confined (so the
+  RT-03 socket/token are unreachable), but Seatbelt does **not** confine TCP:
+  the Node tier's egress is cooperative (`@twd/node enforceEgress()` is
+  in-process defence only), so a hostile Node app can SSRF to loopback/LAN/
+  metadata/internet. workerd-tier egress is still platform-enforced. Documented;
+  treat multi-tenant macOS Node as trusted-only.
+- **Linux process / Node (Landlock ABI ≥ 4).** Strong boundary — the live
+  battery is clean, RT-03 is double-locked. Residuals: (a) ABI < 4 kernels
+  can't restrict TCP, so Node egress is cooperative there (hostd warns,
+  `node_egress`); (b) a user in a container-engine group or able to reach
+  `tailscaled.sock` as a unix-listening Node app is root-equivalent for hostd
+  itself — hostd refuses a second tenant unless `--insecure-shared-host`
+  (`twd doctor host_sockets`). RT2-L1 above.
+- **Linux microVM (Firecracker).** **Not exploited live this pass** (release
+  without guest assets). Code review of the privileged paths found the
+  expected controls intact: the vmhelper authorises each connection by
+  **SO_PEERCRED uid** against `allowedUIDs`; its config must be root-owned and
+  not group/world-writable; a volume image must be **owned by the caller uid**
+  (no attaching another uid's image); a `(device,inode)` **busy map** blocks
+  double-attach; volumes are **LUKS2** and the attach is **epoch-fenced**,
+  persisted, checked before and after `cryptsetup open`, so a taken-over
+  hostd's **stale-epoch** attach is refused (`CodeVolumeFenced`); a wrong key
+  gives `CodeVolumeKey`. `twd host setup --undo` reverses the recorded manifest
+  (unit, root-owned binaries, sysctl/hugepages, only the kvm-group members it
+  added, `/etc/twd`), leaving each user's DO volumes. RT-04 (shared in-guest
+  root MAC key) is the open gap. These should be re-verified with a live
+  Firecracker run once a microVM-asset release is available.
+
+## Supply chain / install (live)
+
+The `linux-arm64` tarball's outer sha256 matched `dist/SHA256SUMS`; its
+internal `SHA256SUMS` verified clean (12881/12881 files, no mismatch).
+`install.sh` is no-sudo and confined to the prefix; `twd doctor` reports the
+sandbox, host-socket and microVM posture honestly. (`workerd`'s mtime is a
+fixed 1985 epoch — cosmetic.)
