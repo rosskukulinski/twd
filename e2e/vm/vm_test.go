@@ -56,11 +56,15 @@ func TestE2EVM(t *testing.T) {
 	if kernel == "" || rootfs == "" {
 		t.Skip("TWD_VM_KERNEL and TWD_VM_ROOTFS must be set (make e2e-vm)")
 	}
-	be, err := vm.New(vm.Config{Kernel: kernel, Rootfs: rootfs, MemMiB: 512})
+	vcpus := 1
+	if v := os.Getenv("TWD_VM_VCPUS"); v != "" {
+		fmt.Sscan(v, &vcpus)
+	}
+	be, err := vm.New(vm.Config{Kernel: kernel, Rootfs: rootfs, MemMiB: 512, VCPUs: vcpus})
 	if err != nil {
 		t.Fatalf("microVM backend unavailable: %v", err)
 	}
-	res := &results{m: map[string]any{"started": time.Now().UTC().Format(time.RFC3339), "kernel": kernel, "rootfs": rootfs}}
+	res := &results{m: map[string]any{"started": time.Now().UTC().Format(time.RFC3339), "kernel": kernel, "rootfs": rootfs, "vcpus": vcpus}}
 	if mb, err := os.ReadFile(filepath.Join(filepath.Dir(rootfs), "manifest.json")); err == nil {
 		var man map[string]any
 		json.Unmarshal(mb, &man)
