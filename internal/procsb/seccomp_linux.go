@@ -25,6 +25,7 @@ var deniedSyscalls = append([]uintptr{
 	unix.SYS_BPF, unix.SYS_PERF_EVENT_OPEN, unix.SYS_USERFAULTFD, unix.SYS_FANOTIFY_INIT,
 	unix.SYS_KEYCTL, unix.SYS_ADD_KEY, unix.SYS_REQUEST_KEY,
 	unix.SYS_UNSHARE, unix.SYS_SETNS,
+	unix.SYS_TKILL, unix.SYS_PIDFD_SEND_SIGNAL, // signals: see buildFilter
 	unix.SYS_OPEN_BY_HANDLE_AT, unix.SYS_NAME_TO_HANDLE_AT,
 }, archDeniedSyscalls...)
 
@@ -90,8 +91,15 @@ func (p *prog) retIfEq(k, v uint32) {
 	p.ret(v)
 }
 
+// filterOpts parameterise the program: self is the sandboxed process's pid
+// (exec keeps it), noUnix denies socket(AF_UNIX).
+type filterOpts struct {
+	self   int
+	noUnix bool
+}
+
 // buildFilter returns the seccomp program (see the package comment).
-func buildFilter() []unix.SockFilter {
+func buildFilter(o filterOpts) []unix.SockFilter {
 	var p prog
 	p.ld(offArch)
 	j := p.jeq(auditArch)
@@ -105,21 +113,34 @@ func buildFilter() []unix.SockFilter {
 	for _, nr := range enosysSyscalls {
 		p.retIfEq(uint32(nr), retErrno(unix.ENOSYS))
 	}
-	// clone: no new namespaces.
 	jClone := p.jeq(uint32(unix.SYS_CLONE))
 	jSocket := p.jeq(uint32(unix.SYS_SOCKET))
+	jSocketpair := p.jeq(uint32(unix.SYS_SOCKETPAIR))
 	jKill := p.jeq(uint32(unix.SYS_KILL))
+	jTgkill := p.jeq(uint32(unix.SYS_TGKILL))
+	jSigq := p.jeq(uint32(unix.SYS_RT_SIGQUEUEINFO))
+	jTgsigq := p.jeq(uint32(unix.SYS_RT_TGSIGQUEUEINFO))
 	p.ret(retAllow)
 
-	// kill(-1, …) would signal every process of the uid (hostd, mgmt,
-	// other tenants). Signals to single pids stay allowed (apps manage
-	// their children); Landlock ABI ≥ 6 scopes those too.
+	self := uint32(o.self)
+	// Signals only to itself or its own process group (hostd starts every
+	// workload as a group leader): not hostd, mgmt or another tenant's
+	// processes, whatever the Landlock ABI (scopes need ABI 6). kill(pid):
+	// pid 0, self or -self; tgkill / rt_(tg)sigqueueinfo: tgid self.
 	p.target(jKill)
 	p.ld(offArgLo(0))
-	p.retIfEq(0xffffffff, retErrno(unix.EPERM))
-	p.ret(retAllow)
+	p.retIfEq(0, retAllow)
+	p.retIfEq(self, retAllow)
+	p.retIfEq(-self, retAllow)
+	p.ret(retErrno(unix.EPERM))
+	p.target(jTgkill)
+	p.target(jSigq)
+	p.target(jTgsigq)
+	p.ld(offArgLo(0))
+	p.retIfEq(self, retAllow)
+	p.ret(retErrno(unix.EPERM))
 
-	// clone(flags, …)
+	// clone(flags, …): no new namespaces.
 	p.target(jClone)
 	p.ld(offArgLo(0))
 	js := p.jsetOrJge(unix.BPF_JSET, cloneNSFlags)
@@ -127,10 +148,27 @@ func buildFilter() []unix.SockFilter {
 	p.ret(retAllow)
 	p.ret(retErrno(unix.EPERM))
 
+	// socketpair(AF_UNIX, type, …): connected pairs only (STREAM,
+	// SEQPACKET); a DGRAM pair could be re-pointed at a host socket.
+	p.target(jSocketpair)
+	if o.noUnix {
+		p.ld(offArgLo(1))
+		p.and(0xf)
+		p.retIfEq(unix.SOCK_STREAM, retAllow)
+		p.retIfEq(unix.SOCK_SEQPACKET, retAllow)
+		p.ret(retErrno(unix.EPERM))
+	} else {
+		p.ret(retAllow)
+	}
+
 	// socket(domain, type, protocol)
 	p.target(jSocket)
 	p.ld(offArgLo(0))
-	p.retIfEq(unix.AF_UNIX, retAllow)
+	if o.noUnix {
+		p.retIfEq(unix.AF_UNIX, retErrno(unix.EPERM))
+	} else {
+		p.retIfEq(unix.AF_UNIX, retAllow)
+	}
 	jInet := p.jeq(unix.AF_INET)
 	jInet6 := p.jeq(unix.AF_INET6)
 	jNetlink := p.jeq(unix.AF_NETLINK)
@@ -159,11 +197,11 @@ func buildFilter() []unix.SockFilter {
 
 // installSeccomp sets no_new_privs and installs the filter on every thread
 // of this process (TSYNC).
-func installSeccomp() error {
+func installSeccomp(o filterOpts) error {
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("no_new_privs: %w", err)
 	}
-	ins := buildFilter()
+	ins := buildFilter(o)
 	fp := unix.SockFprog{Len: uint16(len(ins)), Filter: &ins[0]}
 	_, _, e := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC, uintptr(unsafe.Pointer(&fp)))
 	runtime.KeepAlive(ins)

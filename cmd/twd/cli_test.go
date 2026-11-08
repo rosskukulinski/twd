@@ -22,6 +22,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/internal/policy"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
@@ -293,7 +294,13 @@ func TestDoctor(t *testing.T) {
 		got[c.Name] = c.Status
 	}
 	want := map[string]string{"binaries": "ok", "workerd": "ok", "bundler": "ok", "twd_home_writable": "ok",
-		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "system_tailscaled_not_used": "ok"}
+		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "system_tailscaled_not_used": "ok"}
+	if runtime.GOOS == "linux" {
+		want["host_sockets"] = "ok"
+		if len(procsb.RiskyHostSockets()) > 0 {
+			want["host_sockets"] = "warn"
+		}
+	}
 	if sandboxAvailable() {
 		want["sandbox"] = "ok" // the Seatbelt / Landlock probe ran and enforced a deny
 	} else if runtime.GOOS == "linux" {

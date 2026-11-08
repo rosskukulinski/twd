@@ -156,7 +156,7 @@ func doctorLandlock(s *state) (string, string, string) {
 		return "fail", err.Error(), ""
 	}
 	prof := filepath.Join(own, "doctor.json")
-	if err := (&procsb.Profile{Launcher: self, Exec: []string{wd}, Own: []string{own}}).Write(prof); err != nil {
+	if err := (&procsb.Profile{Launcher: self, Exec: []string{wd}, Own: []string{own}, NoUnixSockets: true}).Write(prof); err != nil {
 		return "fail", err.Error(), ""
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -192,8 +192,26 @@ func doctorLandlock(s *state) (string, string, string) {
 	} else {
 		warn = fmt.Sprintf("Landlock ABI %d < 4 can't restrict TCP: a malicious Node app could bypass the egress proxy (use a 6.7+ kernel)", abi)
 	}
-	if abi < 9 {
-		detail += fmt.Sprintf("; unix sockets: twd's servers refuse sandboxed peers (ABI %d < 9 can't restrict connects)", abi)
+	if r := probe(procsb.ProbeConnectUnix, "/var/run/tailscale/tailscaled.sock"); r != "EPERM" {
+		return "fail", "the sandbox can create unix sockets on " + osv + " (" + r + ")", "report this"
 	}
+	detail += fmt.Sprintf("; workloads get no AF_UNIX sockets (seccomp), so no host unix socket is reachable (Landlock ABI %d alone can't restrict unix connects below 9)", abi)
 	return doctorSandboxActive(s, hostd.SandboxLandlock, detail, warn)
+}
+
+// doctorHostSockets (Linux) lists risky host sockets this user can reach
+// (the system tailscaled's LocalAPI, container engines) and container-engine
+// group memberships. Sandboxed workloads can't reach them (no AF_UNIX
+// sockets), but as defence in depth twd then refuses a second tenant unless
+// twd up --insecure-shared-host.
+func doctorHostSockets() (string, string, string) {
+	if runtime.GOOS != "linux" {
+		return "skip", "Linux-only check (on macOS Seatbelt denies sockets under the home dir)", ""
+	}
+	r := procsb.RiskyHostSockets()
+	if len(r) == 0 {
+		return "ok", "this user can't reach the system tailscaled's socket or a container engine (docker/containerd/podman/lxd) and is in none of their groups", ""
+	}
+	return "warn", "this user can reach " + strings.Join(r, ", ") + ": a workload escaping its sandbox could act as this host's tailnet identity or as root, so twd serves one tenant only here (twd tenant add refuses unless twd up --insecure-shared-host)",
+		"run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups"
 }

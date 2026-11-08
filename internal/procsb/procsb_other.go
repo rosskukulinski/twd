@@ -21,3 +21,7 @@ func Descends(pid, root int) bool { return pid == root }
 
 // Guard returns ln unchanged off Linux.
 func Guard(ln net.Listener, _ func(int) bool) net.Listener { return ln }
+
+// RiskyHostSockets is Linux-only (Seatbelt denies sockets under the home
+// dir on macOS).
+func RiskyHostSockets() []string { return nil }

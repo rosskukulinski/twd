@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -349,6 +351,10 @@ type instance struct {
 	// tenant's dir; profile is the Seatbelt profile it runs under, if any.
 	doStorage string
 	profile   string
+	// Landlock: workerd's inherited ingress listener and the loopback
+	// ports of its outbound services.
+	ingressLn *net.UnixListener
+	loopPorts []uint16
 
 	node *nodeProc // Node process tier (runtime "node"); nil for workerd
 
@@ -419,8 +425,36 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 			DOStorage: proto.DODir,
 		}
 	}
+	// Under Landlock (Linux), workerd gets no AF_UNIX sockets at all: its
+	// three outbound services are hostd loopback TCP listeners (Landlock
+	// pins its connects to exactly these ports; a per-instance token keeps
+	// other local processes out) and its ingress listener is an inherited
+	// fd. So it can't connect to any unix socket on the host.
+	var loop map[string]net.Listener
+	var token string
+	if !vmTier && h.sandbox == SandboxLandlock {
+		loop = map[string]net.Listener{}
+		for _, k := range []string{"obj", "wl", "api"} {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				for _, l := range loop {
+					l.Close()
+				}
+				return nil, err
+			}
+			loop[k] = ln
+		}
+		var tb [32]byte
+		rand.Read(tb[:])
+		token = fmt.Sprintf("%x", tb)
+		opts.Loopback = &gen.LoopbackNet{EgressObj: loop["obj"].Addr().String(), EgressWL: loop["wl"].Addr().String(),
+			HostAPI: loop["api"].Addr().String(), Token: token}
+	}
 	res, err := gen.Generate(app, opts)
 	if err != nil {
+		for _, l := range loop {
+			l.Close()
+		}
 		return nil, err
 	}
 	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, tier: tier, doStorage: opts.DOStorage}
@@ -459,11 +493,36 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 		inst.direct = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", res.Sockets.Ingress)
 		}}}
+		if loop != nil {
+			// workerd's ingress listener, created here and inherited.
+			ln, err := net.Listen("unix", res.Sockets.Ingress)
+			if err != nil {
+				for _, l := range loop {
+					l.Close()
+				}
+				inst.stop()
+				return nil, err
+			}
+			os.Chmod(res.Sockets.Ingress, 0o600)
+			inst.ingressLn = ln.(*net.UnixListener)
+			inst.ingressLn.SetUnlinkOnClose(true)
+			for k, hd := range map[string]http.Handler{
+				"obj": h.egressObjHandler(inst), "wl": h.egressWLHandler(inst), "api": h.hostAPI(inst),
+			} {
+				srv := &http.Server{Handler: localToken(token, hd), ReadHeaderTimeout: 30 * time.Second}
+				inst.servers = append(inst.servers, srv)
+				inst.loopPorts = append(inst.loopPorts, uint16(loop[k].Addr().(*net.TCPAddr).Port))
+				go srv.Serve(loop[k])
+			}
+		}
 		for sock, hd := range map[string]http.Handler{
 			res.Sockets.EgressObj: h.egressObjHandler(inst),
 			res.Sockets.EgressWL:  h.egressWLHandler(inst),
 			res.Sockets.HostAPI:   h.hostAPI(inst),
 		} {
+			if loop != nil {
+				break
+			}
 			ln, err := net.Listen("unix", sock)
 			if err != nil {
 				inst.stop()
@@ -494,8 +553,21 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 // and another tenant already runs process-tier workloads here: without a
 // sandbox, tenants' code shares one uid and could read each other's keys.
 // Config.InsecureSharedHost (twd-hostd -insecure-shared-host) allows it.
+//
+// On Linux it also refuses when this user can reach risky host sockets (the
+// system tailscaled's LocalAPI, a container engine) or is in a container
+// engine's group: defence in depth for a workload that escapes its sandbox,
+// which could then act as the host's tailnet identity or as root.
 func (h *Host) sharedHostCheck(tenant string) error {
-	if h.sandbox != SandboxNone || h.cfg.InsecureSharedHost {
+	if h.cfg.InsecureSharedHost {
+		return nil
+	}
+	var why string
+	if h.sandbox == SandboxNone {
+		why = "this host has no process sandbox (" + h.noSandboxReason() + ")"
+	} else if r := h.riskySockets(); len(r) > 0 {
+		why = "this user can reach " + strings.Join(r, ", ") + " (a workload escaping its sandbox could act as the host's tailnet identity or as root)"
+	} else {
 		return nil
 	}
 	h.mu.Lock()
@@ -508,10 +580,18 @@ func (h *Host) sharedHostCheck(tenant string) error {
 		busy := o.active != nil && o.active.tier != bundle.TierMicroVM
 		o.mu.Unlock()
 		if busy {
-			return fmt.Errorf("sandbox_unavailable: this host has no process sandbox (%s), so it runs process-tier workloads of one tenant only, and tenant %s already runs here; enable Landlock, deploy with tier \"microvm\", or start twd-hostd with -insecure-shared-host (tenants are then NOT isolated from each other)", h.noSandboxReason(), o.tenantID)
+			return fmt.Errorf("sandbox_unavailable: %s, so it runs process-tier workloads of one tenant only, and tenant %s already runs here; fix: run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, enable Landlock, or deploy with tier \"microvm\"; or start twd-hostd with -insecure-shared-host (tenants are then NOT isolated from each other)", why, o.tenantID)
 		}
 	}
 	return nil
+}
+
+// riskySockets is procsb.RiskyHostSockets, overridable in tests.
+func (h *Host) riskySockets() []string {
+	if h.cfg.RiskySockets != nil {
+		return h.cfg.RiskySockets()
+	}
+	return procsb.RiskyHostSockets()
 }
 
 func (h *Host) noSandboxReason() string {
@@ -523,6 +603,20 @@ func (h *Host) noSandboxReason() string {
 		return fmt.Sprintf("Landlock unavailable: %v", err)
 	}
 	return "no sandbox on " + runtime.GOOS
+}
+
+// localToken admits only requests carrying the instance's loopback token
+// (gen.LocalTokenHeader, injected by workerd's config), and strips it.
+func localToken(token string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get(gen.LocalTokenHeader)
+		r.Header.Del(gen.LocalTokenHeader)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			netd.WriteError(w, &netd.Error{Code: "forbidden", Detail: "not this instance's workerd"})
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // instanceDir is a fresh instance's run dir. Its name is unguessable: on
@@ -601,7 +695,14 @@ func (inst *instance) spawn() error {
 	}
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.Dir = inst.dir
-	if err := cmd.Start(); err != nil {
+	// Its own process group: a sandboxed workerd may signal only itself and
+	// its group (seccomp), never hostd's.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	err = cmd.Start()
+	for _, f := range cmd.ExtraFiles {
+		f.Close() // the child has its copy
+	}
+	if err != nil {
 		logf.Close()
 		return err
 	}
@@ -727,6 +828,9 @@ func (inst *instance) stop() {
 	}
 	for _, s := range inst.servers {
 		s.Close()
+	}
+	if inst.ingressLn != nil {
+		inst.ingressLn.Close()
 	}
 	if os.Getenv("TWD_KEEP_INSTANCES") == "" {
 		os.RemoveAll(inst.dir)

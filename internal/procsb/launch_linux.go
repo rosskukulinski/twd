@@ -102,7 +102,7 @@ func (p *Profile) Apply() error {
 	if err := landlock.V11.BestEffort().Restrict(p.Rules(os.Getpid())...); err != nil {
 		return fmt.Errorf("landlock: %w", err)
 	}
-	return installSeccomp()
+	return installSeccomp(filterOpts{self: os.Getpid(), noUnix: p.NoUnixSockets})
 }
 
 func launcherMain(args []string) int {

@@ -94,7 +94,22 @@ func probe(op string, args []string) error {
 		remote := []unix.RemoteIovec{{Base: uintptr(unsafe.Pointer(&b[0])), Len: 8}}
 		_, err := unix.ProcessVMReadv(pid, local, remote, 0)
 		return err
+	case ProbeTgkill:
+		pid, _ := strconv.Atoi(arg(0))
+		return unix.Tgkill(pid, pid, 0)
+	case ProbeSocketpair:
+		ty := map[string]int{"stream": unix.SOCK_STREAM, "seqpacket": unix.SOCK_SEQPACKET, "dgram": unix.SOCK_DGRAM}[arg(0)]
+		fds, err := unix.Socketpair(unix.AF_UNIX, ty, 0)
+		if err != nil {
+			return err
+		}
+		unix.Close(fds[0])
+		unix.Close(fds[1])
+		return nil
 	case ProbeSignal:
+		if arg(0) == "self" {
+			return syscall.Kill(os.Getpid(), 0)
+		}
 		pid, _ := strconv.Atoi(arg(0))
 		if pid == -1 {
 			// Raw syscall: never signal everything if the filter failed.

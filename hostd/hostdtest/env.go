@@ -38,6 +38,8 @@ type Options struct {
 	Sandbox string
 	// InsecureSharedHost: see hostd.Config.
 	InsecureSharedHost bool
+	// RiskySockets: see hostd.Config.
+	RiskySockets func() []string
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -99,7 +101,7 @@ func Start(t testing.TB, o Options) *Env {
 		HostID: "h1", Mgmt: hc, DataDir: filepath.Join(dir, "data"), RunDir: filepath.Join(dir, "run"),
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
-		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost,
+		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, RiskySockets: o.RiskySockets,
 	})
 	if err != nil {
 		t.Fatal(err)

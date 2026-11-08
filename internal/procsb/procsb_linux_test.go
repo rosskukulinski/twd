@@ -166,6 +166,48 @@ func TestSandboxProbes(t *testing.T) {
 	if abi >= 9 && got == "ok" {
 		t.Errorf("ABI %d: connect to a unix socket outside the own dirs allowed", abi)
 	}
+
+	// The workload profiles (NoUnixSockets): no AF_UNIX socket() at all, so
+	// no unix socket on the host is reachable whatever the ABI; connected
+	// socketpairs still work; signals only to itself / its group.
+	nu := writeProfile(t, filepath.Join(root, "own"), procsb.Profile{Own: []string{own}, NoUnixSockets: true})
+	for _, k := range []c{
+		{procsb.ProbeConnectUnix, []string{usock}, "denied"},
+		{procsb.ProbeConnectUnix, []string{gsock}, "denied"},
+		{procsb.ProbeSocketpair, []string{"stream"}, "ok"},
+		{procsb.ProbeSocketpair, []string{"seqpacket"}, "ok"},
+		{procsb.ProbeSocketpair, []string{"dgram"}, "denied"},
+		{procsb.ProbeSignal, []string{"self"}, "ok"},
+		{procsb.ProbeSignal, []string{"0"}, "ok"},
+		{procsb.ProbeSignal, []string{sibPID}, "denied"},
+		{procsb.ProbeSignal, []string{strconv.Itoa(os.Getpid())}, "denied"},
+		{procsb.ProbeSignal, []string{"1"}, "denied"},
+		{procsb.ProbeTgkill, []string{sibPID}, "denied"},
+	} {
+		got := probe(t, nu, k.op, k.args...)
+		if (k.want == "ok") != (got == "ok") {
+			t.Errorf("no-unix profile: %s %v: got %q, want %s", k.op, k.args, got, k.want)
+		} else {
+			t.Logf("no-unix profile: %s %v: %s", k.op, k.args, got)
+		}
+	}
+	// Real host sockets at their real paths, if present (the VM run creates
+	// fake listeners there with sudo; see STATUS.md L2).
+	for _, hs := range []string{"/var/run/tailscale/tailscaled.sock", "/var/run/docker.sock"} {
+		if st, err := os.Stat(hs); err != nil || st.Mode()&os.ModeSocket == 0 {
+			t.Logf("%s: not present (skipped)", hs)
+			continue
+		}
+		if c, err := net.Dial("unix", hs); err == nil {
+			c.Close()
+			t.Logf("%s: reachable unsandboxed (control)", hs)
+		}
+		if got := probe(t, nu, procsb.ProbeConnectUnix, hs); got == "ok" {
+			t.Errorf("sandbox reached %s", hs)
+		} else {
+			t.Logf("sandbox → %s: %s", hs, got)
+		}
+	}
 }
 
 func freePort(t *testing.T) uint16 {

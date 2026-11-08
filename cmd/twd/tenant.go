@@ -12,6 +12,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/internal/policy"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/mgmt"
 )
@@ -146,6 +147,11 @@ func cmdTenantAdd(args []string) error {
 		return fail("sandbox_unavailable", "this host has no process sandbox ("+why+"), so its process tier must not serve more than one tenant",
 			"twd doctor explains the sandbox check; tenants of a shared host need Seatbelt (macOS) or Landlock (Linux)").
 			withFix("use a kernel with Landlock, deploy with tier \"microvm\", or (tenants NOT isolated) twd down && twd up --insecure-shared-host")
+	}
+	if r := procsb.RiskyHostSockets(); len(r) > 0 && !s.Cfg.InsecureSharedHost {
+		return fail("sandbox_unavailable", "this user can reach "+strings.Join(r, ", ")+": a workload that escaped its sandbox could act as this host's tailnet identity (tailscaled) or as root (a container engine), so this host must not serve more than one tenant",
+			"twd doctor lists them under host_sockets").
+			withFix("run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, or (tenants NOT isolated) twd down && twd up --insecure-shared-host")
 	}
 	if err := s.requireUp(); err != nil {
 		return err

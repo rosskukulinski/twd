@@ -398,7 +398,10 @@ type WorkloadStatus struct {
 	PID            int    `json:",omitempty"`
 	Sandbox        string `json:",omitempty"`
 	SandboxProfile string `json:",omitempty"`
-	DOStorage      string `json:",omitempty"`
+	// LoopbackPorts are hostd's token-checked loopback listeners for this
+	// workerd's outbound services (Landlock only).
+	LoopbackPorts []uint16 `json:",omitempty"`
+	DOStorage     string   `json:",omitempty"`
 	// Runtime is "node" for the Node process tier ("" = workerd).
 	Runtime string    `json:",omitempty"`
 	Node    *NodeInfo `json:",omitempty"`
@@ -446,6 +449,7 @@ func (h *Host) Status() StatusView {
 			}
 			if w.active.tier != "microvm" {
 				ws.Sandbox, ws.SandboxProfile = sandboxOf(w.active.profile), w.active.profile
+				ws.LoopbackPorts = w.active.loopPorts
 			}
 			w.active.mu.Unlock()
 			if vm := w.active.currentVM(); vm != nil {

@@ -65,6 +65,12 @@ type Profile struct {
 	// connect to or bind (Landlock ABI ≥ 4).
 	ConnectTCP []uint16 `json:"connectTCP,omitempty"`
 	BindTCP    []uint16 `json:"bindTCP,omitempty"`
+	// NoUnixSockets denies socket(AF_UNIX, …) (seccomp): the process can't
+	// connect to any pathname or abstract unix socket on the host (Landlock
+	// < ABI 9 can't refuse those connects). socketpair(AF_UNIX) stays
+	// allowed for STREAM/SEQPACKET (internal IPC; such sockets are
+	// connected and can't be re-pointed).
+	NoUnixSockets bool `json:"noUnixSockets,omitempty"`
 	// Deny documents what hostd denies explicitly (the home dir, state
 	// and run dirs, key files). Landlock is deny-by-default, so these are
 	// denied because they are not allowed; tests and doctor check them.
@@ -114,7 +120,9 @@ const (
 	ProbeUDP         = "udp"         // send a datagram to host:port
 	ProbePtrace      = "ptrace"      // PTRACE_ATTACH pid
 	ProbeVMRead      = "vmread"      // process_vm_readv pid
-	ProbeSignal      = "signal"      // kill(pid, 0)
+	ProbeSignal      = "signal"      // kill(pid, 0); pid "self" = its own
+	ProbeTgkill      = "tgkill"      // tgkill(pid, pid, 0)
+	ProbeSocketpair  = "socketpair"  // socketpair(AF_UNIX, stream|seqpacket|dgram)
 )
 
 // ProbeCommand applies the profile at path in a fresh launcher process,

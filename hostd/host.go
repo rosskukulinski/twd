@@ -94,6 +94,9 @@ type Config struct {
 	// process-tier workloads of more than one tenant. Without it such a host
 	// refuses the second tenant's deployment (typed sandbox_unavailable).
 	InsecureSharedHost bool
+	// RiskySockets overrides the Linux risky-host-socket check
+	// (procsb.RiskyHostSockets; tests).
+	RiskySockets func() []string
 	// SandboxDeny are extra paths no workerd may read, write or connect to
 	// (twd up: its whole state dir, which holds mgmt's custody and socket).
 	SandboxDeny []string

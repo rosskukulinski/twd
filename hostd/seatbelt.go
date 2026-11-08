@@ -177,9 +177,32 @@ func (h *Host) sandboxDeny() []string {
 // workerdCommand builds the instance's workerd command line, wrapped in its
 // tenant's sandbox. workerd needs no TCP at all: its listener and every
 // service it calls are unix sockets in its own instance dir.
+//
+// Under Landlock it gets no unix sockets: its ingress listener is passed as
+// fd 3 (--socket-fd) and its outbound services are loopback TCP ports (the
+// only ones it may connect to); the profile denies socket(AF_UNIX).
 func (inst *instance) workerdCommand() (*exec.Cmd, error) {
-	return inst.sandboxed(inst.h.cfg.WorkerdBin, []string{"serve", inst.res.Config, "--experimental"},
-		[]string{inst.dir, inst.doStorage}, []string{inst.h.cfg.WorkerdBin}, nil, nil, nil)
+	args := []string{"serve", inst.res.Config, "--experimental"}
+	var f *os.File
+	if inst.ingressLn != nil {
+		var err error
+		if f, err = inst.ingressLn.File(); err != nil {
+			return nil, err
+		}
+		args = append(args, "--socket-fd", "ingress=3")
+	}
+	cmd, err := inst.sandboxed(inst.h.cfg.WorkerdBin, args,
+		[]string{inst.dir, inst.doStorage}, []string{inst.h.cfg.WorkerdBin}, nil, nil, inst.loopPorts)
+	if err != nil {
+		if f != nil {
+			f.Close()
+		}
+		return nil, err
+	}
+	if f != nil {
+		cmd.ExtraFiles = []*os.File{f}
+	}
+	return cmd, nil
 }
 
 // nodeCommand builds the Node tier's command line under the same sandbox as
@@ -225,8 +248,12 @@ func (inst *instance) sandboxed(bin string, args, own, readOnly, readOnlyTrees [
 		if err != nil {
 			return nil, err
 		}
+		// No AF_UNIX socket(): workerd's listener is inherited and its
+		// services are loopback TCP; a Node app listens on TCP. Only a Node
+		// app in listen "unix" mode must create its own unix socket.
+		noUnix := inst.ingressLn != nil || inst.node != nil && inst.node.listen != "unix"
 		prof := &procsb.Profile{Launcher: launcher, Exec: readOnly, ReadOnly: readOnlyTrees, Own: own,
-			BindTCP: bindTCP, ConnectTCP: connectTCP, Deny: inst.h.sandboxDeny()}
+			BindTCP: bindTCP, ConnectTCP: connectTCP, NoUnixSockets: noUnix, Deny: inst.h.sandboxDeny()}
 		p := filepath.Join(inst.dir, "sandbox.json")
 		if err := prof.Write(p); err != nil {
 			return nil, err

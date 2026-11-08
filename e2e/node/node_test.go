@@ -612,17 +612,16 @@ func (e *env) landlockNodeChecks(t *testing.T, ws hostd.WorkloadStatus, base str
 		"tcp_host_loopback": "host=127.0.0.1&port=" + lport,
 		"unix_hostd_push_a": "path=" + url.QueryEscape(e.a.Host.PushSocket()),
 		"unix_hostd_push_b": "path=" + url.QueryEscape(e.b.Host.PushSocket()),
+		"unix_tailscaled":   "path=" + url.QueryEscape("/var/run/tailscale/tailscaled.sock"),
+		"unix_docker":       "path=" + url.QueryEscape("/var/run/docker.sock"),
 	} {
 		m := netop(q)
-		if m["ok"] != false && !strings.HasPrefix(name, "unix_") {
-			t.Fatalf("node app (Landlock) %s: connected, bypassing the egress proxy", name)
+		// TCP mode: the app has no AF_UNIX socket() at all, so no unix
+		// socket on the host (tailscaled's, docker's, hostd's) is reachable.
+		if m["ok"] != false {
+			t.Fatalf("node app (Landlock) %s: connected (%v)", name, m)
 		}
 		got[name] = fmt.Sprint(m["code"])
-		if m["ok"] == true {
-			// A unix connect may complete (Landlock < ABI 9); a guarded
-			// server then closes it at once without answering.
-			got[name] = "accepted-then-closed"
-		}
 	}
 	// The app's own port is allowed (self-calls).
 	if m := netop("host=127.0.0.1&port=" + strings.TrimPrefix(ws.Node.Addr, "127.0.0.1:")); m["ok"] != true {
