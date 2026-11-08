@@ -394,12 +394,25 @@ func TestE2EVM(t *testing.T) {
 		}
 		qc := client.HTTPClient(5 * time.Second)
 		rs := time.Now()
-		_, err := qc.Get("http://" + objIP["c"] + "/")
+		resp, err := qc.Get("http://" + objIP["c"] + "/")
 		d := time.Since(rs)
 		res.set("kill_object_new_request_ms", float64(d.Microseconds())/1000)
-		if err == nil || d > time.Second {
-			t.Fatalf("new request after kill: err=%v after %v", err, d)
+		// Fail fast: the kill tombstone (KillTombstone above) answers a typed
+		// 410 object_killed; once it's gone, the dial fails. Never a 200 or
+		// a timeout.
+		how := "error"
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode != 410 || resp.Header.Get("twd-error") != "object_killed" {
+				t.Fatalf("new request after kill: %d %q after %v", resp.StatusCode, resp.Header.Get("twd-error"), d)
+			}
+			how = "410 object_killed"
 		}
+		if d > time.Second {
+			t.Fatalf("new request after kill took %v (%s, %v)", d, how, err)
+		}
+		res.set("kill_object_new_request", how)
+		t.Logf("new request after kill: %s in %v", how, d)
 	})
 
 	t.Run("KillVMFailsFast", func(t *testing.T) {
