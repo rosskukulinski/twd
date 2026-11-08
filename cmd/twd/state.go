@@ -121,7 +121,46 @@ func (s *state) supervisorPID() int {
 		return 0
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	// After a reboot (or a power cut) the file is stale and its pid may
+	// belong to another process, even another twd: a supervisor wrote the
+	// file after it started, so a process that started later isn't it.
+	if st, err := os.Stat(s.pidFile()); err == nil {
+		if start, ok := procStartTime(pid); ok && start.After(st.ModTime().Add(2*time.Second)) {
+			return 0
+		}
+	}
 	return pid
+}
+
+// procStartTime is when pid started (Linux /proc; ok=false elsewhere).
+func procStartTime(pid int) (time.Time, bool) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return time.Time{}, false
+	}
+	i := strings.LastIndexByte(string(b), ')')
+	if i < 0 {
+		return time.Time{}, false
+	}
+	f := strings.Fields(string(b)[i+1:])
+	if len(f) < 20 {
+		return time.Time{}, false
+	}
+	ticks, err := strconv.ParseInt(f[19], 10, 64) // field 22: starttime, clock ticks after boot
+	if err != nil {
+		return time.Time{}, false
+	}
+	sb, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return time.Time{}, false
+	}
+	for _, ln := range strings.Split(string(sb), "\n") {
+		if v, ok := strings.CutPrefix(ln, "btime "); ok {
+			bt, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return time.Unix(bt, 0).Add(time.Duration(ticks) * time.Second / 100), true // USER_HZ = 100
+		}
+	}
+	return time.Time{}, false
 }
 
 func pidAlive(pid int) bool {
