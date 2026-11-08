@@ -86,8 +86,11 @@ export function createTailnetContext(tw: TailnetApiStub, env: Record<string, any
       const cls = classOf(ns);
       const v = await op("spawn", { class: cls, name: opts.name, caps: opts.caps, ttl: opts.ttl, principal: opts.principal });
       let state: "pending" | "ready" | "failed" = v.status === "ready" ? "ready" : "pending";
+      // Await: inside a facet, env.X is an RPC stub and getByName returns an
+      // RpcPromise that must not be stored un-awaited.
+      const stub = await ns.getByName(opts.name);
       const sp: Spawned<any> = {
-        stub: ns.getByName(opts.name),
+        stub,
         name: v.hostname ?? opts.name,
         objectId: v.objectID,
         state: () => state,
@@ -191,7 +194,11 @@ export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts:
 
 /** wrapHandler installs ctx.tailnet (workload identity) on the default export. */
 export function wrapHandler(H: any, bindings: BindingMap) {
-  if (!H) return H;
+  if (!H) {
+    return {
+      fetch: () => new TailnetError("unknown_object", "this app has no default export (Worker); address objects via their own nodes or /_twd/o/<Class>/<name>/").toResponse(),
+    };
+  }
   if (typeof H === "function") {
     // A WorkerEntrypoint class.
     return {

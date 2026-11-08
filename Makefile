@@ -57,3 +57,8 @@ hooks:
 
 clean:
 	rm -rf bin dist
+
+## gen-js: rebuild the runtime module hostd embeds into every deployment (from @twd/tailnet).
+gen-js: $(WORKERD)
+	node_modules/.bin/esbuild js/packages/tailnet/src/runtime.ts --bundle --format=esm --platform=neutral \
+		--target=es2022 --legal-comments=none --log-level=warning --outfile=hostd/gen/js/twd-rt.js
