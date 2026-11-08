@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -40,6 +41,9 @@ func OpenStore(ctx context.Context, dsn string) (*SQLStore, error) {
 		s = &SQLStore{db: db, d: dialectPostgres}
 	} else {
 		path := strings.TrimPrefix(dsn, "sqlite:")
+		if f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600); err == nil {
+			f.Close() // create 0600 up front; SQLite gives -wal/-shm the same mode
+		}
 		db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_txlock=immediate")
 		if err != nil {
 			return nil, err

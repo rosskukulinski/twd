@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps test test-go test-js e2e-local e2e-real e2e-vm release lint hooks clean
+.PHONY: all build deps test test-go test-js test-pg e2e-local e2e-real e2e-vm release lint hooks clean
 
 all: build
 
@@ -27,6 +27,12 @@ test-go:
 
 test-js:
 	npm test --silent
+
+## test-pg: the mgmt Store tests against Postgres 17 in OrbStack docker (throwaway container).
+PG_CTX  ?= orbstack
+PG_PORT ?= 55433
+test-pg:
+	sh scripts/test-pg.sh "$(PG_CTX)" "$(PG_PORT)"
 
 ## e2e-local: the twd-netd binary as a real process against a local control plane + workerd.
 e2e-local: deps

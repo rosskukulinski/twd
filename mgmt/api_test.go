@@ -219,11 +219,19 @@ func newTestEnv(t *testing.T, issuer *Issuer) *testEnv {
 	ts := newFakeTS(t)
 	keyFile := filepath.Join(dir, "api.env")
 	os.WriteFile(keyFile, []byte("TS_API_KEY="+ts.apiToken+"\n"), 0o600)
-	st, err := OpenStore(ctx, filepath.Join(dir, "mgmt.db"))
-	if err != nil {
-		t.Fatal(err)
+	var st *SQLStore
+	if os.Getenv("TWD_TEST_API_POSTGRES") != "" {
+		st = storesUnderTest(t)["postgres"] // fresh schema
+		if st == nil {
+			t.Fatal("TWD_TEST_API_POSTGRES needs TWD_TEST_POSTGRES_DSN")
+		}
+	} else {
+		var err error
+		if st, err = OpenStore(ctx, filepath.Join(dir, "mgmt.db")); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
 	}
-	t.Cleanup(func() { st.Close() })
 	cust, err := OpenFileCustody(filepath.Join(dir, "custody"))
 	if err != nil {
 		t.Fatal(err)
@@ -466,7 +474,10 @@ func TestAPIEndToEnd(t *testing.T) {
 	for _, r := range aud.Records {
 		kinds = append(kinds, r.Kind)
 	}
-	if strings.Join(kinds, ",") != "spawn,mint,deny,credential,ready,kill" || !aud.Verified {
+	// mint is asynchronous, so it may land before or after the refused spawn (deny).
+	sorted := append([]string(nil), kinds...)
+	slices.Sort(sorted[1:3])
+	if strings.Join(sorted, ",") != "spawn,deny,mint,credential,ready,kill" || !aud.Verified {
 		t.Fatalf("audit for gg: %v verified=%v", kinds, aud.Verified)
 	}
 	var kd map[string]any
