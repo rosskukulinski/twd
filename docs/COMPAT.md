@@ -90,7 +90,13 @@ check below runs in both.
 
 ## Node process tier (M9)
 
-See [node-tier.md](node-tier.md) for the full table and the security caveat: in the process tier, egress enforcement relies on proxy settings that a malicious Node app can bypass, so the microVM tier is the enforcement boundary.
+See [node-tier.md](node-tier.md) for the full table and the security
+caveat: on Linux with Landlock ABI ≥ 4 (kernel 6.7+) the sandbox lets a Node
+app open TCP only to its own port and its egress proxy, so egress through
+netd is **enforced**; on macOS (Seatbelt) and on Landlock ABI < 4 it is
+**cooperative** (a malicious Node app can bypass the proxy; `twd status`
+says `egress unenforced` and a multi-tenant host refuses such a deploy by
+default). The microVM tier is the strongest boundary.
 
 | env | value |
 |---|---|

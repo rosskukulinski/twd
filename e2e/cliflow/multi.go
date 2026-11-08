@@ -355,8 +355,8 @@ func (m *MultiEnv) Run() {
 		if get(r.Body, "refund", "ok") != false || get(r.Body, "refund", "error") != "cap_missing" {
 			t.Fatalf("(d) tenant %s: narrowed child's refund must be cap_missing: %s", tn.Key, r)
 		}
-		if m.PolicyGrantsParentRefund && get(r.Body, "parent", "refund", "error") == "cap_missing" {
-			t.Fatalf("(d) tenant %s: the parent's refund was cap_missing too; the denial proves nothing about lim: %s", tn.Key, r)
+		if m.PolicyGrantsParentRefund && (get(r.Body, "parent", "refund", "ok") != true || get(r.Body, "parent", "lookup_order", "ok") != true) {
+			t.Fatalf("(d) tenant %s: the unnarrowed parent's refund/lookup_order must be admitted, else the child's denial proves nothing about lim: %s", tn.Key, r)
 		}
 		res.pass("d_lim_enforced_"+tn.Key, fmt.Sprintf("same-tag child with lim=[lookup_order]: refund cap_missing, lookup_order ok; parent refund %v", get(r.Body, "parent", "refund", "ok")))
 	}

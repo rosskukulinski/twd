@@ -119,7 +119,7 @@ on macOS, Landlock + seccomp on Linux) works and enforces, and that twd is not u
 
 ```sh
 twd up --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env --yes
-twd init support --template agent        # or hello, mcp
+twd init support --template agent        # or hello, mcp, ai-agent; node-workflow needs Node.js on this machine
 cd support && twd deploy
 twd status
 ```
@@ -288,6 +288,14 @@ client on another machine after 9.5 s.
 boot, ssh up at 6.6 s, `twd.service` active and twd healthy at 6.6 s, every
 object rejoined from saved state (same node IDs, nothing re-minted), and
 the workload answered a client on another machine at 8.6–17.1 s (two runs).
+The spread is on the **client's** side, not twd's: a persistent node comes
+back with the same node key but fresh WireGuard state, so a client that
+still holds a recent session to it keeps sending on that dead session and
+WireGuard only re-handshakes after ~15 s of silence; a client whose session
+had already gone idle, or a client that has never talked to the node,
+reaches it within 2–3 s of `twd up` (measured in STATUS.md, "Diagnosis: the
+12–17 s re-find delay"). The node is reachable over DERP the moment it is
+up.
 
 ### Per-distro notes
 
@@ -382,7 +390,7 @@ Firecracker and its jailer (v1.17), plus `bin/twd-vmhelper`.
 ```sh
 ./install.sh                                   # as you, into ~/.twd (no sudo)
 sudo ~/.twd/bin/twd host setup --microvm       # sudo's PATH lacks ~/.twd/bin: use the full path
-twd doctor                                     # "microvm: ok"
+twd doctor                                     # "microvm_tier: ok"
 ```
 
 `twd host setup --microvm` (for `$SUDO_USER`, or `--user <name>`):
@@ -403,9 +411,11 @@ twd doctor                                     # "microvm: ok"
   virtualization they cut workerd start-up from ~3.7 s to ~0.5 s.
 
 After that **twd runs as you**: `twd up …` as usual. `twd up` prints
-`tiers: process, microvm`. Without the setup, `"tier": "microvm"` falls
-back to the process tier with a warning, and `twd doctor` says why
-(`microvm: warn … fix: sudo ~/.twd/bin/twd host setup --microvm`).
+`tiers: process [Landlock+seccomp, landlock (ABI 4)], microvm [Firecracker,
+jailed, via twd-vmhelper; "tier": "microvm" in twd.jsonc]`. Without the
+setup, `"tier": "microvm"` falls back to the process tier with a warning,
+and `twd doctor` says why (`microvm_tier: warn … fix: sudo
+~/.twd/bin/twd host setup --microvm`).
 
 ### Deploying in a microVM
 

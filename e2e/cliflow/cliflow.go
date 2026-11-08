@@ -636,8 +636,10 @@ func (e *Env) Run() {
 		t.Fatalf("(d) narrowed child's refund must be cap_missing (lim not enforced?): %s", r)
 	}
 	if e.PolicyGrantsParentRefund {
-		if get(r.Body, "parent", "refund", "error") == "cap_missing" {
-			t.Fatalf("(d) the unnarrowed parent's refund was cap_missing too, so the denial proves nothing about lim: %s", r)
+		// The parent (same tag, no lim) must be ADMITTED: the child's denial
+		// then comes from its certificate's lim, not from the tenant policy.
+		if get(r.Body, "parent", "refund", "ok") != true || get(r.Body, "parent", "lookup_order", "ok") != true {
+			t.Fatalf("(d) the unnarrowed parent's refund/lookup_order must be admitted, else the child's denial proves nothing about lim: %s", r)
 		}
 	} else {
 		res.Notes = append(res.Notes, "(d) hermetic policy grants nobody refund: the parent's refund is cap_missing as well; the lim-vs-policy contrast is asserted on the real tailnets")
@@ -648,8 +650,8 @@ func (e *Env) Run() {
 	if no.Parent != ao.ID || !slices.Contains(no.Tags, "tag:twd-agent-support") || fmt.Sprint(get(ncaps, MCPCap, "tools")) != "[lookup_order]" {
 		t.Fatalf("(d) narrowed child object: %+v", no)
 	}
-	res.pass("d_spawn", fmt.Sprintf("child %s node %s tags %v caps %s; lim enforced: same-tag child %s (tag %v, lim %s) → refund cap_missing, lookup_order ok; parent refund %v",
-		co.ID, co.MagicDNS, co.Tags, co.Caps, no.ID, no.Tags, no.Caps, get(r.Body, "parent", "refund", "error")))
+	res.pass("d_spawn", fmt.Sprintf("child %s node %s tags %v caps %s; lim enforced: same-tag child %s (tag %v, lim %s) → refund cap_missing, lookup_order ok; parent refund ok=%v",
+		co.ID, co.MagicDNS, co.Tags, co.Caps, no.ID, no.Tags, no.Caps, get(r.Body, "parent", "refund", "ok")))
 
 	// Record the IDs twd created (leftover checks after down).
 	for _, o := range e.objects() {
