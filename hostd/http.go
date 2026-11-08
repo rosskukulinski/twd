@@ -390,6 +390,12 @@ type WorkloadStatus struct {
 	InstanceDir                                     string
 	Tier                                            string
 	VM                                              *sandbox.Info `json:",omitempty"`
+	// Process tier: the workerd pid, its sandbox ("none" | "seatbelt"),
+	// the Seatbelt profile, and its DO storage dir.
+	PID            int    `json:",omitempty"`
+	Sandbox        string `json:",omitempty"`
+	SandboxProfile string `json:",omitempty"`
+	DOStorage      string `json:",omitempty"`
 }
 
 // StatusView is GET /v0/status.
@@ -418,6 +424,18 @@ func (h *Host) Status() StatusView {
 			ws.Requests = w.active.reqs.Load()
 			ws.InstanceDir = w.active.dir
 			ws.Tier = w.active.tier
+			ws.DOStorage = w.active.doStorage
+			w.active.mu.Lock()
+			if w.active.cmd != nil && w.active.cmd.Process != nil {
+				ws.PID = w.active.cmd.Process.Pid
+			}
+			if w.active.tier != "microvm" {
+				ws.Sandbox, ws.SandboxProfile = SandboxNone, w.active.profile
+				if w.active.profile != "" {
+					ws.Sandbox = SandboxSeatbelt
+				}
+			}
+			w.active.mu.Unlock()
 			if vm := w.active.currentVM(); vm != nil {
 				info := vm.Info()
 				ws.VM = &info

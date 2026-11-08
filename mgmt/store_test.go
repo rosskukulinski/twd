@@ -223,11 +223,11 @@ func TestStoreObjectsAndDeployments(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		d, c, err := s.FindClass(ctx, "tn", "A")
+		d, c, err := s.FindClass(ctx, "tn", "", "A")
 		if err != nil || d.ID != "d1" || c.Tags[0] != "tag:a2" {
 			t.Fatalf("FindClass: %+v %+v %v", d, c, err)
 		}
-		if _, _, err := s.FindClass(ctx, "tn", "Z"); !errors.Is(err, ErrNotFound) {
+		if _, _, err := s.FindClass(ctx, "tn", "", "Z"); !errors.Is(err, ErrNotFound) {
 			t.Fatal(err)
 		}
 		if got, err := s.GetDeployment(ctx, "d0"); err != nil || len(got.Bundle) != 3 {
@@ -241,7 +241,7 @@ func TestStoreObjectsAndDeployments(t *testing.T) {
 			t.Fatalf("assignments %+v", as)
 		}
 		mk := func(id, parent, root string, st string) {
-			if err := s.CreateObject(ctx, Object{ID: id, TenantID: "tn", Namespace: "A", Name: id, Hostname: id, ParentID: parent,
+			if err := s.CreateObject(ctx, Object{ID: id, TenantID: "tn", Workload: "w", Namespace: "A", Name: id, Hostname: id, ParentID: parent,
 				RootID: root, Status: st, Tags: []string{"tag:a"}}); err != nil {
 				t.Fatal(err)
 			}
@@ -250,7 +250,7 @@ func TestStoreObjectsAndDeployments(t *testing.T) {
 		mk("c1", "r", "r", StatusReady)
 		mk("c2", "r", "r", StatusKilled)
 		mk("g1", "c1", "r", StatusPending)
-		if err := s.CreateObject(ctx, Object{ID: "dup", TenantID: "tn", Namespace: "A", Name: "r"}); !errors.Is(err, ErrExists) {
+		if err := s.CreateObject(ctx, Object{ID: "dup", TenantID: "tn", Workload: "w", Namespace: "A", Name: "r"}); !errors.Is(err, ErrExists) {
 			t.Fatalf("dup name: %v", err)
 		}
 		if n, _ := s.CountLive(ctx, "tn", "r"); n != 2 {

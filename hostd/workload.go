@@ -279,6 +279,10 @@ type instance struct {
 	direct  *http.Client
 	tier    string // bundle.TierProcess | bundle.TierMicroVM
 	spec    sandbox.Spec
+	// doStorage is the workload's DO storage (process tier), under its
+	// tenant's dir; profile is the Seatbelt profile it runs under, if any.
+	doStorage string
+	profile   string
 
 	inflight atomic.Int64
 	reqs     atomic.Int64
@@ -323,7 +327,7 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
 	opts := gen.Options{
 		Dir:          dir,
-		DOStorage:    filepath.Join(h.cfg.DataDir, "tenants", w.tenantID, "workloads", w.name, "do"),
+		DOStorage:    filepath.Join(h.tenantDir(w.tenantID), "workloads", w.name, "do"),
 		DeploymentID: depID,
 		Workload:     w.name,
 	}
@@ -345,7 +349,7 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	if err != nil {
 		return nil, err
 	}
-	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, tier: tier}
+	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, tier: tier, doStorage: opts.DOStorage}
 	if vmTier {
 		inst.ingress = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			vm := inst.currentVM()
@@ -456,7 +460,11 @@ func (inst *instance) spawn() error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(inst.h.cfg.WorkerdBin, "serve", inst.res.Config, "--experimental")
+	cmd, err := inst.workerdCommand()
+	if err != nil {
+		logf.Close()
+		return err
+	}
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.Dir = inst.dir
 	if err := cmd.Start(); err != nil {

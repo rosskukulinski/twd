@@ -83,6 +83,12 @@ type Config struct {
 	DefaultTier string
 	// VMDebug enables guest diagnostics (connectivity probes; tests).
 	VMDebug bool
+	// Sandbox confines process-tier workerds: "none" (default),
+	// "seatbelt" (macOS) or "auto".
+	Sandbox string
+	// SandboxDeny are extra paths no workerd may read, write or connect to
+	// (twd up: its whole state dir, which holds mgmt's custody and socket).
+	SandboxDeny []string
 }
 
 // Host is a running twd-hostd.
@@ -101,6 +107,7 @@ type Host struct {
 	byKey     map[string]*object   // tenantID|namespace|name (live only)
 	creating  map[string]*createCall
 	instSeq   int
+	sandbox   string // resolved Config.Sandbox
 	lastHB    time.Time
 	fenced    bool
 
@@ -139,14 +146,19 @@ func New(cfg Config) (*Host, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
+	sb, err := ResolveSandbox(cfg.Sandbox)
+	if err != nil {
+		return nil, err
+	}
 	cfg.Mgmt.HostID = cfg.HostID
-	h := &Host{cfg: cfg, log: cfg.Logger, mgmt: cfg.Mgmt,
+	h := &Host{cfg: cfg, sandbox: sb, log: cfg.Logger, mgmt: cfg.Mgmt,
 		tenants: map[string]*tenant{}, workloads: map[string]*workload{}, objects: map[string]*object{},
 		byNetd: map[string]*object{}, byKey: map[string]*object{}, creating: map[string]*createCall{},
 		syncNow: make(chan struct{}, 1)}
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, err
 	}
+	os.Chmod(cfg.DataDir, 0o700)
 	if h.cfg.RunDir == "" {
 		d, err := os.MkdirTemp("/tmp", "twd-h-")
 		if err != nil {

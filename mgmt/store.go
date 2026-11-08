@@ -26,15 +26,17 @@ type Store interface {
 	// Assignments returns the latest deployment of every (tenant, workload)
 	// whose namespace lease this host currently holds.
 	Assignments(ctx context.Context, hostID string) ([]Deployment, error)
-	// FindClass returns the latest deployment of tenantID that declares the
-	// DO class (namespace).
-	FindClass(ctx context.Context, tenantID, class string) (Deployment, ClassConfig, error)
+	// FindClass returns the latest deployment of the tenant's workload that
+	// declares the DO class (namespace). With workload "", the class must be
+	// declared by exactly one workload (else ErrAmbiguous).
+	FindClass(ctx context.Context, tenantID, workload, class string) (Deployment, ClassConfig, error)
 	// LatestDeployments returns the latest deployment of every workload of a tenant.
 	LatestDeployments(ctx context.Context, tenantID string) ([]Deployment, error)
 
-	CreateObject(ctx context.Context, o Object) error // ErrExists on (tenant, namespace, name)
+	// Object identity is (tenant, workload, namespace = class, name).
+	CreateObject(ctx context.Context, o Object) error // ErrExists on (tenant, workload, namespace, name)
 	GetObject(ctx context.Context, id string) (Object, error)
-	GetObjectByName(ctx context.Context, tenantID, namespace, name string) (Object, error)
+	GetObjectByName(ctx context.Context, tenantID, workload, namespace, name string) (Object, error)
 	ListObjects(ctx context.Context, f ObjectFilter) ([]Object, error)
 	// UpdateObject is a read-modify-write in one transaction. With a non-nil
 	// fence, the lease must still be held at fence.Epoch (else ErrLeaseLost).
@@ -73,6 +75,7 @@ type Fence struct {
 // ObjectFilter selects objects; empty fields match everything.
 type ObjectFilter struct {
 	TenantID  string
+	Workload  string
 	Namespace string
 	ParentID  string
 	RootID    string

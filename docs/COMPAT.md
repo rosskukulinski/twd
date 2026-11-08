@@ -77,11 +77,13 @@ check below runs in both.
   `schedule()` in facet mode wedged the agent (every later request 500).
   twd now delegates facet alarms to the Host DO (`hostd/gen/js/platform.js`
   `__twd_alarm_op`/`alarm`, `@twd/tailnet` runtime `installAlarmShim`).
-- **Cross-workload object collision** (fail closed): mgmt keys objects by
-  `(tenant, namespace = class, name)`, so two workloads of one tenant with the
-  same DO class and object name got the **same** object, and the second
-  app's egress left from the first app's node. hostd now refuses with
-  `409 namespace_conflict` (`SameClassAcrossWorkloadsFailsClosed`). Give DO
-  classes tenant-unique names until the mgmt namespace includes the workload.
+- **Cross-workload object collision** (fixed in M7): M5 found that mgmt
+  keyed objects by `(tenant, namespace = class, name)`, so two workloads of
+  one tenant with the same DO class and object name got the **same** object
+  (the second app's egress left from the first app's node), and hostd
+  failed closed with `409 namespace_conflict`. mgmt now scopes identity by
+  `(tenant, workload, class, name)`: the two get distinct objects, nodes,
+  hostnames and state dirs (`SameClassAcrossWorkloadsDistinctIdentities`).
+  hostd keeps `namespace_conflict` as a defensive assertion only.
 - **Same-host MCP**: an agent and the MCP server it calls must be on
   different hosts (or the call must go through the platform, not built).

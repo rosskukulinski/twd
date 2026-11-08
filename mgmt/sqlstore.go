@@ -106,14 +106,14 @@ CREATE TABLE IF NOT EXISTS deployments (
   bundle %s, created_at BIGINT NOT NULL);
 CREATE INDEX IF NOT EXISTS deployments_tw ON deployments (tenant_id, workload, created_at);
 CREATE TABLE IF NOT EXISTS objects (
-  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, namespace TEXT NOT NULL, name TEXT NOT NULL,
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, workload TEXT NOT NULL DEFAULT '', namespace TEXT NOT NULL, name TEXT NOT NULL,
   hostname TEXT NOT NULL, deployment_id TEXT NOT NULL, lease TEXT NOT NULL, tags TEXT NOT NULL,
   caps TEXT NOT NULL DEFAULT '', parent_id TEXT NOT NULL DEFAULT '', root_id TEXT NOT NULL,
   depth BIGINT NOT NULL, ttl_seconds BIGINT NOT NULL DEFAULT 0, ephemeral BIGINT NOT NULL DEFAULT 0,
   status TEXT NOT NULL, node_id TEXT NOT NULL DEFAULT '', stable_node_id TEXT NOT NULL DEFAULT '',
   magic_dns TEXT NOT NULL DEFAULT '', key_id TEXT NOT NULL DEFAULT '', key_expires BIGINT NOT NULL DEFAULT 0,
   kill_reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
-  UNIQUE (tenant_id, namespace, name));
+  UNIQUE (tenant_id, workload, namespace, name));
 CREATE INDEX IF NOT EXISTS objects_parent ON objects (parent_id);
 CREATE INDEX IF NOT EXISTS objects_root ON objects (root_id, status);
 CREATE TABLE IF NOT EXISTS leases (
@@ -154,11 +154,17 @@ func (s *SQLStore) migrate(ctx context.Context) error {
 		}
 		defer s.db.ExecContext(context.Background(), "SELECT pg_advisory_unlock(7464)")
 	}
+	legacy, err := s.renameLegacyObjects(ctx)
+	if err != nil {
+		return err
+	}
 	ddl := fmt.Sprintf(schemaCommon, blob)
 	if s.d == dialectPostgres {
 		// pgx runs multi-statement strings as one simple-protocol batch.
-		_, err := s.db.ExecContext(ctx, ddl+trig)
-		return err
+		if _, err := s.db.ExecContext(ctx, ddl+trig); err != nil {
+			return err
+		}
+		return s.copyLegacyObjects(ctx, legacy)
 	}
 	for _, stmt := range splitSQL(ddl) {
 		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
@@ -170,7 +176,68 @@ func (s *SQLStore) migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	return s.copyLegacyObjects(ctx, legacy)
+}
+
+// Object identity is (tenant, workload, namespace = class, name) since M7.
+// A store created before that has objects keyed by (tenant, namespace,
+// name) and no workload column: renameLegacyObjects moves that table
+// aside (with its indexes) before the DDL creates the new one, and
+// copyLegacyObjects copies the rows back with the workload taken from each
+// object's deployment. Object IDs are kept, so existing nodes keep their
+// identity.
+func (s *SQLStore) renameLegacyObjects(ctx context.Context) (bool, error) {
+	var exists bool
+	if s.d == dialectPostgres {
+		if err := s.db.QueryRowContext(ctx, "SELECT to_regclass('objects') IS NOT NULL").Scan(&exists); err != nil {
+			return false, err
+		}
+	} else {
+		var n int
+		if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='objects'").Scan(&n); err != nil {
+			return false, err
+		}
+		exists = n > 0
+	}
+	if !exists {
+		return false, nil
+	}
+	rows, err := s.db.QueryContext(ctx, "SELECT workload FROM objects WHERE 1=0")
+	if err == nil {
+		rows.Close()
+		return false, nil // already has the workload column
+	}
+	stmts := []string{"DROP INDEX IF EXISTS objects_parent", "DROP INDEX IF EXISTS objects_root",
+		"ALTER TABLE objects RENAME TO objects_v0"}
+	if s.d == dialectPostgres {
+		// Postgres keeps index names on rename; free the new table's PK name.
+		stmts = append(stmts, "ALTER INDEX IF EXISTS objects_pkey RENAME TO objects_v0_pkey")
+	}
+	for _, stmt := range stmts {
+		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+			return false, fmt.Errorf("%w: %s", err, stmt)
+		}
+	}
+	return true, nil
+}
+
+func (s *SQLStore) copyLegacyObjects(ctx context.Context, legacy bool) error {
+	if !legacy {
+		return nil
+	}
+	old := strings.Replace(objectCols, "workload, ", "", 1)
+	ins := "INSERT INTO objects (" + objectCols + ") SELECT " +
+		strings.Replace(prefixCols("o.", old), "o.tenant_id, ", "o.tenant_id, COALESCE((SELECT d.workload FROM deployments d WHERE d.id=o.deployment_id), ''), ", 1) +
+		" FROM objects_v0 o"
+	if _, err := s.db.ExecContext(ctx, ins); err != nil {
+		return fmt.Errorf("migrate objects: %w", err)
+	}
+	// The workload entry node of a workload is named after it.
+	if _, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET workload=name WHERE workload='' AND namespace=?"), WorkloadNamespace); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, "DROP TABLE objects_v0")
+	return err
 }
 
 func splitSQL(s string) []string {
@@ -401,30 +468,46 @@ func (s *SQLStore) LatestDeployments(ctx context.Context, tenantID string) ([]De
 	return s.latestDeployments(ctx, "AND d.tenant_id=?", tenantID)
 }
 
-func (s *SQLStore) FindClass(ctx context.Context, tenantID, class string) (Deployment, ClassConfig, error) {
+func (s *SQLStore) FindClass(ctx context.Context, tenantID, workload, class string) (Deployment, ClassConfig, error) {
 	ds, err := s.latestDeployments(ctx, "AND d.tenant_id=?", tenantID)
 	if err != nil {
 		return Deployment{}, ClassConfig{}, err
 	}
+	var hits []Deployment
+	var cfg ClassConfig
 	for i := len(ds) - 1; i >= 0; i-- {
+		if workload != "" && ds[i].Workload != workload {
+			continue
+		}
 		for _, c := range ds[i].Namespaces {
 			if c.Class == class {
-				return ds[i], c, nil
+				hits, cfg = append(hits, ds[i]), c
+				break
 			}
 		}
+	}
+	switch {
+	case len(hits) == 1:
+		return hits[0], cfg, nil
+	case len(hits) > 1:
+		var ws []string
+		for _, d := range hits {
+			ws = append(ws, d.Workload)
+		}
+		return Deployment{}, ClassConfig{}, fmt.Errorf("namespace %q is declared by workloads %v; name the workload: %w", class, ws, ErrAmbiguous)
 	}
 	return Deployment{}, ClassConfig{}, fmt.Errorf("namespace %q: %w", class, ErrNotFound)
 }
 
 // ---- objects ----
 
-const objectCols = "id, tenant_id, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
+const objectCols = "id, tenant_id, workload, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
 
 func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var o Object
 	var tags, caps string
 	var depth, eph int64
-	err := sc.Scan(&o.ID, &o.TenantID, &o.Namespace, &o.Name, &o.Hostname, &o.DeploymentID, &o.Lease, &tags, &caps,
+	err := sc.Scan(&o.ID, &o.TenantID, &o.Workload, &o.Namespace, &o.Name, &o.Hostname, &o.DeploymentID, &o.Lease, &tags, &caps,
 		&o.ParentID, &o.RootID, &depth, &o.TTLSeconds, &eph, &o.Status, &o.NodeID, &o.StableNodeID, &o.MagicDNS,
 		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -443,13 +526,13 @@ func objectArgs(o Object) []any {
 	if o.Ephemeral {
 		eph = 1
 	}
-	return []any{o.ID, o.TenantID, o.Namespace, o.Name, o.Hostname, o.DeploymentID, o.Lease, jsonStr(o.Tags), string(o.Caps),
+	return []any{o.ID, o.TenantID, o.Workload, o.Namespace, o.Name, o.Hostname, o.DeploymentID, o.Lease, jsonStr(o.Tags), string(o.Caps),
 		o.ParentID, o.RootID, o.Depth, o.TTLSeconds, eph, o.Status, o.NodeID, o.StableNodeID, o.MagicDNS,
 		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt}
 }
 
 func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -460,8 +543,8 @@ func (s *SQLStore) GetObject(ctx context.Context, id string) (Object, error) {
 	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE id=?"), id))
 }
 
-func (s *SQLStore) GetObjectByName(ctx context.Context, tenantID, ns, name string) (Object, error) {
-	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE tenant_id=? AND namespace=? AND name=?"), tenantID, ns, name))
+func (s *SQLStore) GetObjectByName(ctx context.Context, tenantID, workload, ns, name string) (Object, error) {
+	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE tenant_id=? AND workload=? AND namespace=? AND name=?"), tenantID, workload, ns, name))
 }
 
 func (s *SQLStore) ListObjects(ctx context.Context, f ObjectFilter) ([]Object, error) {
@@ -470,6 +553,9 @@ func (s *SQLStore) ListObjects(ctx context.Context, f ObjectFilter) ([]Object, e
 	add := func(cond string, v any) { where = append(where, cond); args = append(args, v) }
 	if f.TenantID != "" {
 		add("tenant_id=?", f.TenantID)
+	}
+	if f.Workload != "" {
+		add("workload=?", f.Workload)
 	}
 	if f.Namespace != "" {
 		add("namespace=?", f.Namespace)

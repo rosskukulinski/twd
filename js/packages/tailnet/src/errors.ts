@@ -54,7 +54,7 @@ export const CATALOG: Readonly<Record<TailnetErrorCode, CatalogEntry>> = Object.
   object_killed: { status: 410, title: "a new request reached a killed object (its node's tombstone answered)" },
   no_identity: { status: 401, title: "the request carries no verified tailnet caller" },
   lease_lost: { status: 409, title: "this host no longer holds the namespace lease" },
-  namespace_conflict: { status: 409, title: "another workload of this tenant already owns this DO class + object name (class names must be unique per tenant)" },
+  namespace_conflict: { status: 409, title: "mgmt returned another identity's object for this workload's class + object name (an invariant violation; twd fails closed rather than share a node)" },
   bad_request: { status: 400, title: "the request is malformed" },
   unknown_object: { status: 404, title: "no such object" },
   dial_failed: { status: 502, title: "the tailnet dial failed" },

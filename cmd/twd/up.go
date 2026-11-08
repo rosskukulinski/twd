@@ -396,7 +396,11 @@ func cmdSupervise(args []string) error {
 	}
 	hargs := []string{hostdBin, "-mgmt", "unix://" + s.mgmtSock(), "-host-id", s.Cfg.HostID,
 		"-data-dir", filepath.Join(s.Dir, "hostd"), "-run-dir", s.hostdRunDir(), "-workerd", s.Cfg.Workerd,
-		"-heartbeat", s.Cfg.Heartbeat, "-kill-tombstone", s.Cfg.KillTombstone, "-hostname-prefix", s.Cfg.HostnamePrefix}
+		"-heartbeat", s.Cfg.Heartbeat, "-kill-tombstone", s.Cfg.KillTombstone, "-hostname-prefix", s.Cfg.HostnamePrefix,
+		// No tenant's workerd may touch twd's state (mgmt custody, every
+		// tenant's node keys and DO storage) or its sockets, except its own.
+		"-sandbox", "auto", "-sandbox-deny", strings.Join([]string{filepath.Join(s.Dir, "mgmt"), filepath.Join(s.Dir, "hostd"),
+			s.logDir(), s.configPath(), filepath.Join(s.Dir, "tenants"), s.runDir()}, ",")}
 	if s.Cfg.Ephemeral {
 		hargs = append(hargs, "-ephemeral")
 	}
@@ -502,8 +506,15 @@ func cmdDown(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	if (*purge || s.Cfg.Ephemeral) && s.Cfg.TenantID != "" && s.mgmtHealthy(ctx) {
+		// Every tenant this host serves (each kill goes to its own tailnet).
 		var objs []mgmt.Object
-		if err := s.mgmt().Do(ctx, "GET", "/v0/objects?tenant="+s.Cfg.TenantID, nil, &objs); err == nil {
+		for _, tn := range s.tenants() {
+			o, err := s.objectsOf(ctx, tn.TenantID)
+			if err == nil {
+				objs = append(objs, o...)
+			}
+		}
+		{
 			live := map[string]bool{}
 			for _, o := range objs {
 				if o.Status != "killed" && o.Status != "failed" {
@@ -561,10 +572,19 @@ func actor() string {
 
 // ---- status ----
 
+type tenantStatus struct {
+	Tailnet   string         `json:"tailnet"`
+	TenantID  string         `json:"tenantID"`
+	MintQueue int            `json:"mintQueue"`
+	Rate      float64        `json:"registrationsPerMinute"`
+	Objects   map[string]int `json:"objectsByStatus"`
+}
+
 type statusResult struct {
 	StateDir   string                 `json:"stateDir"`
 	Tailnet    string                 `json:"tailnet"`
 	TenantID   string                 `json:"tenantID"`
+	Tenants    []tenantStatus         `json:"tenants"`
 	Supervisor bool                   `json:"supervisor"`
 	Mgmt       bool                   `json:"mgmt"`
 	Host       bool                   `json:"host"`
@@ -619,13 +639,31 @@ func cmdStatus(args []string) error {
 		}
 	}
 	var hv hostd.StatusView
-	if r.Supervisor && s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv) == nil {
+	hostOK := r.Supervisor && s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv) == nil
+	if hostOK {
 		r.Workloads = hv.Workloads
 		for _, o := range hv.Objects {
 			r.Objects[o.Status]++
 		}
 	} else {
 		r.Host = false
+	}
+	for _, t := range s.tenants() {
+		ts := tenantStatus{Tailnet: t.Tailnet, TenantID: t.TenantID, Objects: map[string]int{}}
+		if r.Mgmt {
+			var tn struct {
+				Q    int     `json:"mintQueue"`
+				Rate float64 `json:"effectiveRegistrationsPerMinute"`
+			}
+			s.mgmt().Do(ctx, "GET", "/v0/tenants/"+t.TenantID, nil, &tn)
+			ts.MintQueue, ts.Rate = tn.Q, tn.Rate
+		}
+		for _, o := range hv.Objects {
+			if o.TenantID == t.TenantID {
+				ts.Objects[o.Status]++
+			}
+		}
+		r.Tenants = append(r.Tenants, ts)
 	}
 	r.Healthy = r.Supervisor && r.Mgmt && r.Host
 	emit(f, r, func() {
@@ -639,12 +677,21 @@ func cmdStatus(args []string) error {
 		fmt.Printf("%s supervisor  pid %d\n", mark(r.Supervisor), s.supervisorPID())
 		fmt.Printf("%s mgmt        tenant %s · mint queue %d · %.0f registrations/min · %d pending device deletes\n", mark(r.Mgmt), r.TenantID, r.MintQueue, r.Rate, r.Pending)
 		fmt.Printf("%s host        %s · heartbeat %.1fs ago · objects %v\n", mark(r.Host), s.Cfg.HostID, float64(r.HostAgeMS)/1000, r.Objects)
+		if len(r.Tenants) > 1 {
+			for _, t := range r.Tenants {
+				fmt.Printf("  tenant      %s (%s) · mint queue %d · %.0f registrations/min · objects %v\n", t.Tailnet, t.TenantID, t.MintQueue, t.Rate, t.Objects)
+			}
+		}
 		for _, w := range r.Workloads {
 			e := ""
 			if w.Error != "" {
 				e = " · " + w.Error
 			}
-			fmt.Printf("%s workload    %s %s (%s, epoch %d, %d requests)%s\n", mark(w.Status == "active"), w.Workload, w.Status, w.DeploymentID, w.Epoch, w.Requests, e)
+			sb := ""
+			if w.Sandbox != "" {
+				sb = ", sandbox " + w.Sandbox
+			}
+			fmt.Printf("%s workload    %s %s (tenant %s, %s, epoch %d, %d requests%s)%s\n", mark(w.Status == "active"), w.Workload, w.Status, w.TenantID, w.DeploymentID, w.Epoch, w.Requests, sb, e)
 		}
 	})
 	if !r.Healthy {

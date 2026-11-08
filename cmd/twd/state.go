@@ -32,6 +32,9 @@ type Config struct {
 	KillTombstone     string `json:"killTombstone"`
 	DeviceDeleteDelay string `json:"deviceDeleteDelay"`
 	CreatedAt         string `json:"createdAt"`
+	// Tenants are the tenants added with `twd tenant add` (the operator
+	// tenant above is the default for every command).
+	Tenants []TenantRef `json:"tenants,omitempty"`
 }
 
 type state struct {

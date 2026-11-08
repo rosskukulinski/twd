@@ -137,7 +137,10 @@ type ObjectRef struct {
 }
 
 type CreateObjectRequest struct {
-	TenantID   string          `json:"tenantID"`
+	TenantID string `json:"tenantID"`
+	// Workload (M7) scopes the identity: (tenant, workload, namespace,
+	// objectName). hostd always sends it.
+	Workload   string          `json:"workload,omitempty"`
 	Namespace  string          `json:"namespace"`
 	ObjectName string          `json:"objectName"`
 	Parent     *ObjectRef      `json:"parent,omitempty"`
@@ -183,6 +186,7 @@ type KillResponse struct {
 type Object struct {
 	ObjectID   string          `json:"objectID"`
 	TenantID   string          `json:"tenantID"`
+	Workload   string          `json:"workload,omitempty"`
 	Namespace  string          `json:"namespace"`
 	ObjectName string          `json:"objectName"`
 	Parent     string          `json:"parent,omitempty"`

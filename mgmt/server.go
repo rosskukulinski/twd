@@ -285,7 +285,7 @@ func (s *Server) Handler() http.Handler {
 		return m.CreateObject(r.Context(), req)
 	}))
 	mux.HandleFunc("GET /v0/objects", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.ListObjects(r.Context(), r.URL.Query().Get("tenant"), r.URL.Query().Get("namespace"))
+		return m.ListObjects(r.Context(), r.URL.Query().Get("tenant"), r.URL.Query().Get("workload"), r.URL.Query().Get("namespace"))
 	}))
 	mux.HandleFunc("GET /v0/objects/{id}", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		return m.GetObject(r.Context(), r.PathValue("id"))

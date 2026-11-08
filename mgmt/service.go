@@ -521,7 +521,7 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 			}
 		}
 	}
-	if o, err := m.store.GetObjectByName(ctx, d.TenantID, WorkloadNamespace, d.Workload); err == nil {
+	if o, err := m.store.GetObjectByName(ctx, d.TenantID, d.Workload, WorkloadNamespace, d.Workload); err == nil {
 		v.Endpoint.ObjectID, v.Endpoint.MagicDNS, v.Endpoint.Status = o.ID, o.MagicDNS, o.Status
 		v.Endpoint.Node, _, _ = strings.Cut(o.MagicDNS, ".")
 	}
@@ -611,7 +611,12 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 // CreateObjectRequest is POST /v0/objects. ActingFor is an addition (the
 // human principal of the spawning request, for audit).
 type CreateObjectRequest struct {
-	TenantID   string `json:"tenantID"`
+	TenantID string `json:"tenantID"`
+	// Workload scopes the object's identity (M7): (tenant, workload,
+	// namespace, objectName). Optional for compatibility: if empty, a
+	// spawn takes its parent's workload, the "_workload" namespace takes
+	// objectName, and otherwise exactly one workload may declare the class.
+	Workload   string `json:"workload,omitempty"`
 	Namespace  string `json:"namespace"`
 	ObjectName string `json:"objectName"`
 	Parent     *struct {
@@ -634,11 +639,13 @@ type CreateObjectResponse struct {
 
 var b32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
-// objectID is <class-slug>-<b32(hmac(tenant/ns/name))[:10]> (RFC §4.3); it
-// doubles as the node hostname.
-func (m *Mgmt) objectID(tenantID, ns, name string) string {
+// objectID is <class-slug>-<b32(hmac(tenant/workload/ns/name))[:10]> (RFC
+// §4.3); it doubles as the node hostname. Every part of the identity is in
+// the MAC, so two workloads (or two tenants) with the same class and object
+// name get distinct IDs, hostnames, nodes and state dirs.
+func (m *Mgmt) objectID(tenantID, workload, ns, name string) string {
 	mac := hmac.New(sha256.New, m.cfg.IDSecret)
-	fmt.Fprintf(mac, "%s\x00%s\x00%s", tenantID, ns, name)
+	fmt.Fprintf(mac, "%s\x00%s\x00%s\x00%s", tenantID, workload, ns, name)
 	var slug strings.Builder
 	src := ns
 	if ns == WorkloadNamespace {
@@ -681,16 +688,42 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	if r.ObjectName == "" || len(r.ObjectName) > 256 {
 		return resp, errf(400, "bad_request", "objectName required (≤256 bytes)")
 	}
+	var parent *Object
+	if r.Parent != nil && r.Parent.ID != "" {
+		p, err := m.store.GetObject(ctx, r.Parent.ID)
+		if err != nil || p.TenantID != t.ID {
+			return resp, errf(404, "delegation_invalid", "parent %q not found in tenant %s", r.Parent.ID, t.ID)
+		}
+		parent = &p
+	}
+	workload := r.Workload
+	switch {
+	case r.Namespace == WorkloadNamespace:
+		if workload != "" && workload != r.ObjectName {
+			return resp, errf(400, "bad_request", "the %s object of workload %q must be named after it (got %q)", WorkloadNamespace, workload, r.ObjectName)
+		}
+		workload = r.ObjectName
+	case workload == "" && parent != nil:
+		workload = parent.Workload
+	}
 	var dep Deployment
 	var class ClassConfig
 	if r.Namespace == WorkloadNamespace {
-		dep, class, err = m.findWorkloadClass(ctx, t.ID, r.ObjectName)
+		dep, class, err = m.findWorkloadClass(ctx, t.ID, workload)
 	} else {
-		dep, class, err = m.store.FindClass(ctx, t.ID, r.Namespace)
+		dep, class, err = m.store.FindClass(ctx, t.ID, workload, r.Namespace)
+	}
+	if errors.Is(err, ErrAmbiguous) {
+		return resp, errf(409, "namespace_ambiguous", "%v", err)
 	}
 	if err != nil {
-		return resp, errf(404, "unknown_namespace", "no deployment of tenant %s declares namespace %q", t.ID, r.Namespace)
+		in := ""
+		if workload != "" {
+			in = " of workload " + workload
+		}
+		return resp, errf(404, "unknown_namespace", "no deployment%s of tenant %s declares namespace %q", in, t.ID, r.Namespace)
 	}
+	workload = dep.Workload
 	ttl, err := ParseTTL(r.TTL)
 	if err != nil {
 		return resp, errf(400, "bad_request", "%v", err)
@@ -702,9 +735,9 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	l.Lock()
 	defer l.Unlock()
 
-	if o, err := m.store.GetObjectByName(ctx, t.ID, r.Namespace, r.ObjectName); err == nil {
+	if o, err := m.store.GetObjectByName(ctx, t.ID, workload, r.Namespace, r.ObjectName); err == nil {
 		if !o.Live() {
-			return resp, errf(410, "killed", "object %s (%s/%s) was %s", o.ID, r.Namespace, r.ObjectName, o.Status)
+			return resp, errf(410, "killed", "object %s (%s %s/%s) was %s", o.ID, workload, r.Namespace, r.ObjectName, o.Status)
 		}
 		return CreateObjectResponse{ObjectID: o.ID, Status: o.Status, Tags: o.Tags, Hostname: o.Hostname}, nil
 	}
@@ -713,17 +746,19 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	} else if n >= t.MaxObjects {
 		return resp, errf(429, "object_quota_exceeded", "tenant %s has %d live objects (maxObjects %d)", t.ID, n, t.MaxObjects)
 	}
-	id := m.objectID(t.ID, r.Namespace, r.ObjectName)
-	o := Object{ID: id, TenantID: t.ID, Namespace: r.Namespace, Name: r.ObjectName, Hostname: id, DeploymentID: dep.ID,
+	id := m.objectID(t.ID, workload, r.Namespace, r.ObjectName)
+	if _, err := m.store.GetObject(ctx, id); err == nil {
+		// An ID collision with another identity (a 50-bit MAC prefix): never
+		// hand out an existing object's node.
+		return resp, errf(409, "identity_conflict", "object ID %s is already taken by another identity", id)
+	}
+	o := Object{ID: id, TenantID: t.ID, Workload: workload, Namespace: r.Namespace, Name: r.ObjectName, Hostname: id, DeploymentID: dep.ID,
 		Lease: LeaseName(t.ID, dep.Workload), Tags: class.Tags, Caps: r.Caps, RootID: id, TTLSeconds: int64(ttl / time.Second),
 		Status: StatusPending, CreatedAt: m.now().UnixMilli(), UpdatedAt: m.now().UnixMilli()}
 	kind := "create"
-	if r.Parent != nil && r.Parent.ID != "" {
+	if parent != nil {
 		kind = "spawn"
-		p, err := m.store.GetObject(ctx, r.Parent.ID)
-		if err != nil || p.TenantID != t.ID {
-			return resp, errf(404, "delegation_invalid", "parent %q not found in tenant %s", r.Parent.ID, t.ID)
-		}
+		p := *parent
 		if !p.Live() {
 			return resp, errf(410, "delegation_invalid", "parent %s is %s", p.ID, p.Status)
 		}
@@ -738,7 +773,7 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	if err := m.store.CreateObject(ctx, o); err != nil {
 		return resp, err
 	}
-	detail := map[string]any{"namespace": o.Namespace, "name": o.Name, "tags": o.Tags, "root": o.RootID}
+	detail := map[string]any{"workload": o.Workload, "namespace": o.Namespace, "name": o.Name, "tags": o.Tags, "root": o.RootID}
 	if o.ParentID != "" {
 		detail["parent"] = o.ParentID
 	}
@@ -823,8 +858,8 @@ func (m *Mgmt) GetObject(ctx context.Context, id string) (Object, error) {
 }
 
 // ListObjects lists objects with lineage (children filled in).
-func (m *Mgmt) ListObjects(ctx context.Context, tenant, ns string) ([]Object, error) {
-	objs, err := m.store.ListObjects(ctx, ObjectFilter{TenantID: tenant, Namespace: ns})
+func (m *Mgmt) ListObjects(ctx context.Context, tenant, workload, ns string) ([]Object, error) {
+	objs, err := m.store.ListObjects(ctx, ObjectFilter{TenantID: tenant, Workload: workload, Namespace: ns})
 	if err != nil {
 		return nil, err
 	}

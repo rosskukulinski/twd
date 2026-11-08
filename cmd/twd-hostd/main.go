@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -57,6 +58,8 @@ func run() error {
 		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
 		vmCPUs     = flag.Int("vm-vcpus", 2, "microVM tier: guest vCPUs")
 		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
+		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd sandbox: auto (seatbelt on macOS) | seatbelt | none")
+		sbDeny     = flag.String("sandbox-deny", "", "comma-separated extra paths no workerd may read, write or connect to (twd up: its state and run dirs)")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -79,6 +82,7 @@ func run() error {
 	h, err := hostd.New(hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
+		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny),
 		DefaultTier: *tier, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
 	if err != nil {
 		return err
@@ -110,4 +114,14 @@ func findWorkerd(flagVal, home string) (string, error) {
 		return p, nil
 	}
 	return "", errors.New("workerd not found (use -workerd or $TWD_WORKERD)")
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

@@ -68,7 +68,7 @@ type Server struct {
 	deployments map[string]*deployment
 	leases      map[string]*lease // tenantID + "|" + namespace
 	objects     map[string]*object
-	byName      map[string]string // tenant|ns|name -> objectID (live)
+	byName      map[string]string // tenant|workload|ns|name -> objectID
 	audit       map[string][]mgmtapi.AuditRecord
 	nodeIDs     map[string]string // stable node ID -> objectID (every node that reported ready)
 	pushes      []string
@@ -433,7 +433,7 @@ func (s *Server) getDeployment(w http.ResponseWriter, r *http.Request) {
 	if d.superseded {
 		resp.Status = "superseded"
 	}
-	if id, ok := s.byName[objKey(d.tenantID, mgmtapi.WorkloadNamespace, d.workload)]; ok {
+	if id, ok := s.byName[objKey(d.tenantID, d.workload, mgmtapi.WorkloadNamespace, d.workload)]; ok {
 		if o := s.objects[id]; o != nil && o.MagicDNS != "" {
 			resp.Endpoint = mgmtapi.Endpoint{Node: strings.Split(o.MagicDNS, ".")[0], MagicDNS: o.MagicDNS}
 		}
@@ -455,7 +455,10 @@ func (s *Server) getBundle(w http.ResponseWriter, r *http.Request) {
 
 // ---- objects ----
 
-func objKey(tenant, ns, name string) string { return tenant + "|" + ns + "|" + name }
+// objKey is the object identity: (tenant, workload, namespace, name).
+func objKey(tenant, workload, ns, name string) string {
+	return tenant + "|" + workload + "|" + ns + "|" + name
+}
 
 func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 	var req mgmtapi.CreateObjectRequest
@@ -470,8 +473,15 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, mgmtapi.CodeNotFound, "no such tenant")
 		return
 	}
-	k := objKey(req.TenantID, req.Namespace, req.ObjectName)
-	if id, ok := s.byName[k]; ok {
+	wl := req.Workload
+	if wl == "" && req.Parent != nil {
+		if p := s.objects[req.Parent.ObjectID]; p != nil {
+			wl = p.workload
+		}
+	}
+	workload := s.workloadOf(req.TenantID, wl, req.Namespace, req.ObjectName)
+	k := objKey(req.TenantID, workload, req.Namespace, req.ObjectName)
+	if id, ok := s.byName[k]; ok && workload != "" {
 		o := s.objects[id]
 		if o.Status == "killed" {
 			writeErr(w, 410, mgmtapi.CodeKilled, "object "+o.ObjectID+" was killed")
@@ -480,7 +490,6 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, mgmtapi.CreateObjectResponse{ObjectID: o.ObjectID, Status: o.Status, Tags: o.Tags, Hostname: req.Hostname})
 		return
 	}
-	workload := s.workloadOf(req.TenantID, req.Namespace, req.ObjectName)
 	l := s.leases[mgmtapi.LeaseName(req.TenantID, workload)]
 	if workload == "" || l == nil {
 		writeErr(w, 404, "unknown_namespace", "no deployment of this tenant declares namespace "+req.Namespace)
@@ -496,8 +505,8 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 429, "spawn_budget_exceeded", fmt.Sprintf("tenant has %d live objects (maxObjects %d)", live, t.MaxObjects))
 		return
 	}
-	tags := s.namespaceTags(req.TenantID, req.Namespace)
-	o := &object{Object: mgmtapi.Object{ObjectID: newID("o"), TenantID: req.TenantID, Namespace: req.Namespace,
+	tags := s.namespaceTags(req.TenantID, workload, req.Namespace)
+	o := &object{Object: mgmtapi.Object{ObjectID: newID("o"), TenantID: req.TenantID, Workload: workload, Namespace: req.Namespace,
 		ObjectName: req.ObjectName, Status: "pending", Tags: tags, Host: l.host}, created: time.Now(), workload: workload}
 	if len(req.Caps) > 0 && string(req.Caps) != "null" {
 		if err := json.Unmarshal(req.Caps, &o.caps); err != nil {
@@ -544,10 +553,11 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 }
 
 // workloadOf finds the (live) deployment declaring namespace: a DO class,
-// or "_workload" whose object name is the workload.
-func (s *Server) workloadOf(tenantID, ns, name string) string {
+// or "_workload" whose object name is the workload. With workload set,
+// only that workload's deployment counts.
+func (s *Server) workloadOf(tenantID, workload, ns, name string) string {
 	for _, d := range s.sortedDeployments() {
-		if d.tenantID != tenantID || d.superseded {
+		if d.tenantID != tenantID || d.superseded || (workload != "" && d.workload != workload) {
 			continue
 		}
 		if ns == mgmtapi.WorkloadNamespace && name == d.workload {
@@ -633,10 +643,10 @@ func subset(child, parent any, path string) string {
 	return ""
 }
 
-func (s *Server) namespaceTags(tenantID, ns string) []string {
+func (s *Server) namespaceTags(tenantID, workload, ns string) []string {
 	var tags []string
 	for _, d := range s.deployments {
-		if d.tenantID != tenantID || d.superseded {
+		if d.tenantID != tenantID || d.workload != workload || d.superseded {
 			continue
 		}
 		if ns == mgmtapi.WorkloadNamespace {

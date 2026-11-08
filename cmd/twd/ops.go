@@ -19,12 +19,6 @@ import (
 	"github.com/rosskukulinski/twd/mgmt"
 )
 
-func (s *state) objects(ctx context.Context) ([]mgmt.Object, error) {
-	var objs []mgmt.Object
-	err := s.mgmt().Do(ctx, "GET", "/v0/objects?tenant="+url.QueryEscape(s.Cfg.TenantID), nil, &objs)
-	return objs, err
-}
-
 func nodeName(o mgmt.Object) string {
 	if o.MagicDNS != "" {
 		n, _, _ := strings.Cut(o.MagicDNS, ".")
@@ -37,6 +31,9 @@ func displayNS(o mgmt.Object) string {
 	if o.Namespace == mgmt.WorkloadNamespace {
 		return "workload " + o.Name
 	}
+	if o.Workload != "" {
+		return o.Workload + ":" + o.Namespace + "/" + o.Name
+	}
 	return o.Namespace + "/" + o.Name
 }
 
@@ -47,6 +44,7 @@ func resolveObject(objs []mgmt.Object, ref string) (mgmt.Object, error) {
 	var hits []mgmt.Object
 	for _, o := range objs {
 		if o.ID == ref || o.Hostname == ref || o.MagicDNS == ref || nodeName(o) == ref || o.Namespace+"/"+o.Name == ref ||
+			o.Workload+":"+o.Namespace+"/"+o.Name == ref ||
 			(o.Namespace == mgmt.WorkloadNamespace && o.Name == ref) {
 			hits = append(hits, o)
 		}
@@ -159,6 +157,7 @@ func chainString(principal string, lin []mgmt.Object) string {
 func cmdLs(args []string) error {
 	f := newFlags("ls")
 	all := f.Bool("all", false, "include killed objects")
+	tenantF := tenantFlag(f)
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
@@ -169,13 +168,17 @@ func cmdLs(args []string) error {
 	if err := s.requireUp(); err != nil {
 		return err
 	}
+	tn, err := s.tenant(*tenantF)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	var deps []mgmt.DeploymentView
-	if err := s.mgmt().Do(ctx, "GET", "/v0/deployments?tenant="+url.QueryEscape(s.Cfg.TenantID), nil, &deps); err != nil {
+	if err := s.mgmt().Do(ctx, "GET", "/v0/deployments?tenant="+url.QueryEscape(tn.TenantID), nil, &deps); err != nil {
 		return err
 	}
-	objs, err := s.objects(ctx)
+	objs, err := s.objectsOf(ctx, tn.TenantID)
 	if err != nil {
 		return err
 	}
@@ -186,7 +189,8 @@ func cmdLs(args []string) error {
 		}
 	}
 	sort.Slice(shown, func(i, j int) bool { return shown[i].CreatedAt < shown[j].CreatedAt })
-	emit(f, map[string]any{"deployments": deps, "objects": shown}, func() {
+	emit(f, map[string]any{"tenant": tn.Tailnet, "tenantID": tn.TenantID, "deployments": deps, "objects": shown}, func() {
+		fmt.Printf("TENANT %s (%s)\n", tn.Tailnet, tn.TenantID)
 		fmt.Println("DEPLOYMENTS")
 		for _, d := range deps {
 			fmt.Printf("  %-12s %-22s %-8s %-10s http://%s/\n", d.Workload, d.DeploymentID, d.Host, d.Status, d.Endpoint.MagicDNS)
@@ -222,6 +226,7 @@ func cmdKill(args []string) error {
 	f := newFlags("kill")
 	cascade := f.Bool("cascade", false, "also kill every descendant (sub-agents)")
 	reason := f.String("reason", "", "why (recorded in audit)")
+	tenantF := tenantFlag(f)
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -236,16 +241,23 @@ func cmdKill(args []string) error {
 	if err := s.requireUp(); err != nil {
 		return err
 	}
+	tn, err := s.tenant(*tenantF)
+	if err != nil {
+		return err
+	}
 	t0 := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	objs, err := s.objects(ctx)
+	objs, err := s.objectsOf(ctx, tn.TenantID)
 	if err != nil {
 		return err
 	}
 	o, err := resolveObject(objs, pos[0])
 	if err != nil {
 		return err
+	}
+	if o.TenantID != tn.TenantID { // defensive: mgmt filtered by tenant
+		return fail("unknown_object", fmt.Sprintf("%s is not an object of tenant %s", pos[0], tn.Tailnet))
 	}
 	if !o.Live() {
 		return fail("killed", fmt.Sprintf("%s is already %s (%s)", nodeName(o), o.Status, o.KillReason))
@@ -286,6 +298,7 @@ func cmdKill(args []string) error {
 
 type auditLine struct {
 	TS        string          `json:"ts"`
+	Tenant    string          `json:"tenantID"`
 	Kind      string          `json:"kind"`
 	Object    string          `json:"object"`
 	Node      string          `json:"node"`
@@ -382,6 +395,8 @@ func orDash(s string) string {
 }
 
 type auditResult struct {
+	Tenant   string             `json:"tenant"`
+	TenantID string             `json:"tenantID"`
 	Chain    string             `json:"chain,omitempty"`
 	Lines    []auditLine        `json:"records"`
 	Verified bool               `json:"verified"`
@@ -392,6 +407,8 @@ func cmdAudit(args []string) error {
 	f := newFlags("audit")
 	human := f.String("human", "", "records acting for this principal (login or caller node)")
 	trace := f.String("trace", "", "records of one trace")
+	all := f.Bool("all", false, "every record of the tenant")
+	tenantF := tenantFlag(f)
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -403,12 +420,16 @@ func cmdAudit(args []string) error {
 	if err := s.requireUp(); err != nil {
 		return err
 	}
-	if len(pos) != 1 && *human == "" && *trace == "" {
-		return fail("bad_request", "twd audit needs an object, --human or --trace", "usage: twd "+usageOf("audit"))
+	if len(pos) != 1 && *human == "" && *trace == "" && !*all {
+		return fail("bad_request", "twd audit needs an object, --human, --trace or --all", "usage: twd "+usageOf("audit"))
+	}
+	tn, err := s.tenant(*tenantF)
+	if err != nil {
+		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	objs, err := s.objects(ctx)
+	objs, err := s.objectsOf(ctx, tn.TenantID)
 	if err != nil {
 		return err
 	}
@@ -416,7 +437,7 @@ func cmdAudit(args []string) error {
 	for _, o := range objs {
 		names[o.ID] = nodeName(o)
 	}
-	res := auditResult{Lines: []auditLine{}, Verified: true}
+	res := auditResult{Tenant: tn.Tailnet, TenantID: tn.TenantID, Lines: []auditLine{}, Verified: true}
 	seen := map[string]bool{}
 	var recs []mgmt.AuditRecord
 	query := func(q string) error {
@@ -425,7 +446,8 @@ func cmdAudit(args []string) error {
 			Chains   []mgmt.ChainStatus `json:"chains"`
 			Verified bool               `json:"verified"`
 		}
-		if err := s.mgmt().Do(ctx, "GET", "/v0/audit?"+q, nil, &ar); err != nil {
+		// Always scoped to the tenant: one tenant's audit never shows another's.
+		if err := s.mgmt().Do(ctx, "GET", "/v0/audit?tenant="+url.QueryEscape(tn.TenantID)+"&"+q, nil, &ar); err != nil {
 			return err
 		}
 		res.Verified = res.Verified && ar.Verified
@@ -460,6 +482,10 @@ func cmdAudit(args []string) error {
 		if err := query("human=" + url.QueryEscape(*human)); err != nil {
 			return err
 		}
+	case *all:
+		if err := query("all=1"); err != nil {
+			return err
+		}
 	default:
 		if err := query("trace=" + url.QueryEscape(*trace)); err != nil {
 			return err
@@ -467,7 +493,10 @@ func cmdAudit(args []string) error {
 	}
 	sort.SliceStable(recs, func(i, j int) bool { return recs[i].TS < recs[j].TS })
 	for _, r := range recs {
-		res.Lines = append(res.Lines, auditLine{TS: r.TS, Kind: r.Kind, Object: r.ObjectID, Node: names[r.ObjectID], Chain: r.Chain,
+		if r.TenantID != tn.TenantID {
+			continue // defensive: mgmt filtered by tenant
+		}
+		res.Lines = append(res.Lines, auditLine{TS: r.TS, Tenant: r.TenantID, Kind: r.Kind, Object: r.ObjectID, Node: names[r.ObjectID], Chain: r.Chain,
 			ActingFor: r.ActingFor, Text: describe(r, names), Detail: r.Detail})
 	}
 	emit(f, res, func() {
@@ -514,6 +543,7 @@ func cmdLogs(args []string) error {
 	comp := f.String("component", "", "mgmt | hostd | supervisor (default: hostd, or workerd for a workload)")
 	n := f.Int("n", 50, "lines")
 	follow := f.Bool("f", false, "follow")
+	tenantF := tenantFlag(f)
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -534,8 +564,12 @@ func cmdLogs(args []string) error {
 		if err := s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv); err != nil {
 			return fail("host_unavailable", "twd-hostd is not answering", err.Error()).withFix("twd status")
 		}
+		tn, err := s.tenant(*tenantF)
+		if err != nil {
+			return err
+		}
 		for _, w := range hv.Workloads {
-			if w.Workload == pos[0] && w.InstanceDir != "" {
+			if w.TenantID == tn.TenantID && w.Workload == pos[0] && w.InstanceDir != "" {
 				path = filepath.Join(w.InstanceDir, "workerd.log")
 			}
 		}

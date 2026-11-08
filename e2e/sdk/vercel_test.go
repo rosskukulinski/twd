@@ -155,15 +155,26 @@ func TestVercelAI(t *testing.T) {
 		})
 	}
 
-	t.Run("SameClassAcrossWorkloadsFailsClosed", func(t *testing.T) {
-		// Both ai-agent deployments have class AiAgent; mgmt keys objects by
-		// (tenant, class, name), so the same name in the second workload is
-		// the first one's object. hostd refuses to share the identity.
-		s.agentStream(t, "http://"+ips["mcp-handler"]+"/agents/dup")
-		code, _, b := s.do("GET", "http://"+ips["createMcpHandler"]+"/agents/dup", nil)
-		t.Logf("same class+name in a second workload: %d %s", code, hostdtest.Trim(string(b), 300))
-		if code == 200 || !strings.Contains(string(b), "namespace_conflict") {
-			t.Fatalf("want namespace_conflict: %d %s", code, b)
+	t.Run("SameClassAcrossWorkloadsDistinctIdentities", func(t *testing.T) {
+		// Both ai-agent deployments have class AiAgent. Identity is
+		// (tenant, workload, class, name) since M7, so the same name in the
+		// two workloads is two objects with two nodes, and each one's MCP
+		// calls leave from its own node (M5 failed closed here instead).
+		var nodes [2]string
+		for i, k := range []string{"mcp-handler", "createMcpHandler"} {
+			st := s.agentStream(t, "http://"+ips[k]+"/agents/dup")
+			o, err := s.a.WaitObjectErr(ai[k], "AiAgent", "dup", 30*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(st.outputs["whoami"], o.Hostname+".") {
+				t.Fatalf("%s: MCP server saw %s, want %s", ai[k], st.outputs["whoami"], o.Hostname)
+			}
+			nodes[i] = o.Hostname + "/" + o.ID
+		}
+		t.Logf("same class+name in two workloads: %s and %s", nodes[0], nodes[1])
+		if nodes[0] == nodes[1] {
+			t.Fatalf("one identity for two workloads: %s", nodes[0])
 		}
 	})
 

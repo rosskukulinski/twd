@@ -95,6 +95,7 @@ func LeaseName(tenantID, workload string) string { return tenantID + "/" + workl
 type Object struct {
 	ID           string          `json:"objectID"`
 	TenantID     string          `json:"tenantID"`
+	Workload     string          `json:"workload"`
 	Namespace    string          `json:"namespace"`
 	Name         string          `json:"objectName"`
 	Hostname     string          `json:"hostname"`
@@ -176,6 +177,7 @@ var (
 	ErrLeaseHeld = errors.New("lease held by another holder")
 	ErrLeaseLost = errors.New("lease_lost")
 	ErrConflict  = errors.New("conflict")
+	ErrAmbiguous = errors.New("ambiguous")
 )
 
 // asAPIError maps store errors to API errors.

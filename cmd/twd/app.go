@@ -225,6 +225,8 @@ func (v varFlags) Set(s string) error {
 
 type deployResult struct {
 	Workload     string               `json:"workload"`
+	Tenant       string               `json:"tenant"`
+	TenantID     string               `json:"tenantID"`
 	DeploymentID string               `json:"deploymentID"`
 	Host         string               `json:"host"`
 	Status       string               `json:"status"`
@@ -240,6 +242,7 @@ func cmdDeploy(args []string) error {
 	allowMissing := f.Bool("allow-missing-grants", false, "deploy even if tailnet.connects grants are missing")
 	noWait := f.Bool("no-wait", false, "return once mgmt accepted the deploy")
 	wait := f.Duration("wait", 3*time.Minute, "how long to wait for ready")
+	tenantF := tenantFlag(f)
 	vars := varFlags{}
 	f.Var(vars, "var", "override a wrangler var (KEY=VALUE, repeatable)")
 	pos, err := f.parse(args)
@@ -257,19 +260,23 @@ func cmdDeploy(args []string) error {
 	if err := s.requireUp(); err != nil {
 		return err
 	}
+	tn, err := s.tenant(*tenantF)
+	if err != nil {
+		return err
+	}
 	a, err := loadApp(dir, *name)
 	if err != nil {
 		return err
 	}
 	t0 := time.Now()
-	res := deployResult{Workload: a.Name, Timings: map[string]float64{}}
+	res := deployResult{Workload: a.Name, Tenant: tn.Tailnet, TenantID: tn.TenantID, Timings: map[string]float64{}}
 	ctx, cancel := context.WithTimeout(context.Background(), *wait+time.Minute)
 	defer cancel()
 	mc := s.mgmt()
 
 	// Preflight tailnet.connects and tagOwners against the tenant policy.
 	var pf mgmt.PreflightResult
-	if err := mc.Do(ctx, "POST", "/v0/tenants/"+s.Cfg.TenantID+"/preflight",
+	if err := mc.Do(ctx, "POST", "/v0/tenants/"+tn.TenantID+"/preflight",
 		mgmt.PreflightRequest{SrcTags: a.srcTags(), Connects: a.Cfg.Tailnet.Connects}, &pf); err != nil {
 		return err
 	}
@@ -305,7 +312,7 @@ func cmdDeploy(args []string) error {
 	}
 	ds := time.Now()
 	var dr mgmt.DeployResponse
-	if err := mc.Do(ctx, "POST", "/v0/deployments", map[string]any{"tenantID": s.Cfg.TenantID, "workload": a.Name, "bundle": tb}, &dr); err != nil {
+	if err := mc.Do(ctx, "POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}, &dr); err != nil {
 		return err
 	}
 	res.DeploymentID, res.Host = dr.DeploymentID, dr.Host

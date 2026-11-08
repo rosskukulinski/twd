@@ -33,6 +33,8 @@ type Options struct {
 	VM          sandbox.Backend
 	DefaultTier string
 	VMDebug     bool
+	// Sandbox is hostd's process-tier sandbox ("" = none, "auto", "seatbelt").
+	Sandbox string
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -94,7 +96,7 @@ func Start(t testing.TB, o Options) *Env {
 		HostID: "h1", Mgmt: hc, DataDir: filepath.Join(dir, "data"), RunDir: filepath.Join(dir, "run"),
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
-		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug,
+		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: o.Sandbox,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +106,21 @@ func Start(t testing.TB, o Options) *Env {
 	}
 	t.Cleanup(func() { h.Close() })
 	return &Env{T: t, FM: fm, Mgmt: cli, Host: h, TenantID: tr.TenantID, Dir: dir}
+}
+
+// AddTenant creates another tenant in fakemgmt and returns an Env view of
+// it (same mgmt and host; Deploy/WaitActive/WaitObject act for it).
+func (e *Env) AddTenant(t mgmtapi.Tenant) *Env {
+	e.T.Helper()
+	var tr struct {
+		TenantID string `json:"tenantID"`
+	}
+	if err := e.Mgmt.Do(context.Background(), "POST", "/v0/tenants", t, &tr); err != nil {
+		e.T.Fatal(err)
+	}
+	c := *e
+	c.TenantID = tr.TenantID
+	return &c
 }
 
 // Deploy builds appDir and deploys it as workload; it returns the deployment ID.
@@ -140,7 +157,7 @@ func (e *Env) WaitActive(workload, depID string, timeout time.Duration) hostd.Ob
 		st := e.Host.Status()
 		var ws *hostd.WorkloadStatus
 		for i := range st.Workloads {
-			if st.Workloads[i].Workload == workload {
+			if st.Workloads[i].Workload == workload && st.Workloads[i].TenantID == e.TenantID {
 				ws = &st.Workloads[i]
 			}
 		}

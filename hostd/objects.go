@@ -197,7 +197,7 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 	if actingFor == "" && parent != nil {
 		actingFor = parent.ActingFor // a sub-agent acts for its root's principal
 	}
-	req := mgmtapi.CreateObjectRequest{TenantID: w.tenantID, Namespace: mgmtapi.Namespace(w.name, class), ObjectName: name,
+	req := mgmtapi.CreateObjectRequest{TenantID: w.tenantID, Workload: w.name, Namespace: mgmtapi.Namespace(w.name, class), ObjectName: name,
 		Caps: caps, TTL: ttl, Hostname: hn, ActingFor: actingFor}
 	if parent != nil {
 		req.Parent = &mgmtapi.ObjectRef{ObjectID: parent.ID}
@@ -227,15 +227,17 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 	}
 	h.mu.Lock()
 	if old := h.objects[o.ID]; old != nil { // mgmt returned an existing object
-		if old.Workload != w.name || old.Class != class || old.Name != name {
-			// mgmt keys objects by (tenant, namespace = class, name), so two
-			// workloads of one tenant with the same DO class and object name
-			// get the same object. Sharing it would hand one app the other's
-			// node identity: fail closed.
+		if old.TenantID != w.tenantID || old.Workload != w.name || old.Class != class || old.Name != name {
+			// mgmt scopes identity by (tenant, workload, class, name) (M7),
+			// so this is an invariant violation (an old or buggy mgmt).
+			// Sharing the object would hand one app another's node
+			// identity: fail closed.
 			h.mu.Unlock()
+			h.log.Error("identity invariant violated: mgmt returned another identity's object", "object", o.ID,
+				"want", objKey(w.tenantID, w.name, class, name), "have", old.key())
 			return nil, &apiError{Code: "namespace_conflict", Detail: fmt.Sprintf(
-				"object %s/%s of workload %s is the same mgmt object (%s) as %s/%s of workload %s: DO class names must be unique per tenant",
-				class, name, w.name, o.ID, old.Class, old.Name, old.Workload)}
+				"mgmt returned object %s for %s/%s of workload %s, but it is %s/%s of workload %s (tenant %s): refusing to share a node identity",
+				o.ID, class, name, w.name, old.Class, old.Name, old.Workload, old.TenantID)}
 		}
 		h.byKey[o.key()] = old
 		if !old.live && !old.terminal() {
