@@ -94,7 +94,11 @@ e2e-multi: deps
 ## release: self-contained tarballs in dist/ (darwin-arm64, linux-arm64, linux-amd64): Go binaries
 ## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
 ## install.sh, VERSION, SHA256SUMS. darwin binaries are ad-hoc signed (run on macOS).
-RELEASE_VERSION ?= $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
+# Expanded once (:=): a recursive variable would be re-evaluated per use, so an
+# edit during `make release` would name the e2e tarball differently.
+ifndef RELEASE_VERSION
+RELEASE_VERSION := $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
+endif
 RELEASE_TARGETS ?= darwin-arm64 linux-arm64 linux-amd64
 release: deps
 	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS

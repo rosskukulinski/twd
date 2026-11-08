@@ -38,7 +38,7 @@ say() { printf '%s e2e-linux[%s]: %s\n' "$(date +%H:%M:%S)" "$distro" "$*" | tee
 
 cleanup() {
 	rc=$?
-	if limactl list -q 2>/dev/null | grep -qx "$vm"; then
+	if [ "$(limactl list -f '{{.Status}}' "$vm" 2>/dev/null)" = Running ]; then
 		vssh '
 			[ -d ~/.twd-e2e ] || [ -e ~/.config/systemd/user/twd.service ] || exit 0
 			echo "trap: cleaning ~/.twd-e2e"
