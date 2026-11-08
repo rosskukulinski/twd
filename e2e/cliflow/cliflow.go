@@ -107,6 +107,20 @@ type Env struct {
 	// OnPeers, if set, runs once the client sees the agent and mcp
 	// workload nodes (e2e-mbp measures the cross-machine path there).
 	OnPeers func(client *nettest.Node, hc *http.Client, agentIP, mcpIP string)
+	// UpArgs are extra `twd up` flags (e2e-linux: --service).
+	UpArgs []string
+	// Slow scales every wait and latency bound (0 or 1 = as is). e2e-linux
+	// sets it for the emulated (qemu TCG) amd64 VM only; the measured
+	// numbers are recorded unscaled.
+	Slow float64
+}
+
+// tmo scales a wait or a latency bound by e.Slow.
+func (e *Env) tmo(d time.Duration) time.Duration {
+	if e.Slow > 1 {
+		return time.Duration(float64(d) * e.Slow)
+	}
+	return d
 }
 
 // Results are the measured outcome (written as JSON by e2e-mac).
@@ -319,6 +333,7 @@ func (e *Env) Run() {
 	if e.TSAPIURL != "" {
 		upArgs = append(upArgs, "--tsapi-url", e.TSAPIURL)
 	}
+	upArgs = append(upArgs, e.UpArgs...)
 	// Interactive mode must refuse (it would use tailscaled).
 	if _, se, _, err := e.Twd("up", "--yes"); err == nil || !strings.Contains(se, "tailnet_required") {
 		t.Fatalf("twd up without --tailnet should fail with tailnet_required: %v %s", err, se)
@@ -405,10 +420,10 @@ func (e *Env) Run() {
 	clientID, clientName := string(cst.Self.ID), strings.TrimSuffix(cst.Self.DNSName, ".")
 	est, _ := echo.LC.StatusWithoutPeers(context.Background())
 	echoName := strings.TrimSuffix(est.Self.DNSName, ".")
-	hc := client.HTTPClient(45 * time.Second)
+	hc := client.HTTPClient(e.tmo(45 * time.Second))
 
-	agentIP := peerIP(t, client, agent.Endpoint.MagicDNS, 60*time.Second)
-	mcpIP := peerIP(t, client, mcp.Endpoint.MagicDNS, 60*time.Second)
+	agentIP := peerIP(t, client, agent.Endpoint.MagicDNS, e.tmo(60*time.Second))
+	mcpIP := peerIP(t, client, mcp.Endpoint.MagicDNS, e.tmo(60*time.Second))
 	if e.OnPeers != nil {
 		e.OnPeers(client, hc, agentIP, mcpIP)
 	}
@@ -421,9 +436,9 @@ func (e *Env) Run() {
 	}
 	res.Numbers["agent_first_request_ms"] = msOf(r.Dur)
 	r0 := r
-	ao := e.waitObjectReady("SupportAgent", "a1", 90*time.Second)
+	ao := e.waitObjectReady("SupportAgent", "a1", e.tmo(90*time.Second))
 	res.Numbers["first_object_node_ready_ms"] = msOf(time.Since(first))
-	aoIP := peerIP(t, client, ao.MagicDNS, 60*time.Second)
+	aoIP := peerIP(t, client, ao.MagicDNS, e.tmo(60*time.Second))
 	r = do(hc, "GET", "http://"+aoIP+"/", nil)
 	if r.Code != 200 || get(r.Body, "caller", "nodeId") != clientID || (e.ClientTagged && !slices.Contains(anyStrings(get(r.Body, "caller", "tags")), TestTag)) {
 		t.Fatalf("(a) agent via its own node: %s", r)
@@ -464,14 +479,14 @@ func (e *Env) Run() {
 		t.Fatalf("(d) spawn: %s", r)
 	}
 	res.Numbers["spawn_ready_ms"] = msOf(r.Dur)
-	co := e.waitObjectReady("LookupAgent", "c1", 60*time.Second)
+	co := e.waitObjectReady("LookupAgent", "c1", e.tmo(60*time.Second))
 	var caps map[string]any
 	json.Unmarshal(co.Caps, &caps)
 	if co.Parent != ao.ID || co.NodeID == "" || co.NodeID == ao.NodeID || co.MagicDNS == ao.MagicDNS ||
 		!slices.Contains(co.Tags, "tag:twd-agent-support-sub") || fmt.Sprint(get(caps, MCPCap, "tools")) != "[lookup_order]" {
 		t.Fatalf("(d) child object: %+v (parent %s)", co, ao.ID)
 	}
-	coIP := peerIP(t, client, co.MagicDNS, 60*time.Second)
+	coIP := peerIP(t, client, co.MagicDNS, e.tmo(60*time.Second))
 	if r := do(hc, "GET", "http://"+coIP+"/", nil); r.Code != 200 || get(r.Body, "lookup") != "c1" {
 		t.Fatalf("(d) child via its own node: %s", r)
 	}
@@ -503,19 +518,19 @@ func (e *Env) Run() {
 	res.Numbers["kill_cli_ms"] = msOf(d)
 	res.Numbers["kill_api_ms"] = kr.Timings["kill_api"]
 	res.Numbers["kill_push_ms"] = kr.Result.PushMS
-	if d > time.Second || len(kr.Result.Killed) != 2 || len(kr.Result.Pushed) != 2 {
+	if d > e.tmo(time.Second) || len(kr.Result.Killed) != 2 || len(kr.Result.Pushed) != 2 {
 		t.Fatalf("(e) kill: %v %+v", d, kr)
 	}
 	var worst time.Duration
 	for _, tgt := range []struct{ name, ip string }{{"agent", aoIP}, {"sub-agent", coIP}} {
-		r := do(client.HTTPClient(10*time.Second), "GET", "http://"+tgt.ip+"/", nil)
-		if r.Err != nil || r.Code != 410 || get(r.Body, "code") != "object_killed" || r.Dur > time.Second {
+		r := do(client.HTTPClient(e.tmo(10*time.Second)), "GET", "http://"+tgt.ip+"/", nil)
+		if r.Err != nil || r.Code != 410 || get(r.Body, "code") != "object_killed" || r.Dur > e.tmo(time.Second) {
 			t.Fatalf("(e) new request to killed %s: %s after %v", tgt.name, r, r.Dur)
 		}
 		worst = max(worst, r.Dur)
 	}
 	r = do(hc, "GET", "http://"+agentIP+"/?agent=a1", nil)
-	if r.Err != nil || r.Code != 410 || r.Dur > time.Second {
+	if r.Err != nil || r.Code != 410 || r.Dur > e.tmo(time.Second) {
 		t.Fatalf("(e) via workload after kill: %s after %v", r, r.Dur)
 	}
 	res.Numbers["killed_new_request_ms"] = msOf(worst)

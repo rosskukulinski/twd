@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node
 
 all: build
 
@@ -91,11 +91,11 @@ e2e-multi: deps
 		TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2emulti -count=1 -v -timeout 25m ./e2e/multi/...
 
-## release: self-contained tarballs in dist/ (darwin-arm64 + linux-arm64): Go binaries
+## release: self-contained tarballs in dist/ (darwin-arm64, linux-arm64, linux-amd64): Go binaries
 ## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
 ## install.sh, VERSION, SHA256SUMS. darwin binaries are ad-hoc signed (run on macOS).
 RELEASE_VERSION ?= $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
-RELEASE_TARGETS ?= darwin-arm64 linux-arm64
+RELEASE_TARGETS ?= darwin-arm64 linux-arm64 linux-amd64
 release: deps
 	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS
 	sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
@@ -112,6 +112,22 @@ e2e-mbp: release
 		TWD_E2E_TARBALL="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-darwin-arm64.tar.gz" \
 		sh scripts/e2e-mbp.sh $(MBP) -tags e2embp -count=1 -v -timeout 25m ./e2e/mbp/...
 
+## e2e-linux: E2E-LINUX: the e2e-mbp checks (a)–(f) + twd doctor + `twd up --service`
+## (systemd user unit; survives `systemctl --user restart`) on FRESH Lima VMs
+## twdl-<distro> that mount nothing from this Mac, from the linux release tarballs.
+## twd runs in the VM; the test client + echo run here. ≤2 VMs at a time; each is
+## stopped (kept) when its row is done. LINUX_DISTROS picks rows (see
+## scripts/e2e-linux-one.sh; debian11-arm64 / alpine-arm64 check doctor's refusal).
+LINUX_DISTROS ?= ubuntu24-amd64 ubuntu24-arm64 debian12-arm64 ubuntu22-arm64
+e2e-linux: release
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-linux: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	if ! command -v limactl >/dev/null; then echo "e2e-linux: SKIPPED (no limactl)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		TWD_E2E_TARBALL_arm64="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-linux-arm64.tar.gz" \
+		TWD_E2E_TARBALL_amd64="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-linux-amd64.tar.gz" \
+		sh scripts/e2e-linux.sh $(LINUX_DISTROS)
+
 lint:
 	@out=$$(gofmt -l $$(git ls-files -co --exclude-standard '*.go')); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 	$(GO) vet ./...
@@ -123,6 +139,7 @@ lint:
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags e2embp ./e2e/mbp/...
+	$(GO) vet -tags e2elinux ./e2e/linux/...
 	$(GO) vet -tags sdk ./e2e/sdk/...
 	$(GO) vet -tags nodetier ./e2e/node/...
 	@sh scripts/check-secrets.sh
