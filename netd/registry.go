@@ -81,6 +81,9 @@ type Config struct {
 	// OnDelete, if set, is called after a killed object's node is closed
 	// (kill tier 2: delete the device at the coordination server).
 	OnDelete func(ctx context.Context, info ObjectInfo) error
+	// KillFlushDelay is how long Kill keeps a node up after aborting its flows
+	// so the RSTs are transmitted before Close. Default 50 ms; negative disables.
+	KillFlushDelay time.Duration
 	// Logger receives structured logs; it is always wrapped in a
 	// RedactingHandler. Nil discards.
 	Logger *slog.Logger
@@ -136,6 +139,9 @@ func New(cfg Config) (*Registry, error) {
 	}
 	if cfg.ReadyTimeout <= 0 {
 		cfg.ReadyTimeout = 30 * time.Second
+	}
+	if cfg.KillFlushDelay == 0 {
+		cfg.KillFlushDelay = 50 * time.Millisecond
 	}
 	if cfg.Hostname == nil {
 		cfg.Hostname = func(id string) string { return "twd-" + id }

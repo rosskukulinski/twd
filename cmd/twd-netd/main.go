@@ -230,7 +230,7 @@ func ctlMux(reg *netd.Registry) http.Handler {
 	})
 	mux.HandleFunc("POST /v1/objects/{id}/kill", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
-		rep, err := reg.Kill(r.Context(), r.PathValue("id"), netd.KillOptions{Reason: q.Get("reason"), Logout: q.Get("logout") == "1"})
+		rep, err := reg.Kill(r.Context(), r.PathValue("id"), netd.KillOptions{Reason: q.Get("reason"), Logout: q.Get("logout") == "1", CloseFirst: q.Get("close_first") == "1"})
 		if errors.Is(err, netd.ErrNotFound) {
 			js(w, 404, map[string]string{"error": err.Error()})
 			return

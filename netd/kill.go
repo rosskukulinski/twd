@@ -16,15 +16,22 @@ import (
 // KillOptions control Registry.Kill.
 type KillOptions struct {
 	Reason string
-	// Logout logs the node out before closing it. For ephemeral nodes this
-	// removes the device at once, so peers drop it on their next netmap
-	// instead of black-holing packets until the device ages out.
+	// Logout logs the node out before closing it (bounded to 1.5 s). For
+	// ephemeral nodes this removes the device without a lifecycle credential,
+	// so peers drop it instead of black-holing packets until it ages out.
+	// Measured on production control it is slower and far more variable
+	// (0.16-3 s) than OnDelete (~150 ms), so prefer OnDelete when available.
 	Logout bool
 	// KeepState keeps the object's state dir (default: removed, since a killed
 	// object never rejoins and its node key should not linger on disk).
 	KeepState bool
 	// SkipDelete skips Config.OnDelete.
 	SkipDelete bool
+	// CloseFirst closes the node before calling Config.OnDelete. The default
+	// (delete first) was measured faster on production control: removal from
+	// peers' netmaps median 206 ms vs 2.4 s, because closing an ephemeral
+	// node first waits on its control-side logout (up to 5 s).
+	CloseFirst bool
 }
 
 // KillReport records what a kill did and how long each step took.
@@ -46,8 +53,10 @@ func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 // Kill is kill tier 1 (+ tier 2 via OnDelete): it marks the object killed so
 // no new ingress or egress is admitted, aborts every in-flight flow with a
-// TCP RST (so callers fail now rather than at their own timeout), then closes
-// the node, then calls the device-delete hook. Kill is terminal.
+// TCP RST (so callers fail now rather than at their own timeout), waits
+// KillFlushDelay for the RSTs to leave, then deletes the device (OnDelete)
+// and closes the node (see KillOptions.CloseFirst for the order). Kill is
+// terminal.
 func (r *Registry) Kill(ctx context.Context, id string, opts KillOptions) (*KillReport, error) {
 	o := r.Get(id)
 	if o == nil {
@@ -77,31 +86,52 @@ func (r *Registry) Kill(ctx context.Context, id string, opts KillOptions) (*Kill
 	}
 	rep.FlowsAborted = o.abortFlows()
 	rep.AbortMS = ms(time.Since(t0))
+	// Abort only queues the RSTs; tsnet.Close tears down netstack first and
+	// would drop them, leaving callers black-holed (seen on production
+	// control). Keep the node up briefly so the RSTs leave over WireGuard.
+	if rep.FlowsAborted > 0 && r.cfg.KillFlushDelay > 0 {
+		time.Sleep(r.cfg.KillFlushDelay)
+	}
 
-	// 2. Close the node (optionally logging out first).
+	// 2. Optionally log out first.
 	if opts.Logout && lc != nil {
 		ls := time.Now()
-		lctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		lctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 		if err := lc.Logout(lctx); err != nil {
 			rep.LogoutErr = Redact(err.Error())
 		}
 		cancel()
 		rep.LogoutMS = ms(time.Since(ls))
 	}
-	cs := time.Now()
-	o.teardown()
-	rep.CloseMS = ms(time.Since(cs))
-	if !opts.KeepState {
-		os.RemoveAll(o.dir)
-	}
-
-	// 3. Tier 2: delete the device.
-	if r.cfg.OnDelete != nil && !opts.SkipDelete && prev != StateFailed {
+	// 3. Tier 2 (delete the device), then Close the node; or, with
+	// CloseFirst, the other way round. The RST in step 1 has already failed
+	// every in-flight caller; the order only decides when peers drop the node
+	// from their netmaps. Running both concurrently was measured to contend at
+	// control (both took 4-5 s), so they run in sequence.
+	doDelete := func() {
+		if r.cfg.OnDelete == nil || opts.SkipDelete || prev == StateFailed || info.NodeID == "" {
+			return
+		}
 		ds := time.Now()
 		if err := r.cfg.OnDelete(ctx, info); err != nil {
 			rep.DeleteErr = Redact(err.Error())
 		}
 		rep.DeleteMS = ms(time.Since(ds))
+	}
+	doClose := func() {
+		cs := time.Now()
+		o.teardown()
+		rep.CloseMS = ms(time.Since(cs))
+		if !opts.KeepState {
+			os.RemoveAll(o.dir)
+		}
+	}
+	if opts.CloseFirst {
+		doClose()
+		doDelete()
+	} else {
+		doDelete()
+		doClose()
 	}
 	rep.TotalMS = ms(time.Since(t0))
 	r.log.Info("object killed", "object", id, "reason", opts.Reason, "flows_aborted", rep.FlowsAborted,

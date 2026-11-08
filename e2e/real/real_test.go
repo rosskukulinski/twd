@@ -209,7 +209,7 @@ func TestRealTailnet(t *testing.T) {
 	go http.Serve(eln, reg.EgressHandler())
 	closers = append(closers, func() { eln.Close() })
 
-	objects := []string{"a", "b", "c", "d"}
+	objects := []string{"a", "b", "c", "d", "e"}
 	joinStart := time.Now()
 	for _, id := range objects {
 		if _, err := reg.Create(id, netd.ObjectOptions{}); err != nil {
@@ -412,7 +412,7 @@ func TestRealTailnet(t *testing.T) {
 	})
 
 	// Kill with logout (ephemeral: the device is removed at once), streaming caller.
-	killAndMeasure := func(t *testing.T, id string, logout bool, label string) {
+	killAndMeasure := func(t *testing.T, id string, opts netd.KillOptions, label string) {
 		resp, err := hc.Get("http://" + ips[id] + "/stream")
 		if err != nil {
 			t.Fatal(err)
@@ -430,8 +430,23 @@ func TestRealTailnet(t *testing.T) {
 				}
 			}
 		}()
+		// Poll the client's netmap concurrently with the kill (10 ms) so the
+		// removal time is measured from kill start, not from Kill returning.
+		removed := make(chan time.Time, 1)
 		killAt := time.Now()
-		rep, err := reg.Kill(ctx, id, netd.KillOptions{Reason: "e2e-real", Logout: logout})
+		go func() {
+			for time.Since(killAt) < 3*time.Minute {
+				if !client.InNetmap(ctx, ips[id]) {
+					removed <- time.Now()
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			close(removed)
+		}()
+		opts.Reason = "e2e-real"
+		rep, err := reg.Kill(ctx, id, opts)
+		killDone := time.Now()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -452,18 +467,49 @@ func TestRealTailnet(t *testing.T) {
 		if !ok {
 			t.Errorf("time to failure %v (report %+v)", ttf, rep)
 		}
-		if rep.DeleteErr != "" || rep.LogoutErr != "" {
-			t.Errorf("kill errors: %+v", rep)
+		if rep.DeleteErr != "" {
+			t.Errorf("device delete failed: %+v", rep)
+		}
+		if rep.LogoutErr != "" {
+			res.Notes = append(res.Notes, label+": logout error (kill proceeded): "+rep.LogoutErr)
 		}
 		// Real control: time until the killed node leaves the client's netmap.
-		for {
-			if !client.InNetmap(ctx, ips[id]) {
-				res.num(label+"_netmap_removal_ms", msOf(time.Since(killAt)))
+		if rt, ok := <-removed; ok {
+			res.num(label+"_netmap_removal_ms", msOf(rt.Sub(killAt)))
+			// Negative: removal was visible before Kill returned (it waits for
+			// the device-delete API response).
+			res.num(label+"_netmap_removal_after_kill_returned_ms", msOf(rt.Sub(killDone)))
+		} else {
+			res.num(label+"_netmap_removal_ms", -1)
+			t.Errorf("node %s still in client netmap 3 min after kill", id)
+		}
+		// An object calling the killed node through netd egress gets a typed,
+		// immediate peer_not_visible once its own netmap drops the node.
+		qc := client.HTTPClient(3 * time.Second)
+		for s := time.Now(); ; {
+			var code int
+			var h http.Header
+			var b []byte
+			rs := time.Now()
+			resp, err := qc.Get("http://" + ips["a"] + "/egress?url=http://" + ips[id] + "/")
+			d := time.Since(rs)
+			if err == nil {
+				code, h = resp.StatusCode, resp.Header
+				b, _ = io.ReadAll(resp.Body)
+				resp.Body.Close()
+			} else {
+				b = []byte(err.Error())
+				h = http.Header{}
+			}
+			if code == 403 && h.Get(netd.HeaderError) == netd.CodePeerNotVisible {
+				res.num(label+"_object_egress_peer_not_visible_after_kill_ms", msOf(time.Since(killAt)))
+				res.num(label+"_object_egress_refusal_latency_ms", msOf(d))
+				res.check(label+"_object_egress_to_killed_is_peer_not_visible", true, "")
 				break
 			}
-			if time.Since(killAt) > 3*time.Minute {
-				res.num(label+"_netmap_removal_ms", -1)
-				t.Errorf("node %s still in client netmap 3 min after kill", id)
+			if time.Since(s) > 30*time.Second {
+				res.check(label+"_object_egress_to_killed_is_peer_not_visible", false, fmt.Sprintf("%d %s", code, b))
+				t.Errorf("egress to killed %s: %d %s", id, code, b)
 				break
 			}
 			time.Sleep(25 * time.Millisecond)
@@ -478,8 +524,9 @@ func TestRealTailnet(t *testing.T) {
 			t.Error("request to killed object succeeded")
 		}
 	}
-	t.Run("KillWithLogout", func(t *testing.T) { killAndMeasure(t, "c", true, "kill_logout") })
-	t.Run("KillDeviceDeleteOnly", func(t *testing.T) { killAndMeasure(t, "d", false, "kill_delete") })
+	t.Run("KillWithLogout", func(t *testing.T) { killAndMeasure(t, "c", netd.KillOptions{Logout: true}, "kill_logout") })
+	t.Run("KillDefault", func(t *testing.T) { killAndMeasure(t, "d", netd.KillOptions{}, "kill_default") })
+	t.Run("KillCloseFirst", func(t *testing.T) { killAndMeasure(t, "e", netd.KillOptions{CloseFirst: true}, "kill_closefirst") })
 	close(deletes)
 	for ev := range deletes {
 		res.Notes = append(res.Notes, "device delete hook ran for "+ev.id)
