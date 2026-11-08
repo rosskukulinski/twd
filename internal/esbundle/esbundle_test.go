@@ -31,6 +31,14 @@ func TestMatchesBuildMJS(t *testing.T) {
 		tmpl := en.Name()
 		t.Run(tmpl, func(t *testing.T) {
 			dir := filepath.Join(root, "js", "packages", "create-twd", "templates", tmpl)
+			if tb, err := os.ReadFile(filepath.Join(dir, "twd.jsonc")); err == nil {
+				var c struct {
+					Runtime string `json:"runtime"`
+				}
+				if bundle.UnmarshalJSONC(tb, &c) == nil && c.Runtime == "node" {
+					t.Skip("runtime \"node\" template: bundled by build-node.mjs, not esbundle")
+				}
+			}
 			wb, err := os.ReadFile(filepath.Join(dir, "wrangler.jsonc"))
 			if err != nil {
 				t.Fatal(err)

@@ -85,3 +85,22 @@ check below runs in both.
   classes tenant-unique names until the mgmt namespace includes the workload.
 - **Same-host MCP**: an agent and the MCP server it calls must be on
   different hosts (or the call must go through the platform, not built).
+
+## Node process tier (M9)
+
+See [node-tier.md](node-tier.md) for the full table and the security caveat: in the process tier, egress enforcement relies on proxy settings that a malicious Node app can bypass, so the microVM tier is the enforcement boundary.
+
+| env | value |
+|---|---|
+| `TWD_EGRESS_PROXY`, `HTTP_PROXY`, `HTTPS_PROXY` (+ lower case) | `http://twd:<token>@127.0.0.1:<port>` |
+| `NODE_USE_ENV_PROXY` | `1` (Node's `fetch()` and `http` honour the proxy vars) |
+| `NO_PROXY` | only the app's own port (self-calls, e.g. the Workflow queue) and the proxy itself |
+| Thing | Version | Status on the Node tier |
+|---|---|---|
+| Node.js | 25.1 (macOS), 24.x (Lima) | ✅ (needs ≥ 24 for `NODE_USE_ENV_PROXY`) |
+| `workflow` (Vercel Workflow SDK) | 5.4.0 | ✅ `"use workflow"`, steps, `sleep`, `createHook`/`resumeHook`, kill/resume |
+| `@workflow/world-local` | 5.2.1 | ✅ (single process per data dir) |
+| `@workflow/world-postgres` | 5.1.1 | not tested (follow-up) |
+| `@ai-sdk/workflow` `WorkflowAgent` | 2.0.97 (`ai` 7.0.165) | ✅ `generate()` with tools as steps, mock `LanguageModelV4` |
+| `undici` | 8.12.4 | ✅ via `dispatcher(undici)` / `installGlobalDispatcher(undici)`; ⚠ importing it disables env proxies |
+| Node built-in `fetch` / `http` with env proxies | Node 25 | ✅ (CONNECT / absolute form) |

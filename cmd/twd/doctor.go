@@ -128,8 +128,15 @@ func cmdDoctor(args []string) error {
 		if len(tms) == 0 {
 			return "fail", "no templates in " + ct, "reinstall twd"
 		}
+		var nodeTms []string
 		for _, tm := range tms {
 			dir := filepath.Join(ct, "templates", tm)
+			if isNodeRuntimeDir(dir) {
+				// runtime "node" (M9) templates are bundled by build-node.mjs at
+				// deploy time and need Node.js; they are not workerd bundles.
+				nodeTms = append(nodeTms, tm)
+				continue
+			}
 			wb, err := os.ReadFile(filepath.Join(dir, "wrangler.jsonc"))
 			if err != nil {
 				return "fail", "template " + tm + " missing in " + ct, "reinstall twd"
@@ -144,7 +151,11 @@ func cmdDoctor(args []string) error {
 			}
 			sizes = append(sizes, fmt.Sprintf("%s %.0f KB", tm, float64(n)/1024))
 		}
-		return "ok", "esbuild " + esbundle.Version + " (built in, no Node.js needed) bundles every template offline: " + strings.Join(sizes, ", "), ""
+		detail := "esbuild " + esbundle.Version + " (built in, no Node.js needed) bundles every workerd template offline: " + strings.Join(sizes, ", ")
+		if len(nodeTms) > 0 {
+			detail += "; Node-tier templates (need Node.js to deploy): " + strings.Join(nodeTms, ", ")
+		}
+		return "ok", detail, ""
 	})
 
 	run("twd_home_writable", func() (string, string, string) {
@@ -293,3 +304,18 @@ func childPIDs(pid int) []int {
 func lookPathOK(name string) bool { _, err := exec.LookPath(name); return err == nil }
 
 func firstLine(s string) string { l, _, _ := strings.Cut(strings.TrimSpace(s), "\n"); return l }
+
+// isNodeRuntimeDir reports whether dir's twd.jsonc declares runtime "node".
+func isNodeRuntimeDir(dir string) bool {
+	b, err := os.ReadFile(filepath.Join(dir, "twd.jsonc"))
+	if err != nil {
+		return false
+	}
+	var c struct {
+		Runtime string `json:"runtime"`
+	}
+	if bundle.UnmarshalJSONC(b, &c) != nil {
+		return false
+	}
+	return c.Runtime == "node"
+}

@@ -1,0 +1,16 @@
+{
+  "goarch": "arm64",
+  "goos": "darwin",
+  "node": "v25.1.0",
+  "results": {
+    "egress.global_ms": 6,
+    "egress.http_ms": 1,
+    "egress.sdk_ms": 5,
+    "egress.undici_ms": 9,
+    "nodeprobe.cold_start_spawn_to_healthy_ms": 48.712,
+    "nodeprobe.crash_to_serving_ms": 330,
+    "nodeprobe.deploy_to_first_200_ms": 409,
+    "nodeprobe.rss_mib": 102.78125
+  },
+  "when": "2026-11-08T09:20:12Z"
+}
