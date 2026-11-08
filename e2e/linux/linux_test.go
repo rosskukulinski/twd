@@ -159,8 +159,7 @@ func TestE2ELinux(t *testing.T) {
 	b := make([]byte, 3)
 	rand.Read(b)
 	run := hex.EncodeToString(b)
-	testPrefix := "ttest-l1-" + run + "-" // this Mac's client + echo
-	twdPrefix := "twd-l1-" + run + "-"    // every node twd creates in the VM
+	testPrefix, twdPrefix, _ := cliflow.RunPrefixes("l1", run) // this Mac's client + echo; every node twd creates in the VM
 	root, _ := nettest.FindRepoRoot()
 	res := cliflow.NewResults("l1-"+vmName+"-"+run, tailnet)
 	res.Notes = append(res.Notes, "twd in Lima VM "+vmName+" (no mounts) from "+filepath.Base(tarball)+"; test client + echo on this Mac")

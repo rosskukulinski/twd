@@ -834,3 +834,20 @@ func Leftovers(ctx context.Context, api *tsapi.Client, res *Results) (devices, k
 
 // Objects lists every object (twd ls --all).
 func (e *Env) Objects() []Object { return e.objects() }
+
+// RunPrefixes names one real-tailnet run's nodes: the test client + echo
+// get ttest-<label>-<run>- and every node twd creates gets twd-<label>-<run>-.
+// label defaults to def; TWD_E2E_PREFIX=ttest-<label>- overrides it so
+// concurrent runs (and the final-verification runs, ttest-fv-) clean up
+// only their own IDs.
+func RunPrefixes(def, run string) (testPrefix, twdPrefix, label string) {
+	label = def
+	if p := os.Getenv("TWD_E2E_PREFIX"); p != "" {
+		l, ok := strings.CutPrefix(p, "ttest-")
+		if !ok || l == "" {
+			panic("TWD_E2E_PREFIX " + p + " must be ttest-<label>-")
+		}
+		label = strings.TrimSuffix(l, "-")
+	}
+	return "ttest-" + label + "-" + run + "-", "twd-" + label + "-" + run + "-", label
+}

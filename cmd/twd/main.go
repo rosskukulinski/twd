@@ -40,7 +40,7 @@ func init() {
 		{name: "down", usage: "down [--purge]", help: "stop everything twd up started (--purge: kill every object and delete its device first)", run: cmdDown},
 		{name: "status", usage: "status", help: "health of mgmt, the host, the tenant and deployments", run: cmdStatus},
 		{name: "tenant", usage: "tenant add <tailnet> --api-key-file <file> [--policy-apply] | tenant ls", help: "serve another tenant (its own tailnet) from this host, or list tenants", run: cmdTenant},
-		{name: "init", usage: "init <dir> [--template hello|agent|mcp|ai-agent]", help: "create an app from a template", run: cmdInit},
+		{name: "init", usage: "init <dir> [--template hello|agent|mcp|ai-agent|node-workflow] [--name <workload>]", help: "create an app from a template (node-workflow needs Node.js on the deploying machine)", run: cmdInit},
 		{name: "dev", usage: "dev [dir] [--port 8787]", help: "run an app locally: process tier + embedded control plane (no tailnet)", run: cmdDev},
 		{name: "deploy", usage: "deploy [dir] [--tenant <tailnet>] [--name <workload>] [--allow-missing-grants] [--no-wait]", help: "bundle, preflight grants, deploy, wait until ready", run: cmdDeploy},
 		{name: "ls", usage: "ls [--tenant <tailnet>] [--all]", help: "list deployments and objects", run: cmdLs},
@@ -57,22 +57,65 @@ func init() {
 func usage(w io.Writer) {
 	fmt.Fprintln(w, "twd: Workers and Durable Objects with their own tailnet identities")
 	fmt.Fprintln(w, "\nusage: twd <command> [flags]   (every command takes --state-dir, default ~/.twd, and --json)")
+	fmt.Fprintln(w, "       twd <command> --help     usage of one command")
 	fmt.Fprintln(w)
 	for _, c := range commands {
 		if !c.hidden {
 			fmt.Fprintf(w, "  %-8s %s\n           twd %s\n", c.name, c.help, c.usage)
 		}
 	}
+	fmt.Fprintln(w, "\ntemplates (twd init --template): hello | agent | mcp | ai-agent | node-workflow (node-workflow needs Node.js on the deploying machine)")
+}
+
+// commandUsage prints one command's help (`twd <cmd> --help`).
+func commandUsage(w io.Writer, c command) {
+	fmt.Fprintf(w, "twd %s: %s\n\nusage: twd %s\n", c.name, c.help, c.usage)
+	fmt.Fprintln(w, "  (every command takes --state-dir, default ~/.twd, and --json)")
+}
+
+// errHelp is returned by flags.parse when -h/--help was given; main prints
+// the command's usage to stdout and exits 0.
+var errHelp = errors.New("help requested")
+
+// isHelpFlag reports whether a is -h, -help or --help.
+func isHelpFlag(a string) bool { return a == "-h" || a == "-help" || a == "--help" }
+
+// wantsHelp reports whether args ask for help before a `--`.
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		if a == "--" {
+			return false
+		}
+		if isHelpFlag(a) {
+			return true
+		}
+	}
+	return false
 }
 
 func main() {
-	args := os.Args[1:]
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+// run is main without the process exit (tests call it): the exit code is
+// 0 on success and for any help request, 1 for a failed command, 2 for a
+// usage error.
+func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 1 && (args[0] == "--version" || args[0] == "-v") {
 		args = []string{"version"}
 	}
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
-		usage(os.Stdout)
-		return
+	if len(args) == 0 || isHelpFlag(args[0]) || args[0] == "help" {
+		// `twd help <cmd>` is `twd <cmd> --help`.
+		if len(args) == 2 && args[0] == "help" {
+			for _, c := range commands {
+				if c.name == args[1] && !c.hidden {
+					commandUsage(stdout, c)
+					return 0
+				}
+			}
+		}
+		usage(stdout)
+		return 0
 	}
 	// Allow global flags before the command: twd --state-dir X <cmd> …
 	var pre []string
@@ -85,21 +128,33 @@ func main() {
 		args = args[1:]
 	}
 	if len(args) == 0 {
-		usage(os.Stderr)
-		os.Exit(2)
+		if wantsHelp(pre) {
+			usage(stdout)
+			return 0
+		}
+		usage(stderr)
+		return 2
 	}
 	name, rest := args[0], append(pre, args[1:]...)
 	for _, c := range commands {
 		if c.name == name {
-			if err := c.run(rest); err != nil {
-				printErr(err)
-				os.Exit(1)
+			if wantsHelp(rest) && !c.hidden {
+				commandUsage(stdout, c)
+				return 0
 			}
-			return
+			if err := c.run(rest); err != nil {
+				if errors.Is(err, errHelp) {
+					commandUsage(stdout, c)
+					return 0
+				}
+				printErr(err)
+				return 1
+			}
+			return 0
 		}
 	}
 	printErr(fail("bad_request", fmt.Sprintf("unknown command %q", name), "run `twd help` for the list"))
-	os.Exit(2)
+	return 2
 }
 
 // ---- errors (DX.md catalog format) ----
@@ -196,6 +251,9 @@ func (f *flags) parse(args []string) ([]string, error) {
 	var pos []string
 	for {
 		if err := f.FlagSet.Parse(args); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				return nil, errHelp
+			}
 			return nil, fail("bad_request", err.Error(), "usage: twd "+usageOf(f.Name()))
 		}
 		args = f.FlagSet.Args()

@@ -50,7 +50,7 @@ func TestE2ELinuxReboot(t *testing.T) {
 	b := make([]byte, 3)
 	rand.Read(b)
 	run := hex.EncodeToString(b)
-	testPrefix, twdPrefix := "ttest-l3r-"+run+"-", "twd-l3r-"+run+"-"
+	testPrefix, twdPrefix, _ := cliflow.RunPrefixes("l3r", run)
 	root, _ := nettest.FindRepoRoot()
 	res := cliflow.NewResults("l3-reboot-"+run, tailnet)
 	resultsTo := filepath.Join(root, "e2e", "real", "results", "l3-reboot-"+time.Now().Format("20060102-150405")+"-"+run+".json")

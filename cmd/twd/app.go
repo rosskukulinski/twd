@@ -116,7 +116,7 @@ func loadApp(dir, name string) (*app, error) {
 	a := &app{Dir: dir}
 	raw, err := os.ReadFile(filepath.Join(dir, "twd.jsonc"))
 	if err != nil {
-		return nil, fail("bad_request", "no twd.jsonc in "+dir).withFix("twd init <dir> --template hello|agent|mcp|ai-agent")
+		return nil, fail("bad_request", "no twd.jsonc in "+dir).withFix("twd init <dir> --template hello|agent|mcp|ai-agent|node-workflow")
 	}
 	a.TwdRaw = raw
 	if a.Cfg, err = mgmt.ParseTwdConfig(raw); err != nil {

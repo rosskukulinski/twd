@@ -137,8 +137,7 @@ func TestE2EMbp(t *testing.T) {
 	b := make([]byte, 3)
 	rand.Read(b)
 	run := hex.EncodeToString(b)
-	testPrefix := "ttest-m6-" + run + "-" // this Mac's client + echo
-	twdPrefix := "twd-m6-" + run + "-"    // every node twd creates on mbp
+	testPrefix, twdPrefix, _ := cliflow.RunPrefixes("m6", run) // this Mac's client + echo; every node twd creates on mbp
 	root, _ := nettest.FindRepoRoot()
 	res := cliflow.NewResults("m6-mbp-"+run, tailnet)
 	res.Notes = append(res.Notes, "twd on "+host+" from "+filepath.Base(tarball)+"; test client + echo on this Mac")
