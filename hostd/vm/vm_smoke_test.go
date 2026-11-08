@@ -47,7 +47,8 @@ func TestSmoke(t *testing.T) {
 	if kernel == "" || rootfs == "" {
 		t.Skip("TWD_VM_KERNEL / TWD_VM_ROOTFS not set")
 	}
-	b, err := New(Config{Kernel: kernel, Rootfs: rootfs, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES"), VCPUs: envInt("TWD_VM_VCPUS")})
+	b, err := New(Config{Kernel: kernel, Rootfs: rootfs, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES"), VCPUs: envInt("TWD_VM_VCPUS"),
+		Helper: os.Getenv("TWD_VM_HELPER")})
 	if err != nil {
 		t.Skip(err)
 	}
@@ -66,6 +67,12 @@ func TestSmoke(t *testing.T) {
 	}
 	defer m.Stop()
 	t.Logf("info %+v rss %d kB", m.Info(), m.RSSKB())
+	if j := m.Info().Jail; j == nil || j.UID < 1000 || j.Chroot == "" || j.Cgroup == "" {
+		t.Fatalf("not jailed: %+v", j)
+	} else {
+		t.Logf("jail %+v", *j)
+		checkJailed(t, m.Info().PID, j)
+	}
 	cl := &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) { return m.DialGuest(ctx) }}}
 	for _, p := range []string{"/", "/egress"} {
 		resp, err := cl.Get("http://guest" + p)

@@ -400,12 +400,29 @@ func (h *Host) pushAPI() http.Handler {
 		h.killLocal(k.ObjectID, k.Reason)
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
+	// twd down --purge: forget killed objects (their tombstones) so a
+	// redeploy on this state dir starts from a clean registry.
+	m.HandleFunc("POST /v0/purge", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"ok": true, "purged": h.Purge()})
+	})
 	m.HandleFunc("POST /v0/push/assignments", func(w http.ResponseWriter, r *http.Request) {
 		h.TriggerSync()
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
 	m.HandleFunc("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, h.Status())
+	})
+	// Operator checks of a workload's microVM (twd host vmcheck): guest
+	// stats, DO volume fsync latency, and the no-keys-in-guest scan. The
+	// socket is the user's (0700 dir); answers carry no key material.
+	m.HandleFunc("POST /v0/vm/check", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		rep, err := h.VMCheck(r.Context(), q.Get("tenant"), q.Get("workload"), q.Get("keyscan") == "1")
+		if err != nil {
+			writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})
+			return
+		}
+		writeJSON(w, 200, rep)
 	})
 	return m
 }
@@ -424,12 +441,18 @@ type WorkloadStatus struct {
 	InstanceDir                                     string
 	Tier                                            string
 	VM                                              *sandbox.Info `json:",omitempty"`
-	// Process tier: the workerd pid, its sandbox ("none" | "seatbelt"),
-	// the Seatbelt profile, and its DO storage dir.
+	// VMRSSKB is the microVM's VMM resident set (incl. hugetlb guest RAM).
+	VMRSSKB int64 `json:",omitempty"`
+	// Process tier: the workerd (or node) pid, its sandbox ("none" |
+	// "seatbelt" | "landlock"), the profile (.sb / .json), and its DO
+	// storage dir.
 	PID            int    `json:",omitempty"`
 	Sandbox        string `json:",omitempty"`
 	SandboxProfile string `json:",omitempty"`
-	DOStorage      string `json:",omitempty"`
+	// LoopbackPorts are hostd's token-checked loopback listeners for this
+	// workerd's outbound services (Landlock only).
+	LoopbackPorts []uint16 `json:",omitempty"`
+	DOStorage     string   `json:",omitempty"`
 	// Runtime is "node" for the Node process tier ("" = workerd).
 	Runtime string    `json:",omitempty"`
 	Node    *NodeInfo `json:",omitempty"`
@@ -458,7 +481,7 @@ const (
 // of that kind reports itself here, the Node tier's egress is advisory.
 func EgressEnforcement(sandbox string) string {
 	switch sandbox {
-	case "landlock":
+	case SandboxLandlock:
 		return EgressEnforced
 	}
 	return EgressUnenforced
@@ -466,7 +489,14 @@ func EgressEnforcement(sandbox string) string {
 
 // StatusView is GET /v0/status.
 type StatusView struct {
-	HostID    string
+	HostID string
+	// Sandbox is the host's process sandbox: "seatbelt", "landlock (ABI n)"
+	// or "none".
+	Sandbox string `json:",omitempty"`
+	// Tiers this host offers ("process", and "microvm" with a backend);
+	// VMVia says how microVMs are launched (twd-vmhelper or in-process).
+	Tiers     []string
+	VMVia     string `json:",omitempty"`
 	Objects   []ObjectStatus
 	Workloads []WorkloadStatus
 	// InsecureSharedHost echoes Config.InsecureSharedHost.
@@ -476,7 +506,13 @@ type StatusView struct {
 // Status returns a snapshot.
 func (h *Host) Status() StatusView {
 	h.mu.Lock()
-	v := StatusView{HostID: h.cfg.HostID, InsecureSharedHost: h.cfg.InsecureSharedHost}
+	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo(), Tiers: []string{"process"}, InsecureSharedHost: h.cfg.InsecureSharedHost}
+	if h.cfg.VM != nil {
+		v.Tiers = append(v.Tiers, "microvm")
+		if vv, ok := h.cfg.VM.(interface{ Via() string }); ok {
+			v.VMVia = vv.Via()
+		}
+	}
 	for _, o := range h.objects {
 		v.Objects = append(v.Objects, ObjectStatus{o.ID, o.NetdID, o.TenantID, o.Workload, o.Class, o.Name, o.Hostname, o.Status, o.NodeID, o.MagicDNS, o.IP, o.Err, o.Parent, o.Wakes})
 	}
@@ -502,10 +538,8 @@ func (h *Host) Status() StatusView {
 				ws.PID = w.active.cmd.Process.Pid
 			}
 			if w.active.tier != "microvm" {
-				ws.Sandbox, ws.SandboxProfile = SandboxNone, w.active.profile
-				if w.active.profile != "" {
-					ws.Sandbox = SandboxSeatbelt
-				}
+				ws.Sandbox, ws.SandboxProfile = sandboxOf(w.active.profile), w.active.profile
+				ws.LoopbackPorts = w.active.loopPorts
 			}
 			if ws.Runtime == bundle.RuntimeNode {
 				ws.Egress = EgressEnforcement(ws.Sandbox)
@@ -514,6 +548,10 @@ func (h *Host) Status() StatusView {
 			if vm := w.active.currentVM(); vm != nil {
 				info := vm.Info()
 				ws.VM = &info
+				ws.VMRSSKB = vm.RSSKB()
+				if info.Console != "" {
+					ws.LogFile = info.Console // guest workerd logs to the serial console
+				}
 			}
 		}
 		w.mu.Unlock()

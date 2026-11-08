@@ -1,6 +1,10 @@
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
 import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher, enforceEgress } from "@twd/node";
+// The /net sandbox probe must use the UNPATCHED connect (enforceEgress
+// tunnels raw connects through the proxy; the probe measures the OS sandbox).
+const rawConnect = net.connect;
 enforceEgress();
 
 const port = Number(process.env.PORT);
@@ -55,6 +59,19 @@ http.createServer(async (req, res) => {
           return json(res, 200, { ok: true, n: fs.readFileSync(p).length });
         } catch (e) { return json(res, 200, { ok: false, code: e.code ?? String(e) }); }
       }
+      case "/net": {
+        // Sandbox probe: raw TCP (host+port) or unix-socket (path) connect,
+        // bypassing the egress proxy. Only the outcome is returned.
+        const p = u.searchParams.get("path");
+        const opts = p ? { path: p } : { host: u.searchParams.get("host"), port: Number(u.searchParams.get("port")) };
+        const r = await new Promise((resolve) => {
+          const s = rawConnect(opts);
+          const t = setTimeout(() => { s.destroy(); resolve({ ok: false, code: "TIMEOUT" }); }, 3000);
+          s.on("connect", () => { clearTimeout(t); s.destroy(); resolve({ ok: true }); });
+          s.on("error", (e) => { clearTimeout(t); resolve({ ok: false, code: e.code ?? String(e) }); });
+        });
+        return json(res, 200, r);
+      }
       case "/log": console.log("probe-log-line", u.searchParams.get("m")); return json(res, 200, { ok: true });
       case "/crash": json(res, 200, { bye: process.pid }); setTimeout(() => process.exit(3), 10); return;
       case "/stream": {
@@ -69,4 +86,4 @@ http.createServer(async (req, res) => {
     if (e instanceof CallerError) return json(res, 401, { code: e.code, message: e.message });
     json(res, 500, { error: String(e?.cause?.message ?? e?.message ?? e) });
   }
-}).listen(port, "127.0.0.1");
+}).listen(...(process.env.TWD_SOCKET ? [process.env.TWD_SOCKET] : [port, "127.0.0.1"]));

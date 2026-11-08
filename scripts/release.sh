@@ -1,7 +1,7 @@
 #!/bin/sh
 # release.sh <version> [targets…]: self-contained twd release tarballs.
 #
-#   dist/twd-<version>-<os>-<arch>.tar.gz   (default targets: darwin-arm64 linux-arm64)
+#   dist/twd-<version>-<os>-<arch>.tar.gz   (default targets: darwin-arm64 linux-arm64 linux-amd64)
 #   dist/SHA256SUMS
 #
 # Each tarball holds: bin/{twd,twd-mgmt,twd-hostd,twd-netd} (CGO_ENABLED=0,
@@ -10,12 +10,17 @@
 # package-lock.json), share/twd/create-twd (templates + build.mjs),
 # share/twd/node_modules (the templates' runtime deps, vendored: deploy works
 # offline, no npm/node), install.sh, VERSION, SHA256SUMS, INSTALL.md.
+# linux tarballs also hold bin/twd-vmhelper (the microVM tier's privileged
+# helper; `sudo twd host setup --microvm` installs a root-owned copy) and,
+# if TWD_VM_ASSETS_<arch> names a directory (make vm-assets, in Lima), the
+# microVM guest in share/twd/vm: vmlinux, rootfs.ext4 + manifest.json, and
+# Firecracker + jailer.
 # darwin binaries are ad-hoc code-signed (codesign -s -; they are unsigned
 # otherwise and arm64 macOS refuses to run unsigned code).
 set -eu
 VERSION=$1
 shift
-TARGETS=${*:-darwin-arm64 linux-arm64}
+TARGETS=${*:-darwin-arm64 linux-arm64 linux-amd64}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DIST=$ROOT/dist
 CACHE=$DIST/cache
@@ -39,6 +44,12 @@ ROOTS=$(node scripts/template-roots.mjs js/packages/create-twd/templates | tr '\
 echo "release: vendoring the templates' deps: $ROOTS"
 node scripts/vendor-node-modules.mjs "$ROOT" "$VNM/node_modules" $ROOTS >"$CACHE/vendor.json"
 echo "release: vendored node_modules $(cat "$CACHE/vendor.json")"
+# The vendored tree is shared by every target, so it must be pure JS: no
+# native addons (.node), no ELF/Mach-O/PE executables, no package that
+# declares "os"/"cpu" (a platform package). If one ever appears, vendor
+# per target instead of shipping another platform's binary.
+native=$(node scripts/check-pure-js.mjs "$VNM/node_modules") || { echo "release: vendored node_modules are not pure JS:"; echo "$native"; exit 1; }
+echo "release: vendored node_modules are pure JS ($native)"
 
 for t in $TARGETS; do
 	os=${t%-*}
@@ -50,15 +61,20 @@ for t in $TARGETS; do
 	echo "release: $name"
 
 	# Go binaries
+	cmds="./cmd/twd ./cmd/twd-mgmt ./cmd/twd-hostd ./cmd/twd-netd"
+	[ "$os" = linux ] && cmds="$cmds ./cmd/twd-vmhelper"
 	CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
-		-o "$st/bin/" ./cmd/twd ./cmd/twd-mgmt ./cmd/twd-hostd ./cmd/twd-netd
+		-o "$st/bin/" $cmds
 
 	# workerd from the npm platform package, checked against the lockfile.
-	pkg=@cloudflare/workerd-$os-$arch
-	tgz=$CACHE/workerd-$os-$arch-$WORKERD_VERSION.tgz
+	# npm names amd64 "64" (@cloudflare/workerd-linux-64).
+	npmarch=$arch
+	[ "$arch" = amd64 ] && npmarch=64
+	pkg=@cloudflare/workerd-$os-$npmarch
+	tgz=$CACHE/workerd-$os-$npmarch-$WORKERD_VERSION.tgz
 	want=$(node -p "require('./package-lock.json').packages['node_modules/$pkg'].integrity")
 	if [ ! -f "$tgz" ]; then
-		(cd "$CACHE" && npm pack --silent "$pkg@$WORKERD_VERSION" >/dev/null && mv "cloudflare-workerd-$os-$arch-$WORKERD_VERSION.tgz" "$tgz")
+		(cd "$CACHE" && npm pack --silent "$pkg@$WORKERD_VERSION" >/dev/null && mv "cloudflare-workerd-$os-$npmarch-$WORKERD_VERSION.tgz" "$tgz")
 	fi
 	got="sha512-$(openssl dgst -sha512 -binary "$tgz" | openssl base64 -A)"
 	[ "$got" = "$want" ] || { echo "release: $pkg integrity mismatch ($got != $want)"; exit 1; }
@@ -66,6 +82,8 @@ for t in $TARGETS; do
 	mv "$CACHE/package/bin/workerd" "$st/bin/workerd"
 	rm -rf "$CACHE/package"
 	chmod 755 "$st/bin/"*
+	# Every binary must be for this target (catches a wrong npm package or GOARCH).
+	node scripts/check-arch.mjs "$os" "$arch" "$st/bin/"*
 
 	# templates + bundler sources, and the vendored modules
 	mkdir -p "$st/share/twd/create-twd"
@@ -74,12 +92,26 @@ for t in $TARGETS; do
 	find "$st/share/twd/create-twd/templates" -name dist -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	cp -R "$VNM/node_modules" "$st/share/twd/node_modules"
 
+	# microVM guest + Firecracker (linux, when built: make vm-assets)
+	microvm=false
+	eval "va=\${TWD_VM_ASSETS_$arch:-}"
+	if [ "$os" = linux ] && [ -n "$va" ]; then
+		for f in vmlinux rootfs.ext4 manifest.json firecracker jailer; do
+			[ -f "$va/$f" ] || { echo "release: $va/$f missing (make vm-assets)"; exit 1; }
+		done
+		mkdir -p "$st/share/twd/vm"
+		cp "$va/vmlinux" "$va/rootfs.ext4" "$va/manifest.json" "$va/firecracker" "$va/jailer" "$st/share/twd/vm/"
+		chmod 644 "$st/share/twd/vm/vmlinux" "$st/share/twd/vm/rootfs.ext4" "$st/share/twd/vm/manifest.json"
+		chmod 755 "$st/share/twd/vm/firecracker" "$st/share/twd/vm/jailer"
+		microvm=true
+	fi
+
 	cp scripts/install.sh "$st/install.sh"
 	chmod 755 "$st/install.sh"
 	cp docs/INSTALL.md "$st/INSTALL.md"
 	printf '%s\n' "$VERSION" >"$st/VERSION"
 	cat >"$st/share/twd/release.json" <<EOF
-{"version":"$VERSION","os":"$os","arch":"$arch","workerd":"$WORKERD_VERSION","esbuild":"built into twd","sandbox":"$( [ "$os" = darwin ] && echo seatbelt || echo none )","commit":"$(git rev-parse HEAD)","built":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"version":"$VERSION","os":"$os","arch":"$arch","workerd":"$WORKERD_VERSION","esbuild":"built into twd","sandbox":"$( [ "$os" = darwin ] && echo seatbelt || echo landlock )","microvm":$microvm,"commit":"$(git rev-parse HEAD)","built":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 
 	if [ "$os" = darwin ]; then

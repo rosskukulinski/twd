@@ -196,6 +196,21 @@ type Credential struct {
 // String never prints the key.
 func (c Credential) String() string { return "mgmtapi.Credential{redacted}" }
 
+// VolumeKey is GET /v0/volumes/key (L3): a workload's DO volume data key.
+type VolumeKey struct {
+	Key []byte `json:"key"`
+}
+
+// String never prints the key.
+func (VolumeKey) String() string { return "mgmtapi.VolumeKey{redacted}" }
+
+// RemintRequest is POST /v0/objects/{id}/remint: the saved node state was
+// rejected by control; mint again under the same hostname.
+type RemintRequest struct {
+	Epoch  int64  `json:"epoch,omitempty"`
+	Reason string `json:"reason"`
+}
+
 type ReadyRequest struct {
 	NodeID       string `json:"nodeID"`
 	StableNodeID string `json:"stableNodeID"`

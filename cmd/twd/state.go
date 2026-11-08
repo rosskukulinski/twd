@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,24 +20,25 @@ import (
 
 // Config is <state>/twd.json, written by `twd up`.
 type Config struct {
-	Tailnet           string `json:"tailnet"`
-	TenantID          string `json:"tenantID,omitempty"`
-	APIKeyFile        string `json:"apiKeyFile"` // path only; the key itself is never copied
-	ControlURL        string `json:"controlURL"`
-	TSAPIURL          string `json:"tsapiURL,omitempty"`
-	HostID            string `json:"hostID"`
-	HostnamePrefix    string `json:"hostnamePrefix,omitempty"`
-	Ephemeral         bool   `json:"ephemeral,omitempty"`
-	Workerd           string `json:"workerd"`
-	Heartbeat         string `json:"heartbeat"`
-	KillTombstone     string `json:"killTombstone"`
-	DeviceDeleteDelay string `json:"deviceDeleteDelay"`
-	// InsecureSharedHost (RT-08): run Node-tier apps for several tenants on
-	// this host although their egress is not enforced here.
+	Tailnet        string `json:"tailnet"`
+	TenantID       string `json:"tenantID,omitempty"`
+	APIKeyFile     string `json:"apiKeyFile"` // path only; the key itself is never copied
+	ControlURL     string `json:"controlURL"`
+	TSAPIURL       string `json:"tsapiURL,omitempty"`
+	HostID         string `json:"hostID"`
+	HostnamePrefix string `json:"hostnamePrefix,omitempty"`
+	Ephemeral      bool   `json:"ephemeral,omitempty"`
+	// InsecureSharedHost (twd up --insecure-shared-host): without a process
+	// sandbox, still serve process-tier workloads of several tenants
+	// (incl. Node-tier apps whose egress is then unenforced, RT-08).
 	InsecureSharedHost bool `json:"insecureSharedHost,omitempty"`
 	// AllowSiblingEgress: objects may reach other objects on this host over
 	// the tailnet (single-host tests/demos).
 	AllowSiblingEgress bool   `json:"allowSiblingEgress,omitempty"`
+	Workerd            string `json:"workerd"`
+	Heartbeat          string `json:"heartbeat"`
+	KillTombstone      string `json:"killTombstone"`
+	DeviceDeleteDelay  string `json:"deviceDeleteDelay"`
 	CreatedAt          string `json:"createdAt"`
 	// Tenants are the tenants added with `twd tenant add` (the operator
 	// tenant above is the default for every command).
@@ -127,14 +129,62 @@ func (s *state) supervisorPID() int {
 		return 0
 	}
 	pid, _ := strconv.Atoi(strings.TrimSpace(string(b)))
+	// After a reboot (or a power cut) the file is stale and its pid may
+	// belong to another process, even another twd: a supervisor wrote the
+	// file after it started, so a process that started later isn't it.
+	if st, err := os.Stat(s.pidFile()); err == nil {
+		if start, ok := procStartTime(pid); ok && start.After(st.ModTime().Add(2*time.Second)) {
+			return 0
+		}
+	}
 	return pid
+}
+
+// procStartTime is when pid started (Linux /proc; ok=false elsewhere).
+func procStartTime(pid int) (time.Time, bool) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return time.Time{}, false
+	}
+	i := strings.LastIndexByte(string(b), ')')
+	if i < 0 {
+		return time.Time{}, false
+	}
+	f := strings.Fields(string(b)[i+1:])
+	if len(f) < 20 {
+		return time.Time{}, false
+	}
+	ticks, err := strconv.ParseInt(f[19], 10, 64) // field 22: starttime, clock ticks after boot
+	if err != nil {
+		return time.Time{}, false
+	}
+	sb, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return time.Time{}, false
+	}
+	for _, ln := range strings.Split(string(sb), "\n") {
+		if v, ok := strings.CutPrefix(ln, "btime "); ok {
+			bt, _ := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			return time.Unix(bt, 0).Add(time.Duration(ticks) * time.Second / 100), true // USER_HZ = 100
+		}
+	}
+	return time.Time{}, false
 }
 
 func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	// After a reboot the pid file's number may belong to another process:
+	// on Linux, only a twd binary counts.
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+		argv0, _, _ := strings.Cut(string(b), "\x00")
+		return strings.HasPrefix(filepath.Base(argv0), "twd")
+	}
+	return true
 }
 
 func (s *state) supervisorAlive() bool { return pidAlive(s.supervisorPID()) }

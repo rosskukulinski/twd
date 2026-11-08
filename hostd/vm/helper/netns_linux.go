@@ -1,6 +1,6 @@
 //go:build linux
 
-package vm
+package helper
 
 import (
 	"encoding/binary"
@@ -34,14 +34,16 @@ func ipCmd(args ...string) error {
 	return nil
 }
 
-func setupNetns(ns string, mtu int) error {
+// setupNetns creates ns with br0 and fc0, Firecracker's TAP, owned by the
+// jail's uid/gid (the VMM opens it after dropping privileges).
+func setupNetns(ns string, mtu, uid, gid int) error {
 	if err := ipCmd("netns", "add", ns); err != nil {
 		return err
 	}
 	steps := [][]string{
 		{"netns", "exec", ns, "sysctl", "-qw", "net.ipv6.conf.all.disable_ipv6=1", "net.ipv6.conf.default.disable_ipv6=1", "net.ipv4.ip_forward=0"},
 		{"-n", ns, "link", "add", "br0", "type", "bridge", "stp_state", "0", "forward_delay", "0"},
-		{"-n", ns, "tuntap", "add", "dev", "fc0", "mode", "tap"},
+		{"-n", ns, "tuntap", "add", "dev", "fc0", "mode", "tap", "user", fmt.Sprint(uid), "group", fmt.Sprint(gid)},
 		{"-n", ns, "link", "set", "fc0", "mtu", fmt.Sprint(mtu), "master", "br0", "up"},
 		{"-n", ns, "link", "set", "br0", "mtu", fmt.Sprint(mtu), "up"},
 	}
@@ -119,35 +121,4 @@ func openTapInNetns(ns, name string, mtu int) (int, error) {
 
 func teardownNetns(ns string) {
 	exec.Command("ip", "netns", "del", ns).Run()
-}
-
-// procRSSKB is pid's resident memory in kB: VmRSS plus hugetlb pages
-// (guest memory backed by huge pages is not counted in VmRSS).
-func procRSSKB(pid int) int64 {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return 0
-	}
-	var total int64
-	for _, ln := range strings.Split(string(b), "\n") {
-		for _, k := range []string{"VmRSS:", "HugetlbPages:"} {
-			if strings.HasPrefix(ln, k) {
-				var n int64
-				fmt.Sscan(strings.TrimSpace(strings.TrimPrefix(ln, k)), &n)
-				total += n
-			}
-		}
-	}
-	return total
-}
-
-// FreeHugePages2M returns the host's free 2 MiB hugetlbfs pages.
-func FreeHugePages2M() int {
-	b, err := os.ReadFile("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages")
-	if err != nil {
-		return 0
-	}
-	var n int
-	fmt.Sscan(strings.TrimSpace(string(b)), &n)
-	return n
 }

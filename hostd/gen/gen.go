@@ -65,7 +65,22 @@ type Options struct {
 	// Guest, if set, generates for the microVM tier: workerd listens and
 	// dials over TCP (the guest's NIC), and DO storage is guest-local.
 	Guest *GuestNet
+	// Loopback, if set (process tier under the Linux Landlock sandbox),
+	// points workerd's three outbound services at hostd's loopback TCP
+	// listeners instead of unix sockets, each request carrying Token in
+	// LocalTokenHeader (hostd checks and strips it). The sandbox then needs
+	// no AF_UNIX socket() at all: its ingress listener is an inherited fd.
+	Loopback *LoopbackNet
 }
+
+// LoopbackNet are hostd's per-instance loopback listeners (127.0.0.1:port).
+type LoopbackNet struct {
+	EgressObj, EgressWL, HostAPI string
+	Token                        string
+}
+
+// LocalTokenHeader carries an instance's loopback token (Options.Loopback).
+const LocalTokenHeader = "x-twd-local-token"
 
 // GuestNet are the guest-side addresses of the microVM tier (host:port).
 type GuestNet struct {
@@ -249,9 +264,20 @@ func Generate(app *bundle.App, o Options) (*Result, error) {
 	if g := o.Guest; g != nil {
 		addrIngress, addrObj, addrWL, addrAPI, doPath = g.Ingress, g.EgressObj, g.EgressWL, g.HostAPI, g.DOStorage
 	}
-	fmt.Fprintf(&c, "    (name = \"netd-egress\", external = (address = %s, http = (style = proxy))),\n", cq(addrObj))
-	fmt.Fprintf(&c, "    (name = \"egress-wl\", external = (address = %s, http = (style = proxy))),\n", cq(addrWL))
-	fmt.Fprintf(&c, "    (name = \"hostd\", external = (address = %s, http = ())),\n", cq(addrAPI))
+	inject := ""
+	if l := o.Loopback; l != nil && o.Guest == nil {
+		addrObj, addrWL, addrAPI = l.EgressObj, l.EgressWL, l.HostAPI
+		inject = fmt.Sprintf("injectRequestHeaders = [ (name = %s, value = %s) ]", cq(LocalTokenHeader), cq(l.Token))
+	}
+	sep := func(a string) string {
+		if a != "" && inject != "" {
+			return a + ", " + inject
+		}
+		return a + inject
+	}
+	fmt.Fprintf(&c, "    (name = \"netd-egress\", external = (address = %s, http = (%s))),\n", cq(addrObj), sep("style = proxy"))
+	fmt.Fprintf(&c, "    (name = \"egress-wl\", external = (address = %s, http = (%s))),\n", cq(addrWL), sep("style = proxy"))
+	fmt.Fprintf(&c, "    (name = \"hostd\", external = (address = %s, http = (%s))),\n", cq(addrAPI), sep(""))
 	fmt.Fprintf(&c, "    (name = \"do-storage\", disk = (path = %s, writable = true)),\n  ],\n", cq(doPath))
 	fmt.Fprintf(&c, "  sockets = [ (name = \"ingress\", address = %s, service = \"platform\", http = (cfBlobHeader = \"x-twd-cf\")) ],\n);\n\n", cq(addrIngress))
 

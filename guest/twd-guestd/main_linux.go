@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,12 +84,39 @@ func run() error {
 		return fmt.Errorf("network: %w", err)
 	}
 	os.MkdirAll(proto.DODir, 0o700)
+	if cfg.Volume != "" {
+		if err := mountVolume(cfg.Volume); err != nil {
+			return fmt.Errorf("DO volume: %w", err)
+		}
+	}
 
 	g := &guest{cfg: cfg, out: make(chan proto.Msg, 64)}
 	go g.vsockLoop()
 	go g.reap()
 	g.send(proto.Msg{Type: "boot", UptimeMS: time.Since(start).Milliseconds()})
 	g.superviseWorkerd()
+	return nil
+}
+
+// mountVolume mounts the persistent DO volume (ext4 made on the host) at
+// DODir. The host decrypts it (dm-crypt); there is no key in here. data=
+// ordered plus the host's Writeback cache mode make workerd's fsyncs reach
+// the host disk.
+func mountVolume(dev string) error {
+	var err error
+	for i := 0; i < 100; i++ { // devtmpfs creates the node asynchronously
+		if _, err = os.Stat(dev); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		return err
+	}
+	if err := unix.Mount(dev, proto.DODir, "ext4", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC|unix.MS_NOATIME, "errors=remount-ro,data=ordered"); err != nil {
+		return fmt.Errorf("mount %s: %w", dev, err)
+	}
+	os.Chmod(proto.DODir, 0o700)
 	return nil
 }
 
@@ -235,6 +263,7 @@ type guest struct {
 	mu         sync.Mutex
 	workerdPID int
 	restarts   int
+	stopping   bool     // shutdown: don't restart workerd
 	exits      chan int // workerd exit statuses, fed by reap()
 }
 
@@ -307,6 +336,16 @@ func (g *guest) handle(m proto.Msg) proto.Msg {
 		r.Stats = g.stats()
 	case "fsscan":
 		r.Found, r.Scanned = fsscan("/")
+	case "shutdown":
+		if err := g.shutdown(); err != nil {
+			r.Error = err.Error()
+		}
+	case "fsbench":
+		b, err := fsbench(m.N)
+		if err != nil {
+			r.Error = err.Error()
+		}
+		r.Bench = b
 	case "probe":
 		if !g.cfg.Debug {
 			r.Error = "probe needs debug mode"
@@ -319,8 +358,88 @@ func (g *guest) handle(m proto.Msg) proto.Msg {
 	return r
 }
 
+// shutdown stops workerd for good, then syncs and unmounts the DO volume,
+// so the host can hand it to the next VM with nothing in flight.
+func (g *guest) shutdown() error {
+	g.mu.Lock()
+	g.stopping = true
+	pid := g.workerdPID
+	g.mu.Unlock()
+	if pid > 0 {
+		unix.Kill(pid, unix.SIGTERM)
+		for i := 0; i < 200; i++ { // ≤ 2 s
+			if unix.Kill(pid, 0) != nil {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		unix.Kill(pid, unix.SIGKILL)
+		for i := 0; i < 100 && unix.Kill(pid, 0) == nil; i++ {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	unix.Sync()
+	if g.cfg.Volume != "" {
+		if err := unix.Unmount(proto.DODir, 0); err != nil {
+			// Something still holds it: force it read-only (flushes).
+			unix.Mount("", proto.DODir, "", unix.MS_REMOUNT|unix.MS_RDONLY, "")
+			return fmt.Errorf("unmount %s: %w (remounted read-only)", proto.DODir, err)
+		}
+	}
+	return nil
+}
+
+func doFS() string {
+	b, _ := os.ReadFile("/proc/mounts")
+	for _, ln := range strings.Split(string(b), "\n") {
+		f := strings.Fields(ln)
+		if len(f) > 2 && f[1] == proto.DODir {
+			return f[0] + " " + f[2]
+		}
+	}
+	return "tmpfs (/run)"
+}
+
+// fsbench measures 4 KiB write + fdatasync latency on the DO volume.
+func fsbench(n int) (*proto.Bench, error) {
+	if n <= 0 || n > 2000 {
+		n = 200
+	}
+	p := filepath.Join(proto.DODir, ".twd-fsbench")
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(p)
+	defer f.Close()
+	buf := bytes.Repeat([]byte{0x5a}, 4096)
+	var w, s []int64
+	for i := 0; i < n; i++ {
+		t := time.Now()
+		if _, err := f.WriteAt(buf, int64(i%256)*4096); err != nil {
+			return nil, err
+		}
+		t2 := time.Now()
+		if err := unix.Fdatasync(int(f.Fd())); err != nil {
+			return nil, err
+		}
+		w = append(w, t2.Sub(t).Microseconds())
+		s = append(s, time.Since(t2).Microseconds())
+	}
+	pct := func(xs []int64, q float64) int64 {
+		c := append([]int64(nil), xs...)
+		sort.Slice(c, func(i, j int) bool { return c[i] < c[j] })
+		return c[int(float64(len(c)-1)*q)]
+	}
+	return &proto.Bench{N: n, FS: doFS(), WriteP50US: pct(w, 0.5), WriteP95US: pct(w, 0.95), SyncP50US: pct(s, 0.5), SyncP95US: pct(s, 0.95)}, nil
+}
+
 func (g *guest) stats() *proto.Stats {
-	s := &proto.Stats{UptimeMS: time.Since(start).Milliseconds()}
+	s := &proto.Stats{UptimeMS: time.Since(start).Milliseconds(), DOFS: doFS()}
+	var sf unix.Statfs_t
+	if unix.Statfs(proto.DODir, &sf) == nil {
+		s.DOUsedKB = int64(sf.Blocks-sf.Bfree) * sf.Bsize / 1024
+	}
 	if b, err := os.ReadFile("/proc/meminfo"); err == nil {
 		s.MemTotalKB = kv(b, "MemTotal:")
 		s.MemAvailableKB = kv(b, "MemAvailable:")
@@ -480,6 +599,13 @@ func (g *guest) superviseWorkerd() {
 			g.send(proto.Msg{Type: "workerd-exit", ExitCode: code, Restarts: attempt})
 		case code := <-g.exits:
 			g.send(proto.Msg{Type: "workerd-exit", ExitCode: code, Restarts: attempt, Error: "exited before healthy"})
+		}
+		g.mu.Lock()
+		stopping := g.stopping
+		g.mu.Unlock()
+		if stopping {
+			logf("workerd stopped for shutdown")
+			select {}
 		}
 		if attempt >= 5 {
 			logf("workerd keeps exiting; giving up")

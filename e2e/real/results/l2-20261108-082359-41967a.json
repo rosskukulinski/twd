@@ -1,0 +1,89 @@
+{
+  "checks": {
+    "a_A_own_agent": "PASS caller ttest-l2-41967a-a-client.tail7906d5.ts.net (nYpCcpgver11CNTRL) [tag:ttest]; agent ttest-l2-41967a-supportagent-vph5srmw5i.tail7906d5.ts.net egress → own echo as ttest-l2-41967a-supportagent-vph5srmw5i.tail7906d5.ts.net.",
+    "a_B_own_agent": "PASS caller ttest-l2-41967a-b-client.tail2c3a48.ts.net (nDwrnopepZ11CNTRL) [tag:ttest]; agent ttest-l2-41967a-supportagent-zmgm2d4uui.tail2c3a48.ts.net egress → own echo as ttest-l2-41967a-supportagent-zmgm2d4uui.tail2c3a48.ts.net.",
+    "b_distinct_identities": "PASS agent:SupportAgent/a1 → A supportagent-vph5srmw5i node n64LkuwKaR11CNTRL (ttest-l2-41967a-supportagent-vph5srmw5i.tail7906d5.ts.net) · B supportagent-zmgm2d4uui node nf43yU9rpE11CNTRL (ttest-l2-41967a-supportagent-zmgm2d4uui.tail2c3a48.ts.net); workload nodes ttest-l2-41967a-agent-yvhc6aqqh2.tail7906d5.ts.net / ttest-l2-41967a-agent-gjvyi5obw4.tail2c3a48.ts.net; workerd pids 11924 / 11945",
+    "c_isolation_A_to_B": "PASS echo name peer_not_visible in 3 ms; echo FQDN peer_not_visible in 2 ms; echo IP peer_not_visible in 2 ms; agent name peer_not_visible in 2 ms; agent FQDN peer_not_visible in 1 ms; agent IP peer_not_visible in 1 ms; workload FQDN peer_not_visible in 1 ms; workload IP peer_not_visible in 1 ms",
+    "c_isolation_B_to_A": "PASS echo name peer_not_visible in 2 ms; echo FQDN peer_not_visible in 1 ms; echo IP peer_not_visible in 1 ms; agent name peer_not_visible in 1 ms; agent FQDN peer_not_visible in 1 ms; agent IP peer_not_visible in 1 ms; workload FQDN peer_not_visible in 1 ms; workload IP peer_not_visible in 1 ms",
+    "d_state_isolation_A": "PASS tenant dirs 0700; workerd pid 11924 under Landlock: tenant B state dir denied, tenant B node state denied, tenant B DO storage denied, tenant B API key file denied, its own tenant's node keys denied, mgmt admin socket denied, ptrace of the other tenant's workerd denied (EPERM), its memory denied (EPERM), its /proc environ denied (EACCES), its egress socket denied (EPERM), hostd's push socket denied (EPERM), TCP to 1.1.1.1:443 denied (EACCES); own DO storage readable",
+    "d_state_isolation_B": "PASS tenant dirs 0700; workerd pid 11945 under Landlock: tenant A state dir denied, tenant A node state denied, tenant A DO storage denied, tenant A API key file denied, its own tenant's node keys denied, mgmt admin socket denied, ptrace of the other tenant's workerd denied (EPERM), its memory denied (EPERM), its /proc environ denied (EACCES), its egress socket denied (EPERM), hostd's push socket denied (EPERM), TCP to 1.1.1.1:443 denied (EACCES); own DO storage readable",
+    "deploy_same_app": "PASS agent → A ttest-l2-41967a-agent-yvhc6aqqh2.tail7906d5.ts.net · B ttest-l2-41967a-agent-gjvyi5obw4.tail2c3a48.ts.net",
+    "down": "PASS 3 objects purged, 4 devices deleted, 8.33s",
+    "e_kill_A_spares_B": "PASS killed [supportagent-vph5srmw5i] in 61ms; A's agent → 410 object_killed in 582µs; B's agent and workload still 200 (3×), B object ready",
+    "f_audit_A": "PASS 11 records, all tenant tn_tail7906d5, chain verified, kinds map[create:2 credential:2 deploy:1 kill:1 mint:2 ready:2 tenant:1]",
+    "f_audit_B": "PASS 10 records, all tenant tn_tail2c3a48, chain verified, kinds map[create:2 credential:2 deploy:1 mint:2 ready:2 tenant:1]",
+    "tenants": "PASS A tail7906d5.ts.net (tn_tail7906d5, operator) · B tail2c3a48.ts.net (tn_tail2c3a48) via `twd tenant add` in 450ms"
+  },
+  "notes": [
+    "tailnet-2 discovered: tail2c3a48.ts.net (from the API-minted test client's MagicDNS name)",
+    "tail7906d5.ts.net: policy already had the scenario's rules (read-only check, not written)",
+    "tail2c3a48.ts.net: policy already had the scenario's rules (read-only check, not written)"
+  ],
+  "numbers": {
+    "deploy_A_ms": 6690.714,
+    "deploy_A_ready_ms": 6191.816,
+    "deploy_B_ms": 1655.751,
+    "deploy_B_ready_ms": 1465.472,
+    "down_ms": 8330.095,
+    "kill_A_cli_ms": 61.091,
+    "tenant_add_ms": 449.731,
+    "up_ready_ms": 524.503
+  },
+  "run": "m7-41967a",
+  "tenants": {
+    "tail2c3a48.ts.net": {
+      "run": "m7-41967a-B",
+      "tailnet": "tail2c3a48.ts.net",
+      "date": "2026-11-08T08:24:06-08:00",
+      "checks": {},
+      "numbers": {},
+      "cleanup": {
+        "devices_deleted_by_cleanup": 4,
+        "devices_left": 0,
+        "devices_tracked": 4,
+        "test_keys_minted": 2,
+        "test_keys_revoke_errors": null,
+        "twd_devices_left_after_down": 0,
+        "twd_devices_tracked": 2,
+        "twd_keys_tracked": 2,
+        "twd_keys_valid_after_down": 0,
+        "untracked_run_devices": null
+      },
+      "nodeIDs": [
+        "nf3qRwsTR521CNTRL",
+        "nf43yU9rpE11CNTRL"
+      ],
+      "keyIDs": [
+        "kDrKWLNRXt11CNTRL",
+        "khG4V5sfd621CNTRL"
+      ]
+    },
+    "tail7906d5.ts.net": {
+      "run": "m7-41967a-A",
+      "tailnet": "tail7906d5.ts.net",
+      "date": "2026-11-08T08:24:06-08:00",
+      "checks": {},
+      "numbers": {},
+      "cleanup": {
+        "devices_deleted_by_cleanup": 4,
+        "devices_left": 0,
+        "devices_tracked": 4,
+        "test_keys_minted": 2,
+        "test_keys_revoke_errors": null,
+        "twd_devices_left_after_down": 0,
+        "twd_devices_tracked": 2,
+        "twd_keys_tracked": 2,
+        "twd_keys_valid_after_down": 0,
+        "untracked_run_devices": null
+      },
+      "nodeIDs": [
+        "nRQy1wLT6V11CNTRL",
+        "n64LkuwKaR11CNTRL"
+      ],
+      "keyIDs": [
+        "kdvUdAYq2v11CNTRL",
+        "kkjmDsKjwH11CNTRL"
+      ]
+    }
+  }
+}

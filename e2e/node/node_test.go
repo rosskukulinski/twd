@@ -31,6 +31,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
 )
@@ -277,15 +278,17 @@ func TestNodeTier(t *testing.T) {
 	t.Run("Sandbox", func(t *testing.T) {
 		// Node apps are tenant code too: on macOS they run under the same
 		// Seatbelt profile shape as workerd (own instance + data dir only).
+		// On Linux: Landlock (+ seccomp), the same allow list plus TCP ports.
 		ws := e.nodeStatus(e.a, "nodeprobe")
-		if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxSeatbelt {
+		sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto)
+		if sb == hostd.SandboxNone {
 			if ws.Sandbox != hostd.SandboxNone {
-				t.Fatalf("sandbox without Seatbelt: %q", ws.Sandbox)
+				t.Fatalf("sandbox %q on a host without one", ws.Sandbox)
 			}
-			t.Skip("no Seatbelt on this OS (Node tier dirs are 0700; the microVM tier is the isolation answer)")
+			t.Skip("no process sandbox on this OS (Node tier dirs are 0700; the microVM tier is the isolation answer)")
 		}
-		if ws.Sandbox != hostd.SandboxSeatbelt || ws.SandboxProfile == "" {
-			t.Fatalf("node app not sandboxed: %q %q", ws.Sandbox, ws.SandboxProfile)
+		if ws.Sandbox != sb || ws.SandboxProfile == "" {
+			t.Fatalf("node app not sandboxed: %q %q (want %s)", ws.Sandbox, ws.SandboxProfile, sb)
 		}
 		fsop := func(op, path string) map[string]any {
 			code, _, b := do(e.hc, "GET", base+"/fs?op="+op+"&path="+url.QueryEscape(path), nil)
@@ -317,11 +320,16 @@ func TestNodeTier(t *testing.T) {
 			"home_list":         {"list", home},
 		}
 		for name, c := range denied {
-			if m := fsop(c[0], c[1]); m["ok"] != false || m["code"] != "EPERM" {
+			// Seatbelt: EPERM; Landlock: EACCES.
+			if m := fsop(c[0], c[1]); m["ok"] != false || (m["code"] != "EPERM" && m["code"] != "EACCES") {
 				t.Fatalf("%s (%s %s) not denied: %v", name, c[0], c[1], m)
 			}
 		}
-		e.record("nodeprobe.sandbox", map[string]any{"sandbox": ws.Sandbox, "own_rw": true, "denied": len(denied)})
+		rec := map[string]any{"sandbox": ws.Sandbox, "own_rw": true, "denied": len(denied)}
+		if sb == hostd.SandboxLandlock {
+			rec["landlock"] = e.landlockNodeChecks(t, ws, base)
+		}
+		e.record("nodeprobe.sandbox", rec)
 	})
 
 	t.Run("EgressAttributed", func(t *testing.T) {
@@ -568,25 +576,27 @@ func TestNodeWorkflow(t *testing.T) {
 	e.record("workflow.mcp_caller_node", wf.NodeID)
 }
 
-// RT-08: on a host whose sandbox does not confine the process's network,
-// the Node tier's egress is unenforced (cooperative proxy). Such a
-// deployment is reported as `Egress: "unenforced"` and is refused on a host
-// serving other tenants unless the operator passes -insecure-shared-host.
+// RT-08: the Node tier's egress proxy is an enforcement boundary only under
+// a sandbox that confines the process's TCP (Landlock); elsewhere status says
+// `Egress: "unenforced"`. On a host with NO process sandbox at all, a
+// Node-tier deployment for a second tenant is refused (egress_unenforced)
+// unless the operator passes -insecure-shared-host.
 func TestNodeTierSharedHostRefused(t *testing.T) {
 	e := start(t)
 	dep := e.a.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
 	e.a.WaitActive("nodeprobe", dep, 60*time.Second)
 	ws := e.nodeStatus(e.a, "nodeprobe")
-	want := hostd.EgressEnforcement(ws.Sandbox)
-	if ws.Egress != want || (ws.Sandbox != "landlock" && ws.Egress != hostd.EgressUnenforced) {
-		t.Fatalf("status Egress=%q Sandbox=%q (want %q)", ws.Egress, ws.Sandbox, want)
+	if ws.Egress != hostd.EgressEnforcement(ws.Sandbox) || (ws.Sandbox == hostd.SandboxLandlock) != (ws.Egress == hostd.EgressEnforced) {
+		t.Fatalf("status Egress=%q Sandbox=%q", ws.Egress, ws.Sandbox)
 	}
-	if want == hostd.EgressEnforced {
-		t.Skip("egress is enforced by this host's sandbox; the refusal does not apply")
-	}
-	// A second tenant on the same host: its Node-tier deploy is refused.
-	b := e.a.AddTenant(mgmtapi.Tenant{Tailnet: "tenant-b.ts.net", ControlURL: e.ctl.URL, MintMode: "static"})
-	depB := b.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
+	// A host without any process sandbox, serving a second tenant.
+	o := hostdtest.Options{ControlURL: e.ctl.URL, Ephemeral: true, HostnamePrefix: "n-", Sandbox: hostd.SandboxNone,
+		Tenant: mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: e.ctl.URL, MintMode: "static"}}
+	o.Fake.StaticKey = nettest.DummyKey
+	c := hostdtest.Start(t, o)
+	c.Deploy(hostdtest.Fixture("probe"), "probe", nil) // tenant A's workload on the host
+	b := c.AddTenant(mgmtapi.Tenant{Tailnet: "tenant-b.ts.net", ControlURL: e.ctl.URL, MintMode: "static"})
+	b.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		st := b.Host.Status()
@@ -603,8 +613,8 @@ func TestNodeTierSharedHostRefused(t *testing.T) {
 		if found != nil && found.Status == "failed" {
 			t.Fatalf("refused for the wrong reason: %s", found.Error)
 		}
-		if found != nil && found.Status == "active" && found.DeploymentID == depB {
-			t.Fatal("tenant B's Node-tier deployment ran on a shared host without -insecure-shared-host")
+		if found != nil && found.Status == "active" {
+			t.Fatal("tenant B's Node-tier deployment ran on an unsandboxed shared host without -insecure-shared-host")
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("tenant B's deployment neither failed nor ran: %+v", found)
@@ -612,15 +622,94 @@ func TestNodeTierSharedHostRefused(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	// The operator's override lets it run (and status still says unenforced).
-	o := hostdtest.Options{ControlURL: e.ctl.URL, Ephemeral: true, HostnamePrefix: "c-", Sandbox: hostd.SandboxAuto, InsecureSharedHost: true,
-		Tenant: mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: e.ctl.URL, MintMode: "static"}}
-	o.Fake.StaticKey = nettest.DummyKey
-	c := hostdtest.Start(t, o)
-	c.Deploy(hostdtest.Fixture("probe"), "probe", nil) // another tenant's workload on the host
-	d := c.AddTenant(mgmtapi.Tenant{Tailnet: "tenant-d.ts.net", ControlURL: e.ctl.URL, MintMode: "static"})
+	o2 := o
+	o2.HostnamePrefix, o2.InsecureSharedHost = "i-", true
+	c2 := hostdtest.Start(t, o2)
+	c2.Deploy(hostdtest.Fixture("probe"), "probe", nil)
+	d := c2.AddTenant(mgmtapi.Tenant{Tailnet: "tenant-d.ts.net", ControlURL: e.ctl.URL, MintMode: "static"})
 	depD := d.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
 	d.WaitActive("nodeprobe", depD, 60*time.Second)
-	if ws := e.nodeStatus(d, "nodeprobe"); ws.Egress != hostd.EgressUnenforced || !c.Host.Status().InsecureSharedHost {
+	if ws := e.nodeStatus(d, "nodeprobe"); ws.Egress != hostd.EgressUnenforced || !c2.Host.Status().InsecureSharedHost {
 		t.Fatalf("override: %+v", ws)
 	}
+}
+
+// landlockNodeChecks: from inside the sandboxed Node app (Linux), raw TCP
+// that bypasses the egress proxy fails (the internet, a host-loopback
+// listener), unix sockets of hostd fail, its own app port works; under the
+// app's profile, ptrace of a sibling fails. Egress through netd is checked
+// by EgressAttributed, which runs under the same sandbox.
+func (e *env) landlockNodeChecks(t *testing.T, ws hostd.WorkloadStatus, base string) map[string]string {
+	t.Helper()
+	netop := func(q string) map[string]any {
+		code, _, b := do(e.hc, "GET", base+"/net?"+q, nil)
+		if code != 200 {
+			t.Fatalf("net %s: %d %s", q, code, b)
+		}
+		return obj(b)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	lport := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	got := map[string]string{}
+	for name, q := range map[string]string{
+		"tcp_1.1.1.1:80":    "host=1.1.1.1&port=80",
+		"tcp_1.1.1.1:443":   "host=1.1.1.1&port=443",
+		"tcp_host_loopback": "host=127.0.0.1&port=" + lport,
+		"unix_hostd_push_a": "path=" + url.QueryEscape(e.a.Host.PushSocket()),
+		"unix_hostd_push_b": "path=" + url.QueryEscape(e.b.Host.PushSocket()),
+		"unix_tailscaled":   "path=" + url.QueryEscape("/var/run/tailscale/tailscaled.sock"),
+		"unix_docker":       "path=" + url.QueryEscape("/var/run/docker.sock"),
+	} {
+		m := netop(q)
+		// TCP mode: the app has no AF_UNIX socket() at all, so no unix
+		// socket on the host (tailscaled's, docker's, hostd's) is reachable.
+		if m["ok"] != false {
+			t.Fatalf("node app (Landlock) %s: connected (%v)", name, m)
+		}
+		got[name] = fmt.Sprint(m["code"])
+	}
+	// The app's own port is allowed (self-calls).
+	if m := netop("host=127.0.0.1&port=" + strings.TrimPrefix(ws.Node.Addr, "127.0.0.1:")); m["ok"] != true {
+		t.Fatalf("node app can't connect to its own port %s: %v", ws.Node.Addr, m)
+	}
+	// Guarded sockets really refuse it: an HTTP request through hostd's push
+	// socket from the app's profile gets no answer.
+	for _, sock := range []string{e.a.Host.PushSocket(), e.b.Host.PushSocket()} {
+		cmd, err := procsb.ProbeCommand(ws.SandboxProfile, procsb.ProbeConnectUnix, sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, _ := cmd.Output(); strings.TrimSpace(string(out)) == "ok" {
+			t.Fatalf("hostd push socket %s answers a sandboxed peer", sock)
+		}
+	}
+	sib := exec.Command("sleep", "30")
+	if err := sib.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer sib.Process.Kill()
+	cmd, _ := procsb.ProbeCommand(ws.SandboxProfile, procsb.ProbePtrace, strconv.Itoa(sib.Process.Pid))
+	if out, _ := cmd.Output(); strings.TrimSpace(string(out)) == "ok" {
+		t.Fatal("ptrace of a sibling allowed under the node app's profile")
+	} else {
+		got["ptrace_sibling"] = strings.TrimSpace(string(out))
+	}
+	if !procsb.Sandboxed(ws.Node.PID) {
+		t.Fatalf("node pid %d carries no sandbox marker", ws.Node.PID)
+	}
+	t.Logf("landlock node app: %v", got)
+	return got
 }

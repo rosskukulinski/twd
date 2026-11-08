@@ -74,9 +74,13 @@ type Server struct {
 	byName      map[string]string // tenant|workload|ns|name -> objectID
 	audit       map[string][]mgmtapi.AuditRecord
 	nodeIDs     map[string]string // stable node ID -> objectID (every node that reported ready)
+	remints     int               // POST /remint calls (rejoins rejected by control)
 	pushes      []string
 	oboKey      ed25519.PrivateKey // one OBO root key for every tenant (node certs, RT-01)
 	certDenied  map[string]bool    // stable node IDs whose cert lookup fails (tests: fail closed)
+	volKeys     map[string][]byte  // tenant/workload -> DO volume data key
+	// VolumeKeyCalls counts GET /v0/volumes/key (tests).
+	VolumeKeyCalls int
 }
 
 type tenant struct {
@@ -135,7 +139,7 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(),
 		tenants: map[string]*tenant{}, hosts: map[string]*host{}, deployments: map[string]*deployment{},
 		leases: map[string]*lease{}, objects: map[string]*object{}, byName: map[string]string{},
-		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, oboKey: priv, certDenied: map[string]bool{}}
+		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}, oboKey: priv, certDenied: map[string]bool{}}
 	m := s.mux
 	m.HandleFunc("GET /v0/certs/{nodeID}", s.nodeCert)
 	m.HandleFunc("POST /v0/tenants", s.createTenant)
@@ -152,6 +156,8 @@ func New(cfg Config) *Server {
 	m.HandleFunc("GET /v0/objects/{id}", s.getObject)
 	m.HandleFunc("GET /v0/objects/{id}/credential", s.credential)
 	m.HandleFunc("POST /v0/objects/{id}/ready", s.ready)
+	m.HandleFunc("GET /v0/volumes/key", s.volumeKey)
+	m.HandleFunc("POST /v0/objects/{id}/remint", s.remint)
 	m.HandleFunc("POST /v0/objects/{id}/kill", s.kill)
 	m.HandleFunc("POST /v0/audit", s.postAudit)
 	m.HandleFunc("GET /v0/audit", s.getAudit)
@@ -705,6 +711,42 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.lineage(o))
 }
 
+// volumeKey releases a workload's DO volume key to the lease holder at
+// the lease's epoch (mgmt.VolumeKey's contract).
+func (s *Server) volumeKey(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	epoch, _ := strconv.ParseInt(q.Get("epoch"), 10, 64)
+	name := mgmtapi.LeaseName(q.Get("tenant"), q.Get("workload"))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.VolumeKeyCalls++
+	l := s.leases[name]
+	if l == nil || l.epoch != epoch {
+		writeErr(w, 409, mgmtapi.CodeLeaseLost, fmt.Sprintf("lease %s is not held at epoch %d", name, epoch))
+		return
+	}
+	if hid := r.Header.Get("Twd-Host-ID"); hid != "" && hid != l.host {
+		writeErr(w, 409, mgmtapi.CodeLeaseLost, "host "+hid+" does not hold the lease")
+		return
+	}
+	k := s.volKeys[name]
+	if k == nil {
+		k = make([]byte, 32)
+		rand.Read(k)
+		s.volKeys[name] = k
+	}
+	w.Header().Set("content-type", "application/json")
+	json.NewEncoder(w).Encode(mgmtapi.VolumeKey{Key: k})
+}
+
+// VolumeKeyOf returns the volume key fakemgmt holds for (tenant, workload)
+// (tests: the no-keys-in-guest scan's needle).
+func (s *Server) VolumeKeyOf(tenantID, workload string) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.volKeys[mgmtapi.LeaseName(tenantID, workload)]
+}
+
 func (s *Server) credential(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	epoch, _ := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
@@ -772,6 +814,31 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	if req.StableNodeID != "" {
 		s.nodeIDs[req.StableNodeID] = o.ObjectID
 	}
+	writeJSON(w, 200, mgmtapi.OK{OK: true})
+}
+
+// remint: the host's rejoin was rejected by control; back to pending so the
+// next credential call mints again (same hostname).
+func (s *Server) remint(w http.ResponseWriter, r *http.Request) {
+	var req mgmtapi.RemintRequest
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.objects[r.PathValue("id")]
+	if o == nil {
+		writeErr(w, 404, mgmtapi.CodeNotFound, "no such object")
+		return
+	}
+	if o.Status == "killed" {
+		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
+		return
+	}
+	delete(s.nodeIDs, o.NodeID)
+	o.Status, o.NodeID, o.MagicDNS = "pending", "", ""
+	s.remints++
 	writeJSON(w, 200, mgmtapi.OK{OK: true})
 }
 

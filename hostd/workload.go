@@ -3,6 +3,8 @@ package hostd
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -24,6 +27,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/gen"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -195,19 +199,33 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	w.mu.Unlock()
 
 	tier := h.tierFor(app, t)
-	if app.Runtime == bundle.RuntimeNode {
-		// RT-08: without a network-confining sandbox, a Node app's egress is
-		// only cooperatively attributed; on a host that serves other
-		// tenants that is a cross-tenant SSRF vector, so refuse unless the
-		// operator accepted it explicitly.
-		if others := h.otherTenants(w.tenantID); len(others) > 0 && !h.cfg.InsecureSharedHost && EgressEnforcement(h.sandbox) != EgressEnforced {
-			w.fail(a.DeploymentID, &apiError{Code: "egress_unenforced", Detail: fmt.Sprintf(
-				"runtime \"node\" on a host serving %d other tenant(s) (%s) with sandbox %q: the Node tier's egress proxy is not an enforcement boundary here (raw sockets bypass it); "+
-					"use the workerd runtime, a single-tenant host, Linux with Landlock, or start twd-hostd with -insecure-shared-host (twd up --insecure-shared-host)",
-				len(others), strings.Join(others, ","), h.sandbox)})
+	if tier == bundle.TierProcess {
+		// RT-08: a Node app on a host with NO process sandbox has fully
+		// cooperative egress (raw sockets bypass the proxy); on a host that
+		// serves other tenants that is a cross-tenant SSRF vector. Under
+		// Landlock (TCP pinned to the proxy) or Seatbelt the shared-host
+		// rule below decides, as for any process-tier workload.
+		if app.Runtime == bundle.RuntimeNode && h.sandbox == SandboxNone && !h.cfg.InsecureSharedHost {
+			if others := h.otherTenants(w.tenantID); len(others) > 0 {
+				w.fail(a.DeploymentID, &apiError{Code: "egress_unenforced", Detail: fmt.Sprintf(
+					"runtime \"node\" on a host serving %d other tenant(s) (%s) with no process sandbox: the Node tier's egress proxy is not an enforcement boundary here (raw sockets bypass it); "+
+						"use the workerd runtime, a single-tenant host, Linux with Landlock, or start twd-hostd with -insecure-shared-host (twd up --insecure-shared-host)",
+					len(others), strings.Join(others, ","))})
+				return
+			}
+		}
+		// microVM workloads are isolated by the jailer + VM, not by the
+		// process sandbox, so the shared-host rule applies to the process
+		// tier only.
+		if err := h.sharedHostCheck(w.tenantID, app); err != nil {
+			w.fail(a.DeploymentID, err)
 			return
 		}
-		h.deployNode(w, a, app, st)
+	}
+	if app.Runtime == bundle.RuntimeNode || tier == bundle.TierMicroVM {
+		// One process / one VM per data directory or volume: the old one
+		// releases it before the new one starts.
+		h.deploySerial(w, a, app, tier, st)
 		return
 	}
 	inst, err := h.startInstance(w, a.DeploymentID, app, tier)
@@ -241,17 +259,7 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 		w.gate = nil
 	}
 	w.mu.Unlock()
-	// Objects of this workload saved from a previous run rejoin now (nodes
-	// stay online; no auth key, no registration budget).
-	h.mu.Lock()
-	for _, o := range h.objects {
-		if o.TenantID == w.tenantID && o.Workload == w.name && !o.live && !o.terminal() {
-			if o.Class == "" || app.Classes[o.Class] != nil && app.Classes[o.Class].Node {
-				h.startNodeLocked(o)
-			}
-		}
-	}
-	h.mu.Unlock()
+	h.rejoinObjects(w, app)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
 }
@@ -273,11 +281,12 @@ func (h *Host) otherTenants(tenantID string) []string {
 	return out
 }
 
-// deployNode switches a Node-tier workload stop-then-start: durable Node
-// runtimes (Vercel Workflow's local World, SQLite files) assume one process
-// per data directory, so the old process exits before the new one starts.
-// New requests wait at the gate meanwhile.
-func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st time.Time) {
+// deploySerial switches a workload stop-then-start. Node-tier runtimes
+// (Vercel Workflow's local World, SQLite files) assume one process per
+// data directory; a microVM's DO volume (L3) can be attached to one VM
+// only, so the old VM drains, unmounts and releases it (helper) before the
+// new one attaches it. New requests wait at the gate meanwhile.
+func (h *Host) deploySerial(w *workload, a mgmtapi.Assignment, app *bundle.App, tier string, st time.Time) {
 	w.mu.Lock()
 	old := w.active
 	gate := make(chan struct{})
@@ -295,7 +304,7 @@ func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st
 		old.drain(h.cfg.DrainTimeout)
 		old.stop()
 	}
-	inst, err := h.startInstance(w, a.DeploymentID, app, bundle.TierProcess)
+	inst, err := h.startInstance(w, a.DeploymentID, app, tier)
 	w.mu.Lock()
 	if old != nil && w.active == old {
 		w.active = nil
@@ -316,8 +325,23 @@ func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st
 	w.active, w.app, w.activeDep, w.status = inst, app, a.DeploymentID, "active"
 	w.mu.Unlock()
 	open()
+	h.rejoinObjects(w, app)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
-		"runtime", bundle.RuntimeNode, "restart", old != nil, "ms", time.Since(st).Milliseconds())
+		"runtime", app.Runtime, "tier", tier, "restart", old != nil, "ms", time.Since(st).Milliseconds())
+}
+
+// rejoinObjects: objects of this workload saved from a previous run
+// rejoin now (nodes stay online; no auth key, no registration budget).
+func (h *Host) rejoinObjects(w *workload, app *bundle.App) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, o := range h.objects {
+		if o.TenantID == w.tenantID && o.Workload == w.name && !o.live && !o.terminal() {
+			if o.Class == "" || app.Classes[o.Class] != nil && app.Classes[o.Class].Node {
+				h.startNodeLocked(o)
+			}
+		}
+	}
 }
 
 // undeploy stops serving a workload: workerd stops and its nodes close
@@ -370,6 +394,10 @@ type instance struct {
 	// tenant's dir; profile is the Seatbelt profile it runs under, if any.
 	doStorage string
 	profile   string
+	// Landlock: workerd's inherited ingress listener and the loopback
+	// ports of its outbound services.
+	ingressLn *net.UnixListener
+	loopPorts []uint16
 
 	node *nodeProc // Node process tier (runtime "node"); nil for workerd
 
@@ -420,7 +448,7 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	if app.Runtime == bundle.RuntimeNode {
 		return h.startNodeInstance(w, depID, app, n)
 	}
-	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
+	dir := h.instanceDir(n)
 	opts := gen.Options{
 		Dir:          dir,
 		DOStorage:    filepath.Join(h.tenantDir(w.tenantID), "workloads", w.name, "do"),
@@ -430,8 +458,8 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	vmTier := tier == bundle.TierMicroVM
 	if vmTier {
 		// The guest's workerd listens on its NIC and reaches hostd only via
-		// the gateway (host netd's userspace stack); DO storage is
-		// guest-local (tmpfs; see STATUS.md M8 gaps).
+		// the gateway (host netd's userspace stack); DO storage is the
+		// workload's persistent volume, mounted at proto.DODir (L3).
 		gw := proto.GatewayIP
 		opts.Guest = &gen.GuestNet{
 			Ingress:   fmt.Sprintf("*:%d", proto.IngressPort),
@@ -441,11 +469,56 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 			DOStorage: proto.DODir,
 		}
 	}
+	// Under Landlock (Linux), workerd gets no AF_UNIX sockets at all: its
+	// three outbound services are hostd loopback TCP listeners (Landlock
+	// pins its connects to exactly these ports; a per-instance token keeps
+	// other local processes out) and its ingress listener is an inherited
+	// fd. So it can't connect to any unix socket on the host.
+	var loop map[string]net.Listener
+	var token string
+	if !vmTier && h.sandbox == SandboxLandlock {
+		loop = map[string]net.Listener{}
+		for _, k := range []string{"obj", "wl", "api"} {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				for _, l := range loop {
+					l.Close()
+				}
+				return nil, err
+			}
+			loop[k] = ln
+		}
+		var tb [32]byte
+		rand.Read(tb[:])
+		token = fmt.Sprintf("%x", tb)
+		opts.Loopback = &gen.LoopbackNet{EgressObj: loop["obj"].Addr().String(), EgressWL: loop["wl"].Addr().String(),
+			HostAPI: loop["api"].Addr().String(), Token: token}
+	}
 	res, err := gen.Generate(app, opts)
 	if err != nil {
+		for _, l := range loop {
+			l.Close()
+		}
 		return nil, err
 	}
 	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, tier: tier, doStorage: opts.DOStorage}
+	var vol *sandbox.Volume
+	if vmTier {
+		// The DO volume's key comes from mgmt custody, released only to the
+		// namespace lease holder at this epoch; it stays in hostd memory
+		// and the helper (dm-crypt), never on disk or in the guest.
+		w.mu.Lock()
+		epoch := w.epoch
+		w.mu.Unlock()
+		ctx, cancel := context.WithTimeout(h.ctx, 30*time.Second)
+		key, err := h.mgmt.VolumeKey(ctx, w.tenantID, w.name, epoch)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("DO volume key: %w", err)
+		}
+		vol = &sandbox.Volume{Path: h.volumePath(w), Name: w.tenantID + "/" + w.name, Epoch: epoch, Key: key, SizeMiB: h.cfg.VMVolumeMiB}
+		inst.doStorage = "volume:" + vol.Path
+	}
 	if vmTier {
 		inst.ingress = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			vm := inst.currentVM()
@@ -469,6 +542,7 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 			WorkerdArgs: []string{"serve", "config.capnp", "--experimental"},
 			HealthCF:    string(hc),
 			Debug:       h.cfg.VMDebug,
+			Volume:      vol,
 			Log:         h.log.With("workload", w.name),
 			Handlers: map[uint16]http.Handler{
 				proto.EgressObj: h.egressObjHandler(inst),
@@ -481,17 +555,45 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 		inst.direct = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", res.Sockets.Ingress)
 		}}}
+		if loop != nil {
+			// workerd's ingress listener, created here and inherited.
+			ln, err := net.Listen("unix", res.Sockets.Ingress)
+			if err != nil {
+				for _, l := range loop {
+					l.Close()
+				}
+				inst.stop()
+				return nil, err
+			}
+			os.Chmod(res.Sockets.Ingress, 0o600)
+			inst.ingressLn = ln.(*net.UnixListener)
+			inst.ingressLn.SetUnlinkOnClose(true)
+			for k, hd := range map[string]http.Handler{
+				"obj": h.egressObjHandler(inst), "wl": h.egressWLHandler(inst), "api": h.hostAPI(inst),
+			} {
+				srv := &http.Server{Handler: localToken(token, hd), ReadHeaderTimeout: 30 * time.Second}
+				inst.servers = append(inst.servers, srv)
+				inst.loopPorts = append(inst.loopPorts, uint16(loop[k].Addr().(*net.TCPAddr).Port))
+				go srv.Serve(loop[k])
+			}
+		}
 		for sock, hd := range map[string]http.Handler{
 			res.Sockets.EgressObj: h.egressObjHandler(inst),
 			res.Sockets.EgressWL:  h.egressWLHandler(inst),
 			res.Sockets.HostAPI:   h.hostAPI(inst),
 		} {
+			if loop != nil {
+				break
+			}
 			ln, err := net.Listen("unix", sock)
 			if err != nil {
 				inst.stop()
 				return nil, err
 			}
 			os.Chmod(sock, 0o600)
+			// Only this instance's own (sandboxed) workerd may use its
+			// egress and host API sockets, not another tenant's.
+			ln = procsb.Guard(ln, inst.ownsPID)
 			srv := &http.Server{Handler: hd, ReadHeaderTimeout: 30 * time.Second}
 			inst.servers = append(inst.servers, srv)
 			go srv.Serve(ln)
@@ -506,6 +608,132 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 		return nil, err
 	}
 	return inst, nil
+}
+
+// sharedHostCheck refuses a process-tier deployment of tenant (app) when
+// this host must not be shared and another tenant already runs process-tier
+// workloads here:
+//   - no process sandbox (Linux without Landlock, or -sandbox none):
+//     tenants' code shares one uid and could read each other's keys;
+//   - this user can reach a container engine's socket or is in its group
+//     (procsb.ScanHostSockets Hard): root-equivalent for hostd itself, so
+//     only a dedicated user fixes it;
+//   - this user can reach the system tailscaled's socket (the host's own
+//     tailnet identity) AND some workload could use it: the sandbox is not
+//     Landlock+seccomp, or a Node app listens on a unix socket (that mode
+//     keeps AF_UNIX). With every workload denied AF_UNIX, tailscaled's
+//     socket is out of reach and the host may be shared.
+//
+// Config.InsecureSharedHost (twd-hostd -insecure-shared-host) allows all.
+func (h *Host) sharedHostCheck(tenant string, app *bundle.App) error {
+	if h.cfg.InsecureSharedHost {
+		return nil
+	}
+	hs := h.hostSockets()
+	var why string
+	switch {
+	case h.sandbox == SandboxNone:
+		why = "this host has no process sandbox (" + h.noSandboxReason() + ")"
+	case len(hs.Hard) > 0:
+		why = "this user can reach " + strings.Join(hs.Hard, ", ") + " (root-equivalent for twd-hostd itself)"
+	case hs.Tailscaled != "" && h.sandbox != SandboxLandlock:
+		why = "this user can reach " + hs.Tailscaled + " (the host's tailnet identity) and the " + h.sandbox + " sandbox doesn't deny unix sockets"
+	case hs.Tailscaled != "" && (nodeListensUnix(app) || h.anyNodeListensUnix()):
+		why = "this user can reach " + hs.Tailscaled + " (the host's tailnet identity) and a Node app listens on a unix socket (that mode keeps AF_UNIX sockets)"
+	default:
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, o := range h.workloads {
+		if o.tenantID == tenant {
+			continue
+		}
+		o.mu.Lock()
+		busy := o.active != nil && o.active.tier != bundle.TierMicroVM
+		o.mu.Unlock()
+		if busy {
+			return fmt.Errorf("sandbox_unavailable: %s, so it runs process-tier workloads of one tenant only, and tenant %s already runs here; fix: run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, enable Landlock, use TCP listen mode for Node apps, or deploy with tier \"microvm\"; or start twd-hostd with -insecure-shared-host (tenants are then NOT isolated from each other)", why, o.tenantID)
+		}
+	}
+	return nil
+}
+
+func nodeListensUnix(app *bundle.App) bool {
+	return app != nil && app.Runtime == bundle.RuntimeNode && app.Node.Listen == "unix"
+}
+
+// anyNodeListensUnix: some active or pending workload is a unix-listening
+// Node app.
+func (h *Host) anyNodeListensUnix() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, w := range h.workloads {
+		w.mu.Lock()
+		u := nodeListensUnix(w.app)
+		w.mu.Unlock()
+		if u {
+			return true
+		}
+	}
+	return false
+}
+
+// hostSockets is procsb.ScanHostSockets, overridable in tests.
+func (h *Host) hostSockets() procsb.HostSockets {
+	if h.cfg.HostSockets != nil {
+		return h.cfg.HostSockets()
+	}
+	return procsb.ScanHostSockets()
+}
+
+func (h *Host) noSandboxReason() string {
+	if h.cfg.Sandbox == SandboxNone {
+		return "started with -sandbox none"
+	}
+	if runtime.GOOS == "linux" {
+		_, err := procsb.ABI()
+		return fmt.Sprintf("Landlock unavailable: %v", err)
+	}
+	return "no sandbox on " + runtime.GOOS
+}
+
+// localToken admits only requests carrying the instance's loopback token
+// (gen.LocalTokenHeader, injected by workerd's config), and strips it.
+func localToken(token string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get(gen.LocalTokenHeader)
+		r.Header.Del(gen.LocalTokenHeader)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			netd.WriteError(w, &netd.Error{Code: "forbidden", Detail: "not this instance's workerd"})
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// instanceDir is a fresh instance's run dir. Its name is unguessable: on
+// Linux kernels whose Landlock can't refuse unix-socket connects (ABI < 9),
+// a sandboxed workload can't list the run dir or read /proc/net/unix, so it
+// can't find another instance's workerd ingress socket either.
+func (h *Host) instanceDir(n int) string {
+	var b [8]byte
+	rand.Read(b[:])
+	return filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d-%x", n, b))
+}
+
+// ownsPID reports whether pid is this instance's process or a descendant.
+func (inst *instance) ownsPID(pid int) bool {
+	inst.mu.Lock()
+	cmd := inst.cmd
+	inst.mu.Unlock()
+	return cmd != nil && cmd.Process != nil && procsb.Descends(pid, cmd.Process.Pid)
+}
+
+// volumePath is the (tenant, workload) DO volume image (microVM tier): a
+// LUKS2 image under the tenant's 0700 dir.
+func (h *Host) volumePath(w *workload) string {
+	return filepath.Join(h.tenantDir(w.tenantID), "workloads", w.name, "do.img")
 }
 
 func (inst *instance) currentVM() sandbox.VM {
@@ -566,7 +794,14 @@ func (inst *instance) spawn() error {
 	}
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.Dir = inst.dir
-	if err := cmd.Start(); err != nil {
+	// Its own process group: a sandboxed workerd may signal only itself and
+	// its group (seccomp), never hostd's.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	err = cmd.Start()
+	for _, f := range cmd.ExtraFiles {
+		f.Close() // the child has its copy
+	}
+	if err != nil {
 		logf.Close()
 		return err
 	}
@@ -692,6 +927,9 @@ func (inst *instance) stop() {
 	}
 	for _, s := range inst.servers {
 		s.Close()
+	}
+	if inst.ingressLn != nil {
+		inst.ingressLn.Close()
 	}
 	if os.Getenv("TWD_KEEP_INSTANCES") == "" {
 		os.RemoveAll(inst.dir)

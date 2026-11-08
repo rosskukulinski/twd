@@ -1,0 +1,30 @@
+{
+  "run": "l3-reboot-c1c406",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T08:17:58-08:00",
+  "checks": {},
+  "numbers": {
+    "reboot1_boot_to_helper_active_ms": 4374.741,
+    "reboot1_boot_to_ssh_ms": 5250,
+    "reboot1_limactl_start_ms": 6782.045,
+    "reboot1_stop_ms": 1561.142,
+    "reboot1_twd_up_ms": 611.076,
+    "up_first_ms": 664.727
+  },
+  "notes": [
+    "before reboots: object boot1 node nEuMQQFKW311CNTRL (twd-l3r-c1c406-supportagent-sfq6cnaxv4.tail7906d5.ts.net, 100.78.222.127), 2 twd devices of this run, SQLite calls=11",
+    "reboot1 (clean limactl stop): helper active 4375 ms after kernel boot; huge pages 1024"
+  ],
+  "cleanup": {
+    "devices_left": 0,
+    "twd_devices_left_after_down": 0,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null,
+    "vm_clean": true
+  },
+  "nodeIDs": [
+    "nRrVDysB6u11CNTRL",
+    "nEuMQQFKW311CNTRL"
+  ],
+  "keyIDs": null
+}

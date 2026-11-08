@@ -80,6 +80,8 @@ func cmdDoctor(args []string) error {
 		return "ok", "twd " + version + ", twd-mgmt and twd-hostd in " + exeDir(), ""
 	})
 
+	doctorPlatform(run) // Linux: glibc (before workerd, which needs it)
+
 	run("workerd", func() (string, string, string) {
 		wd, err := findWorkerd("")
 		if err != nil {
@@ -91,6 +93,9 @@ func cmdDoctor(args []string) error {
 		v := strings.TrimSpace(string(out))
 		if err != nil {
 			fix := "check the binary runs: " + wd + " --version"
+			if runtime.GOOS == "linux" {
+				fix += " (see the glibc check above)"
+			}
 			if runtime.GOOS == "darwin" {
 				fix += " (unsigned? `codesign -f -s - " + wd + "`; quarantined? `xattr -d com.apple.quarantine " + wd + "`)"
 			}
@@ -210,6 +215,9 @@ func cmdDoctor(args []string) error {
 	})
 
 	run("sandbox", func() (string, string, string) { return doctorSandbox(s) })
+	run("host_sockets", func() (string, string, string) { return doctorHostSockets(s) })
+
+	doctorLinuxHost(run, s) // Linux: kernel, Landlock, user namespaces, KVM, firecracker, cgroups v2, systemd, microvm_tier
 
 	run("node_egress", func() (string, string, string) {
 		// RT-08: the Node tier's egress proxy is a boundary only under a
@@ -255,26 +263,18 @@ func cmdDoctor(args []string) error {
 			notes = append(notes, "twd only ever runs tsnet nodes for the tailnet you name (no bootstrap from tailscaled)")
 		}
 		// Running twd processes must not hold the system tailscaled's
-		// LocalAPI socket (checked with lsof; never contacts tailscaled).
+		// LocalAPI socket or state (lsof on macOS, /proc + ss on Linux;
+		// never contacts tailscaled).
 		if s != nil && s.supervisorAlive() {
 			pids := append([]int{s.supervisorPID()}, childPIDs(s.supervisorPID())...)
-			if lsof, err := exec.LookPath("lsof"); err == nil {
-				var ps []string
-				for _, p := range pids {
-					ps = append(ps, strconv.Itoa(p))
+			if bad, method := tailscaledHolders(pids); method != "" {
+				if len(bad) > 0 {
+					return "fail", "a twd process uses the system tailscaled: " + strings.Join(bad, "; "), "report this: twd must never use the system tailscaled"
 				}
-				out, _ := exec.Command(lsof, "-n", "-P", "-Fn", "-p", strings.Join(ps, ",")).Output()
-				for _, ln := range strings.Split(string(out), "\n") {
-					l := strings.ToLower(ln)
-					if strings.HasPrefix(l, "n") && (strings.Contains(l, "tailscaled.sock") || strings.Contains(l, "io.tailscale.ipn") ||
-						strings.Contains(l, "sameuserproof") || strings.Contains(l, "/var/run/tailscale")) {
-						return "fail", "a twd process has the system tailscaled's socket open: " + ln[1:], "report this: twd must never use the system tailscaled"
-					}
-				}
-				notes = append(notes, fmt.Sprintf("%d running twd processes hold no tailscaled LocalAPI socket (lsof)", len(pids)))
+				notes = append(notes, fmt.Sprintf("%d running twd processes hold no tailscaled LocalAPI socket (%s)", len(pids), method))
 			}
 		}
-		if isFile("/Applications/Tailscale.app/Contents/Info.plist") || lookPathOK("tailscaled") || lookPathOK("tailscale") {
+		if systemTailscaled() {
 			notes = append(notes, "a system Tailscale is installed on this machine and is left alone (its state is not read)")
 		}
 		return "ok", strings.Join(notes, "; "), ""
@@ -288,7 +288,7 @@ func cmdDoctor(args []string) error {
 	}
 	res := map[string]any{"ok": !failed, "version": version, "checks": checks}
 	emit(f, res, func() {
-		mark := map[string]string{"ok": "✓", "warn": "!", "fail": "✗", "skip": "-"}
+		mark := map[string]string{"ok": "✓", "warn": "!", "fail": "✗", "skip": "-", "info": "i"}
 		fmt.Printf("twd doctor · twd %s · %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
 		for _, c := range checks {
 			fmt.Printf("%s %-28s %s\n", mark[c.Status], c.Name, c.Detail)

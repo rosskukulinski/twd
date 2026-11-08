@@ -33,6 +33,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -83,9 +84,23 @@ type Config struct {
 	DefaultTier string
 	// VMDebug enables guest diagnostics (connectivity probes; tests).
 	VMDebug bool
-	// Sandbox confines process-tier workerds: "none" (default),
-	// "seatbelt" (macOS) or "auto".
+	// VMVolumeMiB sizes new DO volumes (microVM tier; sparse; default 1024).
+	VMVolumeMiB int
+	// Sandbox confines process-tier workerds and Node apps: "none"
+	// (default), "seatbelt" (macOS), "landlock" (Linux) or "auto".
 	Sandbox string
+	// SandboxLauncher is the binary that applies Landlock profiles
+	// (default: this executable, which imports internal/procsb).
+	SandboxLauncher string
+	// InsecureSharedHost lets a host without a process sandbox run
+	// process-tier workloads of more than one tenant. Without it such a host
+	// refuses the second tenant's deployment (typed sandbox_unavailable), and
+	// a Node-tier deployment there with egress_unenforced (RT-08: a hostile
+	// Node app can open raw sockets past the egress proxy).
+	InsecureSharedHost bool
+	// HostSockets overrides the Linux risky-host-socket scan
+	// (procsb.ScanHostSockets; tests).
+	HostSockets func() procsb.HostSockets
 	// SandboxDeny are extra paths no workerd may read, write or connect to
 	// (twd up: its whole state dir, which holds mgmt's custody and socket).
 	SandboxDeny []string
@@ -98,12 +113,6 @@ type Config struct {
 	// tests and demos turn it on so that objects can exercise each other's
 	// tailnet-facing authorization (e.g. e2e check (d), RT-01).
 	AllowSiblingEgress bool
-	// InsecureSharedHost lets this host run Node-tier (runtime "node")
-	// deployments while it serves more than one tenant even though the
-	// Node tier's egress is not enforced here (RT-08): a hostile Node app
-	// can open raw sockets past the egress proxy. Default: refused with
-	// egress_unenforced.
-	InsecureSharedHost bool
 }
 
 // Host is a running twd-hostd.
@@ -148,6 +157,9 @@ func New(cfg Config) (*Host, error) {
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 30 * time.Second
+	}
+	if cfg.VMVolumeMiB == 0 {
+		cfg.VMVolumeMiB = 1024
 	}
 	if cfg.DrainTimeout == 0 {
 		cfg.DrainTimeout = 10 * time.Second
@@ -210,6 +222,9 @@ func (h *Host) Start(ctx context.Context) error {
 		return err
 	}
 	os.Chmod(h.pushSock, 0o600)
+	// No sandboxed workload may use the push API (Linux: Landlock < ABI 9
+	// can't refuse the connect itself).
+	ln = procsb.Guard(ln, nil)
 	h.pushSrv = &http.Server{Handler: h.pushAPI(), ReadHeaderTimeout: 10 * time.Second}
 	go h.pushSrv.Serve(ln)
 	if err := h.register(ctx); err != nil {

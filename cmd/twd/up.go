@@ -9,6 +9,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,6 +56,8 @@ type upResult struct {
 	PolicyOK   bool               `json:"policyOK"`
 	PolicyDiff string             `json:"policySnippet,omitempty"`
 	Applied    bool               `json:"policyApplied"`
+	Service    string             `json:"service,omitempty"`
+	LingerHint string             `json:"lingerHint,omitempty"`
 	Timings    map[string]float64 `json:"timingsMs"`
 }
 
@@ -70,12 +74,13 @@ func cmdUp(args []string) error {
 	hostID := f.String("host-id", defaultHostID(), "this host's ID")
 	prefix := f.String("hostname-prefix", "twd-", "prefix for every node hostname")
 	ephemeral := f.Bool("ephemeral", false, "join nodes as ephemeral; `twd down` then deletes every device (tests, demos)")
+	insecureSH := f.Bool("insecure-shared-host", false, "on a host without a process sandbox (Linux without Landlock), still serve process-tier workloads of more than one tenant; tenants are then NOT isolated from each other")
 	workerdFlag := f.String("workerd", "", "workerd binary")
 	hb := f.Duration("heartbeat", time.Second, "host heartbeat period")
 	tomb := f.Duration("kill-tombstone", 12*time.Second, "keep a killed node answering object_killed this long")
 	delDelay := f.Duration("device-delete-delay", 8*time.Second, "delete a killed object's device this long after the kill (< --kill-tombstone)")
 	siblings := f.Bool("allow-sibling-egress", false, "let objects reach other objects on this host over the tailnet (hairpin; single-host tests and demos)")
-	insecure := f.Bool("insecure-shared-host", false, "allow Node-tier (runtime \"node\") apps for several tenants on this host although their egress is not enforced here (RT-08; see docs/node-tier.md)")
+	service := f.Bool("service", false, "Linux: run the supervisor as a systemd user unit (~/.config/systemd/user/twd.service), so twd survives logout (with lingering) and reboot")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -99,6 +104,11 @@ func cmdUp(args []string) error {
 	if *delDelay >= *tomb {
 		return fail("bad_request", "--device-delete-delay must be shorter than --kill-tombstone",
 			"the tombstone answers object_killed only while the device still exists in peers' netmaps")
+	}
+	if *service {
+		if err := serviceAvailable(); err != nil {
+			return err
+		}
 	}
 	absKey, _ := filepath.Abs(*keyFile)
 	apiKey, err := tsapi.LoadEnvFile(absKey, "TS_API_KEY")
@@ -154,17 +164,26 @@ func cmdUp(args []string) error {
 	}
 	s.Cfg.APIKeyFile, s.Cfg.ControlURL, s.Cfg.TSAPIURL, s.Cfg.HostID = absKey, *control, *tsapiURL, *hostID
 	s.Cfg.HostnamePrefix, s.Cfg.Ephemeral, s.Cfg.Workerd = *prefix, *ephemeral, wd
+	s.Cfg.InsecureSharedHost = *insecureSH
 	s.Cfg.Heartbeat, s.Cfg.KillTombstone, s.Cfg.DeviceDeleteDelay = hb.String(), tomb.String(), delDelay.String()
-	s.Cfg.InsecureSharedHost, s.Cfg.AllowSiblingEgress = *insecure, *siblings
+	s.Cfg.AllowSiblingEgress = *siblings
 	if err := s.save(); err != nil {
 		return err
 	}
 	res := upResult{StateDir: s.Dir, Tailnet: *tailnet, HostID: *hostID, Timings: timings}
-	if !s.supervisorAlive() {
-		// RT-03: a fresh per-host token for mgmt's unix socket on every
-		// (re)start. mgmt mints it into <state>/hostd/mgmt.token (0600);
-		// hostd and this CLI read it. Workload sandboxes deny that dir.
-		os.Remove(s.hostTokenFile())
+	if *service {
+		was := s.supervisorAlive()
+		changed, err := installService(s)
+		if err != nil {
+			return err
+		}
+		res.Started = !was || changed
+		res.Service = serviceUnitPath()
+		res.LingerHint = lingerHint()
+	} else if inst, act := serviceActive(); inst && act {
+		return fail("service_running", "twd runs as the systemd user unit "+serviceUnit+" (installed by twd up --service)").
+			withFix("twd up --service … to change its settings", "systemctl --user restart "+serviceUnit, "twd down --service to remove it")
+	} else if !s.supervisorAlive() {
 		if err := startSupervisor(s); err != nil {
 			return err
 		}
@@ -252,7 +271,7 @@ func cmdUp(args []string) error {
 			started = "started"
 		}
 		fmt.Printf("✓ mgmt     twd-mgmt %s · leases in SQLite (%s) · custody: file (homelab mode)\n", started, filepath.Join(s.Dir, "mgmt", "mgmt.db"))
-		fmt.Printf("✓ host     this machine (%s) · tier: process [macOS: process tier, dev-grade isolation]\n", *hostID)
+		fmt.Printf("✓ host     this machine (%s) · %s\n", *hostID, tierLine(s))
 		fmt.Printf("✓ tenant   %s connected (tenant %s) · control %s\n", *tailnet, tid, *control)
 		switch {
 		case res.Applied:
@@ -263,6 +282,12 @@ func cmdUp(args []string) error {
 			fmt.Printf("› policy   not applied (re-run with --policy-apply, or add in the admin console):\n")
 			for _, l := range strings.Split(strings.TrimSpace(res.PolicyDiff), "\n") {
 				fmt.Printf("    %s\n", l)
+			}
+		}
+		if res.Service != "" {
+			fmt.Printf("✓ service  systemd user unit %s (enabled; `systemctl --user status %s`, `twd down --service` removes it)\n", res.Service, serviceUnit)
+			if res.LingerHint != "" {
+				fmt.Printf("› linger   %s\n", res.LingerHint)
 			}
 		}
 		fmt.Printf("ready in %.1fs · `twd init hello --template agent && cd hello && twd deploy`\n", timings["total"]/1000)
@@ -397,7 +422,11 @@ func cmdSupervise(args []string) error {
 		return err
 	}
 	margs := []string{mgmtBin, "-state-dir", filepath.Join(s.Dir, "mgmt"), "-socket", s.mgmtSock(),
-		"-host-token-file", s.hostTokenFile(), "-device-delete-delay", s.Cfg.DeviceDeleteDelay}
+		// RT-03: a fresh per-host token on every mgmt start (twd up, a
+		// supervisor/systemd restart). hostd re-reads the file when it
+		// changes and the CLI reads it per call, so rotation never strands
+		// a running hostd.
+		"-host-token-file", s.hostTokenFile(), "-rotate-host-token", "-device-delete-delay", s.Cfg.DeviceDeleteDelay}
 	if s.Cfg.TSAPIURL != "" {
 		margs = append(margs, "-tsapi-url", s.Cfg.TSAPIURL)
 	}
@@ -495,13 +524,17 @@ func cmdSupervise(args []string) error {
 // ---- down ----
 
 type downResult struct {
-	Killed  []string           `json:"killed"`
-	Flushed int                `json:"devicesDeleted"`
-	Timings map[string]float64 `json:"timingsMs"`
+	ServiceRemoved bool               `json:"serviceRemoved,omitempty"`
+	ServiceStopped bool               `json:"serviceStopped,omitempty"`
+	Purged         int                `json:"objectsPurged"`
+	Killed         []string           `json:"killed"`
+	Flushed        int                `json:"devicesDeleted"`
+	Timings        map[string]float64 `json:"timingsMs"`
 }
 
 func cmdDown(args []string) error {
 	f := newFlags("down")
+	service := f.Bool("service", false, "Linux: also disable and remove the systemd user unit installed by twd up --service")
 	purge := f.Bool("purge", false, "kill every live object (audit: \"twd down --purge\") and delete its device before stopping (default with --ephemeral)")
 	if _, err := f.parse(args); err != nil {
 		return err
@@ -513,7 +546,19 @@ func cmdDown(args []string) error {
 	t0 := time.Now()
 	res := downResult{Killed: []string{}, Timings: map[string]float64{}}
 	if !s.supervisorAlive() {
-		emit(f, res, func() { fmt.Println("twd is not running in " + s.Dir) })
+		if *service {
+			removed, err := removeService()
+			if err != nil {
+				return err
+			}
+			res.ServiceRemoved = removed
+		}
+		emit(f, res, func() {
+			fmt.Println("twd is not running in " + s.Dir)
+			if res.ServiceRemoved {
+				fmt.Println("✓ removed  " + serviceUnitPath())
+			}
+		})
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -552,10 +597,38 @@ func cmdDown(args []string) error {
 		}
 		s.mgmt().Do(ctx, "POST", "/v0/flush", nil, &fr)
 		res.Flushed = fr.Flushed
+		// Forget the killed objects (mgmt rows, hostd tombstones) so the
+		// same workload deploys again on this state dir.
+		for _, tn := range s.tenants() {
+			var pr mgmt.PurgeResult
+			if err := s.mgmt().Do(ctx, "POST", "/v0/tenants/"+tn.TenantID+"/purge", nil, &pr); err == nil {
+				res.Purged += len(pr.Purged)
+			}
+		}
+		s.hostd().Do(ctx, "POST", "/v0/purge", nil, nil)
 		res.Timings["purge"] = ms(time.Since(t0))
 	}
 	pid := s.supervisorPID()
-	syscall.Kill(pid, syscall.SIGTERM)
+	inst, act := serviceActive()
+	switch {
+	case *service:
+		// disable --now stops it (the supervisor's own SIGTERM path) and
+		// keeps it from starting again at login/boot.
+		removed, err := removeService()
+		if err != nil {
+			return err
+		}
+		res.ServiceRemoved = removed
+	case inst && act:
+		// Stop through systemd so it doesn't count as a failure; the unit
+		// stays installed (and enabled: it starts at the next login/boot).
+		if out, err := systemctlUser("stop", serviceUnit); err != nil {
+			return fail("service_failed", "systemctl --user stop "+serviceUnit+" failed", out)
+		}
+		res.ServiceStopped = true
+	default:
+		syscall.Kill(pid, syscall.SIGTERM)
+	}
 	for pidAlive(pid) {
 		if time.Since(t0) > 3*time.Minute {
 			syscall.Kill(pid, syscall.SIGKILL)
@@ -565,10 +638,15 @@ func cmdDown(args []string) error {
 	}
 	res.Timings["total"] = ms(time.Since(t0))
 	emit(f, res, func() {
-		if len(res.Killed) > 0 {
-			fmt.Printf("✓ purged   %d objects killed · %d devices deleted\n", len(res.Killed), res.Flushed)
+		if len(res.Killed) > 0 || res.Purged > 0 {
+			fmt.Printf("✓ purged   %d objects killed · %d devices deleted · %d killed objects forgotten\n", len(res.Killed), res.Flushed, res.Purged)
 		}
 		fmt.Printf("✓ stopped  twd-hostd, twd-mgmt (%.1fs) · state kept in %s\n", res.Timings["total"]/1000, s.Dir)
+		if res.ServiceRemoved {
+			fmt.Println("✓ removed  " + serviceUnitPath() + " (disabled)")
+		} else if res.ServiceStopped {
+			fmt.Println("› service  " + serviceUnit + " stopped but still installed and enabled (starts at next login/boot); `twd down --service` removes it")
+		}
 	})
 	return nil
 }
@@ -718,4 +796,34 @@ func cmdStatus(args []string) error {
 		return fail("unhealthy", "twd is not healthy in "+s.Dir).withFix("twd logs --component supervisor", "twd up")
 	}
 	return nil
+}
+
+// tierLine describes the isolation tiers the running host offers.
+// tierLine says which tiers this host offers and how each isolates
+// tenants: the process tier by the OS sandbox (Seatbelt on macOS,
+// Landlock+seccomp on Linux; "none" is loud), the microVM tier by the
+// Firecracker jailer + VM.
+func tierLine(s *state) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var hv hostd.StatusView
+	_ = s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv)
+	sb := hv.Sandbox
+	switch {
+	case sb == "":
+		sb = "sandbox unknown"
+	case sb == "none":
+		sb = "NO PROCESS SANDBOX: see `twd doctor`"
+	case strings.HasPrefix(sb, "landlock"):
+		sb = "Landlock+seccomp, " + sb
+	case sb == "seatbelt":
+		sb = "Seatbelt, dev-grade isolation"
+	}
+	if runtime.GOOS == "darwin" {
+		return "tier: process [" + sb + "]"
+	}
+	if slices.Contains(hv.Tiers, "microvm") {
+		return "tiers: process [" + sb + "], microvm [Firecracker, jailed, via " + hv.VMVia + "; \"tier\": \"microvm\" in twd.jsonc]"
+	}
+	return "tier: process [" + sb + "; microVM tier off: see `twd doctor`, or run `sudo ~/.twd/bin/twd host setup --microvm` once]"
 }

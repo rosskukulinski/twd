@@ -69,12 +69,19 @@ func TestE2EMulti(t *testing.T) {
 	b := make([]byte, 3)
 	rand.Read(b)
 	run := hex.EncodeToString(b)
-	prefix := "ttest-m7-" + run + "-"
-	if p := os.Getenv("TWD_E2E_PREFIX"); p != "" {
-		prefix = p + run + "-"
+	// TWD_E2E_PREFIX names this run's test nodes (default ttest-m7-; L2 runs
+	// use ttest-l2-), so concurrent streams clean up only their own IDs.
+	pfx := os.Getenv("TWD_E2E_PREFIX")
+	if pfx == "" {
+		pfx = "ttest-m7-"
 	}
+	if !strings.HasPrefix(pfx, "ttest-") {
+		t.Fatalf("TWD_E2E_PREFIX %q must start with ttest-", pfx)
+	}
+	prefix := pfx + run + "-"
 	root, _ := nettest.FindRepoRoot()
-	resultsTo := filepath.Join(root, "e2e", "real", "results", "m7-"+time.Now().Format("20060102-150405")+"-"+run+".json")
+	label := strings.TrimSuffix(strings.TrimPrefix(pfx, "ttest-"), "-")
+	resultsTo := filepath.Join(root, "e2e", "real", "results", label+"-"+time.Now().Format("20060102-150405")+"-"+run+".json")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 	quiet := slog.New(netd.NewRedactingHandler(slog.NewTextHandler(io.Discard, nil)))
@@ -205,6 +212,19 @@ func TestE2EMulti(t *testing.T) {
 
 	// Policy: add what the scenario needs to each tailnet (no-op if present).
 	for _, s := range []*side{A, B} {
+		if os.Getenv("TWD_E2E_NO_POLICY_WRITE") != "" {
+			// Read-only: the scenario's rules must already be there.
+			cur, _, err := s.api.GetPolicyHuJSON(ctx)
+			if err != nil {
+				t.Fatalf("policy %s: %v", s.tailnet, netd.RedactError(err))
+			}
+			miss, err := policy.Missing(cur, cliflow.MultiPolicy())
+			if err != nil || !miss.Empty() {
+				t.Fatalf("policy %s lacks the scenario's rules (TWD_E2E_NO_POLICY_WRITE set, so not writing): %v %s", s.tailnet, err, miss.HuJSON())
+			}
+			notes = append(notes, s.tailnet+": policy already had the scenario's rules (read-only check, not written)")
+			continue
+		}
 		ar, err := policy.ApplyWith(ctx, s.api, cliflow.MultiPolicy(), policy.Options{AllowTags: []string{cliflow.TestTag}})
 		if err != nil {
 			t.Fatalf("policy %s: %v", s.tailnet, netd.RedactError(err))

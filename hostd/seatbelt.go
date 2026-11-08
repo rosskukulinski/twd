@@ -3,6 +3,7 @@ package hostd
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/rosskukulinski/twd/internal/procsb"
 )
 
 // Process-tier sandboxes (Config.Sandbox).
@@ -22,7 +25,13 @@ const (
 	// keys, other tenants' DO storage and sockets, mgmt's admin socket,
 	// API key files) except the instance's own dir and its own DO storage.
 	SandboxSeatbelt = "seatbelt"
-	// SandboxAuto is seatbelt on macOS when sandbox-exec exists, else none.
+	// SandboxLandlock runs each workerd and Node app on Linux under the
+	// internal/procsb launcher: Landlock filesystem and TCP rules, no_new_privs
+	// and a seccomp filter, with the same allow list as the Seatbelt profile
+	// (its own dirs; read-only runtime binaries) plus TCP ports.
+	SandboxLandlock = procsb.Name
+	// SandboxAuto is seatbelt on macOS when sandbox-exec exists, landlock on
+	// Linux when the kernel has Landlock, else none.
 	SandboxAuto = "auto"
 )
 
@@ -37,14 +46,23 @@ func ResolveSandbox(s string) (string, error) {
 		if runtime.GOOS == "darwin" && isFileExec(sandboxExec) {
 			return SandboxSeatbelt, nil
 		}
+		if runtime.GOOS == "linux" && procsb.Supported() {
+			return SandboxLandlock, nil
+		}
 		return SandboxNone, nil
 	case SandboxSeatbelt:
 		if runtime.GOOS != "darwin" || !isFileExec(sandboxExec) {
 			return "", fmt.Errorf("sandbox %q needs macOS %s", s, sandboxExec)
 		}
 		return SandboxSeatbelt, nil
+	case SandboxLandlock:
+		if runtime.GOOS != "linux" || !procsb.Supported() {
+			_, err := procsb.ABI()
+			return "", fmt.Errorf("sandbox %q needs Linux with Landlock enabled: %v", s, err)
+		}
+		return SandboxLandlock, nil
 	}
-	return "", fmt.Errorf("unknown sandbox %q (none | seatbelt | auto)", s)
+	return "", fmt.Errorf("unknown sandbox %q (none | seatbelt | landlock | auto)", s)
 }
 
 func isFileExec(p string) bool {
@@ -157,19 +175,55 @@ func (h *Host) sandboxDeny() []string {
 }
 
 // workerdCommand builds the instance's workerd command line, wrapped in its
-// tenant's sandbox.
+// tenant's sandbox. workerd needs no TCP at all: its listener and every
+// service it calls are unix sockets in its own instance dir.
+//
+// Under Landlock it gets no unix sockets: its ingress listener is passed as
+// fd 3 (--socket-fd) and its outbound services are loopback TCP ports (the
+// only ones it may connect to); the profile denies socket(AF_UNIX).
 func (inst *instance) workerdCommand() (*exec.Cmd, error) {
-	return inst.sandboxed(inst.h.cfg.WorkerdBin, []string{"serve", inst.res.Config, "--experimental"},
-		[]string{inst.dir, inst.doStorage}, []string{inst.h.cfg.WorkerdBin}, nil)
+	args := []string{"serve", inst.res.Config, "--experimental"}
+	var f *os.File
+	if inst.ingressLn != nil {
+		var err error
+		if f, err = inst.ingressLn.File(); err != nil {
+			return nil, err
+		}
+		args = append(args, "--socket-fd", "ingress=3")
+	}
+	cmd, err := inst.sandboxed(inst.h.cfg.WorkerdBin, args,
+		[]string{inst.dir, inst.doStorage}, []string{inst.h.cfg.WorkerdBin}, nil, nil, inst.loopPorts)
+	if err != nil {
+		if f != nil {
+			f.Close()
+		}
+		return nil, err
+	}
+	if f != nil {
+		cmd.ExtraFiles = []*os.File{f}
+	}
+	return cmd, nil
 }
 
 // nodeCommand builds the Node tier's command line under the same sandbox as
 // workerd: tenant code too. It may write only its instance dir and its own
 // data dir; it may read the node binary and, when node lives in a
 // "<prefix>/bin" dir (nvm, Homebrew, a tarball), that install prefix.
+//
+// On Linux it may also bind and connect only its own app port (TCP listen
+// mode) and connect only to its egress proxy's port: every other TCP
+// destination, loopback included, is refused by Landlock, so the app can't
+// bypass HTTP_PROXY.
 func (inst *instance) nodeCommand(args []string) (*exec.Cmd, error) {
 	np := inst.node
-	return inst.sandboxed(np.bin, args, []string{inst.dir, np.dataDir}, []string{np.bin}, nodePrefix(np.bin))
+	var bind, connect []uint16
+	if np.port != 0 {
+		bind, connect = []uint16{uint16(np.port)}, []uint16{uint16(np.port)}
+	}
+	if a, ok := np.proxy.Addr().(*net.TCPAddr); ok {
+		connect = append(connect, uint16(a.Port))
+	}
+	return inst.sandboxed(np.bin, args, []string{inst.dir, np.dataDir}, []string{np.bin}, nodePrefix(np.bin), bind, connect)
 }
 
 // nodePrefix is node's install prefix (…/bin/node → …), if it has one.
@@ -184,9 +238,31 @@ func nodePrefix(bin string) []string {
 }
 
 // sandboxed returns bin args, run under the host's sandbox (Seatbelt:
-// sandbox-exec execs bin in place, so the pid is bin's). The profile is
-// written to the instance dir and recorded as inst.profile.
-func (inst *instance) sandboxed(bin string, args, own, readOnly, readOnlyTrees []string) (*exec.Cmd, error) {
+// sandbox-exec execs bin in place; Landlock: the procsb launcher does, so
+// the pid is bin's either way). The profile is written to the instance dir
+// and recorded as inst.profile. bindTCP and connectTCP are the only TCP
+// ports allowed (Landlock; Seatbelt leaves TCP alone).
+func (inst *instance) sandboxed(bin string, args, own, readOnly, readOnlyTrees []string, bindTCP, connectTCP []uint16) (*exec.Cmd, error) {
+	if inst.h.sandbox == SandboxLandlock {
+		launcher, err := inst.h.sandboxLauncher()
+		if err != nil {
+			return nil, err
+		}
+		// No AF_UNIX socket(): workerd's listener is inherited and its
+		// services are loopback TCP; a Node app listens on TCP. Only a Node
+		// app in listen "unix" mode must create its own unix socket.
+		noUnix := inst.ingressLn != nil || inst.node != nil && inst.node.listen != "unix"
+		prof := &procsb.Profile{Launcher: launcher, Exec: readOnly, ReadOnly: readOnlyTrees, Own: own,
+			BindTCP: bindTCP, ConnectTCP: connectTCP, NoUnixSockets: noUnix, Deny: inst.h.sandboxDeny()}
+		p := filepath.Join(inst.dir, "sandbox.json")
+		if err := prof.Write(p); err != nil {
+			return nil, err
+		}
+		inst.mu.Lock()
+		inst.profile = p
+		inst.mu.Unlock()
+		return procsb.Command(launcher, p, bin, args...), nil
+	}
 	if inst.h.sandbox != SandboxSeatbelt {
 		return exec.Command(bin, args...), nil
 	}
@@ -199,4 +275,57 @@ func (inst *instance) sandboxed(bin string, args, own, readOnly, readOnlyTrees [
 	inst.profile = p
 	inst.mu.Unlock()
 	return exec.Command(sandboxExec, append([]string{"-f", p, bin}, args...)...), nil
+}
+
+// sandboxLauncher is the binary that applies Landlock profiles: any binary
+// importing internal/procsb (twd-hostd; in tests, the test binary).
+func (h *Host) sandboxLauncher() (string, error) {
+	if h.cfg.SandboxLauncher != "" {
+		return h.cfg.SandboxLauncher, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("sandbox launcher: %w", err)
+	}
+	return exe, nil
+}
+
+// sandboxOf names the sandbox a process-tier instance runs under, from its
+// profile ("" = none).
+func sandboxOf(profile string) string {
+	switch filepath.Ext(profile) {
+	case ".sb":
+		return SandboxSeatbelt
+	case ".json":
+		return SandboxLandlock
+	}
+	return SandboxNone
+}
+
+// SandboxCommand runs args[0] args[1:] under a workload's recorded sandbox
+// profile (WorkloadStatus.SandboxProfile): sandbox-exec on macOS, the
+// procsb launcher on Linux. Tests use it to check what a workload can
+// reach.
+func SandboxCommand(profile string, args ...string) (*exec.Cmd, error) {
+	switch sandboxOf(profile) {
+	case SandboxSeatbelt:
+		return exec.Command(sandboxExec, append([]string{"-f", profile}, args...)...), nil
+	case SandboxLandlock:
+		p, err := procsb.Load(profile)
+		if err != nil {
+			return nil, err
+		}
+		return procsb.Command(p.Launcher, profile, args[0], args[1:]...), nil
+	}
+	return nil, fmt.Errorf("no sandbox profile %q", profile)
+}
+
+// SandboxInfo describes this host's process sandbox for logs and status:
+// "seatbelt", "landlock (ABI n)" or "none".
+func (h *Host) SandboxInfo() string {
+	if h.sandbox == SandboxLandlock {
+		abi, _ := procsb.ABI()
+		return fmt.Sprintf("landlock (ABI %d)", abi)
+	}
+	return h.sandbox
 }

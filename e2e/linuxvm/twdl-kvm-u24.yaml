@@ -1,0 +1,16 @@
+# Fresh Ubuntu 24.04 arm64 VM with nested virtualization for `make e2e-linux-vm`
+# (L3: the microVM tier from the installed release). Nothing from the Mac is
+# mounted and nothing is provisioned: the release tarball and the API key
+# file are copied in with `limactl copy`, as a real user would get them.
+vmType: vz
+nestedVirtualization: true
+cpus: 6
+memory: 10GiB
+disk: 40GiB
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+mounts: []
+containerd:
+  system: false
+  user: false

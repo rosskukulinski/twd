@@ -110,9 +110,32 @@ type Env struct {
 	Exec func(args []string) (stdout, stderr string, dur time.Duration, err error)
 	// PatchFile, if set, edits a file in WorkDir (which is then remote).
 	PatchFile func(path string, edit func([]byte) []byte) error
+	// Tier, if set, is written into the agent and mcp apps' twd.jsonc
+	// ("tier": "microvm" for e2e-linux-vm).
+	Tier string
+	// OnDeployed, if set, runs right after the agent and mcp deploys.
+	OnDeployed func()
 	// OnPeers, if set, runs once the client sees the agent and mcp
 	// workload nodes (e2e-mbp measures the cross-machine path there).
 	OnPeers func(client *nettest.Node, hc *http.Client, agentIP, mcpIP string)
+	// UpArgs are extra `twd up` flags (e2e-linux: --service).
+	UpArgs []string
+	// Persistent: join nodes non-ephemeral (twd up's default; e2e-linux,
+	// so they rejoin after a service restart). The caller must then stop
+	// with `twd down --purge` (Down doesn't purge).
+	Persistent bool
+	// Slow scales every wait and latency bound (0 or 1 = as is). e2e-linux
+	// sets it for the emulated (qemu TCG) amd64 VM only; the measured
+	// numbers are recorded unscaled.
+	Slow float64
+}
+
+// tmo scales a wait or a latency bound by e.Slow.
+func (e *Env) tmo(d time.Duration) time.Duration {
+	if e.Slow > 1 {
+		return time.Duration(float64(d) * e.Slow)
+	}
+	return d
 }
 
 // Results are the measured outcome (written as JSON by e2e-mac).
@@ -315,18 +338,116 @@ func mcpCall(hc *http.Client, ip, tool string, args map[string]any) (map[string]
 	return m, nil
 }
 
+// upArgs is the `twd up` command line of this run.
+func (e *Env) upArgs() []string {
+	// --allow-sibling-egress: the agent and the MCP server share this host;
+	// check (d) needs the spawned child to reach the server over the tailnet.
+	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", e.APIKeyFile, "--yes",
+		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL, "--allow-sibling-egress"}
+	if !e.Persistent {
+		upArgs = append(upArgs, "--ephemeral")
+	}
+	if e.TSAPIURL != "" {
+		upArgs = append(upArgs, "--tsapi-url", e.TSAPIURL)
+	}
+	return append(upArgs, e.UpArgs...)
+}
+
+// RedeployAfterPurge is the user flow `twd down --purge && twd up && twd
+// deploy` on the SAME state dir, after Run and a purging Down: the agent
+// workload must deploy and its node be ready again (it was refused with
+// `bootstrap_failed: the workload node for agent is killed` before the
+// killed objects were forgotten by purge). It ends with another purging
+// `twd down`; the new node IDs are tracked for the leftover check.
+func (e *Env) RedeployAfterPurge() {
+	t, res := e.T, e.Res
+	t.Helper()
+	var up struct {
+		TenantID string `json:"tenantID"`
+	}
+	e.MustJSON(&up, e.upArgs()...)
+	var dep struct {
+		Status   string `json:"status"`
+		Endpoint struct {
+			Node     string `json:"node"`
+			MagicDNS string `json:"magicDNS"`
+			Status   string `json:"status"`
+		} `json:"endpoint"`
+		Timings map[string]float64 `json:"timingsMs"`
+	}
+	d := e.MustJSON(&dep, "deploy", filepath.Join(e.WorkDir, "agent"))
+	if dep.Status != "active" || dep.Endpoint.Status != "ready" || dep.Endpoint.MagicDNS == "" {
+		t.Fatalf("redeploy after purge: %+v", dep)
+	}
+	e.TrackObjectNodes()
+	res.Numbers["redeploy_after_purge_ready_ms"] = dep.Timings["ready"]
+	res.pass("redeploy_after_purge", fmt.Sprintf("agent %s ready again on the same state dir in %v", dep.Endpoint.MagicDNS, d.Round(time.Millisecond)))
+	var dr struct {
+		Killed []string `json:"killed"`
+		Purged int      `json:"objectsPurged"`
+	}
+	e.MustJSON(&dr, "down", "--purge")
+	if len(dr.Killed) < 1 || dr.Purged < 1 {
+		t.Fatalf("down --purge after redeploy: %+v", dr)
+	}
+	res.pass("redeploy_after_purge_down", fmt.Sprintf("%d objects killed, %d forgotten", len(dr.Killed), dr.Purged))
+}
+
+// Object is a row of `twd ls --all` (exported for harnesses that drive extra
+// phases, e.g. e2e-linux's ephemeral restart).
+type Object = object
+
+// WaitObjectReady waits until ns/name is ready with a MagicDNS name.
+func (e *Env) WaitObjectReady(ns, name string, timeout time.Duration) Object {
+	e.T.Helper()
+	return e.waitObjectReady(ns, name, timeout)
+}
+
+// FindObject returns ns/name from `twd ls --all`.
+func (e *Env) FindObject(ns, name string) (Object, bool) { return e.findObject(ns, name) }
+
+// PeerIPs returns every IPv4 the client's netmap has for magicDNS (a device
+// that was re-minted may briefly coexist with its predecessor's entry).
+func PeerIPs(n *nettest.Node, magicDNS string) []string {
+	want := strings.TrimSuffix(magicDNS, ".") + "."
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := n.LC.Status(ctx)
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, p := range st.Peer {
+		if strings.EqualFold(p.DNSName, want) && len(p.TailscaleIPs) > 0 {
+			ips = append(ips, p.TailscaleIPs[0].String())
+		}
+	}
+	return ips
+}
+
+// PeerIP waits until magicDNS is in n's netmap and returns its IPv4.
+func PeerIP(t testing.TB, n *nettest.Node, magicDNS string, timeout time.Duration) string {
+	t.Helper()
+	return peerIP(t, n, magicDNS, timeout)
+}
+
+// TrackObjectNodes records every object node ID twd reports (live or
+// killed) in Res.NodeIDs for the leftover check.
+func (e *Env) TrackObjectNodes() {
+	for _, o := range e.objects() {
+		for _, id := range []string{o.StableNodeID, o.NodeID} {
+			if id != "" && !slices.Contains(e.Res.NodeIDs, id) {
+				e.Res.NodeIDs = append(e.Res.NodeIDs, id)
+			}
+		}
+	}
+}
+
 // Run executes the scenario. Cleanup of test-created nodes is the caller's;
 // `twd down` (in Down) removes twd's own devices.
 func (e *Env) Run() {
 	t, res := e.T, e.Res
-	keyFile := e.APIKeyFile
-	// --allow-sibling-egress: the agent and the MCP server share this host;
-	// check (d) needs the spawned child to reach the server over the tailnet.
-	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", keyFile, "--yes", "--ephemeral",
-		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL, "--allow-sibling-egress"}
-	if e.TSAPIURL != "" {
-		upArgs = append(upArgs, "--tsapi-url", e.TSAPIURL)
-	}
+	upArgs := e.upArgs()
 	// Interactive mode must refuse (it would use tailscaled).
 	if _, se, _, err := e.Twd("up", "--yes"); err == nil || !strings.Contains(se, "tailnet_required") {
 		t.Fatalf("twd up without --tailnet should fail with tailnet_required: %v %s", err, se)
@@ -364,13 +485,23 @@ func (e *Env) Run() {
 		return bytes.Replace(b, []byte(`"tags": ["tag:twd-wl-agent"],`), []byte(`"tags": ["tag:twd-wl-agent"],
     "connects": ["`+TestTag+`"],`), 1)
 	}
-	if e.PatchFile != nil {
-		if err := e.PatchFile(tj, addConnects); err != nil {
-			t.Fatalf("patch %s: %v", tj, err)
+	patch := func(path string, edit func([]byte) []byte) {
+		if e.PatchFile != nil {
+			if err := e.PatchFile(path, edit); err != nil {
+				t.Fatalf("patch %s: %v", path, err)
+			}
+		} else {
+			b, _ := os.ReadFile(path)
+			os.WriteFile(path, edit(b), 0o644)
 		}
-	} else {
-		b, _ := os.ReadFile(tj)
-		os.WriteFile(tj, addConnects(b), 0o644)
+	}
+	patch(tj, addConnects)
+	if e.Tier != "" {
+		for _, d := range []string{agentDir, mcpDir} {
+			patch(filepath.Join(d, "twd.jsonc"), func(b []byte) []byte {
+				return bytes.Replace(b, []byte("{"), []byte("{\n  \"tier\": \""+e.Tier+"\","), 1)
+			})
+		}
 	}
 
 	// Preflight refuses hello (tailnet.connects tag:db has no grant).
@@ -403,6 +534,9 @@ func (e *Env) Run() {
 	res.Numbers["deploy_mcp_cli_ms"] = msOf(d)
 	res.Numbers["deploy_mcp_ready_ms"] = mcp.Timings["ready"]
 	res.pass("deploy", fmt.Sprintf("agent %s, mcp %s", agent.Endpoint.MagicDNS, mcp.Endpoint.MagicDNS))
+	if e.OnDeployed != nil {
+		e.OnDeployed()
+	}
 
 	client := e.NewNode("client")
 	echo := e.NewNode("echo")
@@ -413,10 +547,10 @@ func (e *Env) Run() {
 	clientID, clientName := string(cst.Self.ID), strings.TrimSuffix(cst.Self.DNSName, ".")
 	est, _ := echo.LC.StatusWithoutPeers(context.Background())
 	echoName := strings.TrimSuffix(est.Self.DNSName, ".")
-	hc := client.HTTPClient(45 * time.Second)
+	hc := client.HTTPClient(e.tmo(45 * time.Second))
 
-	agentIP := peerIP(t, client, agent.Endpoint.MagicDNS, 60*time.Second)
-	mcpIP := peerIP(t, client, mcp.Endpoint.MagicDNS, 60*time.Second)
+	agentIP := peerIP(t, client, agent.Endpoint.MagicDNS, e.tmo(60*time.Second))
+	mcpIP := peerIP(t, client, mcp.Endpoint.MagicDNS, e.tmo(60*time.Second))
 	if e.OnPeers != nil {
 		e.OnPeers(client, hc, agentIP, mcpIP)
 	}
@@ -429,9 +563,9 @@ func (e *Env) Run() {
 	}
 	res.Numbers["agent_first_request_ms"] = msOf(r.Dur)
 	r0 := r
-	ao := e.waitObjectReady("SupportAgent", "a1", 90*time.Second)
+	ao := e.waitObjectReady("SupportAgent", "a1", e.tmo(90*time.Second))
 	res.Numbers["first_object_node_ready_ms"] = msOf(time.Since(first))
-	aoIP := peerIP(t, client, ao.MagicDNS, 60*time.Second)
+	aoIP := peerIP(t, client, ao.MagicDNS, e.tmo(60*time.Second))
 	r = do(hc, "GET", "http://"+aoIP+"/", nil)
 	if r.Code != 200 || get(r.Body, "caller", "nodeId") != clientID || (e.ClientTagged && !slices.Contains(anyStrings(get(r.Body, "caller", "tags")), TestTag)) {
 		t.Fatalf("(a) agent via its own node: %s", r)
@@ -472,14 +606,14 @@ func (e *Env) Run() {
 		t.Fatalf("(d) spawn: %s", r)
 	}
 	res.Numbers["spawn_ready_ms"] = msOf(r.Dur)
-	co := e.waitObjectReady("LookupAgent", "c1", 60*time.Second)
+	co := e.waitObjectReady("LookupAgent", "c1", e.tmo(60*time.Second))
 	var caps map[string]any
 	json.Unmarshal(co.Caps, &caps)
 	if co.Parent != ao.ID || co.NodeID == "" || co.NodeID == ao.NodeID || co.MagicDNS == ao.MagicDNS ||
 		!slices.Contains(co.Tags, "tag:twd-agent-support-sub") || fmt.Sprint(get(caps, MCPCap, "tools")) != "[lookup_order]" {
 		t.Fatalf("(d) child object: %+v (parent %s)", co, ao.ID)
 	}
-	coIP := peerIP(t, client, co.MagicDNS, 60*time.Second)
+	coIP := peerIP(t, client, co.MagicDNS, e.tmo(60*time.Second))
 	if r := do(hc, "GET", "http://"+coIP+"/", nil); r.Code != 200 || get(r.Body, "lookup") != "c1" {
 		t.Fatalf("(d) child via its own node: %s", r)
 	}
@@ -545,20 +679,20 @@ func (e *Env) Run() {
 	res.Numbers["kill_push_ms"] = kr.Result.PushMS
 	// The cascade covers the agent, its LookupAgent child and the narrowed
 	// SupportAgent child from check (d).
-	if d > time.Second || len(kr.Result.Killed) != 3 || len(kr.Result.Pushed) != 3 {
+	noIP := peerIP(t, client, no.MagicDNS, e.tmo(60*time.Second))
+	if d > e.tmo(time.Second) || len(kr.Result.Killed) != 3 || len(kr.Result.Pushed) != 3 {
 		t.Fatalf("(e) kill: %v %+v", d, kr)
 	}
-	noIP := peerIP(t, client, no.MagicDNS, 60*time.Second)
 	var worst time.Duration
 	for _, tgt := range []struct{ name, ip string }{{"agent", aoIP}, {"sub-agent", coIP}, {"narrowed sub-agent", noIP}} {
-		r := do(client.HTTPClient(10*time.Second), "GET", "http://"+tgt.ip+"/", nil)
-		if r.Err != nil || r.Code != 410 || get(r.Body, "code") != "object_killed" || r.Dur > time.Second {
+		r := do(client.HTTPClient(e.tmo(10*time.Second)), "GET", "http://"+tgt.ip+"/", nil)
+		if r.Err != nil || r.Code != 410 || get(r.Body, "code") != "object_killed" || r.Dur > e.tmo(time.Second) {
 			t.Fatalf("(e) new request to killed %s: %s after %v", tgt.name, r, r.Dur)
 		}
 		worst = max(worst, r.Dur)
 	}
 	r = do(hc, "GET", "http://"+agentIP+"/?agent=a1", nil)
-	if r.Err != nil || r.Code != 410 || r.Dur > time.Second {
+	if r.Err != nil || r.Code != 410 || r.Dur > e.tmo(time.Second) {
 		t.Fatalf("(e) via workload after kill: %s after %v", r, r.Dur)
 	}
 	res.Numbers["killed_new_request_ms"] = msOf(worst)
@@ -697,3 +831,6 @@ func Leftovers(ctx context.Context, api *tsapi.Client, res *Results) (devices, k
 	}
 	return devices, keys
 }
+
+// Objects lists every object (twd ls --all).
+func (e *Env) Objects() []Object { return e.objects() }

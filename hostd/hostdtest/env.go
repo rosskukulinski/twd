@@ -15,6 +15,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd"
 	"github.com/rosskukulinski/twd/netd/nettest"
 )
@@ -33,10 +34,13 @@ type Options struct {
 	VM          sandbox.Backend
 	DefaultTier string
 	VMDebug     bool
-	// Sandbox is hostd's process-tier sandbox ("" = none, "auto", "seatbelt").
+	// Sandbox is hostd's process-tier sandbox ("" = none unless
+	// $TWD_TEST_SANDBOX is set, "auto", "seatbelt", "landlock", "none").
 	Sandbox string
-	// InsecureSharedHost is passed to hostd (RT-08).
+	// InsecureSharedHost: see hostd.Config.
 	InsecureSharedHost bool
+	// HostSockets: see hostd.Config.
+	HostSockets func() procsb.HostSockets
 	// AllowSiblingEgress is passed to hostd (same-host object hairpins).
 	AllowSiblingEgress bool
 }
@@ -100,7 +104,7 @@ func Start(t testing.TB, o Options) *Env {
 		HostID: "h1", Mgmt: hc, DataDir: filepath.Join(dir, "data"), RunDir: filepath.Join(dir, "run"),
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
-		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: o.Sandbox, InsecureSharedHost: o.InsecureSharedHost, AllowSiblingEgress: o.AllowSiblingEgress,
+		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, HostSockets: o.HostSockets, AllowSiblingEgress: o.AllowSiblingEgress,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -213,4 +217,13 @@ func (e *Env) WaitObjectErr(workload, class, name string, timeout time.Duration)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+}
+
+// testSandbox applies $TWD_TEST_SANDBOX (e.g. "auto": run a whole test
+// suite with hostd's default sandbox) when a test doesn't pick one.
+func testSandbox(s string) string {
+	if s == "" {
+		return os.Getenv("TWD_TEST_SANDBOX")
+	}
+	return s
 }

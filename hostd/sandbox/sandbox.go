@@ -39,7 +39,31 @@ type Spec struct {
 	Handlers map[uint16]http.Handler
 	// Debug enables guest diagnostics (connectivity probes).
 	Debug bool
-	Log   *slog.Logger
+	// Volume, if set, is the workload's persistent DO storage: attached
+	// to the guest as a block device and mounted at proto.DODir.
+	Volume *Volume
+	Log    *slog.Logger
+}
+
+// Volume is a persistent, encrypted-at-rest block volume for one
+// (tenant, workload). The image lives on the host (Path); the backend
+// creates it (sparse, SizeMiB) if it is missing. Key is the volume's data
+// key from mgmt custody: it stays on the host (dm-crypt there); the guest
+// sees only plaintext ext4.
+type Volume struct {
+	Path    string
+	Name    string // "tenant/workload"
+	Epoch   int64  // the namespace lease epoch (fencing, ADR-011)
+	Key     []byte
+	SizeMiB int
+}
+
+// String never prints the key.
+func (v *Volume) String() string {
+	if v == nil {
+		return "<nil>"
+	}
+	return "sandbox.Volume{" + v.Name + "}"
 }
 
 // Info is a sandbox's boot accounting.
@@ -50,6 +74,27 @@ type Info struct {
 	// call (netns, TAP, stack, VMM, API calls, boot, workerd).
 	Boot, Ready, Total time.Duration
 	GuestUptimeAtReady time.Duration
+	// Jail is how the VMM is confined (microVM tier: jailer chroot,
+	// uid/gid, cgroup limits, seccomp).
+	Jail *Jail `json:",omitempty"`
+	// Console is the host file with the guest's serial console (guestd and
+	// workerd output).
+	Console string `json:",omitempty"`
+	// HugePages: guest RAM is backed by 2 MiB pages.
+	HugePages bool
+	// Volume: the persistent DO volume ("" if none); VolumeNew if it was
+	// created (formatted) by this boot; VolumeAttachMS is the host-side
+	// attach time (loop + dm-crypt open [+ format]).
+	Volume         string  `json:",omitempty"`
+	VolumeNew      bool    `json:",omitempty"`
+	VolumeAttachMS float64 `json:",omitempty"`
+}
+
+// Jail describes the VMM's confinement.
+type Jail struct {
+	ID, Chroot, Cgroup, CPUMax, Seccomp, Netns string
+	UID, GID                                   int
+	MemMax                                     int64
 }
 
 // VM is one running sandbox.

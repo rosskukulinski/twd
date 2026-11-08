@@ -10,10 +10,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"testing"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/internal/policy"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd/nettest"
 )
 
@@ -367,14 +371,20 @@ func (m *MultiEnv) Run() {
 			}
 		}
 	}
-	if m.A.sandbox == "seatbelt" && m.B.sandbox == "seatbelt" {
+	if sb := m.A.sandbox; sb == m.B.sandbox && (sb == hostd.SandboxSeatbelt || sb == hostd.SandboxLandlock) {
 		mgmtSock := st.MgmtSocket
 		for _, src := range m.tenants() {
 			dst := m.other(src)
 			dstState := filepath.Join(hostData, "tenants", dst.TenantID)
 			nodeFile := firstFile(filepath.Join(dstState, "nodes", dst.agent.ID))
+			// Run a command under src's live profile (Seatbelt:
+			// sandbox-exec; Landlock: hostd's procsb launcher).
 			probe := func(args ...string) error {
-				return exec.Command("/usr/bin/sandbox-exec", append([]string{"-f", src.profile}, args...)...).Run()
+				cmd, err := hostd.SandboxCommand(src.profile, args...)
+				if err != nil {
+					t.Fatalf("(d) %v", err)
+				}
+				return cmd.Run()
 			}
 			denied := []struct{ what, cmd, path string }{
 				{"tenant " + dst.Key + " state dir", "/bin/ls", dstState},
@@ -411,12 +421,17 @@ func (m *MultiEnv) Run() {
 			if err := probe("/bin/ls", src.hostDOStorage); err != nil {
 				t.Fatalf("(d) tenant %s's sandbox can't list its own DO storage: %v", src.Key, err)
 			}
-			res.pass("d_state_isolation_"+src.Key, fmt.Sprintf("tenant dirs 0700; workerd pid %d under Seatbelt: %s; own DO storage readable", src.hostPID, strings.Join(got, ", ")))
+			name := "Seatbelt"
+			if sb == hostd.SandboxLandlock {
+				name = "Landlock"
+				got = append(got, landlockProbes(t, src.profile, dst.hostPID, dst.hostInstDir, filepath.Join(filepath.Dir(src.hostInstDir), "hostd.sock"))...)
+			}
+			res.pass("d_state_isolation_"+src.Key, fmt.Sprintf("tenant dirs 0700; workerd pid %d under %s: %s; own DO storage readable", src.hostPID, name, strings.Join(got, ", ")))
 		}
 	} else if m.RequireSandbox {
 		t.Fatalf("(d) workerds not sandboxed: A %q B %q", m.A.sandbox, m.B.sandbox)
 	} else {
-		res.pass("d_state_isolation", "tenant dirs 0700 (no Seatbelt on this OS: same-uid processes are not confined)")
+		res.pass("d_state_isolation", "tenant dirs 0700 (no process sandbox on this host: same-uid processes are not confined)")
 	}
 
 	// Record the IDs twd created in each tailnet (leftover checks).
@@ -540,3 +555,35 @@ func firstFile(dir string) string {
 
 // Down runs `twd down` (purges both tenants' objects and devices).
 func (m *MultiEnv) Down() { m.Env.Down() }
+
+// landlockProbes are the Linux-only (d) checks under a workload's Landlock
+// profile: the other tenant's workerd can't be ptraced or read, its egress
+// socket and hostd's push socket refuse the peer, and raw TCP fails.
+func landlockProbes(t testing.TB, profile string, dstPID int, dstInstDir, hostdSock string) []string {
+	t.Helper()
+	checks := []struct{ what, op, arg string }{
+		{"ptrace of the other tenant's workerd", procsb.ProbePtrace, strconv.Itoa(dstPID)},
+		{"its memory", procsb.ProbeVMRead, strconv.Itoa(dstPID)},
+		{"its /proc environ", procsb.ProbeRead, "/proc/" + strconv.Itoa(dstPID) + "/environ"},
+		{"its egress socket", procsb.ProbeConnectUnix, filepath.Join(dstInstDir, "egress-wl.sock")},
+		{"hostd's push socket", procsb.ProbeConnectUnix, hostdSock},
+		{"TCP to 1.1.1.1:443", procsb.ProbeConnectTCP, "1.1.1.1:443"},
+	}
+	var got []string
+	for _, c := range checks {
+		if c.arg == "" || dstInstDir == "" && c.op == procsb.ProbeConnectUnix && strings.HasSuffix(c.arg, "egress-wl.sock") {
+			continue
+		}
+		cmd, err := procsb.ProbeCommand(profile, c.op, c.arg)
+		if err != nil {
+			t.Fatalf("(d) %v", err)
+		}
+		out, _ := cmd.Output()
+		if r := strings.TrimSpace(string(out)); r == "ok" {
+			t.Fatalf("(d) Landlock profile %s allows %s (%s %s)", profile, c.what, c.op, c.arg)
+		} else {
+			got = append(got, c.what+" denied ("+r+")")
+		}
+	}
+	return got
+}

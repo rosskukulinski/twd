@@ -22,6 +22,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/internal/policy"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
@@ -158,10 +159,12 @@ func TestCLIEndToEnd(t *testing.T) {
 	})
 	e.Run()
 	e.Down()
+	// `twd down --purge && twd up && twd deploy` on the same state dir.
+	e.RedeployAfterPurge()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	devs, keys := cliflow.Leftovers(ctx, &tsapi.Client{Tailnet: "ttest.ts.net", APIKey: "fake", BaseURL: api.URL}, res)
-	if len(res.NodeIDs) < 4 || len(devs) > 0 || len(keys) > 0 {
+	if len(res.NodeIDs) < 5 || len(devs) > 0 || len(keys) > 0 {
 		t.Fatalf("after twd down: %d node IDs tracked, leftover devices %v, keys %v", len(res.NodeIDs), devs, keys)
 	}
 	if fts.setPolicy != 0 {
@@ -245,7 +248,7 @@ func TestCLIMultiTenant(t *testing.T) {
 			}}
 	}
 	m := &cliflow.MultiEnv{Env: &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, TSAPIURL: api.URL, Prefix: "twd-m-",
-		Res: cliflow.NewResults("hermetic-multi", "a+b")}, A: tenant("a"), B: tenant("b"), RequireSandbox: runtime.GOOS == "darwin"}
+		Res: cliflow.NewResults("hermetic-multi", "a+b")}, A: tenant("a"), B: tenant("b"), RequireSandbox: sandboxAvailable()}
 	t.Cleanup(func() {
 		if os.Getenv("TWD_KEEP") != "" {
 			t.Logf("TWD_KEEP: state left running in %s", state)
@@ -296,9 +299,40 @@ func TestDoctor(t *testing.T) {
 		got[c.Name] = c.Status
 	}
 	want := map[string]string{"binaries": "ok", "workerd": "ok", "bundler": "ok", "twd_home_writable": "ok",
-		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "node_egress": "skip", "system_tailscaled_not_used": "ok"}
-	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb == hostd.SandboxSeatbelt {
-		want["sandbox"] = "ok" // the Seatbelt probe ran and enforced a deny
+		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "node_egress": "skip", "system_tailscaled_not_used": "ok"}
+	if runtime.GOOS == "linux" {
+		want["host_sockets"] = "ok"
+		if hs := procsb.ScanHostSockets(); len(hs.Hard) > 0 {
+			want["host_sockets"] = "warn"
+		} else if hs.Tailscaled != "" {
+			want["host_sockets"] = "info" // blocked for workloads by seccomp (twd is not up here)
+			if !sandboxAvailable() {
+				want["host_sockets"] = "warn"
+			}
+		}
+	}
+	if sandboxAvailable() {
+		want["sandbox"] = "ok" // the Seatbelt / Landlock probe ran and enforced a deny
+	} else if runtime.GOOS == "linux" {
+		want["sandbox"] = "warn" // Linux without Landlock: loud warning
+	}
+	if runtime.GOOS == "linux" {
+		// No microVM guest next to this test build: the tier is off (warn).
+		want["microvm"] = "warn"
+	}
+	if runtime.GOOS == "linux" {
+		// Linux host checks: present, never failing on a supported host
+		// (kvm/firecracker/microvm_tier may skip, systemd/landlock may warn).
+		for _, n := range []string{"glibc", "kernel", "landlock", "user_namespaces", "kvm", "firecracker", "cgroups_v2", "systemd", "microvm_tier"} {
+			st, ok := got[n]
+			if !ok || st == "fail" {
+				t.Fatalf("doctor on linux: %s = %q: %v", n, st, r.Checks)
+			}
+			delete(got, n)
+		}
+		if st := r.Checks[1]; st.Name != "glibc" || st.Status != "ok" {
+			t.Fatalf("doctor on linux: glibc must run before workerd and be ok: %+v", st)
+		}
 	}
 	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)
@@ -312,4 +346,11 @@ func TestDoctor(t *testing.T) {
 	if _, se, _, err := e.Twd("doctor", "--tailnet", "example.ts.net", "--api-key-file", bad); err == nil || !strings.Contains(se, "doctor_failed") {
 		t.Fatalf("doctor with a bad key file: %v %s", err, se)
 	}
+}
+
+// sandboxAvailable: this host runs process-tier workloads sandboxed
+// (Seatbelt on macOS, Landlock on Linux).
+func sandboxAvailable() bool {
+	sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto)
+	return sb == hostd.SandboxSeatbelt || sb == hostd.SandboxLandlock
 }

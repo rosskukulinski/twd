@@ -90,15 +90,30 @@ undici, so the template uses `@twd/node` `fetch` explicitly.
 
 ### Enforcement boundary (read this before sharing a host)
 
-**Only an OS sandbox that confines the process's network, i.e. Linux
-Landlock (ABI ≥ 4, pinning the process's TCP connects to the proxy port),
-or a microVM, makes the egress proxy an enforcement boundary.** Everywhere
-else (macOS Seatbelt, Linux without Landlock, `-sandbox none`) egress
-through the proxy is **cooperative**: a malicious or buggy Node app can
-ignore the env proxies, override the global dispatcher, or open raw sockets
-to loopback, the LAN, cloud metadata, the internet or other local services,
-because it is an ordinary process with the host user's network (red-team
-finding RT-08). What the process tier does guarantee even then:
+**On Linux with Landlock (ABI ≥ 4, kernel 6.7+; Ubuntu 24.04's 6.8 has
+ABI 4), egress through the proxy is enforced, not cooperative.** twd-hostd
+starts every Node app under its Landlock sandbox (`internal/procsb`, L2):
+the app may bind and connect only its own app port (TCP listen mode) and
+connect only to its egress proxy's port. Every other TCP `connect()`, to
+loopback, the LAN or the internet, fails with `EACCES` before a packet is
+sent, and a seccomp filter refuses UDP, ICMP, raw, MPTCP and SCTP sockets.
+So the undici pitfall above, an own dispatcher, or `net.connect` can no
+longer reach anything except through netd's proxy, which attributes it to
+this deployment and applies the ADR-019 guard. `make test-node` checks this
+from inside the app: `net.connect` to 1.1.1.1:80 and :443 and to a
+host-loopback listener all fail (`EACCES`); its own port works; egress via
+the proxy is attributed as before (measured on Ubuntu 24.04, kernel 6.8,
+ABI 4). Unix sockets: on ABI < 9 Landlock can't refuse a connect to a
+pathname socket, so twd's own sockets (hostd's, mgmt's, the instance
+egress sockets) refuse sandboxed peers themselves; see INSTALL.md.
+
+**Elsewhere it is cooperative.** On macOS (Seatbelt confines files and unix
+sockets, not TCP) and on Linux kernels with Landlock ABI < 4, a malicious or
+buggy Node app can ignore the env proxies, override the global dispatcher,
+or open raw sockets to loopback, the LAN, the internet or other local
+services, because it is an ordinary process with the host user's network.
+`twd doctor` says which case applies. What the process tier guarantees
+everywhere:
 - the app holds no tailnet key;
 - it can't speak as any node except through the proxy, which attributes
   everything to this deployment;
@@ -120,14 +135,32 @@ whose caps were narrowed by its node certificate (RT-01).
 hostd makes the state visible and refuses the dangerous combination:
 - `twd status` and `GET /v0/status` show `egress unenforced` for every
   Node-tier workload on such a host; `twd doctor` warns (`node_egress`);
-- a Node-tier deployment on a host that **serves other tenants** fails with
-  `egress_unenforced` unless the operator starts the host with
+- a Node-tier deployment on a host **without any process sandbox** that
+  serves other tenants fails with `egress_unenforced` (and the general
+  shared-host rule, `sandbox_unavailable`, applies to every process-tier
+  workload there) unless the operator starts the host with
   `twd up --insecure-shared-host` (`twd-hostd -insecure-shared-host`).
+  Under Seatbelt or Landlock the deployment runs; status stays honest about
+  whether egress is enforced (`enforced` only under Landlock).
 
-Running Node apps inside the Firecracker guest is not built yet; see
-STATUS.md M9. The Landlock sandbox for the Linux process tier lands on the
-`l2-landlock` branch; when a host runs under it, status reports
-`egress enforced`.
+The strongest boundary is the **microVM tier**. There, the guest's only
+network is hostd's gVisor gateway, which exposes only the egress, workload
+and host-API ports, and every other SYN is RST'd (M8). Running Node apps
+inside the Firecracker guest is not built yet; see STATUS.md M9.
+
+### Linux sandbox limits for the app's own processes
+
+Under the Linux sandbox (Landlock + seccomp) the app runs in its own process
+group and may send signals only to **itself (`process.pid`) or its own
+process group** (`process.kill(0, …)` / `-pgid`), never to hostd, mgmt or
+other tenants' processes. The filter names the app's pid, so this reaches
+**child processes** too: a child can't `raise()`/`abort()` or signal its own
+pid, and the parent can't signal a child *by pid* (`child.kill()` fails
+with `EPERM`); signalling the group works. Child processes also get no
+`/proc/self` of their own. Apps in TCP listen mode (the default) can't open
+any AF_UNIX socket; `listen: "unix"` apps keep AF_UNIX, and a host with
+such an app and a reachable system tailscaled socket is not shareable (see
+INSTALL.md `host_sockets`).
 
 ## Supervision and logs
 

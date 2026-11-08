@@ -59,6 +59,25 @@ export class Probe extends DurableObject {
       }
       case "/stream":
         return stream();
+      // DO storage (KV API and SQLite): persistence across VM restarts and
+      // redeploys (L3), and write latency.
+      case "/kv/put":
+        await this.ctx.storage.put(q("k"), q("v"));
+        return Response.json({ ok: true });
+      case "/kv/get":
+        return Response.json({ k: q("k"), v: (await this.ctx.storage.get(q("k"))) ?? null });
+      case "/sql/put": {
+        const sql = this.ctx.storage.sql;
+        sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)");
+        sql.exec("INSERT OR REPLACE INTO kv VALUES (?, ?)", q("k"), q("v"));
+        return Response.json({ ok: true });
+      }
+      case "/sql/get": {
+        const sql = this.ctx.storage.sql;
+        sql.exec("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)");
+        const rows = sql.exec("SELECT v FROM kv WHERE k = ?", q("k")).toArray();
+        return Response.json({ k: q("k"), v: rows.length ? rows[0].v : null });
+      }
       case "/env":
         return Response.json({ env: Object.keys(this.env).sort(), props: this.ctx.props ?? null, hasTailnet: !!this.ctx.tailnet });
       case "/spawn": {

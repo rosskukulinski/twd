@@ -1,0 +1,40 @@
+{
+  "run": "l3-reboot-9cb2a7",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T08:23:04-08:00",
+  "checks": {
+    "reboot1": "PASS helper back via systemd (4242 ms after kernel boot), twd up 0.6 s, object serving 17.7 s later on the same node n5NiQBJn6621CNTRL / 100.75.86.124 (no new device), all 12 SQLite writes present, volume re-opened: type: LUKS2 cipher: aes-xts-plain64 volume attached\" vm=twds-0 uid=501 name=i1 volume=tn_tail7906d5/agent epoch=1 formatted=false"
+  },
+  "numbers": {
+    "reboot1_boot_to_helper_active_ms": 4242.049,
+    "reboot1_boot_to_ssh_ms": 5310,
+    "reboot1_limactl_start_ms": 6829.544,
+    "reboot1_stop_ms": 2586.391,
+    "reboot1_twd_up_ms": 615.271,
+    "reboot1_up_to_object_serving_ms": 17678.353,
+    "reboot1_vm_ready_ms": 867.222,
+    "reboot1_volume_attach_ms": 22.82,
+    "reboot2_boot_to_helper_active_ms": 4261.633,
+    "reboot2_boot_to_ssh_ms": 5330,
+    "reboot2_limactl_start_ms": 6886.492,
+    "reboot2_stop_ms": 53.277,
+    "up_first_ms": 596.382
+  },
+  "notes": [
+    "before reboots: object boot1 node n5NiQBJn6621CNTRL (twd-l3r-9cb2a7-supportagent-toel64im26.tail7906d5.ts.net, 100.75.86.124), 2 twd devices of this run, SQLite calls=11",
+    "reboot1 (clean limactl stop): helper active 4242 ms after kernel boot; huge pages 1024",
+    "reboot2 (limactl stop --force (power cut)): helper active 4262 ms after kernel boot; huge pages 1024"
+  ],
+  "cleanup": {
+    "devices_left": 0,
+    "twd_devices_left_after_down": 2,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null,
+    "vm_clean": true
+  },
+  "nodeIDs": [
+    "nCBhAPAMGT11CNTRL",
+    "n5NiQBJn6621CNTRL"
+  ],
+  "keyIDs": null
+}

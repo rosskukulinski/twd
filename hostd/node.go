@@ -13,10 +13,11 @@ package hostd
 // Both secrets (the caller-signing key and the proxy credential) are fresh
 // for every process start and live only in that process's environment.
 //
-// Enforcement caveat: in the process tier the proxy is cooperative. A
-// malicious app can open raw sockets (loopback, LAN, internet) and ignore
-// the env proxies; the microVM tier's gVisor gateway is the enforcement
-// boundary (see docs/node-tier.md).
+// Enforcement: on Linux with Landlock ABI ≥ 4 the app runs under the procsb
+// sandbox, which allows TCP only to its own port and the egress proxy, so
+// the proxy is enforced. Elsewhere (macOS, older kernels) it is
+// cooperative: a malicious app can open raw sockets (loopback, LAN,
+// internet) and ignore the env proxies (see docs/node-tier.md).
 
 import (
 	"bufio"
@@ -125,7 +126,7 @@ func (h *Host) startNodeInstance(w *workload, depID string, app *bundle.App, n i
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
+	dir := h.instanceDir(n)
 	if err := os.MkdirAll(filepath.Join(dir, "tmp"), 0o700); err != nil {
 		return nil, err
 	}
@@ -543,6 +544,7 @@ type NodeInfo struct {
 	PID       int
 	Starts    int
 	Addr      string // the app's listen address (127.0.0.1:port or socket)
+	Listen    string // "tcp" | "unix"
 	ProxyAddr string // the egress proxy (credentials are not exposed)
 	StartedAt time.Time
 	// ReadyMs is the first start's process spawn → health answered.
@@ -559,6 +561,10 @@ func (inst *instance) nodeInfo() *NodeInfo {
 	}
 	np.mu.Lock()
 	defer np.mu.Unlock()
-	return &NodeInfo{PID: np.pid, Starts: np.starts, Addr: np.addr, ProxyAddr: np.proxy.Addr().String(), StartedAt: np.started,
+	listen := np.listen
+	if listen == "" {
+		listen = "tcp"
+	}
+	return &NodeInfo{PID: np.pid, Starts: np.starts, Addr: np.addr, Listen: listen, ProxyAddr: np.proxy.Addr().String(), StartedAt: np.started,
 		ReadyMs: float64(np.readyDur.Microseconds()) / 1000, LogFile: np.logPath, DataDir: np.dataDir, LastExit: np.lastExit}
 }

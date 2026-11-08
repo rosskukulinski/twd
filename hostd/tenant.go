@@ -150,6 +150,20 @@ func (k *keySource) AuthKey(ctx context.Context, req netd.KeyRequest) (string, e
 	if o == nil || w == nil {
 		return "", errors.New("hostd: no object for node " + req.ObjectID)
 	}
+	if req.Remint {
+		// netd's rejoin from saved state landed in NeedsLogin: control no
+		// longer knows the device. mgmt moves the object back to pending
+		// (clearing its node IDs) and queues a mint under the same hostname;
+		// the credential below is that new key, and awaitNode reports the
+		// new node ID with /ready.
+		h.log.Warn("saved node state rejected by control; re-minting under the same hostname", "object", o.ID, "hostname", o.Hostname)
+		rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+		err := h.mgmt.Remint(rctx, o.ID, mgmtapi.RemintRequest{Epoch: w.epochNow(), Reason: "saved node state rejected by control (NeedsLogin)"})
+		rcancel()
+		if err != nil {
+			return "", fmt.Errorf("hostd: remint %s: %w", o.ID, err)
+		}
+	}
 	backoff := 100 * time.Millisecond
 	for {
 		c, err := h.mgmt.Credential(ctx, o.ID, w.epochNow())

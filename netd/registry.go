@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 )
@@ -211,6 +213,7 @@ type Object struct {
 	queued   time.Time
 	joinDur  time.Duration
 	rejoined bool
+	reminted bool // saved state was rejected by control; joined with a fresh key
 	ln       net.Listener
 	httpSrv  *http.Server
 	tombSrv  *http.Server // after a kill with Tombstone: answers object_killed
@@ -235,6 +238,7 @@ type ObjectInfo struct {
 	Tags      []string `json:"tags,omitempty"`
 	Ephemeral bool     `json:"ephemeral"`
 	Rejoined  bool     `json:"rejoined"`
+	Reminted  bool     `json:"reminted,omitempty"`
 	JoinMS    float64  `json:"joinMs,omitempty"`
 	Flows     int      `json:"flows"`
 }
@@ -367,6 +371,14 @@ func (r *Registry) join(o *Object) {
 	}
 }
 
+// errSavedStateRejected: a rejoin from saved node state left the backend in
+// NeedsLogin (control expired or removed the device).
+var errSavedStateRejected = errors.New("saved node state rejected by control (NeedsLogin)")
+
+// needsLoginGrace is how long NeedsLogin must persist during a rejoin before
+// it counts as a rejection (the backend may pass through it briefly).
+var needsLoginGrace = 2 * time.Second
+
 func (o *Object) start(ctx context.Context) error {
 	r := o.reg
 	if err := os.MkdirAll(o.dir, 0o700); err != nil {
@@ -388,45 +400,34 @@ func (o *Object) start(ctx context.Context) error {
 	if err := os.WriteFile(filepath.Join(o.dir, "object.json"), mb, 0o600); err != nil {
 		return err
 	}
-	logf := func(string, ...any) {}
-	if r.cfg.TSNetLogs {
-		logf = tsnetLogf(r.log, o.id)
-	}
-	srv := &tsnet.Server{
-		Hostname:      o.hostname,
-		Dir:           o.dir,
-		ControlURL:    r.cfg.ControlURL,
-		AuthKey:       key,
-		Ephemeral:     o.ephemeral,
-		AdvertiseTags: o.tags,
-		Logf:          logf,
-		UserLogf:      logf,
-	}
-	o.mu.Lock()
-	if o.state != StatePending {
-		o.mu.Unlock()
-		return errors.New("killed while joining")
-	}
-	o.srv = srv
-	o.mu.Unlock()
-
 	st := time.Now()
-	if _, err := srv.Up(ctx); err != nil {
-		return fmt.Errorf("up %s: %w", o.hostname, err)
+	lc, sst, err := o.up(ctx, key, rejoin)
+	reminted := false
+	if errors.Is(err, errSavedStateRejected) {
+		// The device is gone from control (an ephemeral node that was
+		// offline during a restart, or one an admin removed). Drop the
+		// saved state and join again as the same hostname with a fresh key
+		// (KeyRequest.Remint lets mgmt-backed sources reopen the object).
+		if r.cfg.Keys == nil {
+			return err
+		}
+		r.log.Warn("saved node state rejected by control; re-minting under the same hostname", "object", o.id, "hostname", o.hostname, "ephemeral", o.ephemeral)
+		o.dropSavedState()
+		k, kerr := r.cfg.Keys.AuthKey(ctx, KeyRequest{ObjectID: o.id, Hostname: o.hostname, Tags: o.tags, Ephemeral: o.ephemeral, Remint: true})
+		if kerr != nil {
+			return fmt.Errorf("re-mint after %v: %w", err, kerr)
+		}
+		rejoin, reminted = false, true
+		lc, sst, err = o.up(ctx, k, false)
+	}
+	if err != nil {
+		return err
 	}
 	joinDur := time.Since(st)
-	lc, err := srv.LocalClient()
-	if err != nil {
-		return err
-	}
-	// ADR-019 rule 4: without this every LocalClient call on macOS execs lsof
-	// and sends the *system* Tailscale.app's token (~25 ms/call).
-	lc.OmitAuth = true
+	o.mu.Lock()
+	srv := o.srv
+	o.mu.Unlock()
 	ip4, ip6 := srv.TailscaleIPs()
-	sst, err := lc.StatusWithoutPeers(ctx)
-	if err != nil {
-		return err
-	}
 	ln, err := srv.Listen("tcp", fmt.Sprintf(":%d", r.cfg.IngressPort))
 	if err != nil {
 		return err
@@ -450,7 +451,7 @@ func (o *Object) start(ctx context.Context) error {
 		ln.Close()
 		return errors.New("killed while joining")
 	}
-	o.lc, o.ip4, o.ip6, o.joinDur, o.rejoined = lc, ip4, ip6, joinDur, rejoin
+	o.lc, o.ip4, o.ip6, o.joinDur, o.rejoined, o.reminted = lc, ip4, ip6, joinDur, rejoin, reminted
 	if sst.Self != nil {
 		o.nodeID, o.dnsName = sst.Self.ID, sst.Self.DNSName
 	}
@@ -469,8 +470,122 @@ func (o *Object) start(ctx context.Context) error {
 	r.mu.Unlock()
 	go hs.Serve(o.ln)
 	r.log.Info("object ready", "object", o.id, "hostname", o.hostname, "ip", ip4.String(),
-		"node", string(o.nodeID), "join_ms", joinDur.Milliseconds(), "rejoined", rejoin)
+		"node", string(o.nodeID), "join_ms", joinDur.Milliseconds(), "rejoined", rejoin, "reminted", reminted)
 	return nil
+}
+
+// up builds the tsnet server (stored in o.srv so teardown can close it) and
+// brings it up. With no key (a rejoin), it also watches the IPN bus:
+// tsnet.Up waits for Running and never reacts to NeedsLogin, which is where
+// a rejected saved state ends up for good; that returns errSavedStateRejected.
+func (o *Object) up(ctx context.Context, key string, rejoin bool) (*local.Client, *ipnstate.Status, error) {
+	r := o.reg
+	logf := func(string, ...any) {}
+	if r.cfg.TSNetLogs {
+		logf = tsnetLogf(r.log, o.id)
+	}
+	srv := &tsnet.Server{
+		Hostname:      o.hostname,
+		Dir:           o.dir,
+		ControlURL:    r.cfg.ControlURL,
+		AuthKey:       key,
+		Ephemeral:     o.ephemeral,
+		AdvertiseTags: o.tags,
+		Logf:          logf,
+		UserLogf:      logf,
+	}
+	o.mu.Lock()
+	if o.state != StatePending {
+		o.mu.Unlock()
+		return nil, nil, errors.New("killed while joining")
+	}
+	o.srv = srv
+	o.mu.Unlock()
+
+	upCtx, upCancel := context.WithCancel(ctx)
+	defer upCancel()
+	rejected := make(chan struct{})
+	if rejoin && key == "" {
+		if err := srv.Start(); err != nil {
+			return nil, nil, fmt.Errorf("start %s: %w", o.hostname, err)
+		}
+		lc0, err := srv.LocalClient()
+		if err != nil {
+			return nil, nil, err
+		}
+		lc0.OmitAuth = true
+		var once sync.Once
+		go watchNeedsLogin(upCtx, lc0, func() { once.Do(func() { close(rejected); upCancel() }) })
+	}
+	if _, err := srv.Up(upCtx); err != nil {
+		select {
+		case <-rejected:
+			return nil, nil, errSavedStateRejected
+		default:
+		}
+		return nil, nil, fmt.Errorf("up %s: %w", o.hostname, err)
+	}
+	lc, err := srv.LocalClient()
+	if err != nil {
+		return nil, nil, err
+	}
+	// ADR-019 rule 4: without this every LocalClient call on macOS execs lsof
+	// and sends the *system* Tailscale.app's token (~25 ms/call).
+	lc.OmitAuth = true
+	sst, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return lc, sst, nil
+}
+
+// watchNeedsLogin calls onRejected once the backend has sat in NeedsLogin
+// for needsLoginGrace without reaching Starting/Running.
+func watchNeedsLogin(ctx context.Context, lc *local.Client, onRejected func()) {
+	w, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
+	if err != nil {
+		return
+	}
+	defer w.Close()
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		n, err := w.Next()
+		if err != nil {
+			return
+		}
+		if n.State == nil {
+			continue
+		}
+		switch *n.State {
+		case ipn.NeedsLogin:
+			if timer == nil {
+				timer = time.AfterFunc(needsLoginGrace, onRejected)
+			}
+		case ipn.Starting, ipn.Running:
+			if timer != nil {
+				timer.Stop()
+				timer = nil
+			}
+		}
+	}
+}
+
+// dropSavedState closes the rejected server and removes the node state, so
+// the next up joins as a new device (object.json and certs are kept).
+func (o *Object) dropSavedState() {
+	o.mu.Lock()
+	srv := o.srv
+	o.srv = nil
+	o.mu.Unlock()
+	if srv != nil {
+		srv.Close()
+	}
+	os.Remove(filepath.Join(o.dir, "tailscaled.state"))
 }
 
 func (o *Object) fail(err error) {
@@ -570,7 +685,7 @@ func (o *Object) Info() ObjectInfo {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	in := ObjectInfo{ID: o.id, Hostname: o.hostname, State: o.state, NodeID: string(o.nodeID),
-		DNSName: o.dnsName, Tags: o.tags, Ephemeral: o.ephemeral, Rejoined: o.rejoined,
+		DNSName: o.dnsName, Tags: o.tags, Ephemeral: o.ephemeral, Rejoined: o.rejoined, Reminted: o.reminted,
 		JoinMS: float64(o.joinDur.Microseconds()) / 1000, Flows: len(o.flows)}
 	if o.err != nil {
 		in.Error = Redact(o.err.Error())

@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -74,6 +74,37 @@ e2e-vm: deps guest-image
 	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
 	sudo env $(VM_ENV) bin/vmsmoke.test -test.v -test.count=1
 	cd e2e/vm && sudo env $(VM_ENV) ../../bin/e2evm.test -test.v -test.count=1 -test.timeout 15m
+## vm-assets: the microVM guest for the linux release (Linux only, in Lima twd-dev): the guest
+## image, the kernel (TWD_VM_KERNEL) and Firecracker + jailer (FC_BIN_DIR) in VM_ASSETS.
+FC_BIN_DIR ?= /usr/local/bin
+VM_ASSETS  ?= dist/vm-assets-$(shell go env GOARCH)
+vm-assets: guest-image
+	@[ "$$(uname -s)" = Linux ] || { echo "vm-assets: Linux only; run it inside Lima twd-dev"; exit 1; }
+	mkdir -p $(VM_ASSETS)
+	cp -f $(GUEST_OUT)/rootfs.ext4 $(GUEST_OUT)/manifest.json $(VM_ASSETS)/
+	cp -f $(TWD_VM_KERNEL) $(VM_ASSETS)/vmlinux
+	cp -f $(FC_BIN_DIR)/firecracker $(FC_BIN_DIR)/jailer $(VM_ASSETS)/
+	$(VM_ASSETS)/firecracker --version | head -1
+
+## e2e-linux-vm: L3 E2E from the installed release on a FRESH nested-virt Lima VM
+## (twdl-kvm-u24; created if missing, stopped at the end): the linux-arm64 release with the
+## microVM assets is built in Lima twd-dev, copied in with limactl copy, then install.sh ->
+## sudo twd host setup --microvm -> twd up -> agent + mcp with tier microvm -> checks (a)-(f) from
+## this Mac over tailnet 1, storage persistence across a VM kill and a redeploy, no keys in
+## the guest, twd host setup --undo.
+LINUX_VM ?= twdl-kvm-u24
+e2e-linux-vm:
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-linux-vm: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TS_CREDS="$(TS_CREDS)" TAILNET1="$(TAILNET1)" sh scripts/e2e-linux-vm.sh $(LINUX_VM)
+
+## e2e-linux-reboot: L3 DO storage across host reboots of the same fresh VM (clean, then a
+## power cut): helper back via systemd, twd up, same object node, data present, volume re-opens.
+e2e-linux-reboot:
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-linux-reboot: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_RUN=TestE2ELinuxReboot TS_CREDS="$(TS_CREDS)" TAILNET1="$(TAILNET1)" sh scripts/e2e-linux-vm.sh $(LINUX_VM)
+
 ## e2e-mac: E2E-MAC via the twd CLI on tailnet 1 (twd up → deploy agent+mcp → checks a–f → twd down → zero leftovers).
 e2e-mac: deps
 	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
@@ -91,11 +122,15 @@ e2e-multi: deps
 		TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2emulti -count=1 -v -timeout 25m ./e2e/multi/...
 
-## release: self-contained tarballs in dist/ (darwin-arm64 + linux-arm64): Go binaries
+## release: self-contained tarballs in dist/ (darwin-arm64, linux-arm64, linux-amd64): Go binaries
 ## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
 ## install.sh, VERSION, SHA256SUMS. darwin binaries are ad-hoc signed (run on macOS).
-RELEASE_VERSION ?= $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
-RELEASE_TARGETS ?= darwin-arm64 linux-arm64
+# Expanded once (:=): a recursive variable would be re-evaluated per use, so an
+# edit during `make release` would name the e2e tarball differently.
+ifndef RELEASE_VERSION
+RELEASE_VERSION := $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
+endif
+RELEASE_TARGETS ?= darwin-arm64 linux-arm64 linux-amd64
 release: deps
 	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS
 	sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
@@ -112,17 +147,35 @@ e2e-mbp: release
 		TWD_E2E_TARBALL="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-darwin-arm64.tar.gz" \
 		sh scripts/e2e-mbp.sh $(MBP) -tags e2embp -count=1 -v -timeout 25m ./e2e/mbp/...
 
+## e2e-linux: E2E-LINUX: the e2e-mbp checks (a)–(f) + twd doctor + `twd up --service`
+## (systemd user unit; survives `systemctl --user restart`) on FRESH Lima VMs
+## twdl-<distro> that mount nothing from this Mac, from the linux release tarballs.
+## twd runs in the VM; the test client + echo run here. ≤2 VMs at a time; each is
+## stopped (kept) when its row is done. LINUX_DISTROS picks rows (see
+## scripts/e2e-linux-one.sh; debian11-arm64 / alpine-arm64 check doctor's refusal).
+LINUX_DISTROS ?= ubuntu24-amd64 ubuntu24-arm64 debian12-arm64 ubuntu22-arm64
+e2e-linux: release
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-linux: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	if ! command -v limactl >/dev/null; then echo "e2e-linux: SKIPPED (no limactl)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		TWD_E2E_TARBALL_arm64="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-linux-arm64.tar.gz" \
+		TWD_E2E_TARBALL_amd64="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-linux-amd64.tar.gz" \
+		sh scripts/e2e-linux.sh $(LINUX_DISTROS)
+
 lint:
 	@out=$$(gofmt -l $$(git ls-files -co --exclude-standard '*.go')); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
 	$(GO) vet ./...
 	$(GO) vet -tags e2e ./e2e/local/...
 	$(GO) vet -tags e2ereal ./e2e/real/...
 	$(GO) vet -tags m2mgmt ./e2e/m2mgmt/...
-	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/...
+	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/... ./cmd/twd-vmhelper/... ./cmd/twd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
+	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags e2embp ./e2e/mbp/...
+	$(GO) vet -tags e2elinux ./e2e/linux/...
 	$(GO) vet -tags sdk ./e2e/sdk/...
 	$(GO) vet -tags nodetier ./e2e/node/...
 	@sh scripts/check-secrets.sh

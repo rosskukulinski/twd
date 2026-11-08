@@ -25,6 +25,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -52,18 +53,21 @@ func run() error {
 		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
 		tsnetLogs  = flag.Bool("tsnet-logs", false, "forward tsnet logs at debug level")
 		tier       = flag.String("default-tier", "process", "tier for deployments and tenants that name none: process | microvm")
-		vmKernel   = flag.String("vm-kernel", filepath.Join(home, ".twd", "vm", "vmlinux"), "microVM tier: guest kernel (Linux only)")
-		vmRootfs   = flag.String("vm-rootfs", filepath.Join(home, ".twd", "vm", "rootfs.ext4"), "microVM tier: guest image from guest/build-image.sh")
-		vmFC       = flag.String("firecracker", "/usr/local/bin/firecracker", "microVM tier: firecracker binary")
+		vmKernel   = flag.String("vm-kernel", vmAsset(home, "vmlinux"), "microVM tier: guest kernel (Linux only)")
+		vmRootfs   = flag.String("vm-rootfs", vmAsset(home, "rootfs.ext4"), "microVM tier: guest image from guest/build-image.sh")
+		vmHelper   = flag.String("vm-helper", helperapi.DefaultSocket, "microVM tier: twd-vmhelper socket (sudo twd host setup --microvm)")
+		vmFC       = flag.String("firecracker", "/usr/local/bin/firecracker", "microVM tier, as root without the helper service: firecracker binary")
+		vmJailer   = flag.String("jailer", "/usr/local/bin/jailer", "microVM tier, as root without the helper service: jailer binary")
+		vmVolMiB   = flag.Int("vm-volume-mib", 1024, "microVM tier: size of new DO volumes (sparse)")
 		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
 		vmCPUs     = flag.Int("vm-vcpus", 2, "microVM tier: guest vCPUs")
 		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
-		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd sandbox: auto (seatbelt on macOS) | seatbelt | none")
+		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd/Node sandbox: auto (seatbelt on macOS, landlock on Linux) | seatbelt | landlock | none")
+		insecureSH = flag.Bool("insecure-shared-host", false, "without a process sandbox, still run process-tier workloads of more than one tenant (tenants are NOT isolated from each other)")
 		sbDeny     = flag.String("sandbox-deny", "", "comma-separated extra paths no workerd may read, write or connect to (twd up: its state and run dirs)")
 		nodeBin    = flag.String("node", "", "Node process tier (runtime \"node\"): node binary (default: $TWD_NODE, or node on PATH)")
 		tokenFile  = flag.String("mgmt-token-file", filepath.Join(home, ".twd", "hostd", "mgmt.token"), "per-host token file minted by twd-mgmt (sent as Twd-Host-Token on the unix socket; \"\" = none)")
 		siblings   = flag.Bool("allow-sibling-egress", false, "let objects reach other objects hosted here over the tailnet (hairpin; single-host tests/demos)")
-		insecure   = flag.Bool("insecure-shared-host", false, "run Node-tier (runtime \"node\") deployments on a host serving several tenants although their egress is not enforced here (RT-08)")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -92,8 +96,10 @@ func run() error {
 	h, err := hostd.New(hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
-		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecure, AllowSiblingEgress: *siblings,
-		DefaultTier: *tier, NodeBin: *nodeBin, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
+		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH, AllowSiblingEgress: *siblings,
+		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB,
+		VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, jailer: *vmJailer, helper: *vmHelper,
+			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
 	if err != nil {
 		return err
 	}
@@ -103,12 +109,24 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("twd-hostd running", "host", *hostID, "mgmt", *mgmtAddr, "push", h.PushSocket(), "workerd", wd)
+	log.Info("twd-hostd running", "host", *hostID, "mgmt", *mgmtAddr, "push", h.PushSocket(), "workerd", wd, "sandbox", h.SandboxInfo())
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Info("shutting down (node state kept for rejoin)")
 	return h.Close()
+}
+
+// vmAsset finds a microVM asset: next to the installed release
+// (<prefix>/share/twd/vm, e.g. ~/.twd), else ~/.twd/vm.
+func vmAsset(home, name string) string {
+	if exe, err := os.Executable(); err == nil {
+		p := filepath.Join(filepath.Dir(filepath.Dir(exe)), "share", "twd", "vm", name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return filepath.Join(home, ".twd", "vm", name)
 }
 
 func findWorkerd(flagVal, home string) (string, error) {

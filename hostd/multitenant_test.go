@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
 )
@@ -158,8 +162,10 @@ func TestMultiTenant(t *testing.T) {
 			t.Fatalf("tenant A's sandbox can't list its own DO storage: %v", err)
 		}
 		t.Logf("seatbelt: tenant A's workerd profile denies tenant B's state dir, node state and DO storage")
+	} else if sb == hostd.SandboxLandlock {
+		landlockCrossTenant(t, ea, ws["a"], ws["b"], filepath.Join(data, "tenants", eb.TenantID), objs["b"].NetdID)
 	} else {
-		t.Log("no Seatbelt on this OS: sandbox checks skipped (dirs are 0700)")
+		t.Log("no process sandbox on this OS: sandbox checks skipped (dirs are 0700)")
 	}
 
 	// (c) Isolation: tenant A's agent can't reach tenant B's echo by name
@@ -235,5 +241,238 @@ func waitPeerOf(t *testing.T, n *nettest.Node, ip string) {
 	defer cancel()
 	if err := n.WaitPeers(ctx, ip); err != nil {
 		t.Fatalf("peer %s: %v", ip, err)
+	}
+}
+
+// landlockCrossTenant is (d) on Linux: under tenant A's live Landlock
+// profile (the rules, seccomp filter and no_new_privs A's workerd runs
+// with), tenant B's state, hostd's keys, the home dir and the run dir are
+// unreadable; hostd's push socket and B's egress sockets refuse A; B's
+// workerd can't be ptraced; A's own DO storage stays usable.
+func landlockCrossTenant(t *testing.T, ea *hostdtest.Env, a, b hostd.WorkloadStatus, bState, bNetdID string) {
+	t.Helper()
+	if a.Sandbox != hostd.SandboxLandlock || filepath.Ext(a.SandboxProfile) != ".json" {
+		t.Fatalf("tenant A workerd not under Landlock: %+v", a)
+	}
+	if !procsb.Sandboxed(a.PID) || !procsb.Sandboxed(b.PID) {
+		t.Fatalf("workerd pids %d/%d carry no sandbox (no_new_privs + seccomp)", a.PID, b.PID)
+	}
+	pr := func(op string, args ...string) string {
+		cmd, err := procsb.ProbeCommand(a.SandboxProfile, op, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := cmd.Output()
+		return strings.TrimSpace(string(out))
+	}
+	data := filepath.Join(ea.Dir, "data")
+	home, _ := os.UserHomeDir()
+	denied := map[string][2]string{
+		"B state dir":       {procsb.ProbeList, bState},
+		"B node state":      {procsb.ProbeList, filepath.Join(bState, "nodes", bNetdID)},
+		"B DO storage":      {procsb.ProbeList, b.DOStorage},
+		"B instance dir":    {procsb.ProbeList, b.InstanceDir},
+		"hostd audit key":   {procsb.ProbeRead, filepath.Join(data, "audit.key")},
+		"home dir":          {procsb.ProbeList, home},
+		"hostd run dir":     {procsb.ProbeList, filepath.Dir(a.InstanceDir)},
+		"hostd push socket": {procsb.ProbeConnectUnix, ea.Host.PushSocket()},
+		"B egress-wl.sock":  {procsb.ProbeConnectUnix, filepath.Join(b.InstanceDir, "egress-wl.sock")},
+		"B egress-obj.sock": {procsb.ProbeConnectUnix, filepath.Join(b.InstanceDir, "egress-obj.sock")},
+		"B hostapi.sock":    {procsb.ProbeConnectUnix, filepath.Join(b.InstanceDir, "hostapi.sock")},
+		"ptrace B workerd":  {procsb.ProbePtrace, strconv.Itoa(b.PID)},
+		"B process memory":  {procsb.ProbeVMRead, strconv.Itoa(b.PID)},
+		"B /proc environ":   {procsb.ProbeRead, "/proc/" + strconv.Itoa(b.PID) + "/environ"},
+		"TCP to 1.1.1.1":    {procsb.ProbeConnectTCP, "1.1.1.1:80"},
+	}
+	for i, port := range b.LoopbackPorts {
+		denied[fmt.Sprintf("B loopback service %d", i)] = [2]string{procsb.ProbeConnectTCP, "127.0.0.1:" + strconv.Itoa(int(port))}
+	}
+	if len(a.LoopbackPorts) != 3 || len(b.LoopbackPorts) != 3 {
+		t.Fatalf("workerd not on loopback services: %v / %v", a.LoopbackPorts, b.LoopbackPorts)
+	}
+	// Unsandboxed local processes need the instance token.
+	if r, err := http.Get("http://127.0.0.1:" + strconv.Itoa(int(b.LoopbackPorts[0])) + "/"); err == nil {
+		r.Body.Close()
+		if r.StatusCode < 400 {
+			t.Fatalf("B's loopback service answered without its token: %d", r.StatusCode)
+		}
+	}
+	for what, c := range denied {
+		if got := pr(c[0], c[1]); got == "ok" {
+			t.Fatalf("(d) tenant A's Landlock sandbox can reach %s (%s %s)", what, c[0], c[1])
+		} else {
+			t.Logf("landlock: A → %s: %s", what, got)
+		}
+	}
+	if got := pr(procsb.ProbeList, a.DOStorage); got != "ok" {
+		t.Fatalf("tenant A's sandbox can't list its own DO storage: %s", got)
+	}
+	// Control: outside the sandbox, the push socket and B's dirs are fine.
+	if c, err := net.Dial("unix", ea.Host.PushSocket()); err != nil {
+		t.Fatalf("control: push socket unreachable unsandboxed: %v", err)
+	} else {
+		c.Close()
+	}
+	abi, _ := procsb.ABI()
+	t.Logf("landlock (ABI %d): tenant A's workerd profile denies %d cross-tenant targets; own DO storage readable", abi, len(denied))
+}
+
+// A host without a process sandbox (Linux without Landlock, or -sandbox
+// none) serves one tenant's process-tier workloads only: the second
+// tenant's deploy fails typed sandbox_unavailable. -insecure-shared-host
+// would allow it.
+func TestSharedHostWithoutSandbox(t *testing.T) {
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxNone}, "", "-insecure-shared-host")
+}
+
+// With a sandbox, but a container engine reachable (stubbed), the second
+// tenant is refused too (root-equivalent for hostd itself).
+func TestSharedHostRiskySockets(t *testing.T) {
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxAuto,
+		HostSockets: func() procsb.HostSockets { return procsb.HostSockets{Hard: []string{"/var/run/docker.sock"}} }},
+		"", "/var/run/docker.sock")
+}
+
+var tailscaledOnly = func() procsb.HostSockets {
+	return procsb.HostSockets{Tailscaled: "/var/run/tailscale/tailscaled.sock"}
+}
+
+// tailscaled's socket reachable, but every workload under Landlock+seccomp
+// (no AF_UNIX): the host may be shared, and the second tenant's workerd
+// still can't connect to that socket.
+func TestSharedHostTailscaledSandboxed(t *testing.T) {
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxLandlock {
+		t.Skip("needs Landlock")
+	}
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxAuto, HostSockets: tailscaledOnly}, "", "")
+}
+
+// tailscaled's socket reachable and no sandbox: refused.
+func TestSharedHostTailscaledNoSandbox(t *testing.T) {
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxNone, HostSockets: tailscaledOnly}, "", "no process sandbox")
+}
+
+// tailscaled's socket reachable, sandbox on, but tenant A's Node app
+// listens on a unix socket (keeps AF_UNIX): refused, naming the reason.
+func TestSharedHostTailscaledUnixListen(t *testing.T) {
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxLandlock {
+		t.Skip("needs Landlock")
+	}
+	if _, err := os.Stat(hostdtest.NodeDeps()); err != nil {
+		t.Skip("node tier deps not installed (make test-node)")
+	}
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxAuto, HostSockets: tailscaledOnly}, "unix", "listens on a unix socket")
+}
+
+// sharedHost deploys tenant A (the agent template, or nodeprobe listening
+// on aListen when set), then tenant B's agent. With mention == "" B must
+// run and, under Landlock, its workerd must get EPERM on the (stubbed)
+// tailscaled path; otherwise B must fail typed sandbox_unavailable naming
+// mention.
+func sharedHost(t *testing.T, o hostdtest.Options, aListen, mention string) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	ctl, err := nettest.StartControl()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ctl.Close)
+	o.Fake, o.Ephemeral = fakemgmt.Config{StaticKey: nettest.DummyKey}, true
+	o.Tenant = mgmtapi.Tenant{Tailnet: "a.ts.net", ControlURL: ctl.URL, MintMode: "static"}
+	ea := hostdtest.Start(t, o)
+	eb := ea.AddTenant(mgmtapi.Tenant{Tailnet: "b.ts.net", ControlURL: ctl.URL, MintMode: "static"})
+	if aListen != "" {
+		files, err := hostdtest.BuildNode(hostdtest.Fixture("nodeprobe"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["twd.jsonc"] = []byte(strings.Replace(string(files["twd.jsonc"]), `"node": {`, `"node": { "listen": "`+aListen+`",`, 1))
+		ea.WaitActive("nodeprobe", ea.DeployFiles(files, "nodeprobe"), 60*time.Second)
+	} else {
+		ea.WaitActive("agent", ea.Deploy(hostdtest.Template("agent"), "agent", nil), 60*time.Second)
+	}
+	depB := eb.Deploy(hostdtest.Template("agent"), "agent", nil)
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		for _, w := range ea.Host.Status().Workloads {
+			if w.TenantID == eb.TenantID && w.Status == "failed" {
+				if mention == "" {
+					t.Fatalf("tenant B refused on a shareable host: %s", w.Error)
+				}
+				if !strings.Contains(w.Error, "sandbox_unavailable") || !strings.Contains(w.Error, mention) {
+					t.Fatalf("tenant B failed for another reason: %s", w.Error)
+				}
+				t.Logf("tenant B refused: %s", w.Error)
+				return
+			}
+			if w.TenantID == eb.TenantID && w.Status == "active" && w.DeploymentID == depB {
+				if mention != "" {
+					t.Fatal("tenant B's process-tier workload runs on a host that must not be shared")
+				}
+				if w.Sandbox == hostd.SandboxLandlock {
+					cmd, _ := procsb.ProbeCommand(w.SandboxProfile, procsb.ProbeConnectUnix, tailscaledOnly().Tailscaled)
+					out, _ := cmd.Output()
+					if r := strings.TrimSpace(string(out)); r != "EPERM" {
+						t.Fatalf("tenant B's workerd profile → tailscaled.sock: %s (want EPERM)", r)
+					}
+					t.Logf("tenant B runs; its workerd profile → tailscaled.sock: EPERM")
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tenant B's deploy neither failed nor ran")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// Linux: a sandboxed workerd can't reach host unix sockets (no AF_UNIX
+// socket() under its profile) while it serves; checked against the real
+// tailscaled and docker socket paths when they exist (the VM run puts fake
+// listeners there) and a temp listener.
+func TestLandlockHostSockets(t *testing.T) {
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxLandlock {
+		t.Skip("no Landlock")
+	}
+	ctl, err := nettest.StartControl()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ctl.Close)
+	e := hostdtest.Start(t, hostdtest.Options{Fake: fakemgmt.Config{StaticKey: nettest.DummyKey}, Ephemeral: true, Sandbox: hostd.SandboxAuto,
+		Tenant: mgmtapi.Tenant{Tailnet: "a.ts.net", ControlURL: ctl.URL, MintMode: "static"}})
+	e.WaitActive("agent", e.Deploy(hostdtest.Template("agent"), "agent", nil), 60*time.Second)
+	var ws hostd.WorkloadStatus
+	for _, w := range e.Host.Status().Workloads {
+		if w.Workload == "agent" {
+			ws = w
+		}
+	}
+	tmp := filepath.Join(t.TempDir(), "x.sock")
+	ln, err := net.Listen("unix", tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	targets := []string{tmp, e.Host.PushSocket()}
+	for _, hs := range []string{"/var/run/tailscale/tailscaled.sock", "/var/run/docker.sock"} {
+		if st, err := os.Stat(hs); err == nil && st.Mode()&os.ModeSocket != 0 {
+			targets = append(targets, hs)
+		}
+	}
+	for _, p := range targets {
+		cmd, _ := procsb.ProbeCommand(ws.SandboxProfile, procsb.ProbeConnectUnix, p)
+		out, _ := cmd.Output()
+		if r := strings.TrimSpace(string(out)); r == "ok" {
+			t.Fatalf("workerd's profile reaches %s", p)
+		} else {
+			t.Logf("workerd profile → %s: %s", p, r)
+		}
+	}
+	prof, err := procsb.Load(ws.SandboxProfile)
+	if err != nil || !prof.NoUnixSockets {
+		t.Fatalf("workerd profile allows AF_UNIX: %+v %v", prof, err)
 	}
 }

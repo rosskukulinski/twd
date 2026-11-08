@@ -11,10 +11,16 @@ type KeyRequest struct {
 	Hostname  string
 	Tags      []string
 	Ephemeral bool
+	// Remint: the object had saved node state, but control rejected it
+	// (NeedsLogin: the device expired or was removed, which is what happens
+	// to an ephemeral node that is offline during a restart). The object
+	// needs a fresh key under the same hostname; mgmt-backed sources must
+	// move the object out of "ready" first (POST /v0/objects/{id}/remint).
+	Remint bool
 }
 
-// KeySource supplies auth keys for objects that have no saved node state.
-// Objects that rejoin from saved state never call it.
+// KeySource supplies auth keys for objects that have no saved node state,
+// or whose saved state control rejected (KeyRequest.Remint).
 //
 // Implementations must not log the key.
 type KeySource interface {

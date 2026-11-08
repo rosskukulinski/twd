@@ -568,6 +568,42 @@ func (s *SQLStore) GetObject(ctx context.Context, id string) (Object, error) {
 	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE id=?"), id))
 }
 
+func (s *SQLStore) DeleteDeadObjects(ctx context.Context, tenantID string) ([]Object, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE tenant_id=? AND status IN (?,?)"), tenantID, StatusKilled, StatusFailed)
+	if err != nil {
+		return nil, err
+	}
+	var dead []Object
+	for rows.Next() {
+		o, err := scanObject(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		dead = append(dead, o)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Their kill revocations go too: a host syncing after the purge must
+	// not kill a new object that reuses the (deterministic) ID.
+	for _, o := range dead {
+		if _, err := tx.ExecContext(ctx, s.q("DELETE FROM revocations WHERE object_id=?"), o.ID); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, s.q("DELETE FROM objects WHERE tenant_id=? AND status IN (?,?)"), tenantID, StatusKilled, StatusFailed); err != nil {
+		return nil, err
+	}
+	return dead, tx.Commit()
+}
+
 func (s *SQLStore) GetObjectByName(ctx context.Context, tenantID, workload, ns, name string) (Object, error) {
 	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE tenant_id=? AND workload=? AND namespace=? AND name=?"), tenantID, workload, ns, name))
 }

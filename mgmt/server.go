@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/tailscale/peercred"
+
+	"github.com/rosskukulinski/twd/internal/procsb"
 )
 
 // Principal is the authenticated caller of an API request.
@@ -274,6 +276,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v0/status", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		return map[string]any{"ok": true, "pendingDeviceDeletes": m.PendingDeletes()}, nil
 	}))
+	mux.HandleFunc("POST /v0/tenants/{id}/purge", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		return m.Purge(r.Context(), r.PathValue("id"))
+	}))
 	mux.HandleFunc("POST /v0/flush", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		n := m.PendingDeletes()
 		m.FlushDeletes()
@@ -323,12 +328,32 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		return m.Credential(r.Context(), r.PathValue("id"), hostOf(r), epoch, wait)
 	}))
+	mux.HandleFunc("GET /v0/volumes/key", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		q := r.URL.Query()
+		epoch, err := strconv.ParseInt(q.Get("epoch"), 10, 64)
+		if err != nil || epoch <= 0 {
+			return nil, errf(400, "bad_request", "epoch query parameter required")
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		key, err := m.VolumeKey(r.Context(), q.Get("tenant"), q.Get("workload"), hostOf(r), epoch)
+		if err != nil {
+			return nil, err
+		}
+		return VolumeKeyResponse{Key: key}, nil
+	}))
 	mux.HandleFunc("POST /v0/objects/{id}/ready", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req ReadyRequest
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
 		return m.Ready(r.Context(), r.PathValue("id"), hostOf(r), req)
+	}))
+	mux.HandleFunc("POST /v0/objects/{id}/remint", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		var req RemintRequest
+		if err := readJSON(r, &req); err != nil {
+			return nil, err
+		}
+		return m.Remint(r.Context(), r.PathValue("id"), hostOf(r), req)
 	}))
 	mux.HandleFunc("POST /v0/objects/{id}/kill", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req KillRequest
@@ -417,7 +442,10 @@ func ListenUnix(path string) (net.Listener, error) {
 		ln.Close()
 		return nil, err
 	}
-	return &uidListener{Listener: ln, uid: strconv.Itoa(os.Getuid())}, nil
+	// Sandboxed workloads (Linux: procsb) are refused too, even with our
+	// uid: on kernels whose Landlock can't refuse unix-socket connects
+	// (ABI < 9), this is what keeps tenant code off the admin API.
+	return procsb.Guard(&uidListener{Listener: ln, uid: strconv.Itoa(os.Getuid())}, nil), nil
 }
 
 func dirOf(p string) string {

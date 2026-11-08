@@ -288,6 +288,59 @@ func (e *testEnv) asHost(id string) *apiClient {
 	return &c
 }
 
+// TestRemintAfterRejectedRejoin: a ready object's device is gone from
+// control (its saved node state was rejected). The host POSTs /remint: the
+// object goes back to pending, a new key is minted under the SAME hostname,
+// the credential is released again, and /ready records the new node ID.
+func TestRemintAfterRejectedRejoin(t *testing.T) {
+	e := newTestEnv(t, nil)
+	c, h1 := e.c, e.asHost("h1")
+	var tn struct{ TenantID string }
+	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 100, "tiers": []string{"process"}}, nil)
+	bundle := makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "support", "bundle": bundle}, nil)
+	var root CreateObjectResponse
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, &root)
+	var cred Credential
+	h1.ok("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, &cred)
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/ready", map[string]any{"nodeID": "1", "stableNodeID": "nOLD", "magicDNS": root.ObjectID + ".t.ts.net"}, nil)
+	h1.fail("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, 409, "already_joined")
+
+	// Other hosts can't remint it; a stale epoch can't either.
+	e.asHost("h2").fail("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "x"}, 409, "lease_lost")
+	h1.fail("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 2, "reason": "x"}, 409, "lease_lost")
+	var ro Object
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "saved node state rejected (NeedsLogin)"}, &ro)
+	if ro.Status != StatusPending || ro.StableNodeID != "" || ro.NodeID != "" || ro.Hostname != root.ObjectID {
+		t.Fatalf("after remint: %+v", ro)
+	}
+	var cred2 Credential
+	h1.ok("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, &cred2)
+	if cred2.AuthKey == "" || cred2.AuthKey == cred.AuthKey || cred2.Hostname != root.ObjectID {
+		t.Fatalf("second credential: hostname %q, same key %v", cred2.Hostname, cred2.AuthKey == cred.AuthKey)
+	}
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/ready", map[string]any{"nodeID": "2", "stableNodeID": "nNEW", "magicDNS": root.ObjectID + ".t.ts.net"}, nil)
+	c.ok("GET", "/v0/objects/"+root.ObjectID, nil, &ro)
+	if ro.Status != StatusReady || ro.StableNodeID != "nNEW" || ro.Hostname != root.ObjectID {
+		t.Fatalf("after second ready: %+v", ro)
+	}
+	h1.fail("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, 409, "already_joined")
+	// Idempotent while pending; refused once killed.
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "again"}, &ro)
+	c.ok("POST", "/v0/objects/"+root.ObjectID+"/kill", map[string]any{"reason": "test"}, nil)
+	h1.fail("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "x"}, 410, "killed")
+	var audit struct{ Records []AuditRecord }
+	c.ok("GET", "/v0/audit?objectID="+root.ObjectID, nil, &audit)
+	kinds := map[string]int{}
+	for _, r := range audit.Records {
+		kinds[r.Kind]++
+	}
+	if kinds["remint"] < 1 || kinds["ready"] != 2 {
+		t.Fatalf("audit kinds %v", kinds)
+	}
+}
+
 func TestAPIEndToEnd(t *testing.T) {
 	e := newTestEnv(t, nil)
 	c, h1 := e.c, e.asHost("h1")
@@ -726,5 +779,112 @@ func TestKillWhileJoining(t *testing.T) {
 	h1.fail("POST", "/v0/objects/"+a.ObjectID+"/ready", map[string]any{"stableNodeID": "nLATE"}, 410, "killed")
 	if d := e.ts.devicesDeleted(); len(d) != 1 || d[0] != "nLATE" {
 		t.Fatalf("late device not deleted: %v", d)
+	}
+}
+
+// TestPurgeAfterKill: after `twd down --purge` the same workload must
+// deploy again on the same state dir. mgmt keeps killed objects (the 410
+// tombstone, and the UNIQUE name), so POST /v0/tenants/{id}/purge forgets
+// them; a create of the same name is then a new pending object, and the
+// deployment's endpoint no longer reads "killed". Live objects stay.
+func TestPurgeAfterKill(t *testing.T) {
+	e := newTestEnv(t, nil)
+	c, h1 := e.c, e.asHost("h1")
+	var tn struct{ TenantID string }
+	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 10}, nil)
+	var dep DeployResponse
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "agent",
+		"namespaces": []ClassConfig{{Class: WorkloadNamespace, Tags: []string{"tag:ttest"}}, {Class: "A", Tags: []string{"tag:ttest"}}}}, &dep)
+	var wl, a, keep CreateObjectResponse
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "workload": "agent", "namespace": WorkloadNamespace, "objectName": "agent"}, &wl)
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "workload": "agent", "namespace": "A", "objectName": "a"}, &a)
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "workload": "agent", "namespace": "A", "objectName": "keep"}, &keep)
+	h1.ok("POST", "/v0/objects/"+wl.ObjectID+"/ready", map[string]any{"stableNodeID": "nWL", "magicDNS": "agent.t.ts.net"}, nil)
+	var kr KillResult
+	c.ok("POST", "/v0/objects/"+wl.ObjectID+"/kill", map[string]any{"cascade": true, "reason": "twd down --purge"}, &kr)
+	c.ok("POST", "/v0/objects/"+a.ObjectID+"/kill", map[string]any{"reason": "twd down --purge"}, nil)
+
+	// The bug: the killed workload node blocks a redeploy.
+	h1.fail("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "workload": "agent", "namespace": WorkloadNamespace, "objectName": "agent"}, 410, "killed")
+	var dv DeploymentView
+	c.ok("GET", "/v0/deployments/"+dep.DeploymentID, nil, &dv)
+	if dv.Endpoint.Status != StatusKilled {
+		t.Fatalf("endpoint before purge: %+v", dv.Endpoint)
+	}
+
+	var pr PurgeResult
+	c.ok("POST", "/v0/tenants/"+tn.TenantID+"/purge", nil, &pr)
+	if len(pr.Purged) != 2 || !slices.Contains(pr.Purged, wl.ObjectID) || !slices.Contains(pr.Purged, a.ObjectID) {
+		t.Fatalf("purged %v, want %s and %s", pr.Purged, wl.ObjectID, a.ObjectID)
+	}
+	if o, err := e.m.store.GetObject(context.Background(), keep.ObjectID); err != nil || !o.Live() {
+		t.Fatalf("live object touched by purge: %+v %v", o, err)
+	}
+	c.fail("POST", "/v0/tenants/nope/purge", nil, 404, "not_found")
+
+	// The kill's revocation is gone too (else the host kills the new object).
+	if revs, err := e.m.store.Revocations(context.Background(), "h1", time.Time{}); err != nil || slices.Contains(revs, wl.ObjectID) {
+		t.Fatalf("revocations after purge: %v %v", revs, err)
+	}
+	// Same names again: new pending objects (same deterministic IDs).
+	var wl2, a2 CreateObjectResponse
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "workload": "agent", "namespace": WorkloadNamespace, "objectName": "agent"}, &wl2)
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "workload": "agent", "namespace": "A", "objectName": "a"}, &a2)
+	if wl2.Status == StatusKilled || wl2.ObjectID != wl.ObjectID || a2.Status == StatusKilled {
+		t.Fatalf("recreate after purge: %+v %+v", wl2, a2)
+	}
+	c.ok("GET", "/v0/deployments/"+dep.DeploymentID, nil, &dv)
+	if dv.Endpoint.Status == StatusKilled || dv.Endpoint.Status == StatusFailed {
+		t.Fatalf("endpoint after purge: %+v", dv.Endpoint)
+	}
+	var audit struct{ Records []AuditRecord }
+	c.ok("GET", "/v0/audit?object="+wl.ObjectID, nil, &audit)
+	kinds := map[string]int{}
+	for _, r := range audit.Records {
+		kinds[r.Kind]++
+	}
+	if kinds["purge"] != 1 || kinds["kill"] != 1 || kinds["create"] != 2 {
+		t.Fatalf("audit kinds %v", kinds)
+	}
+	// Idempotent.
+	c.ok("POST", "/v0/tenants/"+tn.TenantID+"/purge", nil, &pr)
+	if len(pr.Purged) != 0 {
+		t.Fatalf("second purge: %v", pr.Purged)
+	}
+}
+
+// TestAPIVolumeKey: the DO volume data key (L3) is created in custody once,
+// returned stably, and only to the lease holder at the lease's epoch.
+func TestAPIVolumeKey(t *testing.T) {
+	e := newTestEnv(t, nil)
+	c, h1, h2 := e.c, e.asHost("h1"), e.asHost("h2")
+	var tn struct{ TenantID string }
+	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 100, "tiers": []string{"process", "microvm"}}, nil)
+	bundle := makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})
+	var dep DeployResponse
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "support", "bundle": bundle}, &dep)
+	q := func(epoch int64) string {
+		return fmt.Sprintf("/v0/volumes/key?tenant=%s&workload=support&epoch=%d", tn.TenantID, epoch)
+	}
+	var k1, k2 VolumeKeyResponse
+	h1.ok("GET", q(dep.Epoch), nil, &k1)
+	h1.ok("GET", q(dep.Epoch), nil, &k2)
+	if len(k1.Key) != 32 || !bytes.Equal(k1.Key, k2.Key) {
+		t.Fatalf("volume key: %d bytes, stable %v", len(k1.Key), bytes.Equal(k1.Key, k2.Key))
+	}
+	h1.fail("GET", q(dep.Epoch+1), nil, 409, "lease_lost")
+	h1.fail("GET", q(0), nil, 400, "bad_request")
+	h2.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h2", "capacityNodes": 100, "tiers": []string{"process"}}, nil)
+	h2.fail("GET", q(dep.Epoch), nil, 409, "lease_lost")
+	var other VolumeKeyResponse
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "other", "bundle": bundle}, &dep)
+	h1.ok("GET", fmt.Sprintf("/v0/volumes/key?tenant=%s&workload=other&epoch=%d", tn.TenantID, dep.Epoch), nil, &other)
+	if bytes.Equal(other.Key, k1.Key) {
+		t.Fatal("two workloads share a volume key")
+	}
+	if s := fmt.Sprint(k1); strings.Contains(s, string(k1.Key)) {
+		t.Fatal("VolumeKeyResponse prints its key")
 	}
 }

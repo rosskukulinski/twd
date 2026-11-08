@@ -8,6 +8,8 @@ Last update: 2026-11-08 01:15 PT. M6 (merged with M5; release tarballs, `install
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 Last update: 2026-11-08 01:20 PT. M9 (opt-in Node process tier + Vercel Workflow) on branch `m9-node`: `make test-node` PASS on macOS and Lima.
 Last update: 2026-11-08 01:40 PT. M7 (E2E-MULTI: one host, tenant A on tailnet 1 + tenant B on tailnet-2) on branch `m7-multi`: `make e2e-multi` PASS (3 runs).
+Last update: 2026-11-08 08:30 PT. L3: `make e2e-linux-reboot` PASS (clean reboot + power cut). Earlier, 08:15 PT, L3 (production-shaped microVM tier on Linux) on branch `l3-microvm`: `make e2e-vm` PASS (13 subtests), `make e2e-linux-vm` PASS from the installed release on fresh `twdl-kvm-u24`.
+Last update: 2026-11-08 09:05 PT. L1: ephemeral nodes now re-mint on a rejected rejoin (netd + mgmt `/remint` + hostd); reboot survival and the ephemeral restart measured on Ubuntu 24.04 arm64; 5/5 supported distros PASS.
 Last update: 2026-11-08 02:05 PT. Integration: master (M6 + M5 + M9, `57dd519`) merged into `m7-multi`; the full matrix passes on `4cce30d` (macOS, real tailnets, mbp from the release, Lima).
 
 ## M0: repo skeleton (DONE)
@@ -943,4 +945,249 @@ Also in this branch: `twd up --allow-sibling-egress` / `twd-hostd -allow-sibling
 | | `make e2e-multi` (tailnet 1 + tailnet-2, prefix `ttest-rtf-1c3dc5`, `e2e/real/results/m7-20261108-092949-1c3dc5.json`) | **PASS** 55 s, 15/15 checks incl. `d_lim_enforced_A`/`_B` (refund `cap_missing`, parent admitted, per tenant) and `d_state_isolation` with the mgmt socket probe now carrying the host token (sandbox still denies it) and a token-less request answered **401**. No policy written on either tailnet; 0 `tskey-`; 0 leftovers |
 | Linux / Lima | not run from this branch (the L2 worktree owns the VMs); nothing here changes how hostd launches workloads | — |
 
+### RT fixes × Linux (merge of `int-linux`: L2 Landlock + L3 microVM/vmhelper + L1 release/systemd)
+- **Node certificates and microVM senders.** The microVM tier's object nodes run in host netd (keys never enter the guest), so `serveIngress` → `applyCert` narrows a microVM sender's capMap exactly as for the process tier, and the guest-ingress path receives the already-narrowed `request.cf`. Cert fetches go through hostd's mgmt client (unix socket + host token), which works unchanged under the systemd user service.
+- **Re-mint (L1).** `POST /v0/objects/{id}/remint` clears the object's certificate with its node IDs; the following `ready` issues a new certificate for the new stable node ID (the old one is unknown to `GET /v0/certs/` → receivers treat it as a non-object or, if cached, the cache expires in 60 s and a killed/deleted node has no flows anyway).
+- **Host token and the service.** The supervisor starts mgmt with `-rotate-host-token`, so every mgmt start (`twd up`, `twd up --service` restart, a systemd/supervisor restart) mints a fresh token; hostd re-reads the 0600 file when it changes and the CLI per call, so a running hostd is never stranded (at most one heartbeat retried). `twd-vmhelper` never talks to mgmt; hostd's `GET /v0/volumes/key` uses the same token-bearing client.
+- **RT-08 × L2.** `EgressEnforcement` reports `enforced` only under Landlock (TCP pinned to the proxy); Seatbelt is `unenforced` but counts as a process sandbox, so the Node-tier refusal (`egress_unenforced`) applies only to hosts with **no** sandbox serving other tenants; L2's `sharedHostCheck` (`sandbox_unavailable`) governs everything else. The `nodeprobe` fixture's `/net` sandbox probe uses the unpatched `net.connect` so L2's Landlock checks still measure the OS sandbox, not `enforceEgress()`.
+
 **Not done / honest limits.** RT-04 is partial (root MAC key still in the guest). The `@twd/node` enforcement is cooperative by construction. Same-host object→object calls still need `--allow-sibling-egress` (off by default) to go over the tailnet; the in-process policy-checked path of RFC §4.5 is not built. OBO per-request assertions (RFC §4.6) remain unimplemented.
+## L2: Linux process-tier sandbox, Landlock + seccomp (DONE, branch `l2-landlock`)
+Parity with the macOS Seatbelt sandbox (M7) for the Linux process tier, measured in a fresh Lima VM **`twdl-sbx-u24`** (Ubuntu 24.04 arm64, `vz`, 4 CPU / 6 GiB, kernel 6.8.0-147, **Landlock ABI 4**; `apparmor_restrict_unprivileged_userns=1`, so no user namespaces; Go 1.27.3, Node 24.22). The VM mounts this worktree; tests ran on an rsync'd VM-local copy so the Mac's `node_modules` stay darwin. It is **stopped, not deleted**.
+
+### What's built
+- **`internal/procsb`: a re-exec launcher, no cgo** (`github.com/landlock-lsm/go-landlock` v0.11.0 with best-effort downgrade up to ABI 11; hand-built seccomp BPF, arm64 + amd64). hostd starts `<twd-hostd> __twd-sandbox-exec -f <instance>/sandbox.json -- workerd|node …`. The launcher runs from package `init` in any binary importing procsb (twd-hostd, twd, test binaries), applies the profile to itself and `execve`s the workload in place (same pid). Cost: ~2 ms per start (`workerd --version`: 1 → 3 ms).
+  - **Landlock FS (deny by default):** read+exec `/usr /lib /lib64 /bin /sbin /etc /opt` (+ `/nix/store`), the runtime binary (workerd / node) and node's install prefix; a short list of global `/proc` and `/sys` files (cpuinfo, meminfo, cgroup limits), and the process's **own** `/proc/<pid>` entries except `net/` and `task/`; `/dev/null|zero|full|urandom|random`. Read-write (incl. refer and, at ABI ≥ 9, unix-socket connect) **only** the instance dir and its own DO-storage / Node data dir. So the home dir (`~/.twd`, API key files), hostd/mgmt state and run dirs, other tenants' dirs, node keys, `/tmp` and other processes' `/proc` (environ, cmdline, `/proc/net/unix`) are all `EACCES`.
+  - **Landlock TCP (ABI ≥ 4):** bind/connect only the profile's ports. workerd: **none** (all its sockets are unix sockets in its own dir). Node: bind+connect its own app port, connect its egress proxy's port. Everything else, loopback included, is `EACCES` before a packet is sent.
+  - **Scopes (ABI ≥ 6)** and **pathname unix-socket connects (ABI ≥ 9)** are requested too and apply automatically on newer kernels.
+  - **`PR_SET_NO_NEW_PRIVS` + seccomp (TSYNC):** EPERM for ptrace, process_vm_readv/writev, pidfd_getfd, kcmp, kexec, (u)mount and the new mount API, pivot_root, chroot, bpf, perf_event_open, keyctl/add_key/request_key, module loading, unshare/setns, clone with namespace flags, open_by_handle_at, userfaultfd, fanotify, swap, reboot, syslog, `kill(-1)`; ENOSYS for clone3 and io_uring (glibc/libuv fall back). `socket()` only AF_UNIX, AF_INET/6 **TCP** (protocol 0/6: not MPTCP, which bypasses Landlock, nor SCTP), and NETLINK_ROUTE (not sock_diag, which lists unix socket paths); UDP/ICMP/raw/packet/vsock refused. Foreign syscall ABIs (32-bit compat, x32) are killed. **workerd/V8, Node 24 and Vercel Workflow all run under it** unchanged.
+- **Unix sockets on Landlock ABI < 9 (what can and can't be restricted).** Landlock < 9 can't refuse `connect()` to a pathname unix socket. So:
+  - twd's own servers refuse sandboxed peers themselves: `procsb.Guard` reads `SO_PEERCRED` and refuses a peer that has no_new_privs and **more seccomp filters than the server** (the launcher's filter is inherited by every descendant and can't be removed). Applied to **mgmt's admin socket**, **hostd's push socket** and twd-netd's sockets; each instance's `egress-obj/egress-wl/hostapi.sock` accepts a sandboxed peer only if it is that instance's own process or a descendant.
+  - workerd's own `ingress.sock` (served by workerd, not twd) sits in an instance dir with an **unguessable name** (`i<n>-<64 random bits>`); a sandboxed process can't list the run dir, can't read `/proc/net/unix` or other processes' cmdlines, and can't open sock_diag, so it can't find another instance's socket.
+- **hostd:** `-sandbox auto` (the default) is now `landlock` on Linux when the kernel has Landlock (`seatbelt` on macOS). Workloads report `Sandbox: "landlock"` and `SandboxProfile: …/sandbox.json`; `GET /v0/status` has the host's `Sandbox: "landlock (ABI 4)"`. `hostd.SandboxCommand(profile, cmd…)` runs a command under a workload's live profile on either OS (tests). `release.json` records `"sandbox":"landlock"` for linux tarballs.
+- **No sandbox → no shared host.** If the process tier has no sandbox (Linux without Landlock, or `-sandbox none`), hostd refuses a second tenant's process-tier deployment with `sandbox_unavailable` unless `twd-hostd -insecure-shared-host` (`twd up --insecure-shared-host`); `twd tenant add` refuses the same way up front. The microVM tier is unaffected.
+- **`twd doctor` `sandbox` check on Linux:** runs workerd under a generated Landlock profile launched by the `twd` binary itself, and checks that a file outside it and the home dir are unreadable and (ABI ≥ 4) that a TCP connect to 1.1.1.1 is refused; reports the ABI, the unix-socket mode, and while twd runs, `active: N/N` workloads under Landlock. Without Landlock it **warns loudly** (`NO PROCESS SANDBOX …`) with the fix; ABI < 4 warns that TCP isn't restricted.
+- **Docs:** INSTALL.md isolation section (Linux is no longer "no sandbox"); docs/node-tier.md: on Linux with ABI ≥ 4 the egress proxy is **enforced**, closing the M9 "a malicious Node app can bypass HTTP_PROXY" hole there.
+
+### Test results (measured 2026-11-08)
+| Where | Target | Result |
+|---|---|---|
+| `twdl-sbx-u24` (sandbox on) | `make test` | **PASS** (incl. new `internal/procsb`, `TestMultiTenant` (d) under Landlock, `TestSharedHostWithoutSandbox`, `TestCLIMultiTenant` (d) under Landlock with `RequireSandbox`, `TestDoctor` `sandbox: ok`) |
+| | `TWD_TEST_SANDBOX=auto go test -race ./cmd/... ./hostd/...` (every hostd test with the sandbox on) | **PASS** |
+| | `make test-node` | **PASS**: `Sandbox` subtest now runs on Linux (`sandbox: landlock`), `TestNodeWorkflow` under Landlock |
+| | `make test-sdk` | **PASS**, now under the host sandbox (checked: 8/8 SDK workloads `landlock`) |
+| | `make e2e-multi` ×2 (tailnet 1 + tailnet-2, prefix `ttest-l2-<run>`) | **PASS** `c1b1e5`, `ac586c` (13/13 each; `e2e/real/results/l2-*.json`); 0 devices left in either tailnet; 0 `tskey-` in logs; **no policy written** (`TWD_E2E_NO_POLICY_WRITE`: read-only check, both tailnets already had the rules) |
+| macOS (this Mac) | `make test`, `make lint`, `make test-sdk` (now under Seatbelt: 8/8), `make test-node` | **PASS** |
+
+Attacks, all from inside a sandboxed workload or under its **live** profile (`procsb.ProbeCommand`: same rules, seccomp filter and no_new_privs, launched like the workload):
+
+| Attack (tenant A's workerd / Node app) | Result (ABI 4) |
+|---|---|
+| list/read tenant B's state dir, node state, DO storage, instance dir, **API key file** | `EACCES` |
+| read its **own** tenant's node keys, hostd's audit key, list `$HOME`, hostd's run dir, `/tmp`, `/proc` | `EACCES` |
+| read B's `/proc/<pid>/environ` (the Node tier's caller key lives there), `/proc/self/net/unix` | `EACCES` |
+| **mgmt's admin socket** (curl `--unix-socket … /v0/healthz`), hostd's push socket, B's `egress-wl/egress-obj/hostapi.sock` | connect completes (ABI < 9), the server closes it unanswered (`ECONNRESET`); unsandboxed control answers |
+| **ptrace** B's workerd / a sibling, `process_vm_readv` | `EPERM` |
+| Node app `net.connect` 1.1.1.1:80 / :443, a host-loopback listener | `EACCES` |
+| TCP connect 1.1.1.1:443, bind 127.0.0.1:0, UDP to 1.1.1.1:53, `kill(-1, 0)` | `EACCES` / `EACCES` / `EPERM` / `EPERM` |
+| own DO storage / own data dir (read, write, list); Node app's own port | allowed |
+| serving requests (a–c, e, f of E2E-MULTI) and **egress via netd** (`EgressAttributed`: sdk, global fetch, `node:http`, undici; the echo's WhoIs is the deployment's node) | work under the sandbox |
+
+### Gaps vs Seatbelt
+- ~~**Unix sockets that aren't twd's, on ABI < 9**~~: closed in the follow-up below (workloads get no AF_UNIX sockets).
+- ~~**Signals and abstract unix sockets on ABI < 6**~~: closed in the follow-up below (signals only to self/own group; no AF_UNIX sockets).
+- **The "sandboxed peer" test is a heuristic:** more seccomp filters than the server. A legitimate client that itself runs under extra seccomp filters (e.g. the `twd` CLI inside a container while mgmt runs outside) is refused by mgmt's and hostd's sockets.
+- **Child processes** of a Node app can't read their own `/proc/self/*` (the rules name the launcher's pid). Not hit by any test (Workflow included); an app that forks helpers that need `/proc/self/maps` would see `EACCES`.
+- System dirs (`/usr`, `/etc`, `/opt`) are readable, as with Seatbelt; `/tmp` is **not** (stricter than Seatbelt). Apps can't do their own DNS (UDP is refused), by design.
+- **Not run:** amd64 (builds and vets; the amd64 seccomp file is untested), kernels with Landlock ABI ≥ 5, other distros, and the sandbox **from an installed linux release tarball** (L1's matrix covers that; nothing new is shipped: the launcher is twd-hostd itself). ABI 1–3 kernels (FS-only, TCP unrestricted) are handled by best-effort downgrade and a doctor warning, but not tested.
+
+### Follow-up: host unix sockets contained (lead review)
+The gap in the first pass: on Landlock ABI < 9 a sandboxed workload could `connect()` to host unix sockets at known paths, such as `/var/run/tailscale/tailscaled.sock` (the host's own tailnet identity, BUILD-PLAN rule 1) or `/var/run/docker.sock` (root-equivalent). **Closed by taking unix sockets away from workloads entirely**, plus a shared-host refusal as defence in depth:
+- **workerd needs no unix socket.** Its ingress listener is created by hostd and inherited as fd 3 (`workerd serve --socket-fd ingress=3`). Its three outbound services (`netd-egress`, `egress-wl`, `hostd`) are **hostd loopback TCP listeners** (`127.0.0.1:<ephemeral>`). Landlock pins workerd's connects to exactly those 3 ports. Each request carries a per-instance 256-bit token, injected by workerd's config (`injectRequestHeaders`, in the instance dir, unreadable to others); hostd checks the token in constant time and strips it. So other local processes, which can't connect under Landlock anyway, also can't use the ports on an ABI < 4 kernel. Status shows `LoopbackPorts`.
+- **seccomp `NoUnixSockets`** (workerd, and Node apps in the default TCP listen mode): `socket(AF_UNIX, …)` → EPERM. `socketpair(AF_UNIX)` is allowed for STREAM and SEQPACKET only: those pairs are connected and can't be re-pointed. A DGRAM pair could be re-pointed at a host socket, so it is EPERM. workerd, Node 24, Vercel Workflow and the SDK apps all run unchanged. The Node app in `listen: "unix"` mode still creates its own unix socket, so that mode keeps AF_UNIX (gap below).
+- **Signals (any ABI):** `kill` only to pid 0, self or −self (hostd now starts workerd in its own process group too, like Node). `tgkill`/`rt_sigqueueinfo`/`rt_tgsigqueueinfo` only to self. `tkill` and `pidfd_send_signal` are EPERM. A workload can no longer signal hostd, mgmt or another tenant's processes on ABI < 6.
+- **Defence in depth (Linux):** `procsb.RiskyHostSockets` lists risky sockets this user can connect to and risky group memberships. It checks write permission via `access(W_OK)` and never connects. The sockets covered are tailscaled's, docker, containerd, podman, lxd/incus and rootless docker/podman under `$XDG_RUNTIME_DIR`. The groups are docker, podman, lxd and incus(-admin). If any is found:
+  - hostd refuses a second tenant's process-tier deployment (`sandbox_unavailable`, naming them);
+  - `twd tenant add` refuses up front;
+  - `twd doctor` warns under the new `host_sockets` check, with the fix "run twd as a dedicated user that can't reach those sockets and isn't in those groups";
+  - all three accept `twd up --insecure-shared-host` as the override.
+- **Doctor's `sandbox` probe** now also checks that its profile can't open a unix socket.
+
+**Tests, with fake listeners at the real paths.** In `twdl-sbx-u24`, sudo started a root-owned listener on each of `/var/run/tailscale/tailscaled.sock` and `/var/run/docker.sock` (mode 0666; it answers `HTTP 200 fake`). The VM has no real tailscaled or docker, and neither was touched. The listeners were removed afterwards.
+
+| Check (listeners present) | Result |
+|---|---|
+| control: curl from the user, unsandboxed | reaches both (`fake`) |
+| `procsb` `TestSandboxProbes`, under a workload profile | both sockets: **EPERM**; temp and guarded sockets EPERM; socketpair stream/seqpacket ok, dgram EPERM; `kill(self/0)` ok; kill of a sibling, of the parent test, of pid 1, and `kill(-1)`: EPERM; tgkill of a sibling: EPERM |
+| hostd `TestLandlockHostSockets`: a **serving workerd**'s live profile | tailscaled.sock, docker.sock, hostd's push socket, a temp socket: **EPERM**; profile has `noUnixSockets` |
+| `make test-node`: a **Node app**'s own `net.connect({path})` | tailscaled.sock, docker.sock, both hostds' push sockets: **EPERM**; TCP as before; Workflow passes |
+| `make test-sdk` | PASS (8/8 SDK workloads under Landlock) |
+| `twd doctor` | `sandbox ok`; `host_sockets warn` naming both sockets |
+| `TestCLIMultiTenant` / `make e2e-multi` | `twd tenant add` refused: `sandbox_unavailable … can reach /var/run/tailscale/tailscaled.sock, /var/run/docker.sock` (expected: defence in depth); the e2e run still cleaned up to 0 devices |
+
+**After the listeners were removed:**
+- **`make test` PASS.** It includes `TestMultiTenant`, whose (d) now also shows A → B's 3 loopback service ports refused (`EACCES`) and B's ports refusing a token-less unsandboxed request. It also includes `TestSharedHostRiskySockets`.
+- **`make e2e-multi` ×2 PASS** (`63a580`, `41967a`): 0 devices left, no policy written, 0 `tskey-`.
+- **macOS:** `make test`, `make lint`, `make test-sdk` and `make test-node` PASS.
+
+**Remaining gaps after the follow-up:**
+- A Node app in `listen: "unix"` mode keeps AF_UNIX, so on ABI < 9 it can reach host sockets by path. The `host_sockets` refusal still protects shared hosts.
+- **A Node app's child processes:**
+  - they can't signal their own pid, because the filter names the app's pid, so `raise()`/`abort()` in a child fails;
+  - the app can't signal its children by pid; `kill(0)` or the process group works.
+  - No test hit this.
+- ~~`host_sockets` makes `--insecure-shared-host` necessary on any Linux host where tailscaled is installed~~: resolved in follow-up 2 (exempt while every workload is denied AF_UNIX).
+
+### Follow-up 2: tailscaled.sock exempted from the shared-host refusal when the sandbox makes it moot (lead decision)
+- **Rule (Linux):** `procsb.ScanHostSockets` now separates the system tailscaled's socket from the *hard* cases (docker/containerd/podman/lxd/incus sockets, membership of their groups). Hard cases refuse a second tenant regardless (root-equivalent for twd-hostd itself; a dedicated user is the fix). `tailscaled.sock` refuses **only** if some workload could reach it: the host's sandbox isn't Landlock+seccomp (`twd-hostd` status `Sandbox`), or a Node app listens on a unix socket (`listen: "unix"` keeps AF_UNIX; `NodeInfo.Listen` is now in status). Applied consistently in hostd's `sharedHostCheck` (which also considers the app being deployed), `twd tenant add` (asks hostd's status) and `twd doctor`.
+- **Doctor:** `host_sockets` is `info` ("reachable by this user, blocked for workloads by seccomp (AF_UNIX denied)") when exempted, `warn` with the reason otherwise; `info` is a new, non-failing status.
+- **Tests** (hostd, with a stubbed scan via `Config.HostSockets`): `TestSharedHostTailscaledSandboxed` (sandbox on → tenant B runs; its workerd's live profile → tailscaled path: **EPERM**), `TestSharedHostTailscaledNoSandbox` (refused), `TestSharedHostTailscaledUnixListen` (tenant A runs nodeprobe with `listen: "unix"` → B refused, "listens on a unix socket"), plus the earlier `WithoutSandbox` and `RiskySockets` (docker) cases.
+- **Measured in the VM with a real fake `/var/run/tailscale/tailscaled.sock`** (sudo, 0666, answering; no docker.sock): `TestCLIMultiTenant` passed, so **`twd tenant add` succeeded** and all (d) checks held; `twd doctor` → `host_sockets info …blocked for workloads by seccomp`; `TestLandlockHostSockets` → a serving workerd's profile gets **EPERM** on that path. Listener removed afterwards.
+- **Docs:** docs/node-tier.md documents the child-process signalling limitation (a child can't `raise()` or signal its own pid; the parent can't `child.kill()` by pid, the group works) and the `listen: "unix"` caveat.
+- **Green after the change** (fake socket removed): VM `make test`, `make test-node`, `make test-sdk`, `make e2e-multi` (`dfc01c`: 0 devices left, no policy written, 0 `tskey-`); macOS `make test`, `make lint`, `make test-sdk`, `make test-node`.
+
+
+## L3: production-shaped microVM tier on Linux (DONE, branch `l3-microvm`)
+Persistent encrypted DO storage, the Firecracker jailer, an unprivileged twd with a small privileged helper, and the e2e from the installed release on a fresh nested-virt VM.
+
+### What's built
+- **Privilege model: `twd-vmhelper`** (`cmd/twd-vmhelper`, `hostd/vm/helper`). twd-hostd runs as the user; the helper is the only root part.
+  - systemd system service `twd-vmhelper.service`, root with `CapabilityBoundingSet=` NET_ADMIN SYS_ADMIN SYS_CHROOT SETUID SETGID CHOWN FOWNER DAC_OVERRIDE DAC_READ_SEARCH MKNOD KILL SYS_RESOURCE IPC_LOCK, `NoNewPrivileges`, `Delegate=yes` (per-VM cgroups live in its subtree).
+  - Socket `/run/twd/vmhelper.sock` (root-owned, SOCK_SEQPACKET); every connection is authorized by **SO_PEERCRED uid** against `/etc/twd/vmhelper.json`.
+  - **It never opens a path a client names.** hostd passes open fds (SCM_RIGHTS): kernel, rootfs, config drive, console log, volume image; it gets back fds for its TAP and the vsock listener. The jailer and Firecracker come from root-owned copies in `/usr/local/libexec/twd` (never from the user-writable `~/.twd`). One connection = one VM: the helper tears everything down when the VM exits or hostd hangs up.
+  - No `ProtectSystem=`/`PrivateTmp=`: a private mount namespace can't bind-mount fds from the host namespace (measured: EINVAL).
+  - As root without the service (tests, `make e2e-vm`), hostd runs the same helper code in-process.
+- **Jailer** (Firecracker v1.17): per VM a chroot (`/var/lib/twd-vm/jail/firecracker/<id>/root`: kernel and rootfs bind-mounted read-only, config drive copied, the volume's device node, the vsock socket, `api.sock`), a dedicated uid/gid (3900000000+slot), its own netns (`fc0` TAP owned by the jail uid), cgroup v2 `cpu.max` = vCPUs and `memory.max` = guest RAM (when not on huge pages) + 256 MiB, and Firecracker's default seccomp filter (checked: `/proc/<pid>/status` `Seccomp: 2`, uid, cgroup).
+- **Persistent DO storage**, per (tenant, workload): `~/.twd/hostd/tenants/<t>/workloads/<w>/do.img` (sparse, 1 GiB default), **LUKS2 opened with dm-crypt on the host** by the helper (loop over the passed fd, key on cryptsetup's stdin). The guest gets plaintext ext4 on `/dev/vdc` (Firecracker `cache_type: Writeback`, so guest fsyncs reach the host), mounted at workerd's DO dir. **The key never enters the guest.**
+  - Key: a 256-bit DEK created once in **mgmt custody** (`twd/<tenant>/volumes/<workload>/dek`, sealed by the custody key), released by `GET /v0/volumes/key` only to the namespace lease holder at the current epoch (ADR-011), audited (`volume_key`). fakemgmt implements it too.
+  - **Fencing:** a volume is attached to one VM at a time (in-memory by dev/inode + an exclusive flock held while attached → `volume_busy`), and never at an epoch older than the newest it was attached at (`/var/lib/twd-vm/volumes.json`, keyed by uid + LUKS UUID → `volume_fenced`). A wrong key → `volume_key`.
+  - **Blue/green → serial for microVM workloads** (like the Node tier): requests wait at the gate; the old VM drains, its guest stops workerd, syncs and unmounts the volume (`shutdown` op), the helper releases it; then the new VM attaches it.
+- **`sudo twd host setup --microvm`** (one time): root-owned binaries, helper config (the user's uid), the unit (enabled), adds the user to `kvm`, reserves huge pages (`/etc/sysctl.d/60-twd-microvm.conf`; default 4 VMs' worth, ≤ ¼ RAM). **`--undo`** removes all of it and restores `nr_hugepages` and `kvm` membership (recorded in `/etc/twd/setup.json`). Without setup, `tier: microvm` falls back to the process tier; `twd doctor` has a `microvm` check (Linux) that says why and how to fix it; `twd up` prints `tiers: process, microvm (…)`.
+- **`twd host vmcheck <workload> [--keyscan]`** (hostd `POST /v0/vm/check` on its user-only socket): guest memory, DO volume fsync latency, and the no-keys scan (rootfs, config drive, guest files, full RAM snapshot taken by the helper) for `tskey-`, every node/machine private key in hostd's state, and the volume key; positive control = the instance MAC key in RAM. Output has needle names and counts only.
+- **Release:** linux tarballs carry `bin/twd-vmhelper`, and with `make vm-assets` (in Lima) `share/twd/vm/{vmlinux, rootfs.ext4, manifest.json, firecracker, jailer}`. twd-hostd finds them next to itself. Microvm workloads' `twd logs` is the guest console.
+
+### Test results
+**`make e2e-vm`** (Lima `twd-dev`, root → in-process helper; fresh clone): **PASS**, TestSmoke + TestVolume + TestE2EVM 13/13 (`e2e/vm/results/l3-20261108T155228Z.json`). New: StorageWrite, Jailed, VolumeNeverDoubleMounted (second VM on probe's volume → `volume_busy`), NoKeysInGuest now with the volume key (29 needles, none in 3 disks / 74 files / 512 MiB RAM; the volume image doesn't contain the DO's plaintext), KillVMFailsFast now checks KV + SQLite **and a write acknowledged right before SIGKILL** survive, RedeployKeepsStorage. TestVolume: data across restart, `volume_busy`, `volume_fenced` (epoch 1 after 2), `volume_key`, key absent from RAM + image. The same two backend tests also pass **as the normal user through the systemd helper** in twd-dev.
+
+**`make e2e-linux-vm`: PASS** (run `47c606`, `e2e/real/results/l3-linuxvm-20261108-080743-47c606.json`, release `0.1.0-…`): fresh `twdl-kvm-u24` (Ubuntu 24.04 arm64, vz, nested virt, 6 CPU / 10 GiB / 40 GiB, nothing mounted, no provisioning; tarball and key file via `limactl copy`). install.sh (0.7 s, no sudo) → doctor (`microvm: warn … not installed`, fix shown) → `sudo twd host setup --microvm` (1.0 s) → doctor `microvm: ok` → `twd up` (0.62 s) → agent + mcp with `"tier": "microvm"` → **checks (a)–(f) PASS** from this Mac (tsnet client + echo, `ttest-l3-<run>`) → both workloads jailed (uid, seccomp mode 2 checked via procfs) → storage across a **VMM SIGKILL** (30 SQLite writes, incl. the last acked one) and a **redeploy** → **no keys in either guest** (22/24 needles incl. volume key; none in rootfs, config drive, 70/49 guest files, 512 MiB RAM; MAC-key control found) → `twd down` → `sudo twd host setup --undo` (nothing left; kvm membership and huge pages restored; doctor back to warn). Cleanup: 6 test devices deleted, 0 left; 4 twd devices/keys, 0 left after down; VM clean; key file removed; **VM stopped, not deleted**. An earlier run (`bbc005`) failed only at `twd logs agent` (no host-side workerd.log for microVMs: fixed, logs = guest console) and one at `twd host vmcheck` arg parsing (fixed).
+
+**Measurements** (nested virt on an M5 Pro; fresh VM unless noted):
+
+| Metric | Value |
+|---|---|
+| InstanceStart → workerd ready (agent / mcp) | 744 / 703 ms (twd-dev hermetic: 557–666 ms) |
+| Whole boot (helper: netns, jail, volume attach, jailer, API; guest) | 861 / 811 ms |
+| Volume attach (loop + LUKS2 open; first boot also formats) | 93–95 ms first boot, 15–20 ms after |
+| **RSS per VM** (Firecracker VmRSS + hugetlb guest RAM) | agent 175 → 193 MiB, mcp 159 → 171 MiB (hermetic hello/probe 118/150 MiB); guest workerd RSS 116 / 98 MiB |
+| **Request latency** p50 / p95, this Mac → VM over tailnet 1 | MCP tools/list 1.49 / 3.34 ms; agent request with SQLite insert + setState 4.40 / 5.16 ms |
+| Hermetic (twd-dev, tsnet) | object in VM 0.53 / 0.80 ms vs process 0.38 / 0.44; egress 1.43 / 1.80 vs 0.90 / 1.41 |
+| **DO write latency** (hermetic, per request over tsnet) | KV put 0.59 / 2.80 ms, SQL insert 3.22 / 4.40 ms, KV get 0.55 / 0.87 ms |
+| **Volume 4 KiB write + fdatasync in the guest** (virtio-blk → dm-crypt → image) | write p50 10 µs; fsync p50 2.9–3.2 ms, p95 3.8–4.4 ms (twd-dev 2.3–2.5 / 2.5–2.7 ms) |
+| **Restart → serving** after VMM SIGKILL | 1.28 s (fresh VM, via tailnet); 0.94 s hermetic |
+| Redeploy → serving (serial: drain, guest unmount, release, new VM, attach) | 1.74 s from `twd deploy` (CLI 1.57 s); hermetic 0.82 s, guest unmount + release ~110 ms |
+| `twd host setup --microvm` / install.sh | 1.0 s / 0.7 s |
+
+**`make e2e-linux-reboot`: PASS** (run `4920c5`, `e2e/real/results/l3-reboot-20261108-082536-4920c5.json`; same fresh `twdl-kvm-u24`, non-ephemeral nodes `twd-l3r-<run>-*`). An agent object `boot1` in a jailed microVM writes SQLite (11 calls); then the whole VM reboots **twice**: (1) clean `limactl stop` + start, (2) `limactl stop --force` (a power cut) + start. After each: `twd-vmhelper` is active via systemd, `twd up` again as the user, and the object **rejoins from saved node state** (same stable node ID `n4sx…` and IP, the run's device list unchanged: no new device), **all SQLite writes are present** (12, then 13), and the volume **re-opens** (dm-crypt `type: LUKS2`, helper log `formatted=false`) with the custody key. The main `make e2e-linux-vm` was re-run after these fixes: PASS (`5b1456`).
+
+| Reboot timing | clean | power cut |
+|---|---|---|
+| kernel boot → twd-vmhelper active (systemd, VM clock) | 3.98 s | 4.63 s |
+| kernel boot → ssh usable / `limactl start` returns | 5.2 s / 6.8 s | 6.3 s / 7.8 s |
+| `twd up` (mgmt + hostd ready) | 0.59 s | 0.61 s |
+| microVM InstanceStart → ready / volume attach | 0.80 s / 22 ms | 0.82 s / 22 ms |
+| `twd up` → the object serving the Mac client over tailnet 1 | 17.4 s | 12.8 s |
+
+The object-serving time is dominated by the client re-learning the rejoined node over the tailnet (netmap + path), not by twd: the workload VM is ready ~1 s after `twd up` (not investigated further).
+
+Fixed on the way (found by the reboot test):
+- **Serial deploys didn't rejoin saved objects.** The rejoin of objects from `objects.json` ran only on the blue/green path; microVM (and Node-tier) workloads deploy serially, so after a restart their objects never came back. `rejoinObjects` now runs on both.
+- **Stale `supervisor.pid` after a reboot.** Boots are deterministic enough that the old supervisor's pid was the new `twd up` process: `already_running`. A pid now counts only if that process started before the pid file was written (Linux `/proc/<pid>/stat`).
+
+### Findings
+1. **Fd hygiene matters across jails.** `dup()` without CLOEXEC let a later VM's jailer inherit another VM's volume fd, holding its flock: the restarted VM got `volume_busy`. All dups are `F_DUPFD_CLOEXEC` and received SCM_RIGHTS fds are marked CLOEXEC.
+2. **Acknowledged DO writes survive a VMM SIGKILL** (workerd commits before answering; `Writeback` cache turns guest flushes into host fsyncs). A plain file written through a workerd disk service without fsync did **not** survive (ext4 delayed allocation): durability is the app runtime's fsync, which workerd's DO storage does.
+3. The jailer's pivot_root keeps bind mounts made beforehand in the host namespace; `/proc/<pid>/root` of the jailed VMM isn't readable by the user (only by root).
+4. Huge pages are still decisive (STATUS M8); setup reserves them persistently.
+
+### Known gaps (L3)
+- After a reboot `twd up` is manual here (L1 adds `twd up --service`); the 12–17 s until a tailnet client reaches a rejoined object node is not twd-side.
+- **Snapshot restore** (warm start) not built; boot is ~0.6–0.75 s to workerd ready.
+- Serial blue/green means ~0.8–1.7 s of held requests on redeploy; no hot handover of the volume.
+- The volume never shrinks/grows (fixed sparse size, `-vm-volume-mib`); no online backup (ADR-012's async backup is not built).
+- The helper runs as root with a bounded capability set, not as a capability-only non-root binary; jailer + cryptsetup + mounts need CAP_SYS_ADMIN anyway. No `ProtectSystem` (see above).
+- `kvm` group membership is added (as specified) but unused by twd: the helper opens `/dev/kvm` for the jail.
+- amd64 microVM assets aren't built (L1 adds amd64 releases; the tier needs an x86 kernel + image).
+- The cryptsetup/losetup/mkfs dependency: present on Ubuntu/Debian cloud images; setup fails with an install hint otherwise.
+
+
+## L1: Linux release, doctor, systemd user service, E2E-LINUX matrix (DONE, branch `l1-linux-release`)
+- **Releases:** `make release` now builds `darwin-arm64`, `linux-arm64` and **`linux-amd64`**. The Go binaries are built with `CGO_ENABLED=0`; amd64's workerd comes from npm `@cloudflare/workerd-linux-64` (integrity-checked against the lockfile).
+  - `scripts/check-arch.mjs` checks each binary's ELF/Mach-O machine against the target.
+  - `scripts/check-pure-js.mjs` proves the shared vendored `node_modules` holds no `.node`/ELF/Mach-O/PE files and no `os`/`cpu` packages, so one tree serves every target. The only native package in the closure is `@rolldown/binding-*` (agents → `@rolldown/plugin-babel`, used only by `agents/dist/vite.js`). It was already skipped, and no workerd bundle needs it. `core-js-pure` has a postinstall banner, which is never run.
+  - `install.sh` maps `x86_64` → amd64 and refuses musl or glibc < 2.35 with a clear message. On bash it suggests `~/.profile` instead of creating `~/.bash_profile`, which would shadow `~/.profile` on Debian and Ubuntu.
+  - `RELEASE_VERSION` is now expanded once (`:=`); an edit made during `make release` had renamed the e2e tarball.
+- **`twd doctor` on Linux** (`cmd/twd/doctor_linux.go`). The checks:
+  - `glibc` runs before `workerd`. It uses `getconf`, with `ldd` as a fallback and musl detection. It also reads workerd's ELF `GLIBC_` floor.
+  - `kernel`.
+  - `landlock`: `landlock_create_ruleset(NULL,0,VERSION)`, decoding ENOSYS and EOPNOTSUPP.
+  - `user_namespaces`: informational; reports AppArmor's restriction.
+  - `kvm`: opens `/dev/kvm` read-write and calls `KVM_GET_API_VERSION`; names the group in the fix.
+  - `firecracker`, and the jailer.
+  - `cgroups_v2`, plus what is delegated to the user manager.
+  - `systemd`: the user manager, linger, and the `twd.service` state.
+  - `microvm_tier`: available or unavailable, with every reason.
+
+  The system-tailscaled check now works on Linux too. It finds twd's socket inodes in `/proc/<pid>/fd` and matches the peers of `ss -x` connections bound at `*tailscale*`. macOS still uses lsof. A hermetic test (`TestTailscaledHoldersDetects`, Linux) proves it flags a connection to another process's `…/tailscaled.sock`.
+- **`twd up --service` / `twd down --service`** (`cmd/twd/service.go`):
+  - `--service` writes `~/.config/systemd/user/twd.service`, which runs the same `twd __supervise` (`KillMode=mixed`, `TimeoutStopSec=180`, `Restart=on-failure`), and enables and starts it.
+  - A plain `twd down` stops it through systemctl; the unit stays enabled. `twd down --service` disables and removes it.
+  - It prints `sudo loginctl enable-linger <user>` guidance and never runs sudo. On macOS it is refused (`service_unsupported`).
+  - `twd up` without `--service` refuses while the unit is active.
+- **`make e2e-linux`** (`e2e/linux`, `scripts/e2e-linux{,-one}.sh`):
+  - Each row gets a **fresh** Lima VM `twdl-<distro>` from the official template (4 CPU / 6 GiB / 30 GiB, `--plain --mount-none`). The test asserts nothing in `/proc/mounts` is virtiofs, 9p or sshfs.
+  - The tarball and the key file go in with `limactl copy` (the key 0600, in a 0700 dir). They are removed by `t.Cleanup` and by the shell trap, even on failure.
+  - The run covers `twd doctor`, checks (a)–(f) under `twd up --service`, then `systemctl --user restart` (new MainPID; healthy; the same workload IP answers the Mac), doctor while running, `twd down --purge --service`, and zero leftovers by ID.
+  - At most 2 VMs run at once. Each is `limactl stop`ped (kept) when its row ends.
+  - cliflow gained `UpArgs`, `Persistent` and `Slow` (the amd64 timeout scale, 6×).
+- **Matrix (2026-11-08, release `0.1.0-bb3a3296`). Every row PASSED, with zero leftover devices and keys:**
+  - Ubuntu 24.04 arm64, Debian 12 arm64, Ubuntu 22.04 arm64, Fedora 45 arm64 (vz);
+  - Ubuntu 24.04 **amd64** (qemu x86-64 emulation).
+  - Sandbox: **none (L2 pending)** on every row. The microVM tier is **unavailable** on every row (no /dev/kvm, no firecracker, not root).
+
+  Typical arm64 numbers:
+
+  | step | time |
+  |---|---|
+  | install.sh | 0.4–0.8 s |
+  | up → ready | 0.64–0.70 s |
+  | deploy → ready | 1.5–2.8 s |
+  | first object node | ~1.6 s |
+  | kill CLI | ~66–72 ms |
+  | killed request → 410 | ≤ 1.7 ms |
+  | Mac → VM | direct after ~0.19 s; tools/list 1.9–3.5 ms direct vs 10.7–16.6 ms DERP-only |
+  | service restart → workload reachable | 3.8–6.7 s |
+
+  amd64 (emulated): install 9.1 s, up 3.4 s, deploy 4.7–5.5 s, kill 319 ms, restart → reachable 13.1 s. The full table is in docs/INSTALL.md ("Linux support matrix"); the raw JSON is in `e2e/real/results/l1-linux/`.
+- **Unsupported-host rows** (`TestUnsupportedHost`):
+  - **Debian 11** (glibc 2.31, kernel 5.10): install.sh is refused; `bin/twd doctor` gives `✗ glibc` (with distro and fix), `! kernel` and `! landlock` (ENOSYS).
+  - **Alpine 3.24** (musl): install.sh and doctor both refuse it, naming `/lib/ld-musl-aarch64.so.1`.
+- **Verification:** `make test` is green on macOS and in Lima `twd-dev` (a clone of this branch, at `ccce991`, which includes the re-mint fix). `make lint` is clean.
+
+### L1 findings and gaps
+- **workerd's real glibc floor is 2.27, not 2.35.** The pinned workerd's ELF imports `GLIBC_2.27` at most, on both arm64 and amd64, and `workerd --version` runs on Debian 11 (glibc 2.31). The 2.35 floor (install.sh refusal, doctor `fail`) is kept as policy: it is the oldest glibc tested. The lead may want to lower it to 2.31 after a full run on Debian 11 / RHEL 9 (2.34).
+- **Fixed: ephemeral nodes across a restart (re-mint on rejected rejoin).** First seen on the first e2e-linux run (`--ephemeral`): after `systemctl --user restart` both workload nodes hung in `tsnet.Up` for 2 min and failed with `bootstrap_failed … context deadline exceeded`. Cause: control removes an ephemeral device that logs out, so its saved `tailscaled.state` lands the backend in `NeedsLogin`, and `tsnet.Up` waits for `Running` and never reacts to that. The fix, commit `7f2e608` + follow-up:
+  - **netd:** during a rejoin, `start()` watches the IPN bus next to `tsnet.Up`; `NeedsLogin` that persists for 2 s is a rejection. netd drops `tailscaled.state`, asks the KeySource for a key with `KeyRequest.Remint`, and joins again as the **same hostname** (`ObjectInfo.Reminted`). Persistent nodes whose state is accepted rejoin exactly as before, with no key. Hermetic `TestRejoinRejectedRemints` (testcontrol never refuses a node key by itself, so the test forces `NodeKeyExpired` and lifts it in the remint callback).
+  - **mgmt:** `POST /v0/objects/{id}/remint` (host role, lease-fenced): a live object goes back to `pending` with its node IDs cleared, the **previous device is deleted** (control lists a logged-out ephemeral device for a while; a 404 is fine), an audit record `remint` is written, and the object is re-queued; `credential` then releases the new key and `/ready` records the new node ID. `TestRemintAfterRejectedRejoin`. Rejected for other hosts and stale epochs (`lease_lost`), and for killed objects.
+  - **hostd:** `keySource.AuthKey` calls `Remint` before `Credential` when netd asks with `Remint`; fakemgmt has the route; the log line says `reminted=true`.
+  - **Real tailnet (e2e-linux, Ubuntu 24.04 arm64, `--ephemeral`, `--service`):** agent + spawned sub-agent, then `systemctl --user restart twd`. All 3 nodes (workload, agent, sub-agent) were rejected and re-minted; the sub-agent was ready again as the same hostname with a new node ID **4.1 s** after the restart and answering this Mac **9.5 s** after it (new IP). `twd down --purge --service` then left **zero** devices or keys (the old devices were deleted by `remint`, not by the test's cleanup).
+- **Reboot survival (measured, Ubuntu 24.04 arm64):** `sudo loginctl enable-linger` inside the VM, then `limactl stop` (1.1 s) and `limactl start` from the Mac. From the start of boot: ssh up **6.6 s**, `twd.service` active **6.6 s** (new MainPID), `twd status` healthy **6.6 s**, the mcp workload answering this Mac **8.6 s** (run 3) / **17.1 s** (runs 4 and 5); both live objects rejoined from saved state with their old node IDs, **0 re-minted**. The `e2e-linux` reference row (`ubuntu24-arm64`) now runs both of these phases every time (`TWD_E2E_REBOOT`, `TWD_E2E_EPHEMERAL`); results in `e2e/real/results/l1-linux/` (run `819d63`).
+- **Gap found while doing this:** after `twd down --purge`, deploying the same workload again on the **same state dir** is refused: `bootstrap_failed: the workload node for agent is killed` (mgmt keeps the killed workload-node object and the deploy path looks it up by name). Real users hit this with `twd down --purge && twd up && twd deploy`. The e2e's ephemeral phase uses a fresh state dir to get past it. Not L1's code; needs a fix in mgmt/hostd deploy (create a new workload-node object when the previous one is killed).
+- The rejection is logged twice per node (netd and hostd both say "saved node state rejected by control"); cosmetic.
+- No VM had a system tailscaled installed, so the e2e's "no twd process holds tailscaled's socket" result is a negative only. The positive control is the hermetic `TestTailscaledHoldersDetects`.
+- amd64 ran only under qemu TCG emulation (no x86 hardware here), so its numbers are slow by construction (timeouts scaled 6×; measured values recorded unscaled).
+- Lima: `debian-11` genericcloud doesn't boot under `vmType: vz` (ssh never came up in 10 min), so that row uses qemu. The template locator is now `template:X` (Lima 2 syntax).
+- Integration notes for the lead:
+  - **L2** owns the `sandbox` check (still `skip` on Linux), and should change the `landlock` check's "sandbox pending" wording once Landlock lands; `release.json`'s `"sandbox":"none"` for linux too.
+  - **L3:** `microvm_tier` looks for `~/.twd/vm/{vmlinux,rootfs.ext4}` and for firecracker/jailer on PATH, in `~/.twd/bin` or `/usr/local/bin`. It reports "not root" until `twd host setup --microvm` exists.
+  - The new files (`doctor_linux.go`, `doctor_host.go`, `doctor_other.go`, `service.go`) are separate, to keep conflicts small. `doctor.go`, `up.go` and `cliflow.go` have small hunks.
+- **Matrix VMs (all stopped, kept, not deleted):** `twdl-ubuntu24-arm64`, `twdl-debian12-arm64`, `twdl-ubuntu22-arm64`, `twdl-fedora-arm64`, `twdl-ubuntu24-amd64`, `twdl-debian11-arm64`, `twdl-alpine-arm64`.
