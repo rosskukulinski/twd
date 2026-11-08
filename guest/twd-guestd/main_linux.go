@@ -263,7 +263,7 @@ type guest struct {
 	mu         sync.Mutex
 	workerdPID int
 	restarts   int
-	stopping   bool // shutdown: don't restart workerd
+	stopping   bool     // shutdown: don't restart workerd
 	exits      chan int // workerd exit statuses, fed by reap()
 }
 
