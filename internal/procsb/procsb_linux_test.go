@@ -296,3 +296,9 @@ http.createServer(async (q, r) => {
 		}
 	}
 }
+
+func TestSeccompFilterShape(t *testing.T) {
+	if n := len(procsb.FilterForTest()); n == 0 || n > 4096 {
+		t.Fatalf("seccomp filter has %d instructions", n)
+	}
+}

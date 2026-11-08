@@ -2,6 +2,8 @@ package hostd
 
 import (
 	"context"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -92,5 +94,24 @@ func TestSeatbeltProfileNodePrefix(t *testing.T) {
 	}
 	if strings.Contains(p, `file-write* (subpath "`+dir+`/home/.nvm`) {
 		t.Fatal("node prefix must be read-only")
+	}
+}
+
+// The Landlock profile shape (Linux): sandboxOf maps a recorded profile to
+// its sandbox, and "landlock" is refused where the kernel lacks it.
+func TestSandboxKinds(t *testing.T) {
+	for p, want := range map[string]string{"/r/i1-ab/sandbox.sb": SandboxSeatbelt, "/r/i1-ab/sandbox.json": SandboxLandlock, "": SandboxNone} {
+		if got := sandboxOf(p); got != want {
+			t.Fatalf("sandboxOf(%q) = %q, want %q", p, got, want)
+		}
+	}
+	sb, err := ResolveSandbox(SandboxLandlock)
+	if runtime.GOOS != "linux" && err == nil {
+		t.Fatalf("landlock resolved on %s: %q", runtime.GOOS, sb)
+	}
+	h := &Host{cfg: Config{RunDir: "/r"}}
+	a, b := h.instanceDir(1), h.instanceDir(1)
+	if a == b || !strings.HasPrefix(a, "/r/i1-") || len(filepath.Base(a)) != len("i1-")+16 {
+		t.Fatalf("instance dirs not unguessable: %s %s", a, b)
 	}
 }

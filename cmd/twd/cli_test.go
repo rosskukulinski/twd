@@ -242,7 +242,7 @@ func TestCLIMultiTenant(t *testing.T) {
 			}}
 	}
 	m := &cliflow.MultiEnv{Env: &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, TSAPIURL: api.URL, Prefix: "twd-m-",
-		Res: cliflow.NewResults("hermetic-multi", "a+b")}, A: tenant("a"), B: tenant("b"), RequireSandbox: runtime.GOOS == "darwin"}
+		Res: cliflow.NewResults("hermetic-multi", "a+b")}, A: tenant("a"), B: tenant("b"), RequireSandbox: sandboxAvailable()}
 	t.Cleanup(func() {
 		if os.Getenv("TWD_KEEP") != "" {
 			t.Logf("TWD_KEEP: state left running in %s", state)
@@ -294,8 +294,10 @@ func TestDoctor(t *testing.T) {
 	}
 	want := map[string]string{"binaries": "ok", "workerd": "ok", "bundler": "ok", "twd_home_writable": "ok",
 		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "system_tailscaled_not_used": "ok"}
-	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb == hostd.SandboxSeatbelt {
-		want["sandbox"] = "ok" // the Seatbelt probe ran and enforced a deny
+	if sandboxAvailable() {
+		want["sandbox"] = "ok" // the Seatbelt / Landlock probe ran and enforced a deny
+	} else if runtime.GOOS == "linux" {
+		want["sandbox"] = "warn" // Linux without Landlock: loud warning
 	}
 	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)
@@ -309,4 +311,11 @@ func TestDoctor(t *testing.T) {
 	if _, se, _, err := e.Twd("doctor", "--tailnet", "example.ts.net", "--api-key-file", bad); err == nil || !strings.Contains(se, "doctor_failed") {
 		t.Fatalf("doctor with a bad key file: %v %s", err, se)
 	}
+}
+
+// sandboxAvailable: this host runs process-tier workloads sandboxed
+// (Seatbelt on macOS, Landlock on Linux).
+func sandboxAvailable() bool {
+	sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto)
+	return sb == hostd.SandboxSeatbelt || sb == hostd.SandboxLandlock
 }
