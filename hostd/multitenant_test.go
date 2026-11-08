@@ -149,6 +149,11 @@ func TestMultiTenant(t *testing.T) {
 		if err := probe("/bin/cat", filepath.Join(data, "audit.key")); err == nil {
 			t.Fatal("tenant A's sandbox can read hostd's audit key")
 		}
+		if home, _ := os.UserHomeDir(); home != "" {
+			if err := probe("/bin/ls", home); err == nil {
+				t.Fatal("tenant A's sandbox can list the home dir (API key files live there)")
+			}
+		}
 		if err := probe("/bin/ls", ws["a"].DOStorage); err != nil {
 			t.Fatalf("tenant A's sandbox can't list its own DO storage: %v", err)
 		}

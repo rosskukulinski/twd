@@ -71,16 +71,29 @@ func (s *state) objectsOf(ctx context.Context, tenantID string) ([]mgmt.Object, 
 }
 
 func cmdTenant(args []string) error {
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	// Global flags (--state-dir X, --json) may precede the subcommand.
+	sub := -1
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			sub = i
+			break
+		}
+		if (a == "--state-dir" || a == "-state-dir") && i+1 < len(args) {
+			i++
+		}
+	}
+	if sub < 0 {
 		return fail("bad_request", "twd tenant needs a subcommand: add | ls", "usage: twd "+usageOf("tenant"))
 	}
-	switch args[0] {
+	rest := append(append([]string{}, args[:sub]...), args[sub+1:]...)
+	switch args[sub] {
 	case "add":
-		return cmdTenantAdd(args[1:])
+		return cmdTenantAdd(rest)
 	case "ls", "list":
-		return cmdTenantLs(args[1:])
+		return cmdTenantLs(rest)
 	}
-	return fail("bad_request", fmt.Sprintf("unknown subcommand %q", args[0]), "usage: twd "+usageOf("tenant"))
+	return fail("bad_request", fmt.Sprintf("unknown subcommand %q", args[sub]), "usage: twd "+usageOf("tenant"))
 }
 
 type tenantAddResult struct {

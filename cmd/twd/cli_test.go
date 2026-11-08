@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -194,4 +195,75 @@ func TestDevOnce(t *testing.T) {
 	if r.Smoke.Status != 200 || r.Smoke.Caller.NodeID == "" {
 		t.Fatalf("twd dev --once: %+v", r)
 	}
+}
+
+// TestCLIMultiTenant is E2E-MULTI hermetically: one host (twd up) serves
+// tenant A (testcontrol A) and tenant B (`twd tenant add`, testcontrol B)
+// with the same agent app; e2e/cliflow MultiEnv checks (a)–(f).
+func TestCLIMultiTenant(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	wd, err := nettest.WorkerdBinary()
+	if err != nil || !hostdtest.HasNode() {
+		t.Skip("needs workerd and node (make deps)")
+	}
+	t.Setenv("TWD_WORKERD", wd)
+	ctls := map[string]*nettest.Control{}
+	for _, k := range []string{"a", "b"} {
+		c, err := nettest.StartControl()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		c.Server.SetGlobalAppCaps(tailcfg.PeerCapMap{nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue}})
+		ctls[k] = c
+	}
+	fts := newFakeTS(t)
+	api := httptest.NewServer(fts)
+	defer api.Close()
+	bin := cliflow.BuildBinaries(t)
+	state, _ := hostdtest.ShortDir("twd-mt-")
+	work := t.TempDir()
+	var nodes []*nettest.Node
+	tenant := func(k string) *cliflow.Tenant {
+		kf := filepath.Join(work, k+"-api.env")
+		os.WriteFile(kf, []byte("TS_API_KEY=fake-not-a-key-"+k+"\n"), 0o600)
+		return &cliflow.Tenant{Tailnet: k + ".ttest.ts.net", APIKeyFile: kf, ControlURL: ctls[k].URL,
+			Res: cliflow.NewResults("hermetic-"+k, k+".ttest.ts.net"),
+			NewNode: func(role string) *nettest.Node {
+				n, err := nettest.NewNode(context.Background(), ctls[k].URL, nettest.DummyKey, "ttest-"+role, filepath.Join(work, role))
+				if err != nil {
+					t.Fatal(err)
+				}
+				nodes = append(nodes, n)
+				return n
+			}}
+	}
+	m := &cliflow.MultiEnv{Env: &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, TSAPIURL: api.URL, Prefix: "twd-m-",
+		Res: cliflow.NewResults("hermetic-multi", "a+b")}, A: tenant("a"), B: tenant("b"), RequireSandbox: runtime.GOOS == "darwin"}
+	t.Cleanup(func() {
+		if os.Getenv("TWD_KEEP") != "" {
+			t.Logf("TWD_KEEP: state left running in %s", state)
+			return
+		}
+		if t.Failed() {
+			for _, c := range []string{"supervisor", "mgmt", "hostd"} {
+				b, _ := os.ReadFile(filepath.Join(state, "logs", c+".log"))
+				t.Logf("%s log (tail):\n%s", c, hostdtest.Trim(string(b[max(0, len(b)-5000):]), 5000))
+			}
+		}
+		m.Twd("down")
+		for _, n := range nodes {
+			n.Close()
+		}
+		os.RemoveAll(state)
+	})
+	m.Run()
+	m.Down()
+	if fts.setPolicy != 0 {
+		t.Fatalf("twd wrote a policy without --policy-apply (%d times)", fts.setPolicy)
+	}
+	b, _ := json.MarshalIndent(m.Res, "", "  ")
+	t.Logf("results:\n%s", b)
 }

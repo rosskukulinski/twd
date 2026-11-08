@@ -585,6 +585,7 @@ type statusResult struct {
 	Tailnet    string                 `json:"tailnet"`
 	TenantID   string                 `json:"tenantID"`
 	Tenants    []tenantStatus         `json:"tenants"`
+	MgmtSocket string                 `json:"mgmtSocket"`
 	Supervisor bool                   `json:"supervisor"`
 	Mgmt       bool                   `json:"mgmt"`
 	Host       bool                   `json:"host"`
@@ -611,7 +612,7 @@ func cmdStatus(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	r := statusResult{StateDir: s.Dir, Tailnet: s.Cfg.Tailnet, TenantID: s.Cfg.TenantID, Objects: map[string]int{}}
+	r := statusResult{StateDir: s.Dir, Tailnet: s.Cfg.Tailnet, TenantID: s.Cfg.TenantID, Objects: map[string]int{}, MgmtSocket: s.mgmtSock()}
 	r.Supervisor = s.supervisorAlive()
 	if r.Supervisor && s.mgmtHealthy(ctx) {
 		r.Mgmt = true

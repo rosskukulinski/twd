@@ -129,6 +129,14 @@ func (c *Client) Tenant(ctx context.Context, id string) (*Tenant, error) {
 	return &out, err
 }
 
+// Tenants lists every tenant (local admin socket only; used to keep every
+// tenant's API key file out of every workerd sandbox).
+func (c *Client) Tenants(ctx context.Context) ([]Tenant, error) {
+	var out []Tenant
+	err := c.Do(ctx, "GET", "/v0/tenants", nil, &out)
+	return out, err
+}
+
 // Bundle fetches a deployment bundle (raw tar). bundleURL may be relative to
 // the mgmt base.
 func (c *Client) Bundle(ctx context.Context, bundleURL string) ([]byte, error) {

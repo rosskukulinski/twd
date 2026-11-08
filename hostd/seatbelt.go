@@ -1,6 +1,7 @@
 package hostd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 )
 
 // Process-tier sandboxes (Config.Sandbox).
@@ -114,11 +116,16 @@ func SeatbeltProfile(own, readOnly, deny []string) string {
 	return b.String()
 }
 
-// sandboxDeny is what no workerd may touch: hostd's data and run dirs, the
-// configured extra paths (twd up: the whole state dir), and the API key
-// file of every tenant this host serves.
+// sandboxDeny is what no workerd may touch: the user's home dir (API key
+// files, including those of tenants added after this workerd started, and
+// everything else there), hostd's data and run dirs, the configured extra
+// paths (twd up: its state and run dirs), and the API key file of every
+// tenant this host serves.
 func (h *Host) sandboxDeny() []string {
 	deny := append([]string{h.cfg.DataDir, h.cfg.RunDir}, h.cfg.SandboxDeny...)
+	if home, err := os.UserHomeDir(); err == nil && home != "/" && home != "" {
+		deny = append(deny, home)
+	}
 	h.mu.Lock()
 	for _, t := range h.tenants {
 		if t.info.APIKeyFile != "" {
@@ -126,6 +133,17 @@ func (h *Host) sandboxDeny() []string {
 		}
 	}
 	h.mu.Unlock()
+	// Every tenant mgmt knows, including ones this host has no workload of
+	// yet (best effort: the local socket allows it, a remote mgmt may not).
+	ctx, cancel := context.WithTimeout(h.ctx, 3*time.Second)
+	defer cancel()
+	if ts, err := h.mgmt.Tenants(ctx); err == nil {
+		for _, t := range ts {
+			if t.APIKeyFile != "" {
+				deny = append(deny, t.APIKeyFile)
+			}
+		}
+	}
 	return deny
 }
 

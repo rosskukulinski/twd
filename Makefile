@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
 
 all: build
 
@@ -81,6 +81,15 @@ e2e-mac: deps
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2emac -count=1 -v -timeout 20m ./e2e/mac/...
 
+## e2e-multi: E2E-MULTI on this Mac: one host serves tenant A (tailnet 1, `twd up`) and tenant B
+## (tailnet-2, `twd tenant add`, name discovered) with the same agent app; isolation checks a–f;
+## zero leftovers in both tailnets. Runs only if both credential files exist.
+e2e-multi: deps
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ] || [ ! -f "$(TS_CREDS)/tailnet2_api.env" ]; then \
+		echo "e2e-multi: SKIPPED (needs $(TS_CREDS)/tailnet1_api.env and tailnet2_api.env)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_API_KEY_FILE_B="$(TS_CREDS)/tailnet2_api.env" \
+		TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2emulti -count=1 -v -timeout 25m ./e2e/multi/...
 
 release:
 	@echo "release: not implemented yet (milestone M6)"; exit 1
@@ -94,6 +103,7 @@ lint:
 	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
+	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags sdk ./e2e/sdk/...
 	@sh scripts/check-secrets.sh
 
