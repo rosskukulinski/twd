@@ -396,7 +396,10 @@ func TestE2EKeyless(t *testing.T) {
 		fmt.Sprintf("object %s (%v) answers on its own node; mint mode wif, no API key on the host", ao.MagicDNS, ao.Tags))
 	var aud struct {
 		Verified bool
-		Records  []struct{ Kind, ActingFor, ObjectID string }
+		Records  []struct {
+			Kind, ActingFor string
+			ObjectID        string `json:"object"`
+		}
 	}
 	dev.MustJSON(&aud, "audit", "--all")
 	mints, deployBy := 0, false
