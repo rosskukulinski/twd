@@ -914,3 +914,52 @@ Earlier runs, kept for the record: on merge commit `a219532`, `make e2e-mac` (`8
 - The Node tier on Linux has no per-tenant confinement, same as workerd. `runtime: node` + `tier: microvm` is still rejected (M9 gap).
 - Node-tier templates (`node-workflow`) are shipped in the release but not deployable offline: they need Node and `npm install`, as before (only `@twd/node` is vendored).
 
+
+## L2: Linux process-tier sandbox, Landlock + seccomp (DONE, branch `l2-landlock`)
+Parity with the macOS Seatbelt sandbox (M7) for the Linux process tier, measured in a fresh Lima VM **`twdl-sbx-u24`** (Ubuntu 24.04 arm64, `vz`, 4 CPU / 6 GiB, kernel 6.8.0-147, **Landlock ABI 4**; `apparmor_restrict_unprivileged_userns=1`, so no user namespaces; Go 1.27.3, Node 24.22). The VM mounts this worktree; tests ran on an rsync'd VM-local copy so the Mac's `node_modules` stay darwin. It is **stopped, not deleted**.
+
+### What's built
+- **`internal/procsb`: a re-exec launcher, no cgo** (`github.com/landlock-lsm/go-landlock` v0.11.0 with best-effort downgrade up to ABI 11; hand-built seccomp BPF, arm64 + amd64). hostd starts `<twd-hostd> __twd-sandbox-exec -f <instance>/sandbox.json -- workerd|node …`. The launcher runs from package `init` in any binary importing procsb (twd-hostd, twd, test binaries), applies the profile to itself and `execve`s the workload in place (same pid). Cost: ~2 ms per start (`workerd --version`: 1 → 3 ms).
+  - **Landlock FS (deny by default):** read+exec `/usr /lib /lib64 /bin /sbin /etc /opt` (+ `/nix/store`), the runtime binary (workerd / node) and node's install prefix; a short list of global `/proc` and `/sys` files (cpuinfo, meminfo, cgroup limits), and the process's **own** `/proc/<pid>` entries except `net/` and `task/`; `/dev/null|zero|full|urandom|random`. Read-write (incl. refer and, at ABI ≥ 9, unix-socket connect) **only** the instance dir and its own DO-storage / Node data dir. So the home dir (`~/.twd`, API key files), hostd/mgmt state and run dirs, other tenants' dirs, node keys, `/tmp` and other processes' `/proc` (environ, cmdline, `/proc/net/unix`) are all `EACCES`.
+  - **Landlock TCP (ABI ≥ 4):** bind/connect only the profile's ports. workerd: **none** (all its sockets are unix sockets in its own dir). Node: bind+connect its own app port, connect its egress proxy's port. Everything else, loopback included, is `EACCES` before a packet is sent.
+  - **Scopes (ABI ≥ 6)** and **pathname unix-socket connects (ABI ≥ 9)** are requested too and apply automatically on newer kernels.
+  - **`PR_SET_NO_NEW_PRIVS` + seccomp (TSYNC):** EPERM for ptrace, process_vm_readv/writev, pidfd_getfd, kcmp, kexec, (u)mount and the new mount API, pivot_root, chroot, bpf, perf_event_open, keyctl/add_key/request_key, module loading, unshare/setns, clone with namespace flags, open_by_handle_at, userfaultfd, fanotify, swap, reboot, syslog, `kill(-1)`; ENOSYS for clone3 and io_uring (glibc/libuv fall back). `socket()` only AF_UNIX, AF_INET/6 **TCP** (protocol 0/6: not MPTCP, which bypasses Landlock, nor SCTP), and NETLINK_ROUTE (not sock_diag, which lists unix socket paths); UDP/ICMP/raw/packet/vsock refused. Foreign syscall ABIs (32-bit compat, x32) are killed. **workerd/V8, Node 24 and Vercel Workflow all run under it** unchanged.
+- **Unix sockets on Landlock ABI < 9 (what can and can't be restricted).** Landlock < 9 can't refuse `connect()` to a pathname unix socket. So:
+  - twd's own servers refuse sandboxed peers themselves: `procsb.Guard` reads `SO_PEERCRED` and refuses a peer that has no_new_privs and **more seccomp filters than the server** (the launcher's filter is inherited by every descendant and can't be removed). Applied to **mgmt's admin socket**, **hostd's push socket** and twd-netd's sockets; each instance's `egress-obj/egress-wl/hostapi.sock` accepts a sandboxed peer only if it is that instance's own process or a descendant.
+  - workerd's own `ingress.sock` (served by workerd, not twd) sits in an instance dir with an **unguessable name** (`i<n>-<64 random bits>`); a sandboxed process can't list the run dir, can't read `/proc/net/unix` or other processes' cmdlines, and can't open sock_diag, so it can't find another instance's socket.
+- **hostd:** `-sandbox auto` (the default) is now `landlock` on Linux when the kernel has Landlock (`seatbelt` on macOS). Workloads report `Sandbox: "landlock"` and `SandboxProfile: …/sandbox.json`; `GET /v0/status` has the host's `Sandbox: "landlock (ABI 4)"`. `hostd.SandboxCommand(profile, cmd…)` runs a command under a workload's live profile on either OS (tests). `release.json` records `"sandbox":"landlock"` for linux tarballs.
+- **No sandbox → no shared host.** If the process tier has no sandbox (Linux without Landlock, or `-sandbox none`), hostd refuses a second tenant's process-tier deployment with `sandbox_unavailable` unless `twd-hostd -insecure-shared-host` (`twd up --insecure-shared-host`); `twd tenant add` refuses the same way up front. The microVM tier is unaffected.
+- **`twd doctor` `sandbox` check on Linux:** runs workerd under a generated Landlock profile launched by the `twd` binary itself, and checks that a file outside it and the home dir are unreadable and (ABI ≥ 4) that a TCP connect to 1.1.1.1 is refused; reports the ABI, the unix-socket mode, and while twd runs, `active: N/N` workloads under Landlock. Without Landlock it **warns loudly** (`NO PROCESS SANDBOX …`) with the fix; ABI < 4 warns that TCP isn't restricted.
+- **Docs:** INSTALL.md isolation section (Linux is no longer "no sandbox"); docs/node-tier.md: on Linux with ABI ≥ 4 the egress proxy is **enforced**, closing the M9 "a malicious Node app can bypass HTTP_PROXY" hole there.
+
+### Test results (measured 2026-11-08)
+| Where | Target | Result |
+|---|---|---|
+| `twdl-sbx-u24` (sandbox on) | `make test` | **PASS** (incl. new `internal/procsb`, `TestMultiTenant` (d) under Landlock, `TestSharedHostWithoutSandbox`, `TestCLIMultiTenant` (d) under Landlock with `RequireSandbox`, `TestDoctor` `sandbox: ok`) |
+| | `TWD_TEST_SANDBOX=auto go test -race ./cmd/... ./hostd/...` (every hostd test with the sandbox on) | **PASS** |
+| | `make test-node` | **PASS**: `Sandbox` subtest now runs on Linux (`sandbox: landlock`), `TestNodeWorkflow` under Landlock |
+| | `make test-sdk` | **PASS**, now under the host sandbox (checked: 8/8 SDK workloads `landlock`) |
+| | `make e2e-multi` ×2 (tailnet 1 + tailnet-2, prefix `ttest-l2-<run>`) | **PASS** `c1b1e5`, `ac586c` (13/13 each; `e2e/real/results/l2-*.json`); 0 devices left in either tailnet; 0 `tskey-` in logs; **no policy written** (`TWD_E2E_NO_POLICY_WRITE`: read-only check, both tailnets already had the rules) |
+| macOS (this Mac) | `make test`, `make lint`, `make test-sdk` (now under Seatbelt: 8/8), `make test-node` | **PASS** |
+
+Attacks, all from inside a sandboxed workload or under its **live** profile (`procsb.ProbeCommand`: same rules, seccomp filter and no_new_privs, launched like the workload):
+
+| Attack (tenant A's workerd / Node app) | Result (ABI 4) |
+|---|---|
+| list/read tenant B's state dir, node state, DO storage, instance dir, **API key file** | `EACCES` |
+| read its **own** tenant's node keys, hostd's audit key, list `$HOME`, hostd's run dir, `/tmp`, `/proc` | `EACCES` |
+| read B's `/proc/<pid>/environ` (the Node tier's caller key lives there), `/proc/self/net/unix` | `EACCES` |
+| **mgmt's admin socket** (curl `--unix-socket … /v0/healthz`), hostd's push socket, B's `egress-wl/egress-obj/hostapi.sock` | connect completes (ABI < 9), the server closes it unanswered (`ECONNRESET`); unsandboxed control answers |
+| **ptrace** B's workerd / a sibling, `process_vm_readv` | `EPERM` |
+| Node app `net.connect` 1.1.1.1:80 / :443, a host-loopback listener | `EACCES` |
+| TCP connect 1.1.1.1:443, bind 127.0.0.1:0, UDP to 1.1.1.1:53, `kill(-1, 0)` | `EACCES` / `EACCES` / `EPERM` / `EPERM` |
+| own DO storage / own data dir (read, write, list); Node app's own port | allowed |
+| serving requests (a–c, e, f of E2E-MULTI) and **egress via netd** (`EgressAttributed`: sdk, global fetch, `node:http`, undici; the echo's WhoIs is the deployment's node) | work under the sandbox |
+
+### Gaps vs Seatbelt
+- **Unix sockets that aren't twd's, on ABI < 9:** Landlock can't refuse the connect, so a sandboxed workload can reach other software's sockets **at a known path** (the D-Bus session bus, `docker.sock` if the user may use it, tailscaled's LocalAPI socket). Seatbelt also allows unix sockets outside its denied paths, but on macOS those mostly live under the denied home dir. Kernels with Landlock ABI 9 close this automatically (the profile already requests it); measured only on ABI 4 here.
+- **Signals and abstract unix sockets on ABI < 6:** a workload can signal a same-uid process by pid (not `kill(-1)`) and connect to an abstract socket whose name it knows (names aren't discoverable: `/proc/net/unix` and sock_diag are blocked). Seatbelt allows signals too. ABI 6 scopes apply automatically.
+- **The "sandboxed peer" test is a heuristic:** more seccomp filters than the server. A legitimate client that itself runs under extra seccomp filters (e.g. the `twd` CLI inside a container while mgmt runs outside) is refused by mgmt's and hostd's sockets.
+- **Child processes** of a Node app can't read their own `/proc/self/*` (the rules name the launcher's pid). Not hit by any test (Workflow included); an app that forks helpers that need `/proc/self/maps` would see `EACCES`.
+- System dirs (`/usr`, `/etc`, `/opt`) are readable, as with Seatbelt; `/tmp` is **not** (stricter than Seatbelt). Apps can't do their own DNS (UDP is refused), by design.
+- **Not run:** amd64 (builds and vets; the amd64 seccomp file is untested), kernels with Landlock ABI ≥ 5, other distros, and the sandbox **from an installed linux release tarball** (L1's matrix covers that; nothing new is shipped: the launcher is twd-hostd itself). ABI 1–3 kernels (FS-only, TCP unrestricted) are handled by best-effort downgrade and a doctor warning, but not tested.
