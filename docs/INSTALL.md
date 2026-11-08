@@ -196,9 +196,9 @@ Add `"tier": "microvm"` to the app's `twd.jsonc`, then `twd deploy`.
   dm-crypt **on the host**. Its key is created in twd-mgmt's custody and
   released only to the host that holds the workload's lease, at that epoch.
   The guest sees plaintext ext4 on `/dev/vdc`; the key never enters it.
-  DO SQLite and KV survive a VM crash (SIGKILL) and a redeploy (tested);
-  the image and its key persist across host reboots (by design; not yet
-  tested end to end);
+  DO SQLite and KV survive a VM crash (SIGKILL), a redeploy, and a host
+  reboot or power cut (the helper starts at boot; run `twd up` again, and
+  objects rejoin with the same nodes);
 - is attached to its volume **alone**: a redeploy stops the old VM (which
   unmounts and releases the volume) before the new one starts, and the
   helper refuses a second attach (`volume_busy`) or an older epoch

@@ -8,7 +8,7 @@ Last update: 2026-11-08 01:15 PT. M6 (merged with M5; release tarballs, `install
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 Last update: 2026-11-08 01:20 PT. M9 (opt-in Node process tier + Vercel Workflow) on branch `m9-node`: `make test-node` PASS on macOS and Lima.
 Last update: 2026-11-08 01:40 PT. M7 (E2E-MULTI: one host, tenant A on tailnet 1 + tenant B on tailnet-2) on branch `m7-multi`: `make e2e-multi` PASS (3 runs).
-Last update: 2026-11-08 08:15 PT. L3 (production-shaped microVM tier on Linux) on branch `l3-microvm`: `make e2e-vm` PASS (13 subtests), `make e2e-linux-vm` PASS from the installed release on fresh `twdl-kvm-u24`.
+Last update: 2026-11-08 08:30 PT. L3: `make e2e-linux-reboot` PASS (clean reboot + power cut). Earlier, 08:15 PT, L3 (production-shaped microVM tier on Linux) on branch `l3-microvm`: `make e2e-vm` PASS (13 subtests), `make e2e-linux-vm` PASS from the installed release on fresh `twdl-kvm-u24`.
 Last update: 2026-11-08 02:05 PT. Integration: master (M6 + M5 + M9, `57dd519`) merged into `m7-multi`; the full matrix passes on `4cce30d` (macOS, real tailnets, mbp from the release, Lima).
 
 ## M0: repo skeleton (DONE)
@@ -956,6 +956,22 @@ Persistent encrypted DO storage, the Firecracker jailer, an unprivileged twd wit
 | Redeploy → serving (serial: drain, guest unmount, release, new VM, attach) | 1.74 s from `twd deploy` (CLI 1.57 s); hermetic 0.82 s, guest unmount + release ~110 ms |
 | `twd host setup --microvm` / install.sh | 1.0 s / 0.7 s |
 
+**`make e2e-linux-reboot`: PASS** (run `4920c5`, `e2e/real/results/l3-reboot-20261108-082536-4920c5.json`; same fresh `twdl-kvm-u24`, non-ephemeral nodes `twd-l3r-<run>-*`). An agent object `boot1` in a jailed microVM writes SQLite (11 calls); then the whole VM reboots **twice**: (1) clean `limactl stop` + start, (2) `limactl stop --force` (a power cut) + start. After each: `twd-vmhelper` is active via systemd, `twd up` again as the user, and the object **rejoins from saved node state** (same stable node ID `n4sx…` and IP, the run's device list unchanged: no new device), **all SQLite writes are present** (12, then 13), and the volume **re-opens** (dm-crypt `type: LUKS2`, helper log `formatted=false`) with the custody key. The main `make e2e-linux-vm` was re-run after these fixes: PASS (`5b1456`).
+
+| Reboot timing | clean | power cut |
+|---|---|---|
+| kernel boot → twd-vmhelper active (systemd, VM clock) | 3.98 s | 4.63 s |
+| kernel boot → ssh usable / `limactl start` returns | 5.2 s / 6.8 s | 6.3 s / 7.8 s |
+| `twd up` (mgmt + hostd ready) | 0.59 s | 0.61 s |
+| microVM InstanceStart → ready / volume attach | 0.80 s / 22 ms | 0.82 s / 22 ms |
+| `twd up` → the object serving the Mac client over tailnet 1 | 17.4 s | 12.8 s |
+
+The object-serving time is dominated by the client re-learning the rejoined node over the tailnet (netmap + path), not by twd: the workload VM is ready ~1 s after `twd up` (not investigated further).
+
+Fixed on the way (found by the reboot test):
+- **Serial deploys didn't rejoin saved objects.** The rejoin of objects from `objects.json` ran only on the blue/green path; microVM (and Node-tier) workloads deploy serially, so after a restart their objects never came back. `rejoinObjects` now runs on both.
+- **Stale `supervisor.pid` after a reboot.** Boots are deterministic enough that the old supervisor's pid was the new `twd up` process: `already_running`. A pid now counts only if that process started before the pid file was written (Linux `/proc/<pid>/stat`).
+
 ### Findings
 1. **Fd hygiene matters across jails.** `dup()` without CLOEXEC let a later VM's jailer inherit another VM's volume fd, holding its flock: the restarted VM got `volume_busy`. All dups are `F_DUPFD_CLOEXEC` and received SCM_RIGHTS fds are marked CLOEXEC.
 2. **Acknowledged DO writes survive a VMM SIGKILL** (workerd commits before answering; `Writeback` cache turns guest flushes into host fsyncs). A plain file written through a workerd disk service without fsync did **not** survive (ext4 delayed allocation): durability is the app runtime's fsync, which workerd's DO storage does.
@@ -963,7 +979,7 @@ Persistent encrypted DO storage, the Firecracker jailer, an unprivileged twd wit
 4. Huge pages are still decisive (STATUS M8); setup reserves them persistently.
 
 ### Known gaps (L3)
-- **Host reboot** persistence is by design (image + custody key + helper enabled at boot) but **not tested end to end**.
+- After a reboot `twd up` is manual here (L1 adds `twd up --service`); the 12–17 s until a tailnet client reaches a rejoined object node is not twd-side.
 - **Snapshot restore** (warm start) not built; boot is ~0.6–0.75 s to workerd ready.
 - Serial blue/green means ~0.8–1.7 s of held requests on redeploy; no hot handover of the volume.
 - The volume never shrinks/grows (fixed sparse size, `-vm-volume-mib`); no online backup (ADR-012's async backup is not built).
