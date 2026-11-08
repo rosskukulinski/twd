@@ -41,7 +41,16 @@ type App struct {
 	SpawnMaxLive  int
 	SpawnMaxDepth int
 	Internet      []string // egress.internet (recorded; MVP denies all internet)
+	// Tier is the requested isolation tier (twd.jsonc "tier"): "" (host
+	// default), "process" or "microvm".
+	Tier string
 }
+
+// Isolation tiers.
+const (
+	TierProcess = "process"
+	TierMicroVM = "microvm"
+)
 
 // DOBinding is one env binding to a DO namespace.
 type DOBinding struct {
@@ -81,6 +90,7 @@ type wranglerConfig struct {
 
 type twdConfig struct {
 	Name    string `json:"name"`
+	Tier    string `json:"tier"`
 	Tailnet struct {
 		Tags     []string `json:"tags"`
 		Connects []string `json:"connects"`
@@ -133,7 +143,12 @@ func Parse(files map[string][]byte) (*App, error) {
 		CompatFlags: w.CompatibilityFlags, Vars: w.Vars, Classes: map[string]*Class{},
 		WorkloadTags: t.Tailnet.Tags, Modules: map[string][]byte{},
 		SpawnMaxLive: t.Tailnet.Spawn.MaxLive, SpawnMaxDepth: t.Tailnet.Spawn.MaxDepth,
-		Internet: t.Tailnet.Egress.Internet,
+		Internet: t.Tailnet.Egress.Internet, Tier: t.Tier,
+	}
+	switch a.Tier {
+	case "", TierProcess, TierMicroVM:
+	default:
+		return nil, fmt.Errorf("bundle: twd.jsonc tier %q: want \"process\" or \"microvm\"", a.Tier)
 	}
 	if t.Name != "" {
 		a.Name = t.Name

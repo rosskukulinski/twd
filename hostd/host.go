@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -74,6 +75,14 @@ type Config struct {
 	JoinParallel int
 	Logger       *slog.Logger
 	TSNetLogs    bool
+	// VM boots microVM sandboxes (hostd/vm: Firecracker on Linux + KVM).
+	// Nil means every workload runs in the process tier, whatever it asks for.
+	VM sandbox.Backend
+	// DefaultTier applies when neither the deployment (twd.jsonc "tier")
+	// nor the tenant names one. Default "process".
+	DefaultTier string
+	// VMDebug enables guest diagnostics (connectivity probes; tests).
+	VMDebug bool
 }
 
 // Host is a running twd-hostd.
@@ -189,8 +198,12 @@ func (h *Host) Start(ctx context.Context) error {
 }
 
 func (h *Host) register(ctx context.Context) error {
+	tiers := []string{"process"}
+	if h.cfg.VM != nil {
+		tiers = append(tiers, "microvm")
+	}
 	return h.mgmt.Register(ctx, mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes,
-		Tiers: []string{"process"}, PushURL: "unix://" + h.pushSock,
+		Tiers: tiers, PushURL: "unix://" + h.pushSock,
 		AuditPubKey: base64.StdEncoding.EncodeToString(h.audit.key.Public().(ed25519.PublicKey))})
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,9 +17,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rosskukulinski/twd/guest/proto"
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/hostd/gen"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -183,7 +186,8 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	w.wl = wl
 	w.mu.Unlock()
 
-	inst, err := h.startInstance(w, a.DeploymentID, app)
+	tier := h.tierFor(app, t)
+	inst, err := h.startInstance(w, a.DeploymentID, app, tier)
 	if err != nil {
 		w.fail(a.DeploymentID, err)
 		return
@@ -226,7 +230,7 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	}
 	h.mu.Unlock()
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
-		"blue_green", old != nil, "ms", time.Since(st).Milliseconds())
+		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
 }
 
 // undeploy stops serving a workload: workerd stops and its nodes close
@@ -273,6 +277,8 @@ type instance struct {
 	res     *gen.Result
 	ingress http.Handler
 	direct  *http.Client
+	tier    string // bundle.TierProcess | bundle.TierMicroVM
+	spec    sandbox.Spec
 
 	inflight atomic.Int64
 	reqs     atomic.Int64
@@ -280,45 +286,116 @@ type instance struct {
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
+	vm       sandbox.VM // microVM tier: the running sandbox
 	exited   chan struct{}
 	servers  []*http.Server
 	restarts int
 	started  time.Time
 }
 
-func (h *Host) startInstance(w *workload, depID string, app *bundle.App) (*instance, error) {
+// tierFor picks a deployment's isolation tier: the bundle's twd.jsonc
+// "tier", else the tenant's, else the host default. microvm falls back to
+// process (with a warning) when this host has no microVM backend (macOS, no
+// KVM, not root).
+func (h *Host) tierFor(app *bundle.App, t *tenant) string {
+	tier := app.Tier
+	if tier == "" && t != nil {
+		tier = t.info.Tier
+	}
+	if tier == "" {
+		tier = h.cfg.DefaultTier
+	}
+	if tier == bundle.TierMicroVM && h.cfg.VM == nil {
+		h.log.Warn("microvm tier requested but this host has no microVM backend; using the process tier", "app", app.Name)
+		tier = bundle.TierProcess
+	}
+	if tier != bundle.TierMicroVM {
+		tier = bundle.TierProcess
+	}
+	return tier
+}
+
+func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier string) (*instance, error) {
 	h.mu.Lock()
 	h.instSeq++
 	n := h.instSeq
 	h.mu.Unlock()
 	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
-	res, err := gen.Generate(app, gen.Options{
+	opts := gen.Options{
 		Dir:          dir,
 		DOStorage:    filepath.Join(h.cfg.DataDir, "tenants", w.tenantID, "workloads", w.name, "do"),
 		DeploymentID: depID,
 		Workload:     w.name,
-	})
+	}
+	vmTier := tier == bundle.TierMicroVM
+	if vmTier {
+		// The guest's workerd listens on its NIC and reaches hostd only via
+		// the gateway (host netd's userspace stack); DO storage is
+		// guest-local (tmpfs; see STATUS.md M8 gaps).
+		gw := proto.GatewayIP
+		opts.Guest = &gen.GuestNet{
+			Ingress:   fmt.Sprintf("*:%d", proto.IngressPort),
+			EgressObj: fmt.Sprintf("%s:%d", gw, proto.EgressObj),
+			EgressWL:  fmt.Sprintf("%s:%d", gw, proto.EgressWL),
+			HostAPI:   fmt.Sprintf("%s:%d", gw, proto.HostAPI),
+			DOStorage: proto.DODir,
+		}
+	}
+	res, err := gen.Generate(app, opts)
 	if err != nil {
 		return nil, err
 	}
-	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, ingress: netd.UnixUpstream(res.Sockets.Ingress)}
-	inst.direct = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", res.Sockets.Ingress)
-	}}}
-	for sock, hd := range map[string]http.Handler{
-		res.Sockets.EgressObj: h.egressObjHandler(inst),
-		res.Sockets.EgressWL:  h.egressWLHandler(inst),
-		res.Sockets.HostAPI:   h.hostAPI(inst),
-	} {
-		ln, err := net.Listen("unix", sock)
-		if err != nil {
-			inst.stop()
-			return nil, err
+	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, tier: tier}
+	if vmTier {
+		inst.ingress = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			vm := inst.currentVM()
+			if vm == nil {
+				netd.WriteError(rw, &netd.Error{Code: netd.CodeUpstreamUnavailable, Detail: "microVM is not running"})
+				return
+			}
+			vm.Ingress().ServeHTTP(rw, r)
+		})
+		inst.direct = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			vm := inst.currentVM()
+			if vm == nil {
+				return nil, errors.New("microVM is not running")
+			}
+			return vm.DialGuest(ctx)
+		}}}
+		hc, _ := json.Marshal(map[string]any{"twd": map[string]any{"kind": "admin", "op": "health"}})
+		inst.spec = sandbox.Spec{
+			ID:          fmt.Sprintf("i%d", n),
+			AppDir:      dir,
+			WorkerdArgs: []string{"serve", "config.capnp", "--experimental"},
+			HealthCF:    string(hc),
+			Debug:       h.cfg.VMDebug,
+			Log:         h.log.With("workload", w.name),
+			Handlers: map[uint16]http.Handler{
+				proto.EgressObj: h.egressObjHandler(inst),
+				proto.EgressWL:  h.egressWLHandler(inst),
+				proto.HostAPI:   h.hostAPI(inst),
+			},
 		}
-		os.Chmod(sock, 0o600)
-		srv := &http.Server{Handler: hd, ReadHeaderTimeout: 30 * time.Second}
-		inst.servers = append(inst.servers, srv)
-		go srv.Serve(ln)
+	} else {
+		inst.ingress = netd.UnixUpstream(res.Sockets.Ingress)
+		inst.direct = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", res.Sockets.Ingress)
+		}}}
+		for sock, hd := range map[string]http.Handler{
+			res.Sockets.EgressObj: h.egressObjHandler(inst),
+			res.Sockets.EgressWL:  h.egressWLHandler(inst),
+			res.Sockets.HostAPI:   h.hostAPI(inst),
+		} {
+			ln, err := net.Listen("unix", sock)
+			if err != nil {
+				inst.stop()
+				return nil, err
+			}
+			os.Chmod(sock, 0o600)
+			srv := &http.Server{Handler: hd, ReadHeaderTimeout: 30 * time.Second}
+			inst.servers = append(inst.servers, srv)
+			go srv.Serve(ln)
+		}
 	}
 	if err := inst.spawn(); err != nil {
 		inst.stop()
@@ -331,7 +408,50 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App) (*insta
 	return inst, nil
 }
 
+func (inst *instance) currentVM() sandbox.VM {
+	inst.mu.Lock()
+	defer inst.mu.Unlock()
+	return inst.vm
+}
+
+// bootVM starts (or restarts) the instance's microVM. Firecracker exiting
+// for any reason other than stop() is handled like a workerd crash.
+func (inst *instance) bootVM() error {
+	ctx, cancel := context.WithTimeout(inst.h.ctx, 60*time.Second)
+	defer cancel()
+	vm, err := inst.h.cfg.VM.Boot(ctx, inst.spec)
+	if err != nil {
+		return err
+	}
+	ex := make(chan struct{})
+	inst.mu.Lock()
+	if inst.stopping.Load() {
+		inst.mu.Unlock()
+		vm.Stop()
+		return errors.New("instance stopped while booting")
+	}
+	inst.vm, inst.exited, inst.started = vm, ex, time.Now()
+	inst.mu.Unlock()
+	go func() {
+		<-vm.Done()
+		inst.mu.Lock()
+		if inst.vm == vm {
+			inst.vm = nil
+		}
+		inst.mu.Unlock()
+		close(ex)
+		if err := vm.Err(); err != nil {
+			inst.h.log.Warn("microVM exited", "workload", inst.w.name, "err", err)
+		}
+		inst.onExit()
+	}()
+	return nil
+}
+
 func (inst *instance) spawn() error {
+	if inst.tier == bundle.TierMicroVM {
+		return inst.bootVM()
+	}
 	logf, err := os.OpenFile(filepath.Join(inst.dir, "workerd.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
@@ -442,8 +562,11 @@ func (inst *instance) stop() {
 		return
 	}
 	inst.mu.Lock()
-	cmd, ex := inst.cmd, inst.exited
+	cmd, ex, vm := inst.cmd, inst.exited, inst.vm
 	inst.mu.Unlock()
+	if vm != nil {
+		vm.Stop()
+	}
 	if cmd != nil && cmd.Process != nil {
 		cmd.Process.Signal(syscall.SIGTERM)
 		select {

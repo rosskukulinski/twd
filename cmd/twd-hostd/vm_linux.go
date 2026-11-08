@@ -1,0 +1,28 @@
+//go:build linux
+
+package main
+
+import (
+	"log/slog"
+
+	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/hostd/vm"
+)
+
+type vmOptions struct {
+	kernel, rootfs, firecracker string
+	memMiB                      int
+}
+
+// vmBackend enables the microVM tier when this host can run it (KVM,
+// Firecracker, the guest image, root); otherwise microvm deployments fall
+// back to the process tier.
+func vmBackend(o vmOptions, log *slog.Logger) sandbox.Backend {
+	b, err := vm.New(vm.Config{Firecracker: o.firecracker, Kernel: o.kernel, Rootfs: o.rootfs, MemMiB: o.memMiB, Log: log})
+	if err != nil {
+		log.Info("microVM tier unavailable; process tier only", "reason", err)
+		return nil
+	}
+	log.Info("microVM tier available", "backend", b.Name(), "kernel", o.kernel, "rootfs", o.rootfs)
+	return b
+}

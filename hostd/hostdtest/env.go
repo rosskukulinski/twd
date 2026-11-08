@@ -14,6 +14,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/netd"
 	"github.com/rosskukulinski/twd/netd/nettest"
 )
@@ -28,6 +29,10 @@ type Options struct {
 	KillTombstone  time.Duration
 	HeartbeatEvery time.Duration
 	Verbose        bool
+	// VM, DefaultTier and VMDebug are passed to hostd (microVM tier).
+	VM          sandbox.Backend
+	DefaultTier string
+	VMDebug     bool
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -89,6 +94,7 @@ func Start(t testing.TB, o Options) *Env {
 		HostID: "h1", Mgmt: hc, DataDir: filepath.Join(dir, "data"), RunDir: filepath.Join(dir, "run"),
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
+		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -107,6 +113,17 @@ func (e *Env) Deploy(appDir, workload string, vars map[string]string) string {
 	if err != nil {
 		e.T.Fatal(err)
 	}
+	var resp mgmtapi.DeployResponse
+	if err := e.Mgmt.Do(context.Background(), "POST", "/v0/deployments",
+		mgmtapi.DeployRequest{TenantID: e.TenantID, Workload: workload, Bundle: MustTar(files)}, &resp); err != nil {
+		e.T.Fatal(err)
+	}
+	return resp.DeploymentID
+}
+
+// DeployFiles deploys already-built bundle files as workload.
+func (e *Env) DeployFiles(files map[string][]byte, workload string) string {
+	e.T.Helper()
 	var resp mgmtapi.DeployResponse
 	if err := e.Mgmt.Do(context.Background(), "POST", "/v0/deployments",
 		mgmtapi.DeployRequest{TenantID: e.TenantID, Workload: workload, Bundle: MustTar(files)}, &resp); err != nil {

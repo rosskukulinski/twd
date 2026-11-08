@@ -50,6 +50,11 @@ func run() error {
 		tombstone  = flag.Duration("kill-tombstone", 10*time.Second, "keep killed nodes RST-ing new connections this long")
 		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
 		tsnetLogs  = flag.Bool("tsnet-logs", false, "forward tsnet logs at debug level")
+		tier       = flag.String("default-tier", "process", "tier for deployments and tenants that name none: process | microvm")
+		vmKernel   = flag.String("vm-kernel", filepath.Join(home, ".twd", "vm", "vmlinux"), "microVM tier: guest kernel (Linux only)")
+		vmRootfs   = flag.String("vm-rootfs", filepath.Join(home, ".twd", "vm", "rootfs.ext4"), "microVM tier: guest image from guest/build-image.sh")
+		vmFC       = flag.String("firecracker", "/usr/local/bin/firecracker", "microVM tier: firecracker binary")
+		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -71,7 +76,8 @@ func run() error {
 	}
 	h, err := hostd.New(hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
-		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs})
+		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
+		DefaultTier: *tier, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem}, log)})
 	if err != nil {
 		return err
 	}
