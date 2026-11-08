@@ -24,16 +24,31 @@ import (
 type TenantRef struct {
 	Tailnet    string `json:"tailnet"`
 	TenantID   string `json:"tenantID"`
-	APIKeyFile string `json:"apiKeyFile"`
+	MintMode   string `json:"mintMode,omitempty"` // apikey | wif ("" = apikey)
+	APIKeyFile string `json:"apiKeyFile,omitempty"`
 	ControlURL string `json:"controlURL"`
 	AddedAt    string `json:"addedAt,omitempty"`
 }
 
-// tenants lists the operator tenant first, then the added ones.
+// tenants lists the operator tenant first, then the added ones. Linked
+// to a remote mgmt, it is mgmt's tenant list (fetched once per command).
 func (s *state) tenants() []TenantRef {
+	if s.remote() {
+		if s.remoteTenants == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			var ts []mgmt.Tenant
+			s.mgmt().Do(ctx, "GET", "/v0/tenants", nil, &ts)
+			s.remoteTenants = []TenantRef{}
+			for _, t := range ts {
+				s.remoteTenants = append(s.remoteTenants, TenantRef{Tailnet: t.Tailnet, TenantID: t.ID, MintMode: t.MintMode, ControlURL: t.ControlURL})
+			}
+		}
+		return s.remoteTenants
+	}
 	out := []TenantRef{}
 	if s.Cfg.TenantID != "" {
-		out = append(out, TenantRef{Tailnet: s.Cfg.Tailnet, TenantID: s.Cfg.TenantID, APIKeyFile: s.Cfg.APIKeyFile, ControlURL: s.Cfg.ControlURL})
+		out = append(out, TenantRef{Tailnet: s.Cfg.Tailnet, TenantID: s.Cfg.TenantID, MintMode: s.Cfg.MintMode, APIKeyFile: s.Cfg.APIKeyFile, ControlURL: s.Cfg.ControlURL})
 	}
 	return append(out, s.Cfg.Tenants...)
 }
@@ -44,7 +59,10 @@ func (s *state) tenant(ref string) (TenantRef, error) {
 	ts := s.tenants()
 	if ref == "" {
 		if len(ts) == 0 {
-			return TenantRef{}, fail("not_up", "no tenant yet in "+s.Dir).withFix("twd up --tailnet <tailnet> --api-key-file <file>")
+			if s.remote() {
+				return TenantRef{}, fail("no_tenant", "the linked mgmt "+s.Link.Endpoint+" has no tenant yet").withFix("finish `twd up` on the host")
+			}
+			return TenantRef{}, fail("not_up", "no tenant yet in "+s.Dir).withFix("twd up")
 		}
 		return ts[0], nil
 	}
@@ -60,7 +78,7 @@ func (s *state) tenant(ref string) (TenantRef, error) {
 		names = append(names, t.Tailnet)
 	}
 	return TenantRef{}, fail("unknown_tenant", fmt.Sprintf("no tenant %q", ref), "tenants: "+strings.Join(names, ", ")).
-		withFix("twd tenant ls", "twd tenant add <tailnet> --api-key-file <file>")
+		withFix("twd tenant ls", "twd tenant add <tailnet> --api-key-file <file>   (on the host)")
 }
 
 func tenantFlag(f *flags) *string {
@@ -147,6 +165,9 @@ func cmdTenantAdd(args []string) error {
 		return fail("sandbox_unavailable", "this host has no process sandbox ("+why+"), so its process tier must not serve more than one tenant",
 			"twd doctor explains the sandbox check; tenants of a shared host need Seatbelt (macOS) or Landlock (Linux)").
 			withFix("use a kernel with Landlock, deploy with tier \"microvm\", or (tenants NOT isolated) twd down && twd up --insecure-shared-host")
+	}
+	if s.remote() {
+		return fail("remote_unsupported", "twd tenant add runs on the host that runs twd up (this machine is linked to "+s.Link.Endpoint+")")
 	}
 	if err := s.requireUp(); err != nil {
 		return err

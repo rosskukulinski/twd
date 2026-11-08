@@ -268,6 +268,90 @@ func (m *Mgmt) IssuerInfo(t Tenant) map[string]any {
 		"lifecycleSubject": LifecycleSubject(t.ID)}
 }
 
+// WIFUpdate is PUT /v0/tenants/{id}/wif: switch a tenant to (or re-key)
+// WIF mint mode with new public client IDs. Only client IDs are stored.
+type WIFUpdate struct {
+	WIFClientID          string `json:"wifClientID"`
+	WIFLifecycleClientID string `json:"wifLifecycleClientID,omitempty"`
+}
+
+// UpdateTenantWIF sets the tenant's WIF client IDs and makes wif the mint
+// mode. The cached access tokens of the old IDs are dropped.
+func (m *Mgmt) UpdateTenantWIF(ctx context.Context, tenantID string, u WIFUpdate) (Tenant, error) {
+	t, err := m.store.GetTenant(ctx, tenantID)
+	if err != nil {
+		return Tenant{}, err
+	}
+	if u.WIFClientID == "" {
+		return Tenant{}, errf(400, "bad_request", "wifClientID required")
+	}
+	if m.broker.Issuer == nil {
+		return Tenant{}, errf(400, "bad_request", "mintMode wif needs twd-mgmt to run with an issuer (-issuer-url)")
+	}
+	t.MintMode, t.WIFClientID, t.WIFLifecycleClientID = MintWIF, u.WIFClientID, u.WIFLifecycleClientID
+	if err := m.store.UpdateTenant(ctx, t); err != nil {
+		return Tenant{}, err
+	}
+	m.broker.Forget(t.ID)
+	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "tenant"}, map[string]any{"tailnet": t.Tailnet, "mintMode": t.MintMode, "wifUpdated": true,
+		"lifecycle": t.WIFLifecycleClientID != ""})
+	return t, nil
+}
+
+// WIFCheckResult is POST /v0/tenants/{id}/wif-check: does each trust
+// credential exchange, and can the lifecycle one read the policy.
+type WIFCheckResult struct {
+	MintMode string `json:"mintMode"`
+	// Mint: the mint credential's token exchange succeeded (its auth_keys
+	// scope is only proven by the first real mint).
+	Mint      bool   `json:"mint"`
+	MintError string `json:"mintError,omitempty"`
+	// Lifecycle: "ok", "absent" (no lifecycle client ID: kill tier 2, the
+	// reaper's device deletes, spawn checks and deploy preflight are off)
+	// or "error".
+	Lifecycle      string `json:"lifecycle"`
+	LifecycleError string `json:"lifecycleError,omitempty"`
+	// PolicyRead: the lifecycle credential read the tailnet policy
+	// (policy_file:read), which preflight and spawn checks need.
+	PolicyRead      bool   `json:"policyRead"`
+	PolicyReadError string `json:"policyReadError,omitempty"`
+	Issuer          string `json:"issuer,omitempty"`
+}
+
+// WIFCheck exercises a wif tenant's trust credentials without minting.
+func (m *Mgmt) WIFCheck(ctx context.Context, tenantID string) (WIFCheckResult, error) {
+	t, err := m.store.GetTenant(ctx, tenantID)
+	if err != nil {
+		return WIFCheckResult{}, err
+	}
+	res := WIFCheckResult{MintMode: t.MintMode, Lifecycle: "absent"}
+	if t.MintMode != MintWIF {
+		return res, errf(400, "bad_request", "tenant %s is in mint mode %s, not wif", t.ID, t.MintMode)
+	}
+	res.Issuer = m.broker.Issuer.TenantIssuer(t.ID)
+	m.broker.Forget(t.ID) // a fresh exchange, not a cached token
+	if _, err := m.broker.API(ctx, t, purposeMint); err != nil {
+		res.MintError = err.Error()
+	} else {
+		res.Mint = true
+	}
+	if t.WIFLifecycleClientID != "" {
+		api, err := m.broker.API(ctx, t, purposeLifecycle)
+		if err != nil {
+			res.Lifecycle, res.LifecycleError = "error", err.Error()
+		} else {
+			res.Lifecycle = "ok"
+			if _, _, _, err := api.GetPolicy(ctx, ""); err != nil {
+				res.PolicyReadError = err.Error()
+			} else {
+				res.PolicyRead = true
+				m.policies.Invalidate(t.ID)
+			}
+		}
+	}
+	return res, nil
+}
+
 // ---- hosts ----
 
 // RegisterRequest is POST /v0/hosts/register.
@@ -374,6 +458,10 @@ type DeployRequest struct {
 	Bundle     []byte        `json:"bundle"` // base64 in JSON
 	Namespaces []ClassConfig `json:"namespaces,omitempty"`
 	Host       string        `json:"host,omitempty"`
+	// By is the deployer (set by the API layer from the principal, never
+	// from the request body): a WhoIs login over the tailnet, the local
+	// actor on the unix socket.
+	By string `json:"-"`
 }
 
 // DeployResponse is the deploy reply.
@@ -451,12 +539,12 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		return resp, err
 	}
 	d := Deployment{ID: newID("dp_"), TenantID: t.ID, Workload: r.Workload, HostID: host, Namespaces: classes,
-		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, CreatedAt: m.now().UnixMilli()}
+		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli()}
 	if err := m.store.CreateDeployment(ctx, d); err != nil {
 		return resp, err
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy"}, map[string]any{"deploymentID": d.ID, "workload": d.Workload,
-		"host": host, "epoch": lease.Epoch})
+	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, map[string]any{"deploymentID": d.ID, "workload": d.Workload,
+		"host": host, "epoch": lease.Epoch, "by": r.By})
 	resp.DeploymentID, resp.Host, resp.Epoch = d.ID, host, lease.Epoch
 	resp.Endpoint.Node = r.Workload + "-" + host
 	resp.Endpoint.MagicDNS = resp.Endpoint.Node + "." + t.Tailnet
@@ -491,6 +579,7 @@ type DeploymentView struct {
 	Status       string        `json:"status"`
 	Error        string        `json:"error,omitempty"`
 	Namespaces   []ClassConfig `json:"namespaces"`
+	DeployedBy   string        `json:"deployedBy,omitempty"`
 	CreatedAt    int64         `json:"createdAt"`
 	Endpoint     struct {
 		ObjectID string `json:"objectID,omitempty"`
@@ -510,6 +599,7 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 		return v, err
 	}
 	v.DeploymentID, v.TenantID, v.Workload, v.Host, v.Epoch, v.Namespaces, v.CreatedAt = d.ID, d.TenantID, d.Workload, d.HostID, d.Epoch, d.Namespaces, d.CreatedAt
+	v.DeployedBy = d.DeployedBy
 	m.mu.Lock()
 	st, ok := m.depStatus[id]
 	m.mu.Unlock()

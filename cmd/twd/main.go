@@ -3,7 +3,9 @@
 // ~/.twd), app scaffolding and deploys, and the day-2 commands (kill,
 // audit, ls, logs, status).
 //
-//	twd up --tailnet <tailnet> --api-key-file <file> --yes   # non-interactive (test mode)
+//	twd up                                                   # keyless: tailnet login + WIF trust credential (ADR-026)
+//	twd up --tailnet <tailnet> --api-key-file <file> --yes   # alternative: apikey mint mode (tests, homelab)
+//	twd link twd-mgmt.<tailnet>.ts.net                       # a developer machine: every command below goes to mgmt over the tailnet (WhoIs)
 //	twd init hello --template agent && cd hello && twd deploy
 //	twd ls · twd kill <object> --cascade · twd audit <object> · twd logs <workload>
 //	twd down
@@ -36,8 +38,9 @@ var commands []command
 
 func init() {
 	commands = []command{
-		{name: "up", usage: "up --tailnet <tailnet> --api-key-file <file> [--yes] [--policy-apply]", help: "start twd-mgmt + twd-hostd on this machine (homelab all-in-one)", run: cmdUp},
-		{name: "down", usage: "down [--purge]", help: "stop everything twd up started (--purge: kill every object and delete its device first)", run: cmdDown},
+		{name: "up", usage: "up [--yes] [--service] [--wif-client-id <id>]  |  up --tailnet <tailnet> --api-key-file <file> [--yes] [--policy-apply]", help: "start twd-mgmt + twd-hostd on this machine; keyless by default (tailnet login + WIF trust credential), --api-key-file for apikey mode", run: cmdUp},
+		{name: "down", usage: "down [--purge] [--service]", help: "stop everything twd up started (--purge: kill every object and delete its device first)", run: cmdDown},
+		{name: "link", usage: "link [twd-mgmt.<tailnet>.ts.net] [--unlink]", help: "developer machine: use a remote twd-mgmt over your own Tailscale connection (WhoIs identity; no key or token)", run: cmdLink},
 		{name: "status", usage: "status", help: "health of mgmt, the host, the tenant and deployments", run: cmdStatus},
 		{name: "tenant", usage: "tenant add <tailnet> --api-key-file <file> [--policy-apply] | tenant ls", help: "serve another tenant (its own tailnet) from this host, or list tenants", run: cmdTenant},
 		{name: "init", usage: "init <dir> [--template hello|agent|mcp|ai-agent|node-workflow] [--name <workload>]", help: "create an app from a template (node-workflow needs Node.js on the deploying machine)", run: cmdInit},

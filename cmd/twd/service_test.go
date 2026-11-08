@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -27,23 +28,58 @@ func TestUnitFor(t *testing.T) {
 	}
 }
 
+func TestPlistFor(t *testing.T) {
+	s := &state{Dir: "/Users/u/.twd", Cfg: Config{Tailnet: "example.ts.net"}}
+	p := plistFor(s, "/Users/u/.twd/bin/twd")
+	for _, want := range []string{
+		"<key>Label</key><string>dev.twd.up</string>",
+		"<string>/Users/u/.twd/bin/twd</string>\n    <string>__supervise</string>\n    <string>--state-dir</string>\n    <string>/Users/u/.twd</string>",
+		"<key>RunAtLoad</key><true/>", "<key>SuccessfulExit</key><false/>", "<key>ExitTimeOut</key><integer>180</integer>",
+		"<key>StandardOutPath</key><string>/Users/u/.twd/logs/supervisor.log</string>",
+		"<key>PATH</key><string>/Users/u/.twd/bin:",
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("plist lacks %q:\n%s", want, p)
+		}
+	}
+	// XML-special characters in paths are escaped, and the plist parses.
+	s.Dir = "/Users/u/my & twd"
+	p = plistFor(s, "/opt/t<w>/twd")
+	if !strings.Contains(p, "<string>/Users/u/my &amp; twd</string>") || !strings.Contains(p, "<string>/opt/t&lt;w&gt;/twd</string>") {
+		t.Errorf("paths not XML-escaped:\n%s", p)
+	}
+	if runtime.GOOS == "darwin" {
+		f := filepath.Join(t.TempDir(), "x.plist")
+		os.WriteFile(f, []byte(p), 0o644)
+		if out, err := exec.Command("plutil", "-lint", f).CombinedOutput(); err != nil {
+			t.Errorf("plutil -lint: %v %s", err, out)
+		}
+	}
+}
+
 func TestUserUnitDir(t *testing.T) {
+	home, _ := os.UserHomeDir()
+	if runtime.GOOS == "darwin" {
+		if got := serviceUnitPath(); got != filepath.Join(home, "Library/LaunchAgents/dev.twd.up.plist") {
+			t.Fatal(got)
+		}
+		return
+	}
 	t.Setenv("XDG_CONFIG_HOME", "/x/cfg")
 	if got := serviceUnitPath(); got != "/x/cfg/systemd/user/twd.service" {
 		t.Fatal(got)
 	}
 	t.Setenv("XDG_CONFIG_HOME", "")
-	home, _ := os.UserHomeDir()
 	if got := serviceUnitPath(); got != filepath.Join(home, ".config/systemd/user/twd.service") {
 		t.Fatal(got)
 	}
 }
 
-func TestServiceUnsupportedOffLinux(t *testing.T) {
-	if runtime.GOOS == "linux" {
-		t.Skip("linux")
+func TestServiceUnsupportedOffLinuxAndMac(t *testing.T) {
+	if runtime.GOOS == "linux" || runtime.GOOS == "darwin" {
+		t.Skip("supported here")
 	}
-	if err := serviceAvailable(); err == nil || !strings.Contains(err.Error(), "Linux-only") {
+	if err := serviceAvailable(); err == nil || !strings.Contains(err.Error(), "service_unsupported") {
 		t.Fatalf("serviceAvailable on %s: %v", runtime.GOOS, err)
 	}
 }

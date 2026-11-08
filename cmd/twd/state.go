@@ -20,14 +20,30 @@ import (
 
 // Config is <state>/twd.json, written by `twd up`.
 type Config struct {
-	Tailnet        string `json:"tailnet"`
-	TenantID       string `json:"tenantID,omitempty"`
-	APIKeyFile     string `json:"apiKeyFile"` // path only; the key itself is never copied
-	ControlURL     string `json:"controlURL"`
-	TSAPIURL       string `json:"tsapiURL,omitempty"`
-	HostID         string `json:"hostID"`
-	HostnamePrefix string `json:"hostnamePrefix,omitempty"`
-	Ephemeral      bool   `json:"ephemeral,omitempty"`
+	Tailnet  string `json:"tailnet"`
+	TenantID string `json:"tenantID,omitempty"`
+	// MintMode is "wif" (keyless, the default: mgmt's OIDC issuer + a
+	// Tailscale trust credential) or "apikey" (--api-key-file). Empty
+	// means apikey (state written before M10).
+	MintMode   string `json:"mintMode,omitempty"`
+	APIKeyFile string `json:"apiKeyFile,omitempty"` // apikey mode: path only; the key itself is never copied
+	// Keyless mode: mgmt's own tailnet node (tag:twd-mgmt), joined by
+	// interactive login in `twd up`; the API is served on it (WhoIs auth)
+	// and the WIF issuer over Funnel.
+	MgmtHostname string `json:"mgmtHostname,omitempty"` // tsnet hostname (default twd-mgmt)
+	MgmtDNSName  string `json:"mgmtDNSName,omitempty"`  // twd-mgmt.<tailnet>.ts.net
+	MgmtNodeID   string `json:"mgmtNodeID,omitempty"`   // stable node ID
+	MgmtIP       string `json:"mgmtIP,omitempty"`       // tailnet IPv4
+	HTTPS        bool   `json:"https,omitempty"`        // the tailnet has HTTPS certificates (Funnel + twd link need it)
+	IssuerURL    string `json:"issuerURL,omitempty"`    // https://<mgmtDNSName> (Funnel)
+	// WIF trust credential client IDs (public identifiers, not secrets).
+	WIFClientID          string `json:"wifClientID,omitempty"`
+	WIFLifecycleClientID string `json:"wifLifecycleClientID,omitempty"`
+	ControlURL           string `json:"controlURL"`
+	TSAPIURL             string `json:"tsapiURL,omitempty"`
+	HostID               string `json:"hostID"`
+	HostnamePrefix       string `json:"hostnamePrefix,omitempty"`
+	Ephemeral            bool   `json:"ephemeral,omitempty"`
 	// InsecureSharedHost (twd up --insecure-shared-host): without a process
 	// sandbox, still serve process-tier workloads of several tenants
 	// (incl. Node-tier apps whose egress is then unenforced, RT-08).
@@ -48,6 +64,22 @@ type Config struct {
 type state struct {
 	Dir string
 	Cfg Config
+	// Link is <state>/link.json (`twd link`): this machine drives a remote
+	// mgmt over the tailnet instead of a local `twd up` stack.
+	Link *Link
+
+	remoteTenants []TenantRef
+}
+
+// keyless reports whether this state runs in keyless (WIF) mint mode.
+func (c Config) keyless() bool { return c.MintMode == "wif" }
+
+// mintMode names the mode for humans.
+func (c Config) mintMode() string {
+	if c.keyless() {
+		return "wif (keyless)"
+	}
+	return "apikey"
 }
 
 func stateDirFrom(flagVal string) (string, error) {
@@ -71,6 +103,11 @@ func openState(flagVal string) (*state, error) {
 		return nil, err
 	}
 	s := &state{Dir: d}
+	if l, err := loadLink(s.linkPath()); err == nil {
+		s.Link = l
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 	b, err := os.ReadFile(s.configPath())
 	if errors.Is(err, os.ErrNotExist) {
 		return s, nil
@@ -83,9 +120,21 @@ func openState(flagVal string) (*state, error) {
 
 func (s *state) configured() bool { return s.Cfg.Tailnet != "" }
 
+// remote reports whether commands go to a linked mgmt over the tailnet:
+// link.json exists and this machine has no local `twd up` state.
+func (s *state) remote() bool { return s.Link != nil && !s.configured() }
+
 func (s *state) requireUp() error {
+	if s.remote() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if _, err := s.whoami(ctx); err != nil {
+			return err
+		}
+		return nil
+	}
 	if !s.configured() {
-		return fail("not_up", "twd is not set up in "+s.Dir).withFix("twd up --tailnet <tailnet> --api-key-file <file>")
+		return fail("not_up", "twd is not set up in "+s.Dir).withFix("twd up   (on the host; keyless)", "twd link <twd-mgmt.<tailnet>.ts.net>   (on a developer machine)")
 	}
 	if !s.supervisorAlive() {
 		return fail("not_running", "twd is set up in "+s.Dir+" but not running").withFix("twd up")
@@ -94,6 +143,10 @@ func (s *state) requireUp() error {
 }
 
 func (s *state) configPath() string { return filepath.Join(s.Dir, "twd.json") }
+func (s *state) linkPath() string   { return filepath.Join(s.Dir, "link.json") }
+func (s *state) mgmtTsnetDir() string {
+	return filepath.Join(s.Dir, "mgmt", "tsnet") // twd-mgmt -state-dir <state>/mgmt, tsnet under it
+}
 
 func (s *state) save() error {
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {
@@ -189,10 +242,16 @@ func pidAlive(pid int) bool {
 
 func (s *state) supervisorAlive() bool { return pidAlive(s.supervisorPID()) }
 
-// mgmt is the CLI's client for mgmt's unix socket. It presents the same
-// per-host token hostd uses (RT-03): same-uid peercred alone admits
-// nobody, and the token file is readable only by the twd user.
+// mgmt is the CLI's client for mgmt. Locally (`twd up` on this machine)
+// it is the unix socket with the per-host token hostd uses (RT-03):
+// same-uid peercred alone admits nobody, and the token file is readable
+// only by the twd user. Linked (`twd link`), it is HTTPS to mgmt's tailnet
+// node over this machine's own Tailscale connection, authenticated by
+// WhoIs: the caller's tailnet identity, no token.
 func (s *state) mgmt() *mgmtapi.Client {
+	if s.remote() {
+		return s.Link.client()
+	}
 	c, _ := mgmtapi.NewClient("unix://" + s.mgmtSock())
 	c.TokenFile = s.hostTokenFile()
 	return c

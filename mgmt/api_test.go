@@ -655,63 +655,107 @@ func TestAPIHostAuditChain(t *testing.T) {
 
 func TestTailnetAuth(t *testing.T) {
 	e := newTestEnv(t, nil)
-	srv := &Server{M: e.m, Admins: []string{"ross@example.com"}}
-	whois := func(ctx context.Context, addr string) (string, []string, string, error) {
+	srv := &Server{M: e.m, Admins: []string{"ross@example.com"}, Self: SelfInfo{DNSName: "twd-mgmt.t.ts.net", Tailnet: "t.ts.net"}}
+	whois := func(ctx context.Context, addr string) (WhoIsInfo, error) {
 		switch addr {
 		case "100.64.0.1:1":
-			return "nHOST1", []string{HostTag}, "tagged-devices", nil
+			return WhoIsInfo{NodeID: "nHOST1", Tags: []string{HostTag}, Login: "tagged-devices"}, nil
 		case "100.64.0.2:1":
-			return "nHOST2", []string{HostTag}, "tagged-devices", nil
-		case "100.64.0.3:1":
-			return "nUSER", nil, "ross@example.com", nil
-		case "100.64.0.4:1":
-			return "nEVE", nil, "eve@example.com", nil
-		case "100.64.0.5:1":
-			return "nAGENT", []string{"tag:twd-agent-support"}, "tagged-devices", nil
+			return WhoIsInfo{NodeID: "nHOST2", Tags: []string{HostTag}, Login: "tagged-devices"}, nil
+		case "100.64.0.3:1": // -admins override, no cap
+			return WhoIsInfo{NodeID: "nUSER", Login: "ross@example.com"}, nil
+		case "100.64.0.4:1": // plain user, no cap
+			return WhoIsInfo{NodeID: "nEVE", Login: "eve@example.com"}, nil
+		case "100.64.0.5:1": // a twd object node
+			return WhoIsInfo{NodeID: "nAGENT", Tags: []string{"tag:twd-agent-support"}, Login: "tagged-devices", Name: "agent.t.ts.net"}, nil
+		case "100.64.0.6:1": // autogroup:admin member: the base snippet grants the cap
+			return WhoIsInfo{NodeID: "nADM", Login: "alice@example.com", Caps: []string{AdminCap}}, nil
+		case "100.64.0.7:1": // a tagged node (CI, a dev box) granted the cap
+			return WhoIsInfo{NodeID: "nCI", Tags: []string{"tag:ttest"}, Login: "tagged-devices", Caps: []string{AdminCap}, Name: "ci.t.ts.net"}, nil
 		}
-		return "", nil, "", fmt.Errorf("unknown")
+		return WhoIsInfo{}, fmt.Errorf("unknown")
 	}
 	h := srv.TailnetHandler(whois, srv.Handler())
-	call := func(from, method, path, body string) int {
+	call := func(from, method, path, body string) (int, map[string]any) {
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
 		r.RemoteAddr = from
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
-		return w.Code
+		var out map[string]any
+		json.Unmarshal(w.Body.Bytes(), &out)
+		return w.Code, out
 	}
-	if c := call("100.64.0.1:1", "POST", "/v0/hosts/h1/heartbeat", `{}`); c != 403 {
+	code := func(from, method, path, body string) int { c, _ := call(from, method, path, body); return c }
+	if c := code("100.64.0.1:1", "POST", "/v0/hosts/h1/heartbeat", `{}`); c != 403 {
 		t.Fatalf("unregistered host heartbeat: %d", c)
 	}
-	if c := call("100.64.0.1:1", "POST", "/v0/hosts/register", `{"hostID":"h1"}`); c != 200 {
+	if c := code("100.64.0.1:1", "POST", "/v0/hosts/register", `{"hostID":"h1"}`); c != 200 {
 		t.Fatalf("register: %d", c)
 	}
-	if c := call("100.64.0.1:1", "POST", "/v0/hosts/h1/heartbeat", `{}`); c != 200 {
+	if c := code("100.64.0.1:1", "POST", "/v0/hosts/h1/heartbeat", `{}`); c != 200 {
 		t.Fatalf("own heartbeat: %d", c)
 	}
-	if c := call("100.64.0.2:1", "POST", "/v0/hosts/register", `{"hostID":"h1"}`); c != 403 {
+	if c := code("100.64.0.2:1", "POST", "/v0/hosts/register", `{"hostID":"h1"}`); c != 403 {
 		t.Fatalf("host2 hijacking h1: %d", c)
 	}
-	call("100.64.0.2:1", "POST", "/v0/hosts/register", `{"hostID":"h2"}`)
-	if c := call("100.64.0.2:1", "POST", "/v0/hosts/h1/heartbeat", `{}`); c != 403 {
+	code("100.64.0.2:1", "POST", "/v0/hosts/register", `{"hostID":"h2"}`)
+	if c := code("100.64.0.2:1", "POST", "/v0/hosts/h1/heartbeat", `{}`); c != 403 {
 		t.Fatalf("host2 acting as h1: %d", c)
 	}
-	if c := call("100.64.0.1:1", "GET", "/v0/tenants", ``); c != 403 {
+	if c := code("100.64.0.1:1", "GET", "/v0/tenants", ``); c != 403 {
 		t.Fatalf("host on admin endpoint: %d", c)
 	}
-	if c := call("100.64.0.3:1", "GET", "/v0/tenants", ``); c != 200 {
-		t.Fatalf("admin: %d", c)
+	if c, b := call("100.64.0.1:1", "GET", "/v0/whoami", ``); c != 200 || b["kind"] != "host" || b["hostID"] != "h1" || b["admin"] != false {
+		t.Fatalf("host whoami: %d %v", c, b)
 	}
-	if c := call("100.64.0.3:1", "GET", "/v0/objects/x/credential?epoch=1", ``); c != 403 {
-		t.Fatalf("human fetching a credential: %d", c)
+	// Admins: -admins override, autogroup:admin via the cap, a tagged node via the cap.
+	for _, from := range []string{"100.64.0.3:1", "100.64.0.6:1", "100.64.0.7:1"} {
+		if c := code(from, "GET", "/v0/tenants", ``); c != 200 {
+			t.Fatalf("admin %s: %d", from, c)
+		}
+		if c := code(from, "GET", "/v0/objects/x/credential?epoch=1", ``); c != 403 {
+			t.Fatalf("admin %s fetching a credential: %d", from, c)
+		}
 	}
-	if c := call("100.64.0.4:1", "GET", "/v0/tenants", ``); c != 403 {
-		t.Fatalf("non-admin: %d", c)
+	if c, b := call("100.64.0.6:1", "GET", "/v0/whoami", ``); c != 200 || b["admin"] != true || b["login"] != "alice@example.com" || b["actor"] != "alice@example.com" ||
+		b["mgmt"].(map[string]any)["dnsName"] != "twd-mgmt.t.ts.net" {
+		t.Fatalf("admin whoami: %d %v", c, b)
 	}
-	if c := call("100.64.0.5:1", "GET", "/v0/tenants", ``); c != 403 {
-		t.Fatalf("agent node: %d", c)
+	if c, b := call("100.64.0.7:1", "GET", "/v0/whoami", ``); c != 200 || b["admin"] != true || b["login"] != "tag:ttest" || b["actor"] != "tag:ttest (nCI)" {
+		t.Fatalf("tagged admin whoami: %d %v", c, b)
 	}
-	if c := call("100.99.0.9:1", "GET", "/v0/healthz", ``); c != 401 {
+	// Non-admins are refused with not_admin and the grant to add.
+	for _, tc := range []struct{ from, src string }{{"100.64.0.4:1", "eve@example.com"}, {"100.64.0.5:1", "tag:twd-agent-support"}} {
+		c, b := call(tc.from, "GET", "/v0/tenants", ``)
+		if c != 403 || b["code"] != "not_admin" {
+			t.Fatalf("non-admin %s: %d %v", tc.from, c, b)
+		}
+		if sn, _ := b["snippet"].(string); sn != AdminGrantSnippet(tc.src) || !strings.Contains(sn, AdminCap) || !strings.Contains(sn, MgmtTag) {
+			t.Fatalf("non-admin %s snippet: %q", tc.from, sn)
+		}
+		if c, _ := call(tc.from, "GET", "/v0/whoami", ``); c != 403 {
+			t.Fatalf("non-admin whoami %s: %d", tc.from, c)
+		}
+	}
+	if c := code("100.99.0.9:1", "GET", "/v0/healthz", ``); c != 401 {
 		t.Fatalf("no whois: %d", c)
+	}
+	// deployedBy carries the WhoIs actor.
+	var tn struct{ TenantID string }
+	e.c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	c, b := call("100.64.0.6:1", "POST", "/v0/deployments", `{"tenantID":"`+tn.TenantID+`","workload":"w","namespaces":[{"class":"A","tags":["tag:ttest"]}]}`)
+	if c != 200 {
+		t.Fatalf("deploy as admin: %d %v", c, b)
+	}
+	var dv DeploymentView
+	e.c.ok("GET", "/v0/deployments/"+b["deploymentID"].(string), nil, &dv)
+	if dv.DeployedBy != "alice@example.com" {
+		t.Fatalf("deployedBy %q", dv.DeployedBy)
+	}
+	var aud struct{ Records []AuditRecord }
+	e.c.ok("GET", "/v0/audit?human=alice@example.com", nil, &aud)
+	if len(aud.Records) != 1 || aud.Records[0].Kind != "deploy" {
+		t.Fatalf("deploy audit by human: %+v", aud.Records)
 	}
 }
 
@@ -750,6 +794,37 @@ func TestWIFMintPath(t *testing.T) {
 	}
 	if e.ts.tokenExchanges != 2 { // one per credential (mint, lifecycle), cached afterwards
 		t.Fatalf("token exchanges %d", e.ts.tokenExchanges)
+	}
+	// wif-check: fresh exchanges for both credentials, policy read via lifecycle.
+	var chk WIFCheckResult
+	c.ok("POST", "/v0/tenants/"+tn.TenantID+"/wif-check", nil, &chk)
+	if !chk.Mint || chk.Lifecycle != "ok" || !chk.PolicyRead || chk.Issuer != tn.WIF["issuer"] {
+		t.Fatalf("wif-check %+v", chk)
+	}
+	if e.ts.tokenExchanges != 4 {
+		t.Fatalf("wif-check should exchange afresh: %d", e.ts.tokenExchanges)
+	}
+	// Re-keying: an apikey tenant switches to wif with new client IDs; no lifecycle → "absent".
+	var tn2 struct{ TenantID string }
+	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "u.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn2)
+	c.fail("POST", "/v0/tenants/"+tn2.TenantID+"/wif-check", nil, 400, "bad_request")
+	c.fail("PUT", "/v0/tenants/"+tn2.TenantID+"/wif", map[string]any{}, 400, "bad_request")
+	var up struct {
+		MintMode string
+		WIF      map[string]string
+	}
+	c.ok("PUT", "/v0/tenants/"+tn2.TenantID+"/wif", map[string]any{"wifClientID": "mint-client"}, &up)
+	if up.MintMode != "wif" || up.WIF["mintSubject"] != "twd:tenant:"+tn2.TenantID+":mint" {
+		t.Fatalf("wif update %+v", up)
+	}
+	c.ok("POST", "/v0/tenants/"+tn2.TenantID+"/wif-check", nil, &chk)
+	if !chk.Mint || chk.Lifecycle != "absent" || chk.PolicyRead {
+		t.Fatalf("wif-check after update %+v", chk)
+	}
+	var t2 Tenant
+	c.ok("GET", "/v0/tenants/"+tn2.TenantID, nil, &t2)
+	if t2.MintMode != MintWIF || t2.WIFClientID != "mint-client" {
+		t.Fatalf("tenant after wif update %+v", t2)
 	}
 }
 

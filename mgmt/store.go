@@ -14,6 +14,8 @@ import (
 type Store interface {
 	CreateTenant(ctx context.Context, t Tenant) error
 	GetTenant(ctx context.Context, id string) (Tenant, error)
+	// UpdateTenant rewrites mint configuration and limits (not ID/tailnet).
+	UpdateTenant(ctx context.Context, t Tenant) error
 	ListTenants(ctx context.Context) ([]Tenant, error)
 
 	UpsertHost(ctx context.Context, h Host) error

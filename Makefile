@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -122,6 +122,16 @@ e2e-multi: deps
 		TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2emulti -count=1 -v -timeout 25m ./e2e/multi/...
 
+## e2e-keyless: M10 on tailnet 1: `twd up` keyless (WIF mint mode, mgmt gets NO API key; the key file
+## is used only to mint the mgmt node's auth key, since a browser login can't be automated, and to
+## create/delete the trust credentials), deploy, objects minted via WIF, `twd link` from a tsnet test
+## client (tag:ttest, admin cap) → remote deploy/ls/kill/audit, a non-admin (tag:ttest-noadmin) refused.
+e2e-keyless: deps
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-keyless: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2ekeyless -count=1 -v -timeout 25m ./e2e/keyless/...
+
 ## release: self-contained tarballs in dist/ (darwin-arm64, linux-arm64, linux-amd64): Go binaries
 ## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
 ## install.sh, VERSION, SHA256SUMS. darwin binaries are ad-hoc signed (run on macOS).
@@ -186,6 +196,7 @@ lint:
 	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
+	$(GO) vet -tags e2ekeyless ./e2e/keyless/...
 	$(GO) vet -tags e2embp ./e2e/mbp/...
 	$(GO) vet -tags e2elinux ./e2e/linux/...
 	$(GO) vet -tags sdk ./e2e/sdk/...
