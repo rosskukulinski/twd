@@ -244,19 +244,69 @@ the control plane, and then it can't rejoin.
 
 ### Per-distro notes
 
-- **Ubuntu 24.04**: works out of the box. AppArmor restricts unprivileged user
-  namespaces by default; twd doesn't use them (doctor reports it).
-- **Ubuntu 22.04**: glibc 2.35, exactly the floor. Kernel 5.15 has Landlock ABI 1–2.
-- **Debian 12**: glibc 2.36. Debian's genericcloud image has no `lsof`;
-  doctor uses `/proc` and `ss`, so nothing extra is needed.
-- **Fedora**: glibc 2.4x, SELinux enforcing. twd needs no policy changes:
-  everything runs as your user under `~/.twd`.
+- **Ubuntu 24.04**: works out of the box (glibc 2.39, kernel 6.8, Landlock ABI 4).
+  AppArmor restricts unprivileged user namespaces by default; twd doesn't use
+  them, and doctor reports it.
+- **Ubuntu 22.04**: glibc 2.35, exactly the floor. Kernel 5.15 has Landlock ABI 1,
+  the oldest Landlock.
+- **Debian 12**: glibc 2.36, kernel 6.1 (Landlock ABI 2). No extra packages needed;
+  doctor's process checks use `/proc` and `ss`, not `lsof`.
+- **Fedora 45 (Cloud)**: glibc 2.44, kernel 7.2 (Landlock ABI 10). No extra
+  packages and no policy changes; everything runs as your user under `~/.twd`.
 - **amd64**: the same release built for x86-64 (`@cloudflare/workerd-linux-64`).
-  The matrix ran it under qemu emulation on an Apple-silicon Mac, so its
-  timings are far slower than a real x86 host would be.
-- **Alpine / musl, Debian 11, RHEL 8–9, Amazon Linux 2**: unsupported.
-  `install.sh` and `twd doctor` say so (see the matrix).
+  The matrix ran it under qemu x86-64 emulation on an Apple-silicon Mac, so its
+  timings are slower than a real x86 host's.
+- **Debian 11** (glibc 2.31) is refused by `install.sh` and fails doctor's
+  `glibc` check. The pinned workerd does start there (`workerd --version`),
+  because its ELF needs only `GLIBC_2.27`, but twd is not tested below 2.35.
+  Debian 11's kernel 5.10 also has no Landlock. Lima note: its
+  genericcloud image doesn't boot under `vmType: vz`; use qemu.
+- **Alpine / musl**: refused. workerd can't even be exec'd: there is no glibc
+  loader. The same goes for RHEL/Alma/Rocky 8–9 and Amazon Linux 2 (glibc too
+  old; not run in the matrix).
 
 ### Linux support matrix
 
-<!-- filled from make e2e-linux results -->
+`make e2e-linux`, 2026-11-08, release `0.1.0-bb3a3296`. Every VM was **fresh**:
+a Lima official template, 4 CPU / 6 GiB / 30 GiB, `--plain --mount-none`, and
+nothing mounted from the Mac. The tarball and the API key file (0600) were
+copied in with `limactl copy`. twd ran in the VM under `twd up --service`; the
+tag:ttest client and echo ran on the Mac (M5 Pro) over tailnet 1. Every row
+passed checks (a)–(f), `twd doctor` before and while running,
+`systemctl --user restart twd` (healthy again, the same workload IP answering
+the Mac), `twd down --purge --service`, and cleanup: zero leftover devices or
+keys. **Sandbox: none on every row (Landlock sandbox pending).** **microVM
+tier: unavailable on every row** (no `/dev/kvm` in these VMs, no
+firecracker, not root). Raw results: `e2e/real/results/l1-linux/`.
+
+| | Ubuntu 24.04 arm64 | Debian 12 arm64 | Ubuntu 22.04 arm64 | Fedora 45 arm64 | Ubuntu 24.04 **amd64** (qemu, emulated) |
+|---|---|---|---|---|---|
+| result | **PASS** | **PASS** | **PASS** | **PASS** | **PASS** |
+| glibc · kernel · Landlock ABI | 2.39 · 6.8 · 4 | 2.36 · 6.1 · 2 | 2.35 · 5.15 · 1 | 2.44 · 7.2 · 10 | 2.39 · 6.8 · 4 |
+| `install.sh` | 0.41 s | 0.81 s | 0.84 s | 0.47 s | 9.1 s |
+| `twd up --service` → ready | 0.70 s | 0.65 s | 0.64 s | 0.68 s | 3.4 s |
+| `twd deploy` → ready (agent / mcp) | 2.78 / 1.57 s | 1.57 / 1.45 s | 1.50 / 1.46 s | 1.59 / 1.56 s | 4.70 / 5.55 s |
+| first request → object node ready | 1.64 s | 1.67 s | 1.62 s | 1.59 s | 3.95 s |
+| `twd kill --cascade` (CLI / push) | 66 / 56 ms | 72 / 63 ms | 65 / 59 ms | 69 / 56 ms | 319 / 133 ms |
+| request to a killed object → 410 | 1.7 ms | 1.3 ms | 0.9 ms | 0.9 ms | 10.9 ms |
+| Mac → VM path | **direct** after 0.19 s | **direct** after 0.18 s | **direct** after 0.18 s | **direct** after 0.20 s | **direct** after 0.47 s |
+| MCP `tools/list` direct · DERP-only (median) | 1.9 · 10.7 ms | 2.5 · 11.2 ms | 3.5 · 11.2 ms | 2.0 · 16.6 ms | 33.1 · 41.8 ms |
+| disco ping direct · DERP (median) | 0.41 · 7.8 ms | 0.57 · 9.2 ms | 0.67 · 8.5 ms | 0.42 · 14.1 ms | 1.47 · 13.4 ms |
+| `systemctl --user restart twd` → healthy / workload answers the Mac | 3.6 / 6.6 s | 3.6 / 6.7 s | 3.6 / 6.7 s | 0.7 / 3.8 s | 5.6 / 13.1 s |
+| `twd down --purge --service` | 0.62 s | 0.56 s | 0.60 s | 0.63 s | 4.0 s |
+
+The direct path is the Mac ↔ Lima VM NAT (a private address); DERP-only
+numbers come from a second client with `TS_DEBUG_ALWAYS_USE_DERP=1`
+(region `sea`). The `systemctl --user restart` command itself returned in
+about 3.1 s on Ubuntu and Debian (the supervisor drains hostd, then mgmt,
+before systemd starts the new one), 0.17 s on Fedora 45, and 4.6 s on amd64.
+In every row, the first request after the restart that succeeded had waited
+about 3 s for the workload node to rejoin.
+
+Unsupported hosts (bonus rows; `TestUnsupportedHost`):
+
+| | Debian 11 arm64 (glibc 2.31, kernel 5.10) | Alpine 3.24 arm64 (musl) |
+|---|---|---|
+| `install.sh` | refused: `glibc 2.31 is too old: twd's workerd needs glibc >= 2.35 (Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL 10)` | refused: `this Linux uses musl libc (Alpine?); twd's workerd needs glibc >= 2.35 …` |
+| `bin/twd doctor` | `✗ glibc` (names the distro and the fix); `! kernel` (< 5.13); `! landlock` (ENOSYS) | `✗ glibc`: `this system uses musl libc (/lib/ld-musl-aarch64.so.1) …` |
+| would workerd start anyway? | yes (`workerd --version`; untested beyond that) | no (no glibc loader) |

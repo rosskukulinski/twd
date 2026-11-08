@@ -8,6 +8,7 @@ Last update: 2026-11-08 01:15 PT. M6 (merged with M5; release tarballs, `install
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 Last update: 2026-11-08 01:20 PT. M9 (opt-in Node process tier + Vercel Workflow) on branch `m9-node`: `make test-node` PASS on macOS and Lima.
 Last update: 2026-11-08 01:40 PT. M7 (E2E-MULTI: one host, tenant A on tailnet 1 + tenant B on tailnet-2) on branch `m7-multi`: `make e2e-multi` PASS (3 runs).
+Last update: 2026-11-08 08:45 PT. L1 (Linux release, doctor, systemd service, `make e2e-linux`) on branch `l1-linux-release`: 5/5 supported distros PASS; 2 unsupported hosts refused correctly.
 Last update: 2026-11-08 02:05 PT. Integration: master (M6 + M5 + M9, `57dd519`) merged into `m7-multi`; the full matrix passes on `4cce30d` (macOS, real tailnets, mbp from the release, Lima).
 
 ## M0: repo skeleton (DONE)
@@ -914,3 +915,68 @@ Earlier runs, kept for the record: on merge commit `a219532`, `make e2e-mac` (`8
 - The Node tier on Linux has no per-tenant confinement, same as workerd. `runtime: node` + `tier: microvm` is still rejected (M9 gap).
 - Node-tier templates (`node-workflow`) are shipped in the release but not deployable offline: they need Node and `npm install`, as before (only `@twd/node` is vendored).
 
+## L1: Linux release, doctor, systemd user service, E2E-LINUX matrix (DONE, branch `l1-linux-release`)
+- **Releases:** `make release` now builds `darwin-arm64`, `linux-arm64` and **`linux-amd64`**. The Go binaries are built with `CGO_ENABLED=0`; amd64's workerd comes from npm `@cloudflare/workerd-linux-64` (integrity-checked against the lockfile).
+  - `scripts/check-arch.mjs` checks each binary's ELF/Mach-O machine against the target.
+  - `scripts/check-pure-js.mjs` proves the shared vendored `node_modules` holds no `.node`/ELF/Mach-O/PE files and no `os`/`cpu` packages, so one tree serves every target. The only native package in the closure is `@rolldown/binding-*` (agents → `@rolldown/plugin-babel`, used only by `agents/dist/vite.js`). It was already skipped, and no workerd bundle needs it. `core-js-pure` has a postinstall banner, which is never run.
+  - `install.sh` maps `x86_64` → amd64 and refuses musl or glibc < 2.35 with a clear message. On bash it suggests `~/.profile` instead of creating `~/.bash_profile`, which would shadow `~/.profile` on Debian and Ubuntu.
+  - `RELEASE_VERSION` is now expanded once (`:=`); an edit made during `make release` had renamed the e2e tarball.
+- **`twd doctor` on Linux** (`cmd/twd/doctor_linux.go`). The checks:
+  - `glibc` runs before `workerd`. It uses `getconf`, with `ldd` as a fallback and musl detection. It also reads workerd's ELF `GLIBC_` floor.
+  - `kernel`.
+  - `landlock`: `landlock_create_ruleset(NULL,0,VERSION)`, decoding ENOSYS and EOPNOTSUPP.
+  - `user_namespaces`: informational; reports AppArmor's restriction.
+  - `kvm`: opens `/dev/kvm` read-write and calls `KVM_GET_API_VERSION`; names the group in the fix.
+  - `firecracker`, and the jailer.
+  - `cgroups_v2`, plus what is delegated to the user manager.
+  - `systemd`: the user manager, linger, and the `twd.service` state.
+  - `microvm_tier`: available or unavailable, with every reason.
+
+  The system-tailscaled check now works on Linux too. It finds twd's socket inodes in `/proc/<pid>/fd` and matches the peers of `ss -x` connections bound at `*tailscale*`. macOS still uses lsof. A hermetic test (`TestTailscaledHoldersDetects`, Linux) proves it flags a connection to another process's `…/tailscaled.sock`.
+- **`twd up --service` / `twd down --service`** (`cmd/twd/service.go`):
+  - `--service` writes `~/.config/systemd/user/twd.service`, which runs the same `twd __supervise` (`KillMode=mixed`, `TimeoutStopSec=180`, `Restart=on-failure`), and enables and starts it.
+  - A plain `twd down` stops it through systemctl; the unit stays enabled. `twd down --service` disables and removes it.
+  - It prints `sudo loginctl enable-linger <user>` guidance and never runs sudo. On macOS it is refused (`service_unsupported`).
+  - `twd up` without `--service` refuses while the unit is active.
+- **`make e2e-linux`** (`e2e/linux`, `scripts/e2e-linux{,-one}.sh`):
+  - Each row gets a **fresh** Lima VM `twdl-<distro>` from the official template (4 CPU / 6 GiB / 30 GiB, `--plain --mount-none`). The test asserts nothing in `/proc/mounts` is virtiofs, 9p or sshfs.
+  - The tarball and the key file go in with `limactl copy` (the key 0600, in a 0700 dir). They are removed by `t.Cleanup` and by the shell trap, even on failure.
+  - The run covers `twd doctor`, checks (a)–(f) under `twd up --service`, then `systemctl --user restart` (new MainPID; healthy; the same workload IP answers the Mac), doctor while running, `twd down --purge --service`, and zero leftovers by ID.
+  - At most 2 VMs run at once. Each is `limactl stop`ped (kept) when its row ends.
+  - cliflow gained `UpArgs`, `Persistent` and `Slow` (the amd64 timeout scale, 6×).
+- **Matrix (2026-11-08, release `0.1.0-bb3a3296`). Every row PASSED, with zero leftover devices and keys:**
+  - Ubuntu 24.04 arm64, Debian 12 arm64, Ubuntu 22.04 arm64, Fedora 45 arm64 (vz);
+  - Ubuntu 24.04 **amd64** (qemu x86-64 emulation).
+  - Sandbox: **none (L2 pending)** on every row. The microVM tier is **unavailable** on every row (no /dev/kvm, no firecracker, not root).
+
+  Typical arm64 numbers:
+
+  | step | time |
+  |---|---|
+  | install.sh | 0.4–0.8 s |
+  | up → ready | 0.64–0.70 s |
+  | deploy → ready | 1.5–2.8 s |
+  | first object node | ~1.6 s |
+  | kill CLI | ~66–72 ms |
+  | killed request → 410 | ≤ 1.7 ms |
+  | Mac → VM | direct after ~0.19 s; tools/list 1.9–3.5 ms direct vs 10.7–16.6 ms DERP-only |
+  | service restart → workload reachable | 3.8–6.7 s |
+
+  amd64 (emulated): install 9.1 s, up 3.4 s, deploy 4.7–5.5 s, kill 319 ms, restart → reachable 13.1 s. The full table is in docs/INSTALL.md ("Linux support matrix"); the raw JSON is in `e2e/real/results/l1-linux/`.
+- **Unsupported-host rows** (`TestUnsupportedHost`):
+  - **Debian 11** (glibc 2.31, kernel 5.10): install.sh is refused; `bin/twd doctor` gives `✗ glibc` (with distro and fix), `! kernel` and `! landlock` (ENOSYS).
+  - **Alpine 3.24** (musl): install.sh and doctor both refuse it, naming `/lib/ld-musl-aarch64.so.1`.
+- **Verification:** `make test` is green on macOS and in Lima `twd-dev` (a clone of this branch at `2989366`). `make lint` is clean.
+
+### L1 findings and gaps
+- **workerd's real glibc floor is 2.27, not 2.35.** The pinned workerd's ELF imports `GLIBC_2.27` at most, on both arm64 and amd64, and `workerd --version` runs on Debian 11 (glibc 2.31). The 2.35 floor (install.sh refusal, doctor `fail`) is kept as policy: it is the oldest glibc tested. The lead may want to lower it to 2.31 after a full run on Debian 11 / RHEL 9 (2.34).
+- **`--ephemeral` nodes don't survive a supervisor restart.** On the first run (ephemeral), after `systemctl --user restart` hostd kept the node state ("node state kept for rejoin"), but both workload nodes hung in `tsnet.Up` for 2 min and then failed with `bootstrap_failed: … context deadline exceeded`. This fits control having removed the offline ephemeral devices. The default persistent nodes rejoin with the same IP in ~3 s, so `make e2e-linux` uses those (`cliflow.Env.Persistent`) and `twd down --purge`. The fix belongs in hostd: on rejoin, an ephemeral node whose device is gone should re-mint or fail fast. This is not L1's code.
+- **Not tested:** surviving logout or reboot. Linger was off in every VM; Lima's persistent ssh ControlMaster kept the user manager alive. Doctor and `twd up --service` print the `enable-linger` guidance. A row with `sudo loginctl enable-linger` plus `limactl stop/start` would prove reboot survival.
+- No VM had a system tailscaled installed, so the e2e's "no twd process holds tailscaled's socket" result is a negative only. The positive control is the hermetic `TestTailscaledHoldersDetects`.
+- amd64 ran only under qemu TCG emulation (no x86 hardware here), so its numbers are slow by construction (timeouts scaled 6×; measured values recorded unscaled).
+- Lima: `debian-11` genericcloud doesn't boot under `vmType: vz` (ssh never came up in 10 min), so that row uses qemu. The template locator is now `template:X` (Lima 2 syntax).
+- Integration notes for the lead:
+  - **L2** owns the `sandbox` check (still `skip` on Linux), and should change the `landlock` check's "sandbox pending" wording once Landlock lands; `release.json`'s `"sandbox":"none"` for linux too.
+  - **L3:** `microvm_tier` looks for `~/.twd/vm/{vmlinux,rootfs.ext4}` and for firecracker/jailer on PATH, in `~/.twd/bin` or `/usr/local/bin`. It reports "not root" until `twd host setup --microvm` exists.
+  - The new files (`doctor_linux.go`, `doctor_host.go`, `doctor_other.go`, `service.go`) are separate, to keep conflicts small. `doctor.go`, `up.go` and `cliflow.go` have small hunks.
+- **Matrix VMs (all stopped, kept, not deleted):** `twdl-ubuntu24-arm64`, `twdl-debian12-arm64`, `twdl-ubuntu22-arm64`, `twdl-fedora-arm64`, `twdl-ubuntu24-amd64`, `twdl-debian11-arm64`, `twdl-alpine-arm64`.

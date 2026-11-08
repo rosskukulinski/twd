@@ -26,7 +26,7 @@ ubuntu24-arm64) tmpl=ubuntu-24.04 ;;
 ubuntu22-arm64) tmpl=ubuntu-22.04 ;;
 debian12-arm64) tmpl=debian-12 ;;
 fedora-arm64) tmpl=fedora ;;
-debian11-arm64) tmpl=debian-11 ;;
+debian11-arm64) tmpl=debian-11 vmtype=qemu ;; # its genericcloud kernel does not boot under vz
 alpine-arm64) tmpl=alpine ;;
 ubuntu24-amd64) tmpl=ubuntu-24.04 arch=amd64 vmtype=qemu slow=${TWD_E2E_SLOW_AMD64:-6} extra="--arch x86_64" ;;
 *) echo "e2e-linux: unknown distro $distro" >&2; exit 2 ;;
@@ -75,10 +75,10 @@ if limactl list -q 2>/dev/null | grep -qx "$vm"; then
 	fi
 fi
 if ! limactl list -q 2>/dev/null | grep -qx "$vm"; then
-	say "creating $vm from template://$tmpl ($vmtype, $arch, 4 CPU / 6 GiB / 30 GiB, no mounts)"
+	say "creating $vm from template:$tmpl ($vmtype, $arch, 4 CPU / 6 GiB / 30 GiB, no mounts)"
 	# shellcheck disable=SC2086
 	limactl create --tty=false --name "$vm" --plain --mount-none --vm-type "$vmtype" $extra \
-		--cpus 4 --memory 6 --disk 30 "template://$tmpl" >>"$log" 2>&1 || { say "limactl create failed"; exit 1; }
+		--cpus 4 --memory 6 --disk 30 "template:$tmpl" >>"$log" 2>&1 || { say "limactl create failed"; exit 1; }
 fi
 limactl start --tty=false "$vm" >>"$log" 2>&1 || { say "limactl start failed"; exit 1; }
 vm_ready_s=$(( $(date +%s) - t0 ))
