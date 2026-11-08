@@ -19,7 +19,7 @@ import (
 var errStatus = map[string]int{
 	"bad_request": 400, "no_identity": 401, "unknown_object": 404, "killed": 410,
 	"identity_pending": 503, "upstream_unavailable": 503, "hostd_unavailable": 503,
-	"lease_lost": 409, "spawn_budget_exceeded": 429, "bootstrap_failed": 502,
+	"lease_lost": 409, "namespace_conflict": 409, "spawn_budget_exceeded": 429, "bootstrap_failed": 502,
 	"cap_missing": 403, "delegation_exceeds_parent": 403, "delegation_invalid": 403,
 	"forbidden_destination": 403, "peer_not_visible": 403, "acl_denied": 403,
 }

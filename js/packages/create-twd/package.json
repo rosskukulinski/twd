@@ -1,7 +1,7 @@
 {
   "name": "create-twd",
   "version": "0.1.0",
-  "description": "Scaffold (templates hello, agent, mcp) and bundle twd apps",
+  "description": "Scaffold (templates hello, agent, mcp, ai-agent) and bundle twd apps",
   "type": "module",
   "bin": { "create-twd": "bin/create-twd.js" },
   "exports": { "./build": "./lib/build.mjs" },

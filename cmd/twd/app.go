@@ -31,7 +31,7 @@ func workloadLabel(s string) string {
 
 func cmdInit(args []string) error {
 	f := newFlags("init")
-	tmpl := f.String("template", "hello", "hello | agent | mcp")
+	tmpl := f.String("template", "hello", "hello | agent | mcp | ai-agent")
 	name := f.String("name", "", "workload name (default: the directory name)")
 	pos, err := f.parse(args)
 	if err != nil {
@@ -109,7 +109,7 @@ func loadApp(dir, name string) (*app, error) {
 	a := &app{Dir: dir}
 	raw, err := os.ReadFile(filepath.Join(dir, "twd.jsonc"))
 	if err != nil {
-		return nil, fail("bad_request", "no twd.jsonc in "+dir).withFix("twd init <dir> --template hello|agent|mcp")
+		return nil, fail("bad_request", "no twd.jsonc in "+dir).withFix("twd init <dir> --template hello|agent|mcp|ai-agent")
 	}
 	a.TwdRaw = raw
 	if a.Cfg, err = mgmt.ParseTwdConfig(raw); err != nil {

@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-mac e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
 
 all: build
 
@@ -33,6 +33,11 @@ test-go:
 
 test-js:
 	npm test --silent
+
+## test-sdk: M5 SDK conformance (hermetic): real Cloudflare Agents SDK and Vercel AI SDK
+## apps on twd-hostd + stock workerd over testcontrol + local DERP; mock LLM, no keys.
+test-sdk: deps
+	$(GO) test -tags sdk -count=1 -v -timeout 10m ./e2e/sdk/...
 
 ## test-pg: the mgmt Store tests against Postgres 17 in OrbStack docker (throwaway container).
 PG_CTX  ?= orbstack
@@ -89,6 +94,7 @@ lint:
 	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
+	$(GO) vet -tags sdk ./e2e/sdk/...
 	@sh scripts/check-secrets.sh
 
 hooks:
