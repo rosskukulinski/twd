@@ -27,22 +27,24 @@ const (
 // object is one tailnet identity hosted here: a workload entry node
 // (Class == "") or a Durable Object instance.
 type object struct {
-	ID       string    `json:"id"` // mgmt object ID
-	NetdID   string    `json:"netdID"`
-	TenantID string    `json:"tenantID"`
-	Workload string    `json:"workload"`
-	Class    string    `json:"class,omitempty"`
-	Name     string    `json:"name"`
-	Hostname string    `json:"hostname"`
-	Tags     []string  `json:"tags"`
-	Parent   string    `json:"parent,omitempty"`
-	Status   string    `json:"status"`
-	NodeID   string    `json:"nodeID,omitempty"`
-	MagicDNS string    `json:"magicDNS,omitempty"`
-	IP       string    `json:"ip,omitempty"`
-	Err      string    `json:"error,omitempty"`
-	Wakes    int       `json:"wakes"`
-	Created  time.Time `json:"created"`
+	ID       string   `json:"id"` // mgmt object ID
+	NetdID   string   `json:"netdID"`
+	TenantID string   `json:"tenantID"`
+	Workload string   `json:"workload"`
+	Class    string   `json:"class,omitempty"`
+	Name     string   `json:"name"`
+	Hostname string   `json:"hostname"`
+	Tags     []string `json:"tags"`
+	Parent   string   `json:"parent,omitempty"`
+	// ActingFor is the principal the object was created for (audit).
+	ActingFor string    `json:"actingFor,omitempty"`
+	Status    string    `json:"status"`
+	NodeID    string    `json:"nodeID,omitempty"`
+	MagicDNS  string    `json:"magicDNS,omitempty"`
+	IP        string    `json:"ip,omitempty"`
+	Err       string    `json:"error,omitempty"`
+	Wakes     int       `json:"wakes"`
+	Created   time.Time `json:"created"`
 
 	live    bool          // node created in the netd registry (this process)
 	readyCh chan struct{} // closed on ready/failed/killed
@@ -146,7 +148,7 @@ func netdIDFor(id string) string {
 // ensure returns the object for (workload, class, name), creating it via
 // mgmt and starting its node (async) on first use. class "" is the
 // workload entry node. parent/caps/ttl apply to spawns.
-func (h *Host) ensure(ctx context.Context, w *workload, class, name string, parent *object, caps json.RawMessage, ttl string) (*object, error) {
+func (h *Host) ensure(ctx context.Context, w *workload, class, name string, parent *object, caps json.RawMessage, ttl string, actingFor ...string) (*object, error) {
 	key := objKey(w.tenantID, w.name, class, name)
 	for {
 		h.mu.Lock()
@@ -173,7 +175,11 @@ func (h *Host) ensure(ctx context.Context, w *workload, class, name string, pare
 		h.creating[key] = c
 		h.mu.Unlock()
 
-		o, err := h.create(ctx, w, class, name, parent, caps, ttl)
+		af := ""
+		if len(actingFor) > 0 {
+			af = actingFor[0]
+		}
+		o, err := h.create(ctx, w, class, name, parent, caps, ttl, af)
 		h.mu.Lock()
 		delete(h.creating, key)
 		c.o, c.err = o, err
@@ -183,13 +189,16 @@ func (h *Host) ensure(ctx context.Context, w *workload, class, name string, pare
 	}
 }
 
-func (h *Host) create(ctx context.Context, w *workload, class, name string, parent *object, caps json.RawMessage, ttl string) (*object, error) {
+func (h *Host) create(ctx context.Context, w *workload, class, name string, parent *object, caps json.RawMessage, ttl, actingFor string) (*object, error) {
 	if w.tenant == nil {
 		return nil, &apiError{Code: "upstream_unavailable", Detail: "workload " + w.name + " is not deployed"}
 	}
 	hn := h.hostnameFor(w.name, class, name)
+	if actingFor == "" && parent != nil {
+		actingFor = parent.ActingFor // a sub-agent acts for its root's principal
+	}
 	req := mgmtapi.CreateObjectRequest{TenantID: w.tenantID, Namespace: mgmtapi.Namespace(w.name, class), ObjectName: name,
-		Caps: caps, TTL: ttl, Hostname: hn}
+		Caps: caps, TTL: ttl, Hostname: hn, ActingFor: actingFor}
 	if parent != nil {
 		req.Parent = &mgmtapi.ObjectRef{ObjectID: parent.ID}
 	}
@@ -199,11 +208,19 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 	if err != nil {
 		return nil, err
 	}
-	if resp.Hostname != "" {
-		hn = resp.Hostname // mgmt names the node (M2: the object ID)
+	if resp.Hostname != "" && resp.Hostname != hn {
+		// mgmt names the node (M2: the object ID); keep the host's prefix
+		// (per-run test names, ttest-*/twd-*).
+		hn = resp.Hostname
+		if p := h.cfg.HostnamePrefix; p != "" && !strings.HasPrefix(hn, p) {
+			hn = label(p + hn)
+			if len(hn) > 63 {
+				hn = strings.TrimRight(hn[:63], "-")
+			}
+		}
 	}
 	o := &object{ID: resp.ObjectID, NetdID: netdIDFor(resp.ObjectID), TenantID: w.tenantID, Workload: w.name,
-		Class: class, Name: name, Hostname: hn, Tags: resp.Tags, Status: statusPending, Created: time.Now(),
+		Class: class, Name: name, Hostname: hn, Tags: resp.Tags, Status: statusPending, Created: time.Now(), ActingFor: actingFor,
 		readyCh: make(chan struct{})}
 	if parent != nil {
 		o.Parent = parent.ID
@@ -226,7 +243,7 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 	if parent != nil {
 		h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "spawn", Detail: "by " + parent.ID + " caps " + string(caps), TraceID: newTraceID()})
 	}
-	h.log.Info("object created", "object", o.ID, "class", class, "name", name, "hostname", hn)
+	h.log.Info("object created", "object", o.ID, "class", class, "name", name, "hostname", hn, "acting_for", actingFor)
 	return o, nil
 }
 

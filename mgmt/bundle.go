@@ -19,10 +19,16 @@ import (
 // TwdConfig is the part of twd.jsonc mgmt reads.
 type TwdConfig struct {
 	Tailnet struct {
-		Objects map[string]struct {
-			Tags  []string `json:"tags"`
-			Agent bool     `json:"agent"`
-			TTL   string   `json:"ttl"`
+		// Tags are the workload entry node's tags (the "_workload" namespace).
+		Tags []string `json:"tags"`
+		// Connects are declared dependencies (tags or names), preflighted by twd deploy.
+		Connects []string `json:"connects"`
+		Objects  map[string]struct {
+			Tags   []string `json:"tags"`
+			Agent  bool     `json:"agent"`
+			TTL    string   `json:"ttl"`
+			Node   *bool    `json:"node"`   // false: internal class, no tailnet node
+			Egress string   `json:"egress"` // "workload": plain-DO mode
 		} `json:"objects"`
 		Spawn struct {
 			MaxLive  int `json:"maxLive"`
@@ -31,11 +37,23 @@ type TwdConfig struct {
 	} `json:"tailnet"`
 }
 
-// Classes returns the DO namespaces, sorted by class.
+// WorkloadNamespace is the object namespace of a workload's entry node
+// (its default export); the object name is the workload name.
+const WorkloadNamespace = "_workload"
+
+// Classes returns the DO namespaces that get tailnet nodes, sorted by
+// class, plus the implicit "_workload" namespace (tailnet.tags) when set.
+// Classes with "node": false have no identity and are not namespaces.
 func (c *TwdConfig) Classes() []ClassConfig {
 	var out []ClassConfig
 	for name, o := range c.Tailnet.Objects {
+		if o.Node != nil && !*o.Node {
+			continue
+		}
 		out = append(out, ClassConfig{Class: name, Tags: o.Tags, Agent: o.Agent, TTL: o.TTL})
+	}
+	if len(c.Tailnet.Tags) > 0 {
+		out = append(out, ClassConfig{Class: WorkloadNamespace, Tags: c.Tailnet.Tags})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Class < out[j].Class })
 	return out

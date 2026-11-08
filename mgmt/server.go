@@ -201,13 +201,14 @@ func (s *Server) Handler() http.Handler {
 	}))
 	mux.HandleFunc("POST /v0/hosts/{id}/heartbeat", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req struct {
-			LiveNodes int              `json:"liveNodes"`
-			Leases    []HeartbeatLease `json:"leases"`
+			LiveNodes   int                `json:"liveNodes"`
+			Leases      []HeartbeatLease   `json:"leases"`
+			Deployments []DeploymentStatus `json:"deployments"`
 		}
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
-		return m.Heartbeat(r.Context(), r.PathValue("id"), req.LiveNodes, req.Leases)
+		return m.Heartbeat(r.Context(), r.PathValue("id"), req.LiveNodes, req.Leases, req.Deployments...)
 	}))
 	mux.HandleFunc("GET /v0/hosts/{id}/assignments", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		return m.Assignments(r.Context(), r.PathValue("id"))
@@ -227,6 +228,37 @@ func (s *Server) Handler() http.Handler {
 			return nil, err
 		}
 		return m.Deploy(r.Context(), req)
+	}))
+	mux.HandleFunc("GET /v0/deployments/{id}", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		return m.GetDeployment(r.Context(), r.PathValue("id"))
+	}))
+	mux.HandleFunc("GET /v0/deployments", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		ds, err := m.store.LatestDeployments(r.Context(), r.URL.Query().Get("tenant"))
+		if err != nil {
+			return nil, err
+		}
+		out := []DeploymentView{}
+		for _, d := range ds {
+			if v, err := m.GetDeployment(r.Context(), d.ID); err == nil {
+				out = append(out, v)
+			}
+		}
+		return out, nil
+	}))
+	mux.HandleFunc("POST /v0/tenants/{id}/preflight", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		var req PreflightRequest
+		if err := readJSON(r, &req); err != nil {
+			return nil, err
+		}
+		return m.Preflight(r.Context(), r.PathValue("id"), req)
+	}))
+	mux.HandleFunc("GET /v0/status", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		return map[string]any{"ok": true, "pendingDeviceDeletes": m.PendingDeletes()}, nil
+	}))
+	mux.HandleFunc("POST /v0/flush", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		n := m.PendingDeletes()
+		m.FlushDeletes()
+		return map[string]any{"ok": true, "flushed": n}, nil
 	}))
 	mux.HandleFunc("GET /v0/deployments/{id}/bundle", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		d, err := m.store.GetDeployment(r.Context(), r.PathValue("id"))

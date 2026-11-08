@@ -384,3 +384,17 @@ func (c *PolicyCache) Get(ctx context.Context, t Tenant) (*Policy, error) {
 	c.mu.Unlock()
 	return p, nil
 }
+
+// HasIPGrant reports whether some grant with a network ("ip") part lets a
+// node tagged src reach dst (a tag, or "*").
+func (p *Policy) HasIPGrant(src, dst string) bool {
+	for _, g := range p.Grants {
+		if len(g.IP) == 0 || !srcMatches(g.Src, []string{src}) {
+			continue
+		}
+		if slices.Contains(g.Dst, "*") || slices.Contains(g.Dst, dst) {
+			return true
+		}
+	}
+	return false
+}

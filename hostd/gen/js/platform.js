@@ -29,6 +29,15 @@ function errResponse(code, message, extra = {}) {
   return json(STATUS[code] ?? 403, errBody(code, message, extra), { "twd-error": code });
 }
 
+// principalOf names who a request acts for (audit "actingFor"): the human
+// login for an untagged caller, else the calling node's name.
+function principalOf(req) {
+  const c = req?.cf?.tailscale?.caller;
+  if (!c) return "";
+  const user = typeof c.user === "string" ? c.user : c.user?.login;
+  return user || String(c.node || c.hostname || "").replace(/\.$/, "");
+}
+
 // hostd local API. Errors come back as typed bodies.
 async function hostd(env, op, body) {
   let r;
@@ -119,6 +128,7 @@ function makeHost(cls) {
       super(ctx, env);
       this.__f = null;
       this.__ensured = null;
+      this.__actingFor = ""; // own property: the Proxy would answer unknown names with an RPC forwarder
       this.__killed = ctx.storage.kv.get("__twd_killed") ?? null;
       const self = this;
       return new Proxy(this, {
@@ -127,26 +137,40 @@ function makeHost(cls) {
           if (p === "then") return undefined;
           return async (...args) => {
             if (self.__killed) throw new Error("[killed] object " + cls + "/" + self.ctx.id.name + " was killed: " + self.__killed);
-            const f = self.__facet();
+            const f = self.__facet(true);
             return f[p](...args);
           };
         },
       });
     }
+    __ctxEnsure() {
+      const p = this.__ensure().catch(() => {});
+      try {
+        this.ctx.waitUntil(p);
+      } catch {
+        /* ignore */
+      }
+    }
     __ensure() {
       if (!this.__ensured) {
-        this.__ensured = hostd(this.env, "ensure", { as: { class: cls, name: this.ctx.id.name }, wake: true }).catch((e) => {
+        this.__ensured = hostd(this.env, "ensure", { as: { class: cls, name: this.ctx.id.name }, wake: true, actingFor: this.__actingFor || undefined }).catch((e) => {
           this.__ensured = null;
           throw e;
         });
       }
       return this.__ensured;
     }
-    __facet() {
+    // __facet(rpc): an RPC call (e.g. the Agents SDK's setName from
+    // getAgentByName) usually precedes the first fetch, which knows the
+    // caller; give it a moment so the object is created acting for that
+    // caller (audit), then ensure anyway.
+    __facet(rpc) {
       if (!this.__f) {
         const name = this.ctx.id.name;
         if (!name) throw new Error("[bad_request] twd objects must be addressed by name (getByName/idFromName); newUniqueId() is not supported yet");
-        const p = this.__ensure().catch(() => {});
+        const p = rpc
+          ? new Promise((res) => setTimeout(res, 250)).then(() => this.__ensure()).catch(() => {})
+          : this.__ensure().catch(() => {});
         try {
           this.ctx.waitUntil(p);
         } catch {
@@ -172,7 +196,23 @@ function makeHost(cls) {
     }
     async fetch(req) {
       if (this.__killed) return errResponse("killed", "object " + cls + "/" + this.ctx.id.name + " was killed: " + this.__killed);
-      return this.__facet().fetch(req);
+      // Internal fetches (e.g. partyserver's set-name) carry no caller.
+      const who = principalOf(req);
+      if (who && !this.__actingFor) {
+        this.__actingFor = who;
+        if (this.__ensured) {
+          // Created before its first caller-bearing request (RPC first):
+          // tell hostd whom it acts for (audit "principal").
+          const p = hostd(this.env, "ensure", { as: { class: cls, name: this.ctx.id.name }, actingFor: who }).catch(() => {});
+          try {
+            this.ctx.waitUntil(p);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      if (who && this.__f && !this.__ensured) this.__ctxEnsure();
+      return this.__facet(!who).fetch(req);
     }
     async __twd_kill(reason) {
       this.__killed = reason || "killed";

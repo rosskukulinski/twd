@@ -230,7 +230,14 @@ function wrapHandler(H, bindings) {
     if (typeof H[k] !== "function") continue;
     out[k] = function(a, env, ctx) {
       if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
-      return H[k].call(H, a, env, ctx);
+      const r = H[k].call(H, a, env, ctx);
+      if (k !== "fetch") return r;
+      return Promise.resolve(r).catch((e) => {
+        const m = String(e?.message ?? e);
+        const i = m.indexOf("[killed]");
+        if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+        throw e;
+      });
     };
   }
   return out;

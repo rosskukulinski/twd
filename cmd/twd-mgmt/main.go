@@ -55,6 +55,7 @@ func run() error {
 		custodyKind  = flag.String("custody", "file", "custody backend: file (AES-GCM in <state-dir>/custody) or setec")
 		setecURL     = flag.String("setec-url", "", "setec server URL (with -custody setec)")
 		reapEvery    = flag.Duration("reap-interval", 10*time.Second, "reaper interval")
+		delDelay     = flag.Duration("device-delete-delay", 0, "defer kill tier 2 (device delete) this long after the tier-1 push, so the host's tombstone answers new connections with object_killed (keep < hostd -kill-tombstone)")
 		verbose      = flag.Bool("v", false, "debug logging")
 	)
 	flag.Parse()
@@ -145,7 +146,7 @@ func run() error {
 	}
 
 	m, err := mgmt.New(mgmt.Config{Store: store, Custody: custody, Broker: &mgmt.Broker{BaseURL: *tsapiURL, Issuer: issuer},
-		IDSecret: secret, ReapInterval: *reapEvery, Log: log})
+		IDSecret: secret, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log})
 	if err != nil {
 		return err
 	}

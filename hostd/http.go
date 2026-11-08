@@ -170,6 +170,8 @@ type apiReq struct {
 	Cascade   bool                          `json:"cascade"`
 	Target    *struct{ Class, Name string } `json:"target"`
 	Records   []map[string]any              `json:"records"`
+	ActingFor string                        `json:"actingFor"`
+	Principal string                        `json:"principal"`
 }
 
 func objView(o *object) map[string]any {
@@ -205,7 +207,7 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 			if !c.Node {
 				return nil, &apiError{Code: "bad_request", Detail: "class " + req.As.Class + " has no tailnet identity (\"node\": false)"}
 			}
-			return h.ensure(ctx, wl, req.As.Class, req.As.Name, nil, nil, "")
+			return h.ensure(ctx, wl, req.As.Class, req.As.Name, nil, nil, "", req.ActingFor)
 		}
 		fail := func(err error) { writeAPIError(w, asAPIError(err)) }
 		switch strings.TrimPrefix(r.URL.Path, "/v1/") {
@@ -215,10 +217,18 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 				fail(err)
 				return
 			}
+			h.mu.Lock()
 			if req.Wake {
-				h.mu.Lock()
 				o.Wakes++
-				h.mu.Unlock()
+			}
+			late := req.ActingFor != "" && o.ActingFor == "" && o.Class != ""
+			if late {
+				o.ActingFor = req.ActingFor
+			}
+			h.mu.Unlock()
+			if late {
+				h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "principal", ActingFor: req.ActingFor, Detail: "acting for " + req.ActingFor, TraceID: newTraceID()})
+				h.saveObjects()
 			}
 			writeJSON(w, 200, objView(o))
 		case "self":
@@ -246,7 +256,11 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 			if ttl == "" {
 				ttl = c.TTL
 			}
-			o, err := h.ensure(ctx, wl, req.Class, req.Name, parent, req.Caps, ttl)
+			af := req.Principal
+			if af == "" {
+				af = parent.ActingFor
+			}
+			o, err := h.ensure(ctx, wl, req.Class, req.Name, parent, req.Caps, ttl, af)
 			if err != nil {
 				fail(err)
 				return

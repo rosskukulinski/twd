@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -11,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,6 +42,14 @@ type Config struct {
 	RevocationWindow time.Duration
 	// MintRetries before an object is marked failed (default 5).
 	MintRetries int
+	// DeviceDeleteDelay defers kill tier 2 (device delete) after the tier-1
+	// push, so the killed node's tombstone on the host can answer NEW
+	// connections with a typed object_killed instead of peers black-holing
+	// once control drops it from their netmaps. 0 deletes immediately.
+	// Pending deletes run at once on Close.
+	DeviceDeleteDelay time.Duration
+	// PushTimeout bounds one mgmt → hostd push (default 2 s).
+	PushTimeout time.Duration
 }
 
 // Mgmt is twd-mgmt's core: tenants, deployments, objects, the mint broker
@@ -58,6 +68,9 @@ type Mgmt struct {
 	queues    map[string]chan string
 	waiters   map[string]chan struct{}
 	spawnMu   map[string]*sync.Mutex // per tenant: serialises budget checks
+	depStatus map[string]DeploymentStatus
+	pushURLs  map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
+	pending   map[string]*pendingDelete
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -88,7 +101,11 @@ func New(cfg Config) (*Mgmt, error) {
 	}
 	m := &Mgmt{cfg: cfg, store: cfg.Store, custody: cfg.Custody, broker: cfg.Broker, clock: cfg.Clock, log: cfg.Log,
 		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, waiters: map[string]chan struct{}{},
-		spawnMu: map[string]*sync.Mutex{}}
+		spawnMu: map[string]*sync.Mutex{}, depStatus: map[string]DeploymentStatus{}, pushURLs: map[string]string{},
+		pending: map[string]*pendingDelete{}}
+	if cfg.PushTimeout == 0 {
+		m.cfg.PushTimeout = 2 * time.Second
+	}
 	src := cfg.Policy
 	if src == nil {
 		src = func(ctx context.Context, t Tenant, etag string) ([]byte, string, bool, error) {
@@ -148,6 +165,7 @@ func (m *Mgmt) Start() error {
 
 // Close stops the workers.
 func (m *Mgmt) Close() {
+	m.FlushDeletes() // never leave a killed object's device behind
 	m.cancel()
 	m.wg.Wait()
 }
@@ -255,6 +273,9 @@ type RegisterRequest struct {
 	CapacityNodes int      `json:"capacityNodes"`
 	Tiers         []string `json:"tiers"`
 	AuditPubKey   string   `json:"auditPubKey,omitempty"`
+	// PushURL (hostd-additions) is where mgmt pushes kills and assignment
+	// changes. Only unix:// sockets are accepted.
+	PushURL string `json:"pushURL,omitempty"`
 }
 
 func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID string) error {
@@ -264,6 +285,13 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID strin
 	if old, err := m.store.GetHost(ctx, r.HostID); err == nil && old.NodeID != "" && nodeID != "" && old.NodeID != nodeID {
 		return errf(403, "host_identity_mismatch", "host %s is registered to another node", r.HostID)
 	}
+	m.mu.Lock()
+	if strings.HasPrefix(r.PushURL, "unix:///") {
+		m.pushURLs[r.HostID] = r.PushURL
+	} else {
+		delete(m.pushURLs, r.HostID)
+	}
+	m.mu.Unlock()
 	return m.store.UpsertHost(ctx, Host{ID: r.HostID, CapacityNodes: r.CapacityNodes, Tiers: r.Tiers, NodeID: nodeID,
 		AuditPubKey: r.AuditPubKey, LastSeen: m.now().UnixMilli()})
 }
@@ -283,7 +311,12 @@ type HeartbeatResponse struct {
 	RevokeObjects []string `json:"revokeObjects"`
 }
 
-func (m *Mgmt) Heartbeat(ctx context.Context, hostID string, liveNodes int, leases []HeartbeatLease) (HeartbeatResponse, error) {
+func (m *Mgmt) Heartbeat(ctx context.Context, hostID string, liveNodes int, leases []HeartbeatLease, deps ...DeploymentStatus) (HeartbeatResponse, error) {
+	for _, d := range deps {
+		if d.DeploymentID != "" {
+			m.setDepStatus(d.DeploymentID, d)
+		}
+	}
 	now := m.now()
 	if err := m.store.TouchHost(ctx, hostID, liveNodes, now); err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -382,6 +415,8 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		if err == nil {
 			if len(classes) == 0 {
 				classes = cfg.Classes()
+			} else if len(cfg.Tailnet.Tags) > 0 && !slices.ContainsFunc(classes, func(c ClassConfig) bool { return c.Class == WorkloadNamespace }) {
+				classes = append(classes, ClassConfig{Class: WorkloadNamespace, Tags: cfg.Tailnet.Tags})
 			}
 			if cfg.Tailnet.Spawn.MaxLive > 0 {
 				maxLive = min(cfg.Tailnet.Spawn.MaxLive, DefaultMaxLive)
@@ -392,7 +427,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		}
 	}
 	if len(classes) == 0 {
-		return resp, errf(400, "bad_request", "no namespaces: the bundle's twd.jsonc declares no tailnet.objects")
+		return resp, errf(400, "bad_request", "no namespaces: the bundle's twd.jsonc declares neither tailnet.tags (the workload node) nor tailnet.objects")
 	}
 	for _, c := range classes {
 		if c.Class == "" || len(c.Tags) == 0 {
@@ -422,7 +457,75 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	resp.DeploymentID, resp.Host, resp.Epoch = d.ID, host, lease.Epoch
 	resp.Endpoint.Node = r.Workload + "-" + host
 	resp.Endpoint.MagicDNS = resp.Endpoint.Node + "." + t.Tailnet
+	m.setDepStatus(d.ID, DeploymentStatus{Status: "assigned"})
+	// Tell the host now instead of at its next heartbeat.
+	go m.push(host, "/v0/push/assignments", map[string]any{})
 	return resp, nil
+}
+
+// DeploymentStatus is what the host last reported for a deployment
+// (heartbeat "deployments"); kept in memory, refreshed every heartbeat.
+type DeploymentStatus struct {
+	DeploymentID string `json:"deploymentID"`
+	Status       string `json:"status"`
+	Error        string `json:"error,omitempty"`
+}
+
+func (m *Mgmt) setDepStatus(id string, st DeploymentStatus) {
+	st.DeploymentID = id
+	m.mu.Lock()
+	m.depStatus[id] = st
+	m.mu.Unlock()
+}
+
+// DeploymentView is GET /v0/deployments/{id}.
+type DeploymentView struct {
+	DeploymentID string        `json:"deploymentID"`
+	TenantID     string        `json:"tenantID"`
+	Workload     string        `json:"workload"`
+	Host         string        `json:"host"`
+	Epoch        int64         `json:"epoch"`
+	Status       string        `json:"status"`
+	Error        string        `json:"error,omitempty"`
+	Namespaces   []ClassConfig `json:"namespaces"`
+	CreatedAt    int64         `json:"createdAt"`
+	Endpoint     struct {
+		ObjectID string `json:"objectID,omitempty"`
+		Node     string `json:"node"`
+		MagicDNS string `json:"magicDNS"`
+		Status   string `json:"status"`
+	} `json:"endpoint"`
+}
+
+// GetDeployment returns a deployment with the host-reported status and its
+// workload entry node. Status is "superseded" once a newer deploy of the
+// same workload exists.
+func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, error) {
+	var v DeploymentView
+	d, err := m.store.GetDeployment(ctx, id)
+	if err != nil {
+		return v, err
+	}
+	v.DeploymentID, v.TenantID, v.Workload, v.Host, v.Epoch, v.Namespaces, v.CreatedAt = d.ID, d.TenantID, d.Workload, d.HostID, d.Epoch, d.Namespaces, d.CreatedAt
+	m.mu.Lock()
+	st, ok := m.depStatus[id]
+	m.mu.Unlock()
+	v.Status, v.Error = "unknown", ""
+	if ok {
+		v.Status, v.Error = st.Status, st.Error
+	}
+	if ds, err := m.store.LatestDeployments(ctx, d.TenantID); err == nil {
+		for _, a := range ds {
+			if a.Workload == d.Workload && a.ID != d.ID {
+				v.Status = "superseded"
+			}
+		}
+	}
+	if o, err := m.store.GetObjectByName(ctx, d.TenantID, WorkloadNamespace, d.Workload); err == nil {
+		v.Endpoint.ObjectID, v.Endpoint.MagicDNS, v.Endpoint.Status = o.ID, o.MagicDNS, o.Status
+		v.Endpoint.Node, _, _ = strings.Cut(o.MagicDNS, ".")
+	}
+	return v, nil
 }
 
 // pickHost: MVP is a single host per tenant namespace. Keep the current
@@ -477,6 +580,7 @@ type Assignment struct {
 	Lease        string        `json:"lease"`
 	Tailnet      string        `json:"tailnet"`
 	ControlURL   string        `json:"controlURL,omitempty"`
+	WorkloadTags []string      `json:"workloadTags,omitempty"`
 }
 
 func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, error) {
@@ -487,9 +591,17 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 	out := []Assignment{}
 	for _, d := range ds {
 		t, _ := m.store.GetTenant(ctx, d.TenantID)
-		out = append(out, Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
-			BundleURL: "/v0/deployments/" + d.ID + "/bundle", Namespaces: d.Namespaces, Epoch: d.Epoch,
-			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL})
+		a := Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
+			BundleURL: "/v0/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
+			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}}
+		for _, c := range d.Namespaces {
+			if c.Class == WorkloadNamespace {
+				a.WorkloadTags = c.Tags
+				continue
+			}
+			a.Namespaces = append(a.Namespaces, c)
+		}
+		out = append(out, a)
 	}
 	return out, nil
 }
@@ -528,7 +640,11 @@ func (m *Mgmt) objectID(tenantID, ns, name string) string {
 	mac := hmac.New(sha256.New, m.cfg.IDSecret)
 	fmt.Fprintf(mac, "%s\x00%s\x00%s", tenantID, ns, name)
 	var slug strings.Builder
-	for _, r := range strings.ToLower(ns) {
+	src := ns
+	if ns == WorkloadNamespace {
+		src = name // the workload entry node is named after the workload
+	}
+	for _, r := range strings.ToLower(src) {
 		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
 			slug.WriteRune(r)
 		} else if slug.Len() > 0 {
@@ -565,7 +681,13 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	if r.ObjectName == "" || len(r.ObjectName) > 256 {
 		return resp, errf(400, "bad_request", "objectName required (≤256 bytes)")
 	}
-	dep, class, err := m.store.FindClass(ctx, t.ID, r.Namespace)
+	var dep Deployment
+	var class ClassConfig
+	if r.Namespace == WorkloadNamespace {
+		dep, class, err = m.findWorkloadClass(ctx, t.ID, r.ObjectName)
+	} else {
+		dep, class, err = m.store.FindClass(ctx, t.ID, r.Namespace)
+	}
 	if err != nil {
 		return resp, errf(404, "unknown_namespace", "no deployment of tenant %s declares namespace %q", t.ID, r.Namespace)
 	}
@@ -629,6 +751,26 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ID, Kind: kind, TraceID: r.TraceID, ActingFor: r.ActingFor}, detail)
 	m.enqueue(t.ID, o.ID)
 	return CreateObjectResponse{ObjectID: o.ID, Status: StatusPending, Tags: o.Tags, Hostname: o.Hostname}, nil
+}
+
+// findWorkloadClass finds the latest deployment of the workload named name
+// and its "_workload" namespace (the entry node's tags).
+func (m *Mgmt) findWorkloadClass(ctx context.Context, tenantID, name string) (Deployment, ClassConfig, error) {
+	ds, err := m.store.LatestDeployments(ctx, tenantID)
+	if err != nil {
+		return Deployment{}, ClassConfig{}, err
+	}
+	for _, d := range ds {
+		if d.Workload != name {
+			continue
+		}
+		for _, c := range d.Namespaces {
+			if c.Class == WorkloadNamespace {
+				return d, c, nil
+			}
+		}
+	}
+	return Deployment{}, ClassConfig{}, fmt.Errorf("workload %q has no %s namespace (twd.jsonc tailnet.tags): %w", name, WorkloadNamespace, ErrNotFound)
 }
 
 // checkSpawn enforces depth ≤ maxDepth, live descendants of the root <
@@ -983,17 +1125,23 @@ type KillRequest struct {
 	By      string `json:"-"`
 }
 
-// KillResult reports what a kill did.
+// KillResult reports what a kill did. Pushed lists the objects whose host
+// acknowledged the tier-1 push; DevicesDeleting those whose device delete
+// is scheduled (Config.DeviceDeleteDelay).
 type KillResult struct {
-	Killed         []string          `json:"killed"`
-	DevicesDeleted []string          `json:"devicesDeleted"`
-	Errors         map[string]string `json:"errors,omitempty"`
+	Killed          []string          `json:"killed"`
+	DevicesDeleted  []string          `json:"devicesDeleted"`
+	DevicesDeleting []string          `json:"devicesDeleting,omitempty"`
+	Pushed          []string          `json:"pushed,omitempty"`
+	PushMS          float64           `json:"pushMs,omitempty"`
+	Errors          map[string]string `json:"errors,omitempty"`
 }
 
-// Kill marks the object (and with cascade, every descendant) killed, queues
-// a revocation for the lease-holding host (heartbeat revokeObjects), deletes
-// devices via the tenant API (tier 2), revokes unused keys, wipes custody,
-// and records audit.
+// Kill marks the object (and with cascade, every descendant) killed, pushes
+// the kill to the lease-holding host (tier 1, immediate; the heartbeat's
+// revokeObjects is the fallback), deletes devices via the tenant API (tier
+// 2; deferred by DeviceDeleteDelay), revokes unused keys, wipes custody, and
+// records audit.
 func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, error) {
 	res := KillResult{Killed: []string{}, DevicesDeleted: []string{}, Errors: map[string]string{}}
 	root, err := m.store.GetObject(ctx, id)
@@ -1017,6 +1165,12 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		}
 	}
 	now := m.now()
+	type killedObj struct {
+		o    Object
+		prev string
+	}
+	var done []killedObj
+	byHost := map[string][]string{}
 	for _, o := range targets {
 		if !o.Live() {
 			continue
@@ -1034,28 +1188,151 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		m.notify(o.ID)
 		if l, err := m.store.GetLease(ctx, o.Lease); err == nil && l.Holder != "" {
 			m.store.AddRevocation(ctx, l.Holder, o.ID, now)
+			byHost[l.Holder] = append(byHost[l.Holder], o.ID)
 		}
+		done = append(done, killedObj{killed, prev})
+	}
+	// Tier 1: push to the hosts, all objects in parallel, before any device
+	// delete (the RST must leave while the node is still in peers' netmaps).
+	ps := time.Now()
+	var pmu sync.Mutex
+	var wg sync.WaitGroup
+	for host, ids := range byHost {
+		for _, oid := range ids {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := m.push(host, "/v0/push/kill", map[string]any{"objectID": oid, "reason": r.Reason}); err == nil {
+					pmu.Lock()
+					res.Pushed = append(res.Pushed, oid)
+					pmu.Unlock()
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	if len(byHost) > 0 {
+		res.PushMS = float64(time.Since(ps).Microseconds()) / 1000
+	}
+	for _, k := range done {
+		o, killed, prev := k.o, k.o, k.prev
 		m.custody.Delete(ctx, custodyName(o))
 		if prev != StatusReady {
 			m.revokeKey(ctx, killed)
 		}
-		deleted := false
+		deleted, scheduled := false, false
 		if killed.StableNodeID != "" || killed.NodeID != "" {
-			if err := m.deleteDevice(ctx, killed); err != nil {
+			if m.cfg.DeviceDeleteDelay > 0 {
+				m.scheduleDelete(killed)
+				scheduled = true
+				res.DevicesDeleting = append(res.DevicesDeleting, o.ID)
+			} else if err := m.deleteDevice(ctx, killed); err != nil {
 				res.Errors[o.ID] = "device delete: " + err.Error()
 			} else {
 				deleted = true
 				res.DevicesDeleted = append(res.DevicesDeleted, o.ID)
 			}
 		}
-		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By},
-			map[string]any{"reason": r.Reason, "cascade": r.Cascade, "requested": id, "root": o.RootID,
-				"parent": o.ParentID, "deviceDeleted": deleted, "prevStatus": prev})
+		detail := map[string]any{"reason": r.Reason, "cascade": r.Cascade, "requested": id, "root": o.RootID,
+			"parent": o.ParentID, "deviceDeleted": deleted, "prevStatus": prev, "pushed": slices.Contains(res.Pushed, o.ID)}
+		if scheduled {
+			detail["deviceDeleteIn"] = m.cfg.DeviceDeleteDelay.String()
+		}
+		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By}, detail)
 	}
 	if len(res.Errors) == 0 {
 		res.Errors = nil
 	}
 	return res, nil
+}
+
+// push POSTs body to the host's push socket (best effort; bounded by
+// PushTimeout). Hosts without a push URL get nothing (heartbeat fallback).
+func (m *Mgmt) push(hostID, path string, body any) error {
+	m.mu.Lock()
+	u := m.pushURLs[hostID]
+	m.mu.Unlock()
+	if u == "" {
+		return errors.New("host has no push URL")
+	}
+	sock := strings.TrimPrefix(u, "unix://")
+	hc := &http.Client{Timeout: m.cfg.PushTimeout, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		}}}
+	defer hc.CloseIdleConnections()
+	b, _ := json.Marshal(body)
+	resp, err := hc.Post("http://hostd"+path, "application/json", bytes.NewReader(b))
+	if err != nil {
+		m.log.Debug("push failed", "host", hostID, "path", path, "err", err)
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("push %s: %s", path, resp.Status)
+	}
+	return nil
+}
+
+type pendingDelete struct {
+	o     Object
+	timer *time.Timer
+}
+
+func (m *Mgmt) scheduleDelete(o Object) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.pending[o.ID]; ok {
+		return
+	}
+	pd := &pendingDelete{o: o}
+	pd.timer = time.AfterFunc(m.cfg.DeviceDeleteDelay, func() { m.runDelete(o.ID) })
+	m.pending[o.ID] = pd
+}
+
+// runDelete performs a scheduled device delete (once).
+func (m *Mgmt) runDelete(id string) {
+	m.mu.Lock()
+	pd := m.pending[id]
+	delete(m.pending, id)
+	m.mu.Unlock()
+	if pd == nil {
+		return
+	}
+	pd.timer.Stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	st := time.Now()
+	err := m.deleteDevice(ctx, pd.o)
+	detail := map[string]any{"nodeID": pd.o.StableNodeID, "ms": time.Since(st).Milliseconds()}
+	if err != nil {
+		detail["error"] = err.Error()
+		m.log.Warn("device delete failed", "object", id, "err", err)
+	}
+	m.audit(ctx, AuditRecord{TenantID: pd.o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
+}
+
+// PendingDeletes is how many device deletes are scheduled.
+func (m *Mgmt) PendingDeletes() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.pending)
+}
+
+// FlushDeletes runs every scheduled device delete now (in parallel).
+func (m *Mgmt) FlushDeletes() {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.pending))
+	for id := range m.pending {
+		ids = append(ids, id)
+	}
+	m.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, id := range ids {
+		wg.Add(1)
+		go func() { defer wg.Done(); m.runDelete(id) }()
+	}
+	wg.Wait()
 }
 
 func (m *Mgmt) revokeKey(ctx context.Context, o Object) {
@@ -1215,4 +1492,73 @@ func (m *Mgmt) QueryAudit(ctx context.Context, f AuditFilter) ([]AuditRecord, []
 		recs = []AuditRecord{}
 	}
 	return recs, sts, nil
+}
+
+// ---- deploy preflight ----
+
+// PreflightRequest asks whether the tenant policy lets a workload's tags
+// reach its declared dependencies (twd.jsonc tailnet.connects) and whether
+// every tag it will mint is in tagOwners.
+type PreflightRequest struct {
+	SrcTags  []string `json:"srcTags"`  // workload + object tags
+	Connects []string `json:"connects"` // tags ("tag:db") or "*"; names are reported unchecked
+	Port     string   `json:"port,omitempty"`
+}
+
+// PreflightMissing is one missing grant.
+type PreflightMissing struct {
+	Src     string `json:"src"`
+	Dst     string `json:"dst"`
+	Snippet string `json:"snippet"`
+}
+
+// PreflightResult is the preflight verdict.
+type PreflightResult struct {
+	OK               bool               `json:"ok"`
+	Missing          []PreflightMissing `json:"missing"`
+	MissingTagOwners []string           `json:"missingTagOwners"`
+	TagOwnersSnippet string             `json:"tagOwnersSnippet,omitempty"`
+	Unchecked        []string           `json:"unchecked,omitempty"`
+}
+
+// Preflight checks the request against the tenant's current policy (read
+// through the policy cache; never written).
+func (m *Mgmt) Preflight(ctx context.Context, tenantID string, r PreflightRequest) (PreflightResult, error) {
+	res := PreflightResult{Missing: []PreflightMissing{}, MissingTagOwners: []string{}}
+	t, err := m.store.GetTenant(ctx, tenantID)
+	if err != nil {
+		return res, errf(404, "unknown_tenant", "tenant %q not found", tenantID)
+	}
+	pol, err := m.policies.Get(ctx, t)
+	if err != nil {
+		return res, errf(503, "policy_unavailable", "can't read the tenant policy: %v", err)
+	}
+	port := r.Port
+	if port == "" {
+		port = "tcp:80"
+	}
+	var owners []string
+	for _, tag := range r.SrcTags {
+		if _, ok := pol.TagOwners[tag]; !ok && !slices.Contains(res.MissingTagOwners, tag) {
+			res.MissingTagOwners = append(res.MissingTagOwners, tag)
+			owners = append(owners, fmt.Sprintf("%q: [\"autogroup:admin\", \"tag:twd\"]", tag))
+		}
+	}
+	if len(owners) > 0 {
+		res.TagOwnersSnippet = `"tagOwners": { ` + strings.Join(owners, ", ") + ` }`
+	}
+	for _, dst := range r.Connects {
+		if dst != "*" && !strings.HasPrefix(dst, "tag:") && !strings.HasPrefix(dst, "autogroup:") {
+			res.Unchecked = append(res.Unchecked, dst)
+			continue
+		}
+		for _, src := range r.SrcTags {
+			if !pol.HasIPGrant(src, dst) {
+				res.Missing = append(res.Missing, PreflightMissing{Src: src, Dst: dst,
+					Snippet: fmt.Sprintf(`{ "src": [%q], "dst": [%q], "ip": [%q] }`, src, dst, port)})
+			}
+		}
+	}
+	res.OK = len(res.Missing) == 0 && len(res.MissingTagOwners) == 0
+	return res, nil
 }
