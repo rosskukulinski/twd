@@ -64,10 +64,10 @@ type Msg struct {
 	Op   string `json:"op,omitempty"`
 
 	// boot / ready
-	UptimeMS  int64 `json:"uptimeMs,omitempty"`
-	WorkerdMS int64 `json:"workerdMs,omitempty"`
-	ExitCode  int   `json:"exitCode,omitempty"`
-	Restarts  int   `json:"restarts,omitempty"`
+	UptimeMS  int64  `json:"uptimeMs,omitempty"`
+	WorkerdMS int64  `json:"workerdMs,omitempty"`
+	ExitCode  int    `json:"exitCode,omitempty"`
+	Restarts  int    `json:"restarts,omitempty"`
 	Text      string `json:"text,omitempty"`
 	Error     string `json:"error,omitempty"`
 

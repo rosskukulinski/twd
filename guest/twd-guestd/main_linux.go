@@ -95,8 +95,8 @@ func run() error {
 func mounts() error {
 	for _, m := range []struct {
 		src, dst, typ string
-		flags   uintptr
-		data    string
+		flags         uintptr
+		data          string
 	}{
 		{"proc", "/proc", "proc", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC, ""},
 		{"sysfs", "/sys", "sysfs", unix.MS_NOSUID | unix.MS_NODEV | unix.MS_NOEXEC, ""},

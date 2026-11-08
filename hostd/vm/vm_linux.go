@@ -154,16 +154,16 @@ const guestMAC = "06:00:c0:a8:48:02"
 
 // Machine is one running Firecracker microVM.
 type Machine struct {
-	b      *Backend
-	id     string
-	ns     string
-	dir    string
-	log    *slog.Logger
-	cmd    *exec.Cmd
-	api    *http.Client
-	vn     *vnet
-	tapFD  int
-	vsock  net.Listener
+	b       *Backend
+	id      string
+	ns      string
+	dir     string
+	log     *slog.Logger
+	cmd     *exec.Cmd
+	api     *http.Client
+	vn      *vnet
+	tapFD   int
+	vsock   net.Listener
 	ingress http.Handler
 
 	info    sandbox.Info
