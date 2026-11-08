@@ -933,4 +933,14 @@ Fixes for `security/RED-TEAM.md`, independent of the Linux sandbox landing on `l
 Also in this branch: `twd up --allow-sibling-egress` / `twd-hostd -allow-sibling-egress` (objects may reach other objects on the same host over the tailnet; off by default per ADR-019 rule 2) so a single-host e2e can exercise receiver-side authorization between two of its own objects; `make test-go` includes `./security/...`.
 
 ### Verification (this Mac, 2026-11-08)
-RT_VERIFICATION_PLACEHOLDER
+| Where | Target | Result |
+|---|---|---|
+| macOS (this Mac) | `make lint` | **PASS** (gofmt, vet incl. every e2e tag, check-secrets) |
+| | `make test` (Go `-race`: netd, internal incl. new `caps`/`nodecert`/`policy` hostile+fuzz seeds, cmd, mgmt, hostd, gen, **`security/attacks` un-skipped**; JS 5+9+7) | **PASS** |
+| | `make test-node` (incl. new `TestNodeTierSharedHostRefused`; `@twd/node` 9/9 incl. egress enforcement + replay) | **PASS** |
+| | `make test-sdk` | **PASS** |
+| | `make e2e-mac` (tailnet 1, prefix `ttest-rtf-b1b5c4`, `e2e/real/results/m4-20261108-092854-b1b5c4.json`) | **PASS** 53 s. (d): LookupAgent child as before **and** same-tag SupportAgent child with `lim=[lookup_order]` → MCP `refund` **`cap_missing`**, `lookup_order` ok, parent `refund` admitted (its tag is granted refund by the real policy); kill cascade 3/3 pushed, 410 `object_killed` ~11 ms. **No policy written**; 0 `tskey-` in the log; leftover check 0 devices/keys |
+| | `make e2e-multi` (tailnet 1 + tailnet-2, prefix `ttest-rtf-1c3dc5`, `e2e/real/results/m7-20261108-092949-1c3dc5.json`) | **PASS** 55 s, 15/15 checks incl. `d_lim_enforced_A`/`_B` (refund `cap_missing`, parent admitted, per tenant) and `d_state_isolation` with the mgmt socket probe now carrying the host token (sandbox still denies it) and a token-less request answered **401**. No policy written on either tailnet; 0 `tskey-`; 0 leftovers |
+| Linux / Lima | not run from this branch (the L2 worktree owns the VMs); nothing here changes how hostd launches workloads | — |
+
+**Not done / honest limits.** RT-04 is partial (root MAC key still in the guest). The `@twd/node` enforcement is cooperative by construction. Same-host object→object calls still need `--allow-sibling-egress` (off by default) to go over the tailnet; the in-process policy-checked path of RFC §4.5 is not built. OBO per-request assertions (RFC §4.6) remain unimplemented.

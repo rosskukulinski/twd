@@ -1,0 +1,19 @@
+{
+  "goarch": "arm64",
+  "goos": "darwin",
+  "node": "v25.1.0",
+  "results": {
+    "workflow.build_and_deploy_ms": 2924,
+    "workflow.cold_start_spawn_to_healthy_ms": 447.324,
+    "workflow.hook_resume_to_completed_ms": 67,
+    "workflow.kill_to_hook_ms": 1842,
+    "workflow.kill_to_restarted_ms": 738,
+    "workflow.mcp_caller_node": "TESTCTRL00000004",
+    "workflow.resume_after_restart_ms": 652,
+    "workflow.rss_mib": 319.609375,
+    "workflow.sandbox": "seatbelt",
+    "workflow.start_ms": 42,
+    "workflow.total_ms": 3850
+  },
+  "when": "2026-11-08T17:29:45Z"
+}
