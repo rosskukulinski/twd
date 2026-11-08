@@ -47,11 +47,20 @@ func TestRealHostd(t *testing.T) {
 	b := make([]byte, 3)
 	rand.Read(b)
 	run := hex.EncodeToString(b)
-	prefix := "ttest-m3-" + run + "-"
+	// TWD_E2E_TIER=microvm runs the same suite with every workload in a
+	// Firecracker microVM (M8; Linux + KVM + root, guest image from
+	// TWD_VM_KERNEL / TWD_VM_ROOTFS). Its nodes are ttest-m8-<run>-*.
+	tier, milestone := os.Getenv("TWD_E2E_TIER"), "m3"
+	var vmb vmBackendT
+	if tier == "microvm" {
+		milestone = "m8"
+		vmb = realVMBackend(t)
+	}
+	prefix := "ttest-" + milestone + "-" + run + "-"
 	root, _ := nettest.FindRepoRoot()
-	res := &results{Run: "m3-" + run, Tailnet: tailnet, Date: time.Now().Format(time.RFC3339), Checks: map[string]string{},
+	res := &results{Run: milestone + "-" + run, Tailnet: tailnet, Date: time.Now().Format(time.RFC3339), Checks: map[string]string{},
 		Numbers: map[string]float64{}, Cleanup: map[string]any{}}
-	res.resultsTo = filepath.Join(root, "e2e", "real", "results", "m3-"+time.Now().Format("20060102-150405")+"-"+run+".json")
+	res.resultsTo = filepath.Join(root, "e2e", "real", "results", milestone+"-"+time.Now().Format("20060102-150405")+"-"+run+".json")
 	quiet := slog.New(netd.NewRedactingHandler(slog.NewTextHandler(io.Discard, nil)))
 	testMinter := tsapi.MintSource(api, quiet)
 	tracker := tsapi.NewTracker(api)
@@ -62,7 +71,8 @@ func TestRealHostd(t *testing.T) {
 		ControlURL: prodControl, Ephemeral: true, HostnamePrefix: prefix, HeartbeatEvery: time.Second,
 		KillTombstone: 10 * time.Second,
 		Fake:          fakemgmt.Config{ForceTags: []string{testTag}},
-		Tenant:        mgmtapi.Tenant{Tailnet: tailnet, ControlURL: prodControl, MintMode: "apikey", APIKeyFile: keyFile},
+		Tenant:        mgmtapi.Tenant{Tailnet: tailnet, ControlURL: prodControl, MintMode: "apikey", APIKeyFile: keyFile, Tier: tier},
+		VM:            vmb,
 	})
 	var nodes []*nettest.Node
 	// Cleanup (registered after hostdtest's, so it runs FIRST): track every
@@ -172,6 +182,14 @@ func TestRealHostd(t *testing.T) {
 	res.num("hello_deploy_to_active_ms", msOf(time.Since(st0)))
 	probe := e.WaitActive("probe", dProbe, 2*time.Minute)
 	res.num("probe_deploy_to_active_ms", msOf(time.Since(st0)))
+	if tier == "microvm" {
+		for _, w := range e.Host.Status().Workloads {
+			res.check("tier_"+w.Workload+"_microvm", w.Tier == "microvm" && w.VM != nil, w.Tier)
+			if w.VM != nil {
+				res.num("vm_"+w.Workload+"_instance_start_to_ready_ms", msOf(w.VM.Ready))
+			}
+		}
+	}
 	waitPeer(hello.IP)
 	waitPeer(probe.IP)
 
