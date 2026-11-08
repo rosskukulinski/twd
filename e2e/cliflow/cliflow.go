@@ -672,3 +672,21 @@ func Leftovers(ctx context.Context, api *tsapi.Client, res *Results) (devices, k
 	}
 	return devices, keys
 }
+
+// Object is an object as `twd ls --all --json` reports it.
+type Object = object
+
+// WaitObjectReady waits until object (ns, name) is ready with a node.
+func (e *Env) WaitObjectReady(ns, name string, timeout time.Duration) Object {
+	e.T.Helper()
+	return e.waitObjectReady(ns, name, timeout)
+}
+
+// Objects lists every object (twd ls --all).
+func (e *Env) Objects() []Object { return e.objects() }
+
+// PeerIP waits until magicDNS is in n's netmap and returns its IPv4.
+func PeerIP(t testing.TB, n *nettest.Node, magicDNS string, timeout time.Duration) string {
+	t.Helper()
+	return peerIP(t, n, magicDNS, timeout)
+}

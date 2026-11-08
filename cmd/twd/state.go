@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -127,7 +128,16 @@ func pidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	return syscall.Kill(pid, 0) == nil
+	if syscall.Kill(pid, 0) != nil {
+		return false
+	}
+	// After a reboot the pid file's number may belong to another process:
+	// on Linux, only a twd binary counts.
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil {
+		argv0, _, _ := strings.Cut(string(b), "\x00")
+		return strings.HasPrefix(filepath.Base(argv0), "twd")
+	}
+	return true
 }
 
 func (s *state) supervisorAlive() bool { return pidAlive(s.supervisorPID()) }
