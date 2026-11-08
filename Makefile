@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-vm release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-mac e2e-vm release lint hooks clean gen-js test-m2mgmt
 
 all: build
 
@@ -51,6 +51,13 @@ e2e-real: deps
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2ereal -count=1 -v -timeout 15m ./e2e/real/...
 
+## e2e-mac: E2E-MAC via the twd CLI on tailnet 1 (twd up → deploy agent+mcp → checks a–f → twd down → zero leftovers).
+e2e-mac: deps
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-mac: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2emac -count=1 -v -timeout 20m ./e2e/mac/...
+
 e2e-vm:
 	@echo "e2e-vm: not implemented yet (milestone M8)"; exit 1
 
@@ -63,6 +70,7 @@ lint:
 	$(GO) vet -tags e2e ./e2e/local/...
 	$(GO) vet -tags e2ereal ./e2e/real/...
 	$(GO) vet -tags m2mgmt ./e2e/m2mgmt/...
+	$(GO) vet -tags e2emac ./e2e/mac/...
 	@sh scripts/check-secrets.sh
 
 hooks:
