@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -199,6 +200,20 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 
 	tier := h.tierFor(app, t)
 	if tier == bundle.TierProcess {
+		// RT-08: a Node app on a host with NO process sandbox has fully
+		// cooperative egress (raw sockets bypass the proxy); on a host that
+		// serves other tenants that is a cross-tenant SSRF vector. Under
+		// Landlock (TCP pinned to the proxy) or Seatbelt the shared-host
+		// rule below decides, as for any process-tier workload.
+		if app.Runtime == bundle.RuntimeNode && h.sandbox == SandboxNone && !h.cfg.InsecureSharedHost {
+			if others := h.otherTenants(w.tenantID); len(others) > 0 {
+				w.fail(a.DeploymentID, &apiError{Code: "egress_unenforced", Detail: fmt.Sprintf(
+					"runtime \"node\" on a host serving %d other tenant(s) (%s) with no process sandbox: the Node tier's egress proxy is not an enforcement boundary here (raw sockets bypass it); "+
+						"use the workerd runtime, a single-tenant host, Linux with Landlock, or start twd-hostd with -insecure-shared-host (twd up --insecure-shared-host)",
+					len(others), strings.Join(others, ","))})
+				return
+			}
+		}
 		// microVM workloads are isolated by the jailer + VM, not by the
 		// process sandbox, so the shared-host rule applies to the process
 		// tier only.
@@ -247,6 +262,23 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	h.rejoinObjects(w, app)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
+}
+
+// otherTenants lists the tenants other than tenantID with a workload
+// assigned to this host.
+func (h *Host) otherTenants(tenantID string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, w := range h.workloads {
+		if w.tenantID != tenantID && !seen[w.tenantID] {
+			seen[w.tenantID] = true
+			out = append(out, w.tenantID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // deploySerial switches a workload stop-then-start. Node-tier runtimes
@@ -378,6 +410,7 @@ type instance struct {
 	vm       sandbox.VM // microVM tier: the running sandbox
 	exited   chan struct{}
 	servers  []*http.Server
+	nonces   gen.NonceCache // egress MAC replay cache (RT-05)
 	restarts int
 	started  time.Time
 }

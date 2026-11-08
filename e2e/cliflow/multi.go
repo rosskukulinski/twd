@@ -45,6 +45,7 @@ type Tenant struct {
 	clientID, clientName       string
 	clientIP, echoIP, echoName string
 	wlMagic, wlIP              string
+	mcpMagic                   string
 	agent                      object
 	agentIP                    string
 	wlObj                      object
@@ -69,6 +70,13 @@ type MultiEnv struct {
 }
 
 func (m *MultiEnv) tenants() []*Tenant { return []*Tenant{m.A, m.B} }
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}
 
 func (m *MultiEnv) other(t *Tenant) *Tenant {
 	if t == m.A {
@@ -124,7 +132,7 @@ func (m *MultiEnv) Run() {
 
 	// twd up: the operator tailnet is tenant A.
 	upArgs := []string{"up", "--tailnet", m.A.Tailnet, "--api-key-file", m.A.APIKeyFile, "--yes", "--ephemeral",
-		"--hostname-prefix", m.Prefix, "--control-url", m.A.ControlURL}
+		"--hostname-prefix", m.Prefix, "--control-url", m.A.ControlURL, "--allow-sibling-egress"}
 	if m.TSAPIURL != "" {
 		upArgs = append(upArgs, "--tsapi-url", m.TSAPIURL)
 	}
@@ -192,6 +200,18 @@ func (m *MultiEnv) Run() {
 		res.Numbers["deploy_"+tn.Key+"_ready_ms"] = dr.Timings["ready"]
 	}
 	res.pass("deploy_same_app", fmt.Sprintf("agent → A %s · B %s", m.A.wlMagic, m.B.wlMagic))
+	// … and the MCP server, for check (d): per-spawn cap limits.
+	mcpDir := filepath.Join(m.WorkDir, "mcp")
+	m.MustJSON(nil, "init", mcpDir, "--template", "mcp")
+	for _, tn := range m.tenants() {
+		var dr struct {
+			Endpoint struct {
+				MagicDNS string `json:"magicDNS"`
+			} `json:"endpoint"`
+		}
+		m.MustJSON(&dr, "deploy", mcpDir, "--tenant", tn.Tailnet)
+		tn.mcpMagic = dr.Endpoint.MagicDNS
+	}
 
 	// Test nodes, each in its own tenant's tailnet.
 	for _, tn := range m.tenants() {
@@ -321,6 +341,26 @@ func (m *MultiEnv) Run() {
 		res.pass("c_isolation_"+src.Key+"_to_"+dst.Key, strings.Join(lines, "; "))
 	}
 
+	// (d) Per-spawn cap limits are enforced at the receiver in each tenant
+	// (RT-01): a same-tag child spawned with lim=[lookup_order] gets
+	// cap_missing for refund from its tenant's MCP server, while the
+	// unnarrowed parent's refund passes the cap check.
+	for _, tn := range m.tenants() {
+		hc := tn.client.HTTPClient(60 * time.Second)
+		mcpIP := peerIP(t, tn.client, tn.mcpMagic, 90*time.Second)
+		r := do(hc, "GET", "http://"+tn.agentIP+"/delegate?child=narrow1&server="+url.QueryEscape("http://"+mcpIP+"/mcp"), nil)
+		if r.Code != 200 || get(r.Body, "lookup_order", "ok") != true {
+			t.Fatalf("(d) tenant %s delegate: %s", tn.Key, r)
+		}
+		if get(r.Body, "refund", "ok") != false || get(r.Body, "refund", "error") != "cap_missing" {
+			t.Fatalf("(d) tenant %s: narrowed child's refund must be cap_missing: %s", tn.Key, r)
+		}
+		if m.PolicyGrantsParentRefund && get(r.Body, "parent", "refund", "error") == "cap_missing" {
+			t.Fatalf("(d) tenant %s: the parent's refund was cap_missing too; the denial proves nothing about lim: %s", tn.Key, r)
+		}
+		res.pass("d_lim_enforced_"+tn.Key, fmt.Sprintf("same-tag child with lim=[lookup_order]: refund cap_missing, lookup_order ok; parent refund %v", get(r.Body, "parent", "refund", "ok")))
+	}
+
 	// (d) Tenant A's process can't read tenant B's state dir (and vice versa).
 	for _, tn := range m.tenants() {
 		td := filepath.Join(hostData, "tenants", tn.TenantID)
@@ -363,13 +403,21 @@ func (m *MultiEnv) Run() {
 				}
 				got = append(got, dn.what+" denied")
 			}
-			if err := probe("/usr/bin/curl", "-sf", "--max-time", "3", "--unix-socket", mgmtSock, "http://twd-mgmt/v0/healthz"); err == nil {
+			// mgmt's socket needs the per-host token (RT-03); the probe is
+			// given it on the command line so that a refusal proves the
+			// sandbox blocks the socket, not just the token.
+			tok := strings.TrimSpace(string(must(os.ReadFile(filepath.Join(m.StateDir, "hostd", "mgmt.token")))))
+			if err := probe("/usr/bin/curl", "-sf", "--max-time", "3", "-H", "Twd-Host-Token: "+tok, "--unix-socket", mgmtSock, "http://twd-mgmt/v0/healthz"); err == nil {
 				t.Fatalf("(d) tenant %s's workerd sandbox can reach mgmt's admin socket", src.Key)
 			}
-			if err := exec.Command("/usr/bin/curl", "-sf", "--max-time", "3", "--unix-socket", mgmtSock, "http://twd-mgmt/v0/healthz").Run(); err != nil {
+			if err := exec.Command("/usr/bin/curl", "-sf", "--max-time", "3", "-H", "Twd-Host-Token: "+tok, "--unix-socket", mgmtSock, "http://twd-mgmt/v0/healthz").Run(); err != nil {
 				t.Fatalf("(d) control: mgmt socket unreachable outside the sandbox too: %v", err)
 			}
-			got = append(got, "mgmt admin socket denied")
+			// … and without the token the socket admits nobody, sandbox or not (RT-03).
+			if out, _ := exec.Command("/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3", "--unix-socket", mgmtSock, "http://twd-mgmt/v0/tenants").Output(); strings.TrimSpace(string(out)) != "401" {
+				t.Fatalf("(d) mgmt socket without the host token answered %q, want 401", out)
+			}
+			got = append(got, "mgmt admin socket denied (and 401 without the host token)")
 			if err := probe("/bin/ls", src.hostDOStorage); err != nil {
 				t.Fatalf("(d) tenant %s's sandbox can't list its own DO storage: %v", src.Key, err)
 			}

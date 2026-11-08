@@ -435,6 +435,9 @@ func (h *Host) killLocal(objectID, reason string) {
 	live := o.live
 	h.mu.Unlock()
 	closeOnce(ch)
+	if t != nil && t.certs != nil && o.NodeID != "" {
+		t.certs.forget(o.NodeID) // its certificate must not be reused from cache
+	}
 	st := time.Now()
 	if t != nil && live {
 		opts := netd.KillOptions{Reason: reason, SkipDelete: true}

@@ -1,0 +1,21 @@
+{
+  "goarch": "arm64",
+  "goos": "darwin",
+  "node": "v25.1.0",
+  "results": {
+    "egress.global_ms": 9,
+    "egress.http_ms": 2,
+    "egress.sdk_ms": 9,
+    "egress.undici_ms": 16,
+    "nodeprobe.cold_start_spawn_to_healthy_ms": 128.863,
+    "nodeprobe.crash_to_serving_ms": 356,
+    "nodeprobe.deploy_to_first_200_ms": 535,
+    "nodeprobe.rss_mib": 108.890625,
+    "nodeprobe.sandbox": {
+      "denied": 5,
+      "own_rw": true,
+      "sandbox": "seatbelt"
+    }
+  },
+  "when": "2026-11-08T17:24:21Z"
+}

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -97,7 +98,12 @@ type Env struct {
 	// ClientTagged: test nodes carry tag:ttest (production control). On
 	// testcontrol they are untagged users, so the principal is a login.
 	ClientTagged bool
-	Res          *Results
+	// PolicyGrantsParentRefund: the tenant policy grants the parent agent's
+	// tag `refund` (the real test tailnets do; testcontrol's global caps
+	// can't grant per tag). Then check (d) also asserts the unnarrowed
+	// parent's refund is admitted, proving the child's denial is lim's.
+	PolicyGrantsParentRefund bool
+	Res                      *Results
 	// Exec, if set, runs the CLI elsewhere (e2e-mbp: over ssh on another
 	// Mac) with args after the binary (--state-dir first). dur is the CLI's
 	// own wall time on that machine.
@@ -334,8 +340,10 @@ func mcpCall(hc *http.Client, ip, tool string, args map[string]any) (map[string]
 
 // upArgs is the `twd up` command line of this run.
 func (e *Env) upArgs() []string {
+	// --allow-sibling-egress: the agent and the MCP server share this host;
+	// check (d) needs the spawned child to reach the server over the tailnet.
 	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", e.APIKeyFile, "--yes",
-		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL}
+		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL, "--allow-sibling-egress"}
 	if !e.Persistent {
 		upArgs = append(upArgs, "--ephemeral")
 	}
@@ -609,7 +617,39 @@ func (e *Env) Run() {
 	if r := do(hc, "GET", "http://"+coIP+"/", nil); r.Code != 200 || get(r.Body, "lookup") != "c1" {
 		t.Fatalf("(d) child via its own node: %s", r)
 	}
-	res.pass("d_spawn", fmt.Sprintf("child %s node %s tags %v caps %s", co.ID, co.MagicDNS, co.Tags, co.Caps))
+	// (d) continued: the per-spawn cap limit is ENFORCED at the receiver
+	// (RT-01). A sub-agent of the parent's own class carries the parent's
+	// tag, which the tenant policy grants both lookup_order and refund; it
+	// is spawned with lim = [lookup_order]. The MCP server must refuse its
+	// refund with cap_missing (the WhoIs capMap ∩ the child's node
+	// certificate lim) while the unnarrowed parent's refund is admitted by
+	// the cap check, and the child's lookup_order still works.
+	r = do(hc, "GET", "http://"+aoIP+"/delegate?child=narrow1&server="+url.QueryEscape("http://"+mcpIP+"/mcp"), nil)
+	if r.Code != 200 {
+		t.Fatalf("(d) delegate: %s", r)
+	}
+	res.Numbers["delegate_ms"] = msOf(r.Dur)
+	if get(r.Body, "lookup_order", "ok") != true {
+		t.Fatalf("(d) narrowed child should still be allowed lookup_order: %s", r)
+	}
+	if get(r.Body, "refund", "ok") != false || get(r.Body, "refund", "error") != "cap_missing" {
+		t.Fatalf("(d) narrowed child's refund must be cap_missing (lim not enforced?): %s", r)
+	}
+	if e.PolicyGrantsParentRefund {
+		if get(r.Body, "parent", "refund", "error") == "cap_missing" {
+			t.Fatalf("(d) the unnarrowed parent's refund was cap_missing too, so the denial proves nothing about lim: %s", r)
+		}
+	} else {
+		res.Notes = append(res.Notes, "(d) hermetic policy grants nobody refund: the parent's refund is cap_missing as well; the lim-vs-policy contrast is asserted on the real tailnets")
+	}
+	no := e.waitObjectReady("SupportAgent", "narrow1", 60*time.Second)
+	var ncaps map[string]any
+	json.Unmarshal(no.Caps, &ncaps)
+	if no.Parent != ao.ID || !slices.Contains(no.Tags, "tag:twd-agent-support") || fmt.Sprint(get(ncaps, MCPCap, "tools")) != "[lookup_order]" {
+		t.Fatalf("(d) narrowed child object: %+v", no)
+	}
+	res.pass("d_spawn", fmt.Sprintf("child %s node %s tags %v caps %s; lim enforced: same-tag child %s (tag %v, lim %s) → refund cap_missing, lookup_order ok; parent refund %v",
+		co.ID, co.MagicDNS, co.Tags, co.Caps, no.ID, no.Tags, no.Caps, get(r.Body, "parent", "refund", "error")))
 
 	// Record the IDs twd created (leftover checks after down).
 	for _, o := range e.objects() {
@@ -637,11 +677,14 @@ func (e *Env) Run() {
 	res.Numbers["kill_cli_ms"] = msOf(d)
 	res.Numbers["kill_api_ms"] = kr.Timings["kill_api"]
 	res.Numbers["kill_push_ms"] = kr.Result.PushMS
-	if d > e.tmo(time.Second) || len(kr.Result.Killed) != 2 || len(kr.Result.Pushed) != 2 {
+	// The cascade covers the agent, its LookupAgent child and the narrowed
+	// SupportAgent child from check (d).
+	noIP := peerIP(t, client, no.MagicDNS, e.tmo(60*time.Second))
+	if d > e.tmo(time.Second) || len(kr.Result.Killed) != 3 || len(kr.Result.Pushed) != 3 {
 		t.Fatalf("(e) kill: %v %+v", d, kr)
 	}
 	var worst time.Duration
-	for _, tgt := range []struct{ name, ip string }{{"agent", aoIP}, {"sub-agent", coIP}} {
+	for _, tgt := range []struct{ name, ip string }{{"agent", aoIP}, {"sub-agent", coIP}, {"narrowed sub-agent", noIP}} {
 		r := do(client.HTTPClient(e.tmo(10*time.Second)), "GET", "http://"+tgt.ip+"/", nil)
 		if r.Err != nil || r.Code != 410 || get(r.Body, "code") != "object_killed" || r.Dur > e.tmo(time.Second) {
 			t.Fatalf("(e) new request to killed %s: %s after %v", tgt.name, r, r.Dur)

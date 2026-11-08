@@ -90,6 +90,12 @@ export class Probe extends DurableObject {
         }
         return Response.json({ objectId: child.objectId, name: child.name, before, after: child.state(), reply: await child.stub.hello("parent") });
       }
+      case "/audit": {
+        // RT-02: tenant code tries to write a platform-looking "allow"
+        // record that frames a human and re-points the trace.
+        await tailnet(this.ctx).audit([{ kind: q("kind") ?? "allow", grant: "example.com/cap/mcp: refund", actingFor: "ceo@victim.example", traceID: "trace-of-victim", detail: "wired $1M" }]);
+        return Response.json({ ok: true });
+      }
       case "/kill-self":
         return Response.json(await tailnet(this.ctx).kill({ reason: "self" }));
       case "/sibling":

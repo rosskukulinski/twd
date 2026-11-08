@@ -44,7 +44,7 @@ func newFakeTS(t *testing.T) *fakeTS {
   "tagOwners": {"tag:twd": ["autogroup:admin"], "tag:ttest": ["autogroup:admin"]},
   "grants": [{"src": ["tag:ttest"], "dst": ["tag:ttest"], "ip": ["*"], "app": {"example.com/cap/ttest": [{"role": "tester"}]}}],
 }`
-	p, err := policy.Merge([]byte(base), cliflow.Policy())
+	p, err := policy.MergeWith([]byte(base), cliflow.Policy(), policy.Options{AllowTags: []string{cliflow.TestTag}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,10 @@ func TestCLIMultiTenant(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer c.Close()
-		c.Server.SetGlobalAppCaps(tailcfg.PeerCapMap{nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue}})
+		c.Server.SetGlobalAppCaps(tailcfg.PeerCapMap{
+			nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue},
+			cliflow.MCPCap:  []tailcfg.RawMessage{`{"tools":["lookup_order"]}`}, // check (d): the narrowed child keeps lookup_order
+		})
 		ctls[k] = c
 	}
 	fts := newFakeTS(t)
@@ -296,7 +299,7 @@ func TestDoctor(t *testing.T) {
 		got[c.Name] = c.Status
 	}
 	want := map[string]string{"binaries": "ok", "workerd": "ok", "bundler": "ok", "twd_home_writable": "ok",
-		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "system_tailscaled_not_used": "ok"}
+		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "node_egress": "skip", "system_tailscaled_not_used": "ok"}
 	if runtime.GOOS == "linux" {
 		want["host_sockets"] = "ok"
 		if hs := procsb.ScanHostSockets(); len(hs.Hard) > 0 {

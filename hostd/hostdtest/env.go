@@ -41,6 +41,8 @@ type Options struct {
 	InsecureSharedHost bool
 	// HostSockets: see hostd.Config.
 	HostSockets func() procsb.HostSockets
+	// AllowSiblingEgress is passed to hostd (same-host object hairpins).
+	AllowSiblingEgress bool
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -102,7 +104,7 @@ func Start(t testing.TB, o Options) *Env {
 		HostID: "h1", Mgmt: hc, DataDir: filepath.Join(dir, "data"), RunDir: filepath.Join(dir, "run"),
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
-		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, HostSockets: o.HostSockets,
+		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, HostSockets: o.HostSockets, AllowSiblingEgress: o.AllowSiblingEgress,
 	})
 	if err != nil {
 		t.Fatal(err)

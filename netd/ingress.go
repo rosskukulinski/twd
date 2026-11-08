@@ -3,6 +3,7 @@ package netd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/caps"
 	"tailscale.com/client/tailscale/apitype"
 )
 
@@ -25,6 +27,59 @@ type Caller struct {
 	Tags     []string                     `json:"tags"`
 	User     string                       `json:"user,omitempty"` // login, untagged (human) callers only
 	CapMap   map[string][]json.RawMessage `json:"capMap"`
+	// Object is set when the caller is a twd object with a node certificate
+	// (ADR-010): CapMap has already been narrowed to CapMap ∩ Object.Lim.
+	Object *CallerObject `json:"twd,omitempty"`
+	// CapsWithheld is true when a certificate lookup failed and netd failed
+	// closed: CapMap is empty regardless of the policy (RT-01).
+	CapsWithheld bool `json:"capsWithheld,omitempty"`
+}
+
+// CallerObject is what the sender's node certificate says about it.
+type CallerObject struct {
+	ObjectID string          `json:"objectId"`
+	Lim      json.RawMessage `json:"lim,omitempty"`
+	ParentID string          `json:"parent,omitempty"`
+	RootID   string          `json:"root,omitempty"`
+}
+
+// CertSource resolves a caller's node certificate (RT-01). Lookup returns
+// the verified certificate of the twd object whose node is stableNodeID,
+// ErrNoCert if that node is not a twd object of this tenant (the WhoIs
+// CapMap then applies unchanged), or any other error, on which netd FAILS
+// CLOSED: the caller's caps are withheld.
+type CertSource interface {
+	Lookup(ctx context.Context, stableNodeID string) (*CallerObject, error)
+}
+
+// ErrNoCert: the peer is not a twd object (a human, a plain tailnet node,
+// an MCP server...). Its policy caps apply as WhoIs reports them.
+var ErrNoCert = errors.New("netd: no node certificate for this peer")
+
+// CertLookupTimeout bounds one certificate lookup on the ingress path.
+const CertLookupTimeout = 3 * time.Second
+
+// applyCert narrows c by the sender's certificate (if any). It never lets a
+// lookup failure widen anything: on error the caps are emptied.
+func (r *Registry) applyCert(ctx context.Context, c *Caller) {
+	src := r.cfg.CallerCerts
+	if src == nil || c.NodeID == "" {
+		return
+	}
+	lctx, cancel := context.WithTimeout(ctx, CertLookupTimeout)
+	defer cancel()
+	co, err := src.Lookup(lctx, c.NodeID)
+	switch {
+	case errors.Is(err, ErrNoCert):
+		return
+	case err != nil:
+		r.log.Warn("node certificate lookup failed; withholding the caller's caps (fail closed)", "caller", c.NodeID, "err", RedactError(err))
+		c.CapMap = map[string][]json.RawMessage{}
+		c.CapsWithheld = true
+		return
+	}
+	c.Object = co
+	c.CapMap = caps.Intersect(c.CapMap, co.Lim)
 }
 
 // CFBlob is the JSON netd puts in HeaderCF; workerd exposes it as request.cf.
@@ -108,6 +163,7 @@ func (o *Object) serveIngress(w http.ResponseWriter, req *http.Request) {
 	stripIdentityHeaders(req.Header)
 	var blob CFBlob
 	blob.Tailscale.Caller = CallerFromWhoIs(who)
+	o.reg.applyCert(req.Context(), &blob.Tailscale.Caller)
 	blob.ObjectID = o.id
 	b, _ := json.Marshal(blob)
 	req.Header.Set(HeaderCF, string(b))

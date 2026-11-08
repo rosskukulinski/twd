@@ -142,3 +142,12 @@ func VerifyChain(ctx context.Context, s Store, chain string, pubKey ed25519.Publ
 	}
 	return st
 }
+
+// CheckAuditSourceForTest exposes the ingest provenance rule to
+// regression tests outside the package (security/attacks).
+func CheckAuditSourceForTest(source, kind string) error {
+	if e := checkAuditSource(source, kind); e != nil {
+		return e
+	}
+	return nil
+}

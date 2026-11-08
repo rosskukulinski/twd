@@ -297,9 +297,12 @@ func cmdKill(args []string) error {
 // ---- audit ----
 
 type auditLine struct {
-	TS        string          `json:"ts"`
-	Tenant    string          `json:"tenantID"`
-	Kind      string          `json:"kind"`
+	TS     string `json:"ts"`
+	Tenant string `json:"tenantID"`
+	Kind   string `json:"kind"`
+	// Source is the record's provenance: mgmt, host, or tenant (a
+	// tenant_note whose content is unverified tenant code output; RT-02).
+	Source    string          `json:"source,omitempty"`
 	Object    string          `json:"object"`
 	Node      string          `json:"node"`
 	Chain     string          `json:"chain"`
@@ -385,6 +388,22 @@ func describe(r mgmt.AuditRecord, names map[string]string) string {
 		return fmt.Sprintf("%s %v", r.Code, d["message"])
 	}
 	return compact(d)
+}
+
+// tenantNoteText renders a tenant_note: unverified content written by
+// tenant code, never a platform decision, whatever it claims.
+func tenantNoteText(r mgmt.AuditRecord) string {
+	_, text := detailMap(r)
+	var raw struct {
+		Detail string `json:"detail"`
+	}
+	if len(r.Raw) > 0 && json.Unmarshal(r.Raw, &raw) == nil && raw.Detail != "" {
+		text = raw.Detail
+	}
+	if len(text) > 200 {
+		text = text[:200] + "…"
+	}
+	return "tenant note (unverified, written by tenant code): " + text
 }
 
 func orDash(s string) string {
@@ -496,8 +515,12 @@ func cmdAudit(args []string) error {
 		if r.TenantID != tn.TenantID {
 			continue // defensive: mgmt filtered by tenant
 		}
-		res.Lines = append(res.Lines, auditLine{TS: r.TS, Tenant: r.TenantID, Kind: r.Kind, Object: r.ObjectID, Node: names[r.ObjectID], Chain: r.Chain,
-			ActingFor: r.ActingFor, Text: describe(r, names), Detail: r.Detail})
+		text := describe(r, names)
+		if r.Kind == mgmt.KindTenantNote || r.Source == mgmt.SourceTenant {
+			text = tenantNoteText(r)
+		}
+		res.Lines = append(res.Lines, auditLine{TS: r.TS, Tenant: r.TenantID, Kind: r.Kind, Source: r.Source, Object: r.ObjectID, Node: names[r.ObjectID], Chain: r.Chain,
+			ActingFor: r.ActingFor, Text: text, Detail: r.Detail})
 	}
 	emit(f, res, func() {
 		if res.Chain != "" {
@@ -512,7 +535,11 @@ func cmdAudit(args []string) error {
 			if strings.HasPrefix(l.Chain, "host:") {
 				src = " [" + strings.TrimPrefix(l.Chain, "host:") + "]"
 			}
-			fmt.Printf("%s  %-13s %-34s %s%s\n", ts, l.Kind, orDash(l.Node), l.Text, src)
+			kind := l.Kind
+			if l.Source == mgmt.SourceTenant {
+				kind = "~" + l.Kind // tenant-written content, not a platform record
+			}
+			fmt.Printf("%s  %-13s %-34s %s%s\n", ts, kind, orDash(l.Node), l.Text, src)
 		}
 		var cs []string
 		for _, c := range res.Chains {

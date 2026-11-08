@@ -29,8 +29,12 @@ type Config struct {
 	HostnamePrefix string `json:"hostnamePrefix,omitempty"`
 	Ephemeral      bool   `json:"ephemeral,omitempty"`
 	// InsecureSharedHost (twd up --insecure-shared-host): without a process
-	// sandbox, still serve process-tier workloads of several tenants.
-	InsecureSharedHost bool   `json:"insecureSharedHost,omitempty"`
+	// sandbox, still serve process-tier workloads of several tenants
+	// (incl. Node-tier apps whose egress is then unenforced, RT-08).
+	InsecureSharedHost bool `json:"insecureSharedHost,omitempty"`
+	// AllowSiblingEgress: objects may reach other objects on this host over
+	// the tailnet (single-host tests/demos).
+	AllowSiblingEgress bool   `json:"allowSiblingEgress,omitempty"`
 	Workerd            string `json:"workerd"`
 	Heartbeat          string `json:"heartbeat"`
 	KillTombstone      string `json:"killTombstone"`
@@ -112,6 +116,7 @@ func (s *state) runDir() string {
 }
 
 func (s *state) mgmtSock() string       { return filepath.Join(s.runDir(), "mgmt.sock") }
+func (s *state) hostTokenFile() string  { return filepath.Join(s.Dir, "hostd", "mgmt.token") }
 func (s *state) hostdRunDir() string    { return filepath.Join(s.runDir(), "h") }
 func (s *state) hostdSock() string      { return filepath.Join(s.hostdRunDir(), "hostd.sock") }
 func (s *state) logDir() string         { return filepath.Join(s.Dir, "logs") }
@@ -184,8 +189,12 @@ func pidAlive(pid int) bool {
 
 func (s *state) supervisorAlive() bool { return pidAlive(s.supervisorPID()) }
 
+// mgmt is the CLI's client for mgmt's unix socket. It presents the same
+// per-host token hostd uses (RT-03): same-uid peercred alone admits
+// nobody, and the token file is readable only by the twd user.
 func (s *state) mgmt() *mgmtapi.Client {
 	c, _ := mgmtapi.NewClient("unix://" + s.mgmtSock())
+	c.TokenFile = s.hostTokenFile()
 	return c
 }
 

@@ -576,6 +576,64 @@ func TestNodeWorkflow(t *testing.T) {
 	e.record("workflow.mcp_caller_node", wf.NodeID)
 }
 
+// RT-08: the Node tier's egress proxy is an enforcement boundary only under
+// a sandbox that confines the process's TCP (Landlock); elsewhere status says
+// `Egress: "unenforced"`. On a host with NO process sandbox at all, a
+// Node-tier deployment for a second tenant is refused (egress_unenforced)
+// unless the operator passes -insecure-shared-host.
+func TestNodeTierSharedHostRefused(t *testing.T) {
+	e := start(t)
+	dep := e.a.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
+	e.a.WaitActive("nodeprobe", dep, 60*time.Second)
+	ws := e.nodeStatus(e.a, "nodeprobe")
+	if ws.Egress != hostd.EgressEnforcement(ws.Sandbox) || (ws.Sandbox == hostd.SandboxLandlock) != (ws.Egress == hostd.EgressEnforced) {
+		t.Fatalf("status Egress=%q Sandbox=%q", ws.Egress, ws.Sandbox)
+	}
+	// A host without any process sandbox, serving a second tenant.
+	o := hostdtest.Options{ControlURL: e.ctl.URL, Ephemeral: true, HostnamePrefix: "n-", Sandbox: hostd.SandboxNone,
+		Tenant: mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: e.ctl.URL, MintMode: "static"}}
+	o.Fake.StaticKey = nettest.DummyKey
+	c := hostdtest.Start(t, o)
+	c.Deploy(hostdtest.Fixture("probe"), "probe", nil) // tenant A's workload on the host
+	b := c.AddTenant(mgmtapi.Tenant{Tailnet: "tenant-b.ts.net", ControlURL: e.ctl.URL, MintMode: "static"})
+	b.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		st := b.Host.Status()
+		var found *hostd.WorkloadStatus
+		for i := range st.Workloads {
+			if st.Workloads[i].TenantID == b.TenantID && st.Workloads[i].Workload == "nodeprobe" {
+				found = &st.Workloads[i]
+			}
+		}
+		if found != nil && found.Status == "failed" && strings.Contains(found.Error, "egress_unenforced") {
+			t.Logf("refused: %s", found.Error)
+			break
+		}
+		if found != nil && found.Status == "failed" {
+			t.Fatalf("refused for the wrong reason: %s", found.Error)
+		}
+		if found != nil && found.Status == "active" {
+			t.Fatal("tenant B's Node-tier deployment ran on an unsandboxed shared host without -insecure-shared-host")
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant B's deployment neither failed nor ran: %+v", found)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// The operator's override lets it run (and status still says unenforced).
+	o2 := o
+	o2.HostnamePrefix, o2.InsecureSharedHost = "i-", true
+	c2 := hostdtest.Start(t, o2)
+	c2.Deploy(hostdtest.Fixture("probe"), "probe", nil)
+	d := c2.AddTenant(mgmtapi.Tenant{Tailnet: "tenant-d.ts.net", ControlURL: e.ctl.URL, MintMode: "static"})
+	depD := d.DeployNode(hostdtest.Fixture("nodeprobe"), "nodeprobe", nil)
+	d.WaitActive("nodeprobe", depD, 60*time.Second)
+	if ws := e.nodeStatus(d, "nodeprobe"); ws.Egress != hostd.EgressUnenforced || !c2.Host.Status().InsecureSharedHost {
+		t.Fatalf("override: %+v", ws)
+	}
+}
+
 // landlockNodeChecks: from inside the sandboxed Node app (Linux), raw TCP
 // that bypasses the egress proxy fails (the internet, a host-loopback
 // listener), unix sockets of hostd fail, its own app port works; under the

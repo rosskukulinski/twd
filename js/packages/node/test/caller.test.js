@@ -57,3 +57,12 @@ test("fetch goes through the proxy in absolute form with proxy credentials", asy
   assert.deepEqual(seen, { method: "POST", url: "http://echo.ts.net:8080/p?q=1", auth: "Basic " + Buffer.from("twd:s3cret").toString("base64"), host: "echo.ts.net:8080", body: "hi" });
   srv.close();
 });
+
+test("a header with a nonce is accepted once; its replay is refused (RT-05)", () => {
+  const c = { ...claims(), nonce: "n-" + Math.random() };
+  const h = signCaller(c, key);
+  assert.equal(verifyCaller(h, { key }).caller.nodeId, "nA");
+  assert.throws(() => verifyCaller(h, { key }), /replayed/);
+  // A different nonce (a new request) is fine.
+  assert.equal(verifyCaller(signCaller({ ...c, nonce: "n2-" + Math.random() }, key), { key }).caller.nodeId, "nA");
+});

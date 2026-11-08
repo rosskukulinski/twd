@@ -5,7 +5,12 @@ import http from "node:http";
 import path from "node:path";
 import { start, getRun, resumeHook, getHookByToken } from "workflow/api";
 import { getWorld } from "workflow/runtime";
-import { requireCaller, CallerError } from "@twd/node";
+import { requireCaller, CallerError, enforceEgress } from "@twd/node";
+
+// RT-08: route raw net/tls connects through the egress proxy and refuse
+// direct DNS/UDP. Cooperative (see docs/node-tier.md): only a Landlock
+// sandbox or a microVM makes the proxy an enforcement boundary.
+enforceEgress();
 import { supportWorkflow } from "../workflows/support";
 
 // Durable state lives in the deployment's data dir (kept across restarts and redeploys).

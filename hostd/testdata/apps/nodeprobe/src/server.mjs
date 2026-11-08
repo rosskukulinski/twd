@@ -1,7 +1,14 @@
 import http from "node:http";
 import fs from "node:fs";
 import net from "node:net";
-import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher } from "@twd/node";
+import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher, enforceEgress } from "@twd/node";
+// The /net sandbox probe must use the UNPATCHED connect (enforceEgress
+// tunnels raw connects through the proxy; the probe measures the OS
+// sandbox). net.connect() itself goes through Socket.prototype.connect, so
+// keep the raw prototype method.
+const rawProtoConnect = net.Socket.prototype.connect;
+const rawConnect = (opts) => rawProtoConnect.call(new net.Socket(), opts);
+enforceEgress();
 
 const port = Number(process.env.PORT);
 const json = (res, code, v) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(v)); };
@@ -61,7 +68,7 @@ http.createServer(async (req, res) => {
         const p = u.searchParams.get("path");
         const opts = p ? { path: p } : { host: u.searchParams.get("host"), port: Number(u.searchParams.get("port")) };
         const r = await new Promise((resolve) => {
-          const s = net.connect(opts);
+          const s = rawConnect(opts);
           const t = setTimeout(() => { s.destroy(); resolve({ ok: false, code: "TIMEOUT" }); }, 3000);
           s.on("connect", () => { clearTimeout(t); s.destroy(); resolve({ ok: true }); });
           s.on("error", (e) => { clearTimeout(t); resolve({ ok: false, code: e.code ?? String(e) }); });

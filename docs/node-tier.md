@@ -88,7 +88,7 @@ undici, call `installGlobalDispatcher(undici)` afterwards, or use
 `@twd/node`'s `fetch`. The Vercel Workflow bundles include their own copy of
 undici, so the template uses `@twd/node` `fetch` explicitly.
 
-### Enforcement boundary
+### Enforcement boundary (read this before sharing a host)
 
 **On Linux with Landlock (ABI ≥ 4, kernel 6.7+; Ubuntu 24.04's 6.8 has
 ABI 4), egress through the proxy is enforced, not cooperative.** twd-hostd
@@ -118,6 +118,30 @@ everywhere:
 - it can't speak as any node except through the proxy, which attributes
   everything to this deployment;
 - it can't forge an inbound caller.
+
+`@twd/node` closes the *accidental* bypasses in-process: `enforceEgress()`
+(also run by `installGlobalDispatcher()`; the `node-workflow` template calls
+it at startup) patches `net`/`tls` so that any TCP connect to something
+other than the proxy or the app's own port becomes a CONNECT tunnel through
+the proxy (so netd's ADR-019 guard still applies and the destination still
+sees this deployment's node), makes direct `dns.lookup`/`dns.resolve*` and
+UDP sockets fail with `forbidden_destination`, and refuses unix sockets
+other than the app's own. It runs inside the app's process, so hostile code
+can undo it; it is defence in depth, not a boundary. Verified callers:
+`x-twd-caller` now carries a `nonce` and `@twd/node` refuses a replayed
+header (RT-05), plus `callerObjectId`/`lim` when the caller is a twd object
+whose caps were narrowed by its node certificate (RT-01).
+
+hostd makes the state visible and refuses the dangerous combination:
+- `twd status` and `GET /v0/status` show `egress unenforced` for every
+  Node-tier workload on such a host; `twd doctor` warns (`node_egress`);
+- a Node-tier deployment on a host **without any process sandbox** that
+  serves other tenants fails with `egress_unenforced` (and the general
+  shared-host rule, `sandbox_unavailable`, applies to every process-tier
+  workload there) unless the operator starts the host with
+  `twd up --insecure-shared-host` (`twd-hostd -insecure-shared-host`).
+  Under Seatbelt or Landlock the deployment runs; status stays honest about
+  whether egress is enforced (`enforced` only under Landlock).
 
 The strongest boundary is the **microVM tier**. There, the guest's only
 network is hostd's gVisor gateway, which exposes only the egress, workload

@@ -17,7 +17,19 @@ export interface Caller {
   /** The object (node) the request was delivered to. */
   objectId: string;
   traceId: string;
-  /** JSON values granted for an app capability (union of all grants). */
+  /**
+   * Set when the caller is a twd object with a node certificate (ADR-010):
+   * its object ID and the cap limit (`lim`) its spawner set. caps() is
+   * already narrowed to CapMap ∩ lim by netd, so a sub-agent spawned with
+   * narrower caps than its class tag's grants cannot use the difference.
+   */
+  twd?: { objectId: string; lim?: Record<string, unknown>; parent?: string; root?: string };
+  /**
+   * True when netd could not verify the caller's node certificate and
+   * withheld its caps (fail closed): caps() is empty whatever the policy says.
+   */
+  capsWithheld: boolean;
+  /** JSON values granted for an app capability (union of all grants, ∩ lim). */
   caps<T = unknown>(name: string): T[];
 }
 
@@ -29,6 +41,8 @@ interface WireCaller {
   tags?: string[];
   user?: string;
   capMap?: Record<string, unknown[]>;
+  twd?: { objectId: string; lim?: Record<string, unknown>; parent?: string; root?: string };
+  capsWithheld?: boolean;
 }
 
 /**
@@ -54,6 +68,8 @@ export function getCaller(req: Request | { cf?: any } | null | undefined): Calle
     objectId: cf.objectId ?? "",
     chain: Object.freeze([Object.freeze({ nodeId: c.nodeId, tags })]),
     traceId: cf.traceId ?? "",
+    twd: c.twd ? Object.freeze({ objectId: c.twd.objectId, lim: c.twd.lim ? structuredClone(c.twd.lim) : undefined, parent: c.twd.parent, root: c.twd.root }) : undefined,
+    capsWithheld: !!c.capsWithheld,
     caps<T = unknown>(name: string): T[] {
       return (capMap[name] ?? []).map((v) => structuredClone(v) as T);
     },

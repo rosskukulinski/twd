@@ -16,12 +16,21 @@
 // proxy (TWD_EGRESS_PROXY; also exported as HTTP_PROXY/HTTPS_PROXY with
 // NODE_USE_ENV_PROXY=1), so the destination sees this deployment's own
 // tailnet node and ADR-019 applies (netmap-only names, no loopback, no host,
-// no metadata, no internet). In the process tier this is cooperative: a
-// malicious app can open raw sockets and bypass env proxies. The microVM tier
-// (gVisor gateway) is the enforcement boundary.
+// no metadata, no internet). enforceEgress() (called by
+// installGlobalDispatcher) additionally routes raw `net`/`tls` connects
+// through the proxy as CONNECT tunnels and refuses direct DNS/UDP, so code
+// that ignores the env proxies is still attributed or fails. All of this is
+// COOPERATIVE: it runs inside the app's own process, and hostile code can
+// undo it. Only an OS sandbox that confines the process's network (Landlock
+// ABI ≥ 4 on Linux) or a microVM makes the proxy an enforcement boundary;
+// see docs/node-tier.md.
 import { createHmac, timingSafeEqual } from "node:crypto";
+import dgram from "node:dgram";
+import dns from "node:dns";
 import http from "node:http";
+import net from "node:net";
 import { Readable } from "node:stream";
+import tls from "node:tls";
 
 export const CALLER_HEADER = "x-twd-caller";
 /** Signatures older (or newer) than this are rejected. */
@@ -48,6 +57,12 @@ export interface CallerClaims {
   traceId?: string;
   /** Issued at, unix ms. */
   iat: number;
+  /** Per-request nonce; a header seen twice within the skew window is refused (RT-05). */
+  nonce?: string;
+  /** The calling twd object's ID, when the caller is a twd object with a node certificate (RT-01). */
+  callerObjectId?: string;
+  /** The caller's spawn-time cap limit (its node certificate's lim); caller.capMap is already narrowed by it. */
+  lim?: Record<string, unknown>;
 }
 
 export class CallerError extends Error {
@@ -102,10 +117,26 @@ export function verifyCaller(header: string | null | undefined, opts: VerifyOpti
   } catch {
     throw new CallerError("malformed " + CALLER_HEADER + " payload");
   }
-  const skew = Math.abs((opts.now ?? Date.now()) - claims.iat);
-  if (!(skew <= (opts.maxSkewMs ?? DEFAULT_MAX_SKEW_MS))) throw new CallerError(CALLER_HEADER + " expired");
+  const now = opts.now ?? Date.now();
+  const maxSkew = opts.maxSkewMs ?? DEFAULT_MAX_SKEW_MS;
+  const skew = Math.abs(now - claims.iat);
+  if (!(skew <= maxSkew)) throw new CallerError(CALLER_HEADER + " expired");
   if (claims.v !== 1 || !claims.caller?.nodeId) throw new CallerError("malformed " + CALLER_HEADER + " claims");
+  if (claims.nonce !== undefined && !rememberNonce(sig, now, maxSkew)) throw new CallerError(CALLER_HEADER + " replayed");
   return claims;
+}
+
+// Replay cache (RT-05): a signature is accepted once within the skew window.
+const seenNonces = new Map<string, number>();
+let lastSweep = 0;
+function rememberNonce(sig: string, now: number, maxSkew: number): boolean {
+  if (now - lastSweep > maxSkew || seenNonces.size > 100_000) {
+    for (const [k, exp] of seenNonces) if (exp <= now) seenNonces.delete(k);
+    lastSweep = now;
+  }
+  if (seenNonces.has(sig)) return false;
+  seenNonces.set(sig, now + maxSkew);
+  return true;
 }
 
 type AnyRequest = Request | http.IncomingMessage | { headers: Record<string, string | string[] | undefined> | Headers };
@@ -203,10 +234,11 @@ export async function dispatcher(undici?: any): Promise<any> {
 
 /**
  * installGlobalDispatcher routes the global fetch() (Node's built-in and
- * undici's) through the egress proxy. Call it after importing `undici`:
- * loading the undici package installs a plain Agent as the global
- * dispatcher, which silently overrides NODE_USE_ENV_PROXY for every later
- * global fetch() in the process (measured on Node 25 + undici 8).
+ * undici's) through the egress proxy, and calls enforceEgress(). Call it
+ * after importing `undici`: loading the undici package installs a plain
+ * Agent as the global dispatcher, which silently overrides
+ * NODE_USE_ENV_PROXY for every later global fetch() in the process
+ * (measured on Node 25 + undici 8).
  */
 export async function installGlobalDispatcher(undici?: any): Promise<void> {
   if (!undici) {
@@ -214,4 +246,224 @@ export async function installGlobalDispatcher(undici?: any): Promise<void> {
     undici = await import(spec);
   }
   undici.setGlobalDispatcher(await dispatcher(undici));
+  enforceEgress();
+}
+
+// ---- egress enforcement (cooperative; RT-08) ----
+
+export class EgressError extends Error {
+  code: "forbidden_destination";
+  constructor(detail: string) {
+    super(detail);
+    this.name = "EgressError";
+    this.code = "forbidden_destination";
+    (this as any).errno = -13; // EACCES-like for code that inspects errno
+    (this as any).syscall = "connect";
+  }
+}
+
+export interface EnforceEgressOptions {
+  /** Extra "host:port" destinations allowed directly (default: the proxy and this app's own listener). */
+  allow?: string[];
+  /** Also refuse direct DNS (dns.lookup/resolve*) and UDP sockets (default true). */
+  dns?: boolean;
+}
+
+let enforced = false;
+
+function isLoopbackHost(h: string): boolean {
+  return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]" || h === "0.0.0.0" || h === "::" || /^127\./.test(h);
+}
+
+/**
+ * enforceEgress patches `net`, `tls`, `dns` and `dgram` so that code which
+ * bypasses the env proxies is still attributed: a TCP connect to anything
+ * but the egress proxy or this app's own listener becomes a CONNECT tunnel
+ * through the proxy (netd then applies ADR-019 from the deployment's node
+ * and refuses loopback/LAN/metadata/internet), direct DNS resolution fails
+ * with forbidden_destination (names resolve at the proxy, from the
+ * netmap), and UDP sockets fail. Idempotent.
+ *
+ * This is in-process and therefore cooperative: hostile code can restore
+ * the originals. It closes accidental and dependency-level bypasses, not a
+ * determined attacker; see docs/node-tier.md for what does.
+ */
+export function enforceEgress(opts: EnforceEgressOptions = {}): void {
+  if (enforced) return;
+  enforced = true;
+  const p = proxyParts();
+  const allow = new Set<string>([`${p.host}:${p.port}`, `127.0.0.1:${p.port}`, `localhost:${p.port}`]);
+  const own = process.env.PORT;
+  if (own) for (const h of ["127.0.0.1", "localhost", "::1", "0.0.0.0"]) allow.add(`${h}:${own}`);
+  for (const a of opts.allow ?? []) allow.add(a);
+  const ownSock = process.env.TWD_SOCKET;
+
+  const origConnect = net.Socket.prototype.connect;
+  const tunnel = (sock: net.Socket, host: string, port: number, cb?: () => void) => {
+    // CONNECT host:port through the proxy on this very socket, then hand it
+    // back to the caller as a connected socket. While the handshake runs,
+    // the socket's own connect/ready/data events are intercepted so the
+    // caller only sees a (fake) "connect" once the tunnel is established.
+    const hp = net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`;
+    const realEmit = sock.emit as (this: net.Socket, ev: string, ...args: any[]) => boolean;
+    let buf = "";
+    let handshaking = true;
+    let wasFlowing = false;
+    const finish = (err?: Error, rest?: Buffer) => {
+      handshaking = false;
+      (sock as any).emit = realEmit;
+      if (err) {
+        sock.destroy(err);
+        return;
+      }
+      if (!wasFlowing && sock.listenerCount("data") === 0) {
+        // Back to "never flowed": a later on("data") resumes as usual (an
+        // explicit pause() would make it stay paused).
+        sock.pause();
+        (sock as any)._readableState.flowing = null;
+      }
+      if (rest && rest.length) sock.unshift(rest);
+      sock.emit("connect");
+      sock.emit("ready");
+      cb?.();
+    };
+    (sock as any).emit = function (this: net.Socket, ev: string, ...args: any[]) {
+      if (!handshaking) return realEmit.call(this, ev, ...args);
+      switch (ev) {
+        case "connect":
+          this.write(`CONNECT ${hp} HTTP/1.1\r\nHost: ${hp}\r\n${p.auth ? "Proxy-Authorization: " + p.auth + "\r\n" : ""}\r\n`);
+          // net.Socket deferred its first read to its own once("connect")
+          // listener, which we just swallowed (the stream already counts
+          // itself as reading): start the handle read directly.
+          (this as any)._read(0);
+          // The response must reach our "data" interception even if the
+          // caller has not attached a data listener yet (stream not
+          // flowing); finish() pauses again in that case.
+          wasFlowing = this.readableFlowing === true;
+          this.resume();
+          return true;
+        case "ready":
+          return true;
+        case "data": {
+          buf += (args[0] as Buffer).toString("latin1");
+          const i = buf.indexOf("\r\n\r\n");
+          if (i < 0) return true;
+          const head = buf.slice(0, i);
+          const m = /^HTTP\/1\.[01] (\d{3})/.exec(head);
+          if (!m || m[1] !== "200") {
+            const te = /twd-error:\s*([a-z_]+)/i.exec(head);
+            const err = new EgressError(`egress to ${hp} refused by the twd egress proxy (${te ? te[1] : "HTTP " + (m ? m[1] : "?")})`);
+            if (te) err.code = te[1] as any;
+            finish(err);
+            return true;
+          }
+          finish(undefined, Buffer.from(buf.slice(i + 4), "latin1"));
+          return true;
+        }
+        case "end":
+        case "close":
+          if (handshaking) {
+            handshaking = false;
+            (sock as any).emit = realEmit;
+            realEmit.call(this, "error", new EgressError(`egress proxy closed the connection before answering CONNECT ${hp}`));
+          }
+          return realEmit.call(this, ev, ...args);
+      }
+      return realEmit.call(this, ev, ...args);
+    };
+    origConnect.call(sock, { host: p.host, port: p.port } as any);
+  };
+  (net.Socket.prototype as any).connect = function (this: net.Socket, ...args: any[]) {
+    const n = normalizeConnectArgs(args);
+    if (!n) return origConnect.apply(this, args as any);
+    const { options, cb } = n;
+    if (options.path) {
+      if (ownSock && options.path === ownSock) return origConnect.apply(this, args as any);
+      process.nextTick(() => this.destroy(new EgressError(`unix socket ${options.path} is not reachable from a twd Node app (only this app's own socket is)`)));
+      return this;
+    }
+    const host = String(options.host ?? "localhost");
+    const port = Number(options.port);
+    if (allow.has(`${host}:${port}`)) return origConnect.apply(this, args as any);
+    if (isLoopbackHost(host)) {
+      process.nextTick(() => this.destroy(new EgressError(`loopback ${host}:${port} is not reachable from a twd Node app except its own port and the egress proxy`)));
+      return this;
+    }
+    (this as any)._twdTunnel = `${host}:${port}`;
+    tunnel(this, host, port, cb);
+    return this;
+  };
+  (net as any).connect = (net as any).createConnection = function (...args: any[]) {
+    const s = new net.Socket(typeof args[0] === "object" && args[0] && !Array.isArray(args[0]) ? args[0] : undefined);
+    return (s as any).connect(...args);
+  };
+  // tls.connect builds its own TCP socket via net.connect unless given one:
+  // our patched net.connect tunnels it, so TLS runs end-to-end through the
+  // tunnel. servername must then come from the target, not the proxy.
+  const origTLSConnect = tls.connect;
+  (tls as any).connect = function (...args: any[]) {
+    const n = normalizeConnectArgs(args);
+    if (n && !n.options.socket && !n.options.path) {
+      const host = String(n.options.host ?? "localhost");
+      const port = Number(n.options.port ?? 443);
+      if (!allow.has(`${host}:${port}`)) {
+        const raw = new net.Socket();
+        (raw as any).connect({ host, port });
+        const o = { ...n.options, socket: raw, servername: n.options.servername ?? (net.isIP(host) ? undefined : host) };
+        delete (o as any).host;
+        delete (o as any).port;
+        return (origTLSConnect as any).call(tls, o, n.cb);
+      }
+    }
+    return origTLSConnect.apply(tls, args as any);
+  };
+  if (opts.dns !== false) {
+    const refuse = (what: string) => new EgressError(`${what} is not available in a twd Node app: names resolve at the egress proxy (netmap only)`);
+    const origLookup = dns.lookup;
+    (dns as any).lookup = function (hostname: string, ...rest: any[]) {
+      const cb = rest[rest.length - 1];
+      if (isLoopbackHost(hostname) || hostname === p.host) return (origLookup as any).call(dns, hostname, ...rest);
+      if (typeof cb === "function") process.nextTick(() => cb(refuse(`dns.lookup(${hostname})`)));
+      return undefined;
+    };
+    (dns.promises as any).lookup = async (hostname: string, ...rest: any[]) => {
+      if (isLoopbackHost(hostname) || hostname === p.host) return (origLookup as any).__promisified?.(hostname, ...rest) ?? new Promise((res, rej) => (origLookup as any).call(dns, hostname, ...rest.filter((x: any) => typeof x !== "function"), (e: any, a: any, f: any) => (e ? rej(e) : res({ address: a, family: f }))));
+      throw refuse(`dns.promises.lookup(${hostname})`);
+    };
+    for (const k of Object.keys(dns)) {
+      if (/^resolve/.test(k) || k === "reverse") {
+        (dns as any)[k] = (name: string, ...rest: any[]) => {
+          const cb = rest[rest.length - 1];
+          if (typeof cb === "function") process.nextTick(() => cb(refuse(`dns.${k}(${name})`)));
+        };
+        if ((dns.promises as any)[k]) (dns.promises as any)[k] = async (name: string) => { throw refuse(`dns.promises.${k}(${name})`); };
+      }
+    }
+    const origCreateSocket = dgram.createSocket;
+    (dgram as any).createSocket = function (...args: any[]) {
+      const s = (origCreateSocket as any).apply(dgram, args);
+      const deny = (fn: string) => () => { throw refuse(`dgram.Socket.${fn}()`); };
+      s.send = deny("send");
+      s.connect = deny("connect");
+      s.bind = deny("bind");
+      return s;
+    };
+  }
+}
+
+function normalizeConnectArgs(args: any[]): { options: any; cb?: () => void } | null {
+  let options: any;
+  let cb: any;
+  if (args.length === 0) return null;
+  if (typeof args[0] === "object" && args[0] !== null && !Array.isArray(args[0])) {
+    options = args[0];
+    cb = typeof args[1] === "function" ? args[1] : undefined;
+  } else if (typeof args[0] === "string" && (args.length === 1 || typeof args[1] === "function" || typeof args[1] !== "string") && isNaN(Number(args[0]))) {
+    options = { path: args[0] };
+    cb = typeof args[1] === "function" ? args[1] : undefined;
+  } else {
+    options = { port: Number(args[0]), host: typeof args[1] === "string" ? args[1] : "localhost" };
+    cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
+  }
+  return { options, cb };
 }

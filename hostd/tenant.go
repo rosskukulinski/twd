@@ -21,6 +21,15 @@ type tenant struct {
 	info   mgmtapi.Tenant
 	reg    *netd.Registry
 	egress http.Handler
+	certs  *certSource // node certificate resolver (nil: fail closed)
+}
+
+// failClosedCerts is the CertSource of a tenant whose OBO public key mgmt
+// did not publish: every twd caller's caps are withheld.
+type failClosedCerts struct{}
+
+func (failClosedCerts) Lookup(context.Context, string) (*netd.CallerObject, error) {
+	return nil, errors.New("tenant has no pinned OBO public key; certificates can't be verified")
 }
 
 // tenantIDRE: tenant IDs name directories, so they must be one safe path
@@ -71,17 +80,34 @@ func (h *Host) ensureTenant(ctx context.Context, id string) (*tenant, error) {
 		control = DefaultControlURL
 	}
 	t = &tenant{id: id, info: *info}
+	// RT-01: pin the tenant's OBO root public key now; every inbound
+	// caller's node certificate is verified against it. Without a key,
+	// certificates can't be verified and netd withholds twd callers' caps.
+	certs, err := newCertSource(h, id, info.OBOPublicKey)
+	if err != nil {
+		h.log.Error("node certificates unavailable for tenant; twd callers' caps will be withheld (fail closed)", "tenant", id, "err", err)
+		certs = nil
+	}
+	var certSrc netd.CertSource
+	if certs != nil {
+		certSrc = certs
+		t.certs = certs
+	} else {
+		certSrc = failClosedCerts{}
+	}
 	reg, err := netd.New(netd.Config{
-		ControlURL:   control,
-		StateRoot:    filepath.Join(h.tenantDir(id), "nodes"),
-		Keys:         &keySource{h: h, tenantID: id},
-		Upstream:     h.ingressHandler(t),
-		Ephemeral:    h.cfg.Ephemeral,
-		Hostname:     func(oid string) string { return oid },
-		ReadyTimeout: h.cfg.ReadyTimeout,
-		JoinParallel: h.cfg.JoinParallel,
-		Logger:       h.log.With("tenant", id),
-		TSNetLogs:    h.cfg.TSNetLogs,
+		ControlURL:    control,
+		StateRoot:     filepath.Join(h.tenantDir(id), "nodes"),
+		Keys:          &keySource{h: h, tenantID: id},
+		Upstream:      h.ingressHandler(t),
+		CallerCerts:   certSrc,
+		AllowSiblings: h.cfg.AllowSiblingEgress,
+		Ephemeral:     h.cfg.Ephemeral,
+		Hostname:      func(oid string) string { return oid },
+		ReadyTimeout:  h.cfg.ReadyTimeout,
+		JoinParallel:  h.cfg.JoinParallel,
+		Logger:        h.log.With("tenant", id),
+		TSNetLogs:     h.cfg.TSNetLogs,
 	})
 	if err != nil {
 		return nil, err

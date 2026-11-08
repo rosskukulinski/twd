@@ -225,7 +225,7 @@ func TestE2EMulti(t *testing.T) {
 			notes = append(notes, s.tailnet+": policy already had the scenario's rules (read-only check, not written)")
 			continue
 		}
-		ar, err := policy.Apply(ctx, s.api, cliflow.MultiPolicy())
+		ar, err := policy.ApplyWith(ctx, s.api, cliflow.MultiPolicy(), policy.Options{AllowTags: []string{cliflow.TestTag}})
 		if err != nil {
 			t.Fatalf("policy %s: %v", s.tailnet, netd.RedactError(err))
 		}
@@ -252,7 +252,7 @@ func TestE2EMulti(t *testing.T) {
 			}}
 	}
 	m = &cliflow.MultiEnv{Env: &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, Prefix: prefix,
-		ClientTagged: true, Res: cliflow.NewResults("m7-"+run, tailnetA+"+"+tailnetB)},
+		ClientTagged: true, PolicyGrantsParentRefund: true, Res: cliflow.NewResults("m7-"+run, tailnetA+"+"+tailnetB)},
 		A: mk(A), B: mk(B), RequireSandbox: true, GlobalNodeIDs: true}
 	m.Run()
 	m.Down()

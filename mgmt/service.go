@@ -3,6 +3,7 @@ package mgmt
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -71,7 +72,8 @@ type Mgmt struct {
 	depStatus map[string]DeploymentStatus
 	pushURLs  map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
 	pending   map[string]*pendingDelete
-	volMu     sync.Mutex // VolumeKey create-if-absent
+	oboKeys   map[string]ed25519.PrivateKey // tenant → OBO root key (loaded from custody)
+	volMu     sync.Mutex                    // VolumeKey create-if-absent
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -1146,8 +1148,26 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 		m.deleteDevice(ctx, o)
 		return o, errf(410, "killed", "object %s was killed while joining; device deleted", id)
 	}
-	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "ready"},
-		map[string]any{"nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "host": hostID})
+	// Node certificate (ADR-010): binds this node to the object's tags, lim
+	// and lineage under the tenant's OBO root key. Receivers fetch it by
+	// stable node ID and compute effective caps = CapMap ∩ lim (RT-01).
+	detail := map[string]any{"nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "host": hostID}
+	if cert, err := m.signNodeCert(ctx, o); err != nil {
+		m.log.Error("node certificate not issued", "object", id, "err", err)
+		detail["certError"] = err.Error()
+	} else if o2, err := m.store.UpdateObject(ctx, id, nil, func(x *Object) error {
+		if x.Live() {
+			x.Cert = cert
+		}
+		return nil
+	}); err == nil {
+		o = o2
+		if len(o.Caps) > 0 {
+			detail["lim"] = o.Caps
+		}
+		detail["cert"] = true
+	}
+	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "ready"}, detail)
 	m.notify(id)
 	return o, nil
 }
@@ -1184,6 +1204,7 @@ func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (
 			return nil
 		}
 		o.Status, o.NodeID, o.StableNodeID, o.MagicDNS, o.KeyID, o.KeyExpires = StatusPending, "", "", "", "", 0
+		o.Cert = "" // the certificate named the dead node; ready re-issues one for the new node (RT-01)
 		o.UpdatedAt = m.now().UnixMilli()
 		return nil
 	})
@@ -1544,6 +1565,43 @@ func (m *Mgmt) Reap(ctx context.Context) (int, error) {
 
 // ---- audit ingest / query ----
 
+// Audit record kinds. Privileged kinds describe platform decisions and may
+// only be produced by netd/hostd/mgmt; tenant code (ctx.tailnet.audit) can
+// only produce KindTenantNote, which carries source "tenant".
+const (
+	KindTenantNote = "tenant_note"
+	SourceMgmt     = "mgmt"
+	SourceHost     = "host"
+	SourceTenant   = "tenant"
+)
+
+// PrivilegedKinds are the kinds a tenant may never submit (RT-02).
+var PrivilegedKinds = map[string]bool{"allow": true, "deny": true, "egress": true, "spawn": true, "kill": true,
+	"create": true, "mint": true, "ready": true, "credential": true, "principal": true, "device_delete": true,
+	"tenant": true, "deploy": true, "obo_root": true}
+
+// checkAuditSource enforces the provenance contract on a host-submitted
+// record: a "tenant" source may only carry a tenant_note, and a tenant_note
+// must be marked source "tenant". Anything else is a host record. The
+// submitter itself is authenticated by the route (roleHost + host token).
+func checkAuditSource(source, kind string) *Error {
+	switch source {
+	case SourceTenant:
+		if kind != KindTenantNote {
+			return errf(400, "bad_request", "tenant-sourced audit records may only be kind %q, not %q", KindTenantNote, kind)
+		}
+	case "", SourceHost:
+		if kind == KindTenantNote {
+			return errf(400, "bad_request", "a %s record must carry source %q", KindTenantNote, SourceTenant)
+		}
+	case SourceMgmt:
+		return errf(400, "bad_request", "hosts may not submit records with source %q", SourceMgmt)
+	default:
+		return errf(400, "bad_request", "unknown audit source %q", source)
+	}
+	return nil
+}
+
 // IngestAudit stores host-submitted records on the host's chain. Each must
 // carry hash (and prevHash); the response reports whether they link.
 func (m *Mgmt) IngestAudit(ctx context.Context, hostID string, recs []json.RawMessage) (int, ChainStatus, error) {
@@ -1553,6 +1611,7 @@ func (m *Mgmt) IngestAudit(ctx context.Context, hostID string, recs []json.RawMe
 			TS        any    `json:"ts"`
 			ObjectID  string `json:"objectID"`
 			Kind      string `json:"kind"`
+			Source    string `json:"source"`
 			TraceID   string `json:"traceID"`
 			ActingFor string `json:"actingFor"`
 			PrevHash  string `json:"prevHash"`
@@ -1564,6 +1623,10 @@ func (m *Mgmt) IngestAudit(ctx context.Context, hostID string, recs []json.RawMe
 		}
 		if r.Hash == "" || r.Kind == "" {
 			return i, ChainStatus{}, errf(400, "bad_request", "record %d: kind and hash are required", i)
+		}
+		if e := checkAuditSource(r.Source, r.Kind); e != nil {
+			e.Message = fmt.Sprintf("record %d: %s", i, e.Message)
+			return i, ChainStatus{}, e
 		}
 		canon, err := Canonicalize(raw)
 		if err != nil {
@@ -1627,7 +1690,29 @@ func (m *Mgmt) QueryAudit(ctx context.Context, f AuditFilter) ([]AuditRecord, []
 	if recs == nil {
 		recs = []AuditRecord{}
 	}
+	for i := range recs {
+		recs[i].Source = auditSource(recs[i])
+	}
 	return recs, sts, nil
+}
+
+// auditSource derives a record's provenance: mgmt-chain records are
+// "mgmt"; host-chain records carry "source" in their hashed body ("host"
+// when absent, for records from before RT-02).
+func auditSource(r AuditRecord) string {
+	if r.Chain == "mgmt" {
+		return SourceMgmt
+	}
+	var raw struct {
+		Source string `json:"source"`
+	}
+	if len(r.Raw) > 0 && json.Unmarshal(r.Raw, &raw) == nil && raw.Source != "" {
+		return raw.Source
+	}
+	if r.Kind == KindTenantNote {
+		return SourceTenant
+	}
+	return SourceHost
 }
 
 // ---- deploy preflight ----

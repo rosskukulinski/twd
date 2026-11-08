@@ -83,8 +83,10 @@ type ObjectFilter struct {
 	Namespace string
 	ParentID  string
 	RootID    string
-	Status    []string
-	HasParent bool
+	// StableNodeID selects the object whose node this is (node certs).
+	StableNodeID string
+	Status       []string
+	HasParent    bool
 }
 
 // AuditFilter selects audit records; empty fields match everything.

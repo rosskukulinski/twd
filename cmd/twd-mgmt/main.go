@@ -42,6 +42,8 @@ func run() error {
 	var (
 		stateDir     = flag.String("state-dir", filepath.Join(home, ".twd", "mgmt"), "state directory (0700): db, custody, issuer key")
 		socket       = flag.String("socket", filepath.Join(home, ".twd", "run", "mgmt.sock"), "unix socket for the v0 API (\"\" to disable)")
+		tokenFile    = flag.String("host-token-file", filepath.Join(home, ".twd", "hostd", "mgmt.token"), "per-host bearer token for the unix socket (0600; minted here, read by twd-hostd and the twd CLI; sent as Twd-Host-Token)")
+		rotateToken  = flag.Bool("rotate-host-token", false, "mint a fresh host token at start (twd up does this)")
 		dbDSN        = flag.String("db", "", "store: SQLite path (default <state-dir>/mgmt.db) or postgres://… DSN")
 		dbDSNFile    = flag.String("db-file", "", "read the store DSN from this file (keeps a Postgres password off argv)")
 		tsapiURL     = flag.String("tsapi-url", tsapi.DefaultBaseURL, "Tailscale API base URL")
@@ -171,12 +173,20 @@ func run() error {
 	}
 	var servers []*http.Server
 	if *socket != "" {
+		// RT-03: same-uid peercred is not authorization. Every request on
+		// the socket must carry the per-host token (minted here into a 0600
+		// file under hostd's state dir; hostd and the CLI read it).
+		token, err := mgmt.LoadOrCreateHostToken(*tokenFile, *rotateToken)
+		if err != nil {
+			return fmt.Errorf("host token: %w", err)
+		}
 		ln, err := mgmt.ListenUnix(*socket)
 		if err != nil {
 			return err
 		}
 		defer os.Remove(*socket)
-		servers = append(servers, serve("unix", ln, mgmt.LocalHandler(api.Handler())))
+		log.Info("host token", "file", *tokenFile, "rotated", *rotateToken)
+		servers = append(servers, serve("unix", ln, mgmt.LocalHandler(api.Handler(), token)))
 	}
 	if ts != nil {
 		lc, err := ts.LocalClient()

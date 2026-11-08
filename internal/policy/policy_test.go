@@ -20,7 +20,7 @@ const base = `// my tailnet
 
 func snip() Snippet {
 	return Snippet{
-		TagOwners: map[string][]string{"tag:ttest": {"x"}, "tag:twd-agent": {"autogroup:admin", "tag:twd"}},
+		TagOwners: map[string][]string{"tag:ttest": {"tag:twd-marker"}, "tag:twd-agent": {"autogroup:admin", "tag:twd"}},
 		Grants: []map[string]any{
 			{"src": []string{"tag:ttest"}, "dst": []string{"tag:ttest"}, "ip": []string{"*"}}, // already there
 			{"src": []string{"tag:ttest"}, "dst": []string{"tag:twd-agent"}, "ip": []string{"tcp:80"},
@@ -29,8 +29,10 @@ func snip() Snippet {
 	}
 }
 
+var testOpts = Options{AllowTags: []string{"tag:ttest"}}
+
 func TestMergeKeepsExisting(t *testing.T) {
-	out, err := Merge([]byte(base), snip())
+	out, err := MergeWith([]byte(base), snip(), testOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,13 +51,13 @@ func TestMergeKeepsExisting(t *testing.T) {
 		t.Fatalf("second merge still missing %+v (%v)", miss, err)
 	}
 	// Existing owners untouched.
-	if strings.Contains(s, `"x"`) {
+	if strings.Contains(s, `"tag:twd-marker"`) {
 		t.Fatalf("existing tagOwners entry overwritten:\n%s", s)
 	}
 }
 
 func TestMergeEmptyPolicy(t *testing.T) {
-	out, err := Merge([]byte(`{}`), snip())
+	out, err := MergeWith([]byte(`{}`), snip(), testOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,17 +87,17 @@ func (f *fakeAPI) SetPolicy(_ context.Context, b []byte, m string) (string, erro
 
 func TestApply(t *testing.T) {
 	f := &fakeAPI{body: []byte(base), etag: `"e1"`}
-	r, err := Apply(context.Background(), f, snip())
+	r, err := ApplyWith(context.Background(), f, snip(), testOpts)
 	if err != nil || !r.Changed || f.sets != 1 || f.gotMatch != `"e1"` {
 		t.Fatalf("apply: %+v err=%v sets=%d match=%s", r, err, f.sets, f.gotMatch)
 	}
-	r, err = Apply(context.Background(), f, snip())
+	r, err = ApplyWith(context.Background(), f, snip(), testOpts)
 	if err != nil || r.Changed || f.sets != 1 {
 		t.Fatalf("second apply should be a no-op: %+v %v", r, err)
 	}
 	// Validation failure: nothing written.
 	f2 := &fakeAPI{body: []byte(base), etag: `"e1"`, validErr: errors.New("bad")}
-	if _, err := Apply(context.Background(), f2, snip()); err == nil || f2.sets != 0 {
+	if _, err := ApplyWith(context.Background(), f2, snip(), testOpts); err == nil || f2.sets != 0 {
 		t.Fatalf("invalid policy applied: err=%v sets=%d", err, f2.sets)
 	}
 }

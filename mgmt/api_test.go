@@ -146,9 +146,10 @@ const testTwdJSONC = `// twd.jsonc
 
 // apiClient talks to mgmt over its unix socket.
 type apiClient struct {
-	t    *testing.T
-	hc   *http.Client
-	host string // Twd-Host-ID
+	t     *testing.T
+	hc    *http.Client
+	host  string // Twd-Host-ID
+	token string // Twd-Host-Token ("" = send none)
 }
 
 func (c *apiClient) do(method, path string, body any, out any) (int, map[string]any) {
@@ -161,6 +162,9 @@ func (c *apiClient) do(method, path string, body any, out any) (int, map[string]
 	req, _ := http.NewRequest(method, "http://twd-mgmt"+path, rd)
 	if c.host != "" {
 		req.Header.Set("Twd-Host-ID", c.host)
+	}
+	if c.token != "" {
+		req.Header.Set(HostTokenHeader, c.token)
 	}
 	res, err := c.hc.Do(req)
 	if err != nil {
@@ -207,6 +211,8 @@ type testEnv struct {
 	keyFile string
 	logs    *bytes.Buffer
 	store   *SQLStore
+	token   string
+	sock    string
 }
 
 func newTestEnv(t *testing.T, issuer *Issuer) *testEnv {
@@ -252,7 +258,8 @@ func newTestEnv(t *testing.T, issuer *Issuer) *testEnv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: LocalHandler((&Server{M: m}).Handler())}
+	hostToken := NewHostToken()
+	srv := &http.Server{Handler: LocalHandler((&Server{M: m}).Handler(), hostToken)}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
 	if fi, _ := os.Stat(sock); fi.Mode().Perm() != 0o600 {
@@ -261,7 +268,7 @@ func newTestEnv(t *testing.T, issuer *Issuer) *testEnv {
 	hc := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	}}}
-	return &testEnv{m: m, ts: ts, c: &apiClient{t: t, hc: hc}, keyFile: keyFile, logs: logs, store: st}
+	return &testEnv{m: m, ts: ts, c: &apiClient{t: t, hc: hc, token: hostToken}, keyFile: keyFile, logs: logs, store: st, token: hostToken, sock: sock}
 }
 
 type lockedWriter struct {
@@ -364,6 +371,7 @@ func TestAPIEndToEnd(t *testing.T) {
 		t.Fatalf("assignments %+v", as)
 	}
 	req, _ := http.NewRequest("GET", "http://twd-mgmt"+as[0].BundleURL, nil)
+	req.Header.Set(HostTokenHeader, c.token)
 	if res, err := c.hc.Do(req); err != nil || res.StatusCode != 200 {
 		t.Fatal("bundle fetch", err)
 	} else if b, _ := io.ReadAll(res.Body); !bytes.Equal(b, bundle) {

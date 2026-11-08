@@ -8,12 +8,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +28,47 @@ type Client struct {
 	// HostID, if set, is sent as the Twd-Host-ID header (homelab/test
 	// transports; production mgmt authenticates hosts by WhoIs instead).
 	HostID string
+	// TokenFile, if set, is the per-host token file mgmt minted (RT-03); its
+	// content is sent as Twd-Host-Token on every request. It is re-read when
+	// it changes on disk, so a rotation needs no restart.
+	TokenFile string
+	// Token, if set, is sent as Twd-Host-Token (tests; TokenFile wins).
+	Token string
+
+	tokMu   sync.Mutex
+	tokVal  string
+	tokMod  time.Time
+	tokRead time.Time
+}
+
+// HostTokenHeader is mgmt's per-host bearer token header (mgmt.HostTokenHeader).
+const HostTokenHeader = "Twd-Host-Token"
+
+// hostToken returns the current token ("" if none is configured).
+func (c *Client) hostToken() string {
+	if c.TokenFile == "" {
+		return c.Token
+	}
+	c.tokMu.Lock()
+	defer c.tokMu.Unlock()
+	now := time.Now()
+	if now.Sub(c.tokRead) < time.Second && c.tokVal != "" {
+		return c.tokVal
+	}
+	c.tokRead = now
+	st, err := os.Stat(c.TokenFile)
+	if err != nil {
+		return c.tokVal // keep the last one we saw (the file may be mid-rotation)
+	}
+	if st.ModTime().Equal(c.tokMod) && c.tokVal != "" {
+		return c.tokVal
+	}
+	if b, err := os.ReadFile(c.TokenFile); err == nil {
+		if v := strings.TrimSpace(string(b)); v != "" {
+			c.tokVal, c.tokMod = v, st.ModTime()
+		}
+	}
+	return c.tokVal
 }
 
 // NewClient returns a Client for addr: "unix:///abs/path.sock", a bare
@@ -71,6 +115,9 @@ func (c *Client) DoHeaders(ctx context.Context, method, path string, in, out any
 	}
 	if c.HostID != "" {
 		req.Header.Set("Twd-Host-ID", c.HostID)
+	}
+	if tok := c.hostToken(); tok != "" {
+		req.Header.Set(HostTokenHeader, tok)
 	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)
@@ -189,6 +236,25 @@ func (c *Client) Kill(ctx context.Context, id string, r KillRequest) (*KillRespo
 func (c *Client) Audit(ctx context.Context, recs []AuditRecord) error {
 	return c.Do(ctx, "POST", "/v0/audit", AuditBatch{Records: recs}, nil)
 }
+
+// NodeCert fetches the certificate of the tenant's object whose node is
+// stableNodeID (RT-01). A 404 means the node is not a twd object of that
+// tenant (ErrNoCert).
+func (c *Client) NodeCert(ctx context.Context, tenantID, stableNodeID string) (*NodeCert, error) {
+	var out NodeCert
+	err := c.Do(ctx, "GET", "/v0/certs/"+url.PathEscape(stableNodeID)+"?tenant="+url.QueryEscape(tenantID), nil, &out)
+	if e, ok := AsError(err); ok && (e.Status == 404 || e.Code == CodeNotFound) {
+		return nil, ErrNoCert
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ErrNoCert: the node is not a (live) twd object of the tenant, so no
+// certificate exists and no lim applies.
+var ErrNoCert = errors.New("mgmtapi: no node certificate for that node")
 
 // ChainHash is the audit hash of rec chained to prev (contract v0
 // clarifications): body = the record JSON without "hash" and "hostSig"
