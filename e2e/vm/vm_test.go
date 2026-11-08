@@ -220,6 +220,21 @@ func TestE2EVM(t *testing.T) {
 		res.set("egress_attributed_per_object", fmt.Sprintf("%d/%d", attributed, len(objs)))
 	})
 
+	t.Run("RSSPerVM" /* before the memory dump, which faults in all guest RAM */, func(t *testing.T) {
+		m := map[string]any{}
+		for _, w := range []string{"hello", "probe"} {
+			v := e.Host.Sandbox(e.TenantID, w)
+			r, err := v.Op(ctx, proto.Msg{Op: "stats"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			m[w] = map[string]any{"firecracker_rss_mb": v.RSSKB() / 1024, "guest_mem_total_mb": r.Stats.MemTotalKB / 1024,
+				"guest_mem_used_mb": (r.Stats.MemTotalKB - r.Stats.MemAvailableKB) / 1024, "guest_workerd_rss_mb": r.Stats.WorkerdRSSKB / 1024}
+		}
+		res.set("rss", m)
+		t.Logf("RSS: %v", m)
+	})
+
 	vmProbe := e.Host.Sandbox(e.TenantID, "probe")
 	if vmProbe == nil {
 		t.Fatal("no sandbox for probe")
@@ -355,21 +370,6 @@ func TestE2EVM(t *testing.T) {
 		}
 		res.set("latency_ms", lat)
 		t.Logf("latency: %v", lat)
-	})
-
-	t.Run("RSSPerVM", func(t *testing.T) {
-		m := map[string]any{}
-		for _, w := range []string{"hello", "probe"} {
-			v := e.Host.Sandbox(e.TenantID, w)
-			r, err := v.Op(ctx, proto.Msg{Op: "stats"})
-			if err != nil {
-				t.Fatal(err)
-			}
-			m[w] = map[string]any{"firecracker_rss_mb": v.RSSKB() / 1024, "guest_mem_total_mb": r.Stats.MemTotalKB / 1024,
-				"guest_mem_used_mb": (r.Stats.MemTotalKB - r.Stats.MemAvailableKB) / 1024, "guest_workerd_rss_mb": r.Stats.WorkerdRSSKB / 1024}
-		}
-		res.set("rss", m)
-		t.Logf("RSS: %v", m)
 	})
 
 	t.Run("KillObjectFailsFast", func(t *testing.T) {
