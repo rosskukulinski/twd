@@ -297,6 +297,20 @@ func TestDoctor(t *testing.T) {
 	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb == hostd.SandboxSeatbelt {
 		want["sandbox"] = "ok" // the Seatbelt probe ran and enforced a deny
 	}
+	if runtime.GOOS == "linux" {
+		// Linux host checks: present, never failing on a supported host
+		// (kvm/firecracker/microvm_tier may skip, systemd/landlock may warn).
+		for _, n := range []string{"glibc", "kernel", "landlock", "user_namespaces", "kvm", "firecracker", "cgroups_v2", "systemd", "microvm_tier"} {
+			st, ok := got[n]
+			if !ok || st == "fail" {
+				t.Fatalf("doctor on linux: %s = %q: %v", n, st, r.Checks)
+			}
+			delete(got, n)
+		}
+		if st := r.Checks[1]; st.Name != "glibc" || st.Status != "ok" {
+			t.Fatalf("doctor on linux: glibc must run before workerd and be ok: %+v", st)
+		}
+	}
 	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)
 	}

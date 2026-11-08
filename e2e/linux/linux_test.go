@@ -416,12 +416,17 @@ func TestE2ELinux(t *testing.T) {
 	// supervisor's.
 	unit := vhome + "/.config/systemd/user/twd.service"
 	svcState := func() (active, pid string) {
-		so, _, _ := v.run(`systemctl --user show -p ActiveState -p MainPID --value twd.service`, nil)
-		f := strings.Fields(so)
-		if len(f) == 2 {
-			return f[1], f[0]
+		// key=value: the order of --value output differs across systemd versions.
+		so, _, _ := v.run(`systemctl --user show -p ActiveState -p MainPID twd.service`, nil)
+		for _, l := range strings.Split(so, "\n") {
+			if x, ok := strings.CutPrefix(l, "ActiveState="); ok {
+				active = strings.TrimSpace(x)
+			}
+			if x, ok := strings.CutPrefix(l, "MainPID="); ok {
+				pid = strings.TrimSpace(x)
+			}
 		}
-		return strings.TrimSpace(so), ""
+		return active, pid
 	}
 	sup := func() string {
 		return strings.TrimSpace(v.must(`cat ~/.twd-e2e/state/supervisor.pid 2>/dev/null; true`))
