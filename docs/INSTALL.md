@@ -238,9 +238,20 @@ sudo for you, so to keep it running after logout and start it at boot, run:
 sudo loginctl enable-linger "$USER"
 ```
 
-Use twd's default persistent nodes with a service (don't pass `--ephemeral`).
-An ephemeral node that goes offline during a restart can be removed by
-the control plane, and then it can't rejoin.
+Across a restart or a reboot, **persistent** nodes (the default) rejoin from
+their saved state with the same node IDs and IPs. **Ephemeral** nodes
+(`twd up --ephemeral`) are logged out when twd stops, and control rejects
+their saved state when they come back; twd notices (the backend sits in
+`NeedsLogin`), deletes the dead device, mints a fresh key and rejoins
+**under the same hostname**, so the MagicDNS name is stable but the node ID
+and IP change. Measured on Ubuntu 24.04 arm64: a spawned sub-agent was
+ready again 4.1 s after `systemctl --user restart twd` and answering a
+client on another machine after 9.5 s.
+
+**Reboot** (measured, Ubuntu 24.04 arm64, lingering on): from the start of
+boot, ssh up at 6.6 s, `twd.service` active and twd healthy at 6.6 s, every
+object rejoined from saved state (same node IDs, nothing re-minted), and
+the workload answered a client on another machine at 8.6–17.1 s (two runs).
 
 ### Per-distro notes
 
@@ -294,6 +305,8 @@ firecracker, not root). Raw results: `e2e/real/results/l1-linux/`.
 | disco ping direct · DERP (median) | 0.41 · 7.8 ms | 0.57 · 9.2 ms | 0.67 · 8.5 ms | 0.42 · 14.1 ms | 1.47 · 13.4 ms |
 | `systemctl --user restart twd` → healthy / workload answers the Mac | 3.6 / 6.6 s | 3.6 / 6.7 s | 3.6 / 6.7 s | 0.7 / 3.8 s | 5.6 / 13.1 s |
 | `twd down --purge --service` | 0.62 s | 0.56 s | 0.60 s | 0.63 s | 4.0 s |
+| reboot (enable-linger, `limactl stop`/`start`) → service active / healthy / workload answers | 6.6 / 6.6 / 8.6–17.1 s | — | — | — | — |
+| `--ephemeral` sub-agent across `systemctl --user restart` → re-minted, ready / answers | 4.1 / 9.5 s | — | — | — | — |
 
 The direct path is the Mac ↔ Lima VM NAT (a private address); DERP-only
 numbers come from a second client with `TS_DEBUG_ALWAYS_USE_DERP=1`

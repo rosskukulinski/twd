@@ -1192,8 +1192,22 @@ func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (
 	if old.Status == StatusMinted {
 		m.revokeKey(ctx, old) // an unused key for a node that no longer exists
 	}
+	// The previous device is dead (control rejected its key) but may still
+	// be listed: an ephemeral device that logged out is removed by control
+	// only after a while, an admin-removed one is already gone (404).
+	prevDeleted := false
+	if old.StableNodeID != "" || old.NodeID != "" {
+		if err := m.deleteDevice(ctx, old); err != nil {
+			if !tsapi.IsNotFound(err) {
+				m.log.Warn("remint: deleting the previous device failed", "object", id, "device", old.StableNodeID, "err", err)
+			}
+		} else {
+			prevDeleted = true
+		}
+	}
 	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "remint"},
-		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID, "hostname": o.Hostname})
+		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID,
+			"previousDeviceDeleted": prevDeleted, "hostname": o.Hostname})
 	if old.Status != StatusPending {
 		m.enqueue(o.TenantID, id)
 	}

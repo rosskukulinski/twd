@@ -45,9 +45,11 @@ cleanup() {
 		vssh '
 			[ -d ~/.twd-e2e ] || [ -e ~/.config/systemd/user/twd.service ] || exit 0
 			echo "trap: cleaning ~/.twd-e2e"
-			if [ -x ~/.twd/bin/twd ] && [ -d ~/.twd-e2e/state ]; then
-				~/.twd/bin/twd --state-dir ~/.twd-e2e/state down --purge --service >/dev/null 2>&1 || true
-			fi
+			for st in ~/.twd-e2e/state ~/.twd-e2e/state-eph; do
+				if [ -x ~/.twd/bin/twd ] && [ -d "$st" ]; then
+					~/.twd/bin/twd --state-dir "$st" down --purge --service >/dev/null 2>&1 || true
+				fi
+			done
 			systemctl --user disable --now twd.service >/dev/null 2>&1; rm -f ~/.config/systemd/user/twd.service; systemctl --user daemon-reload 2>/dev/null
 			pkill -TERM -f "$HOME/.twd/bin/" 2>/dev/null; sleep 0.5; pkill -KILL -f "$HOME/.twd/bin/" 2>/dev/null
 			u=$(ls -d ~/.twd-e2e/twd-*/install.sh 2>/dev/null | head -1)

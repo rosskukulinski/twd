@@ -502,16 +502,26 @@ func TestE2ELinux(t *testing.T) {
 		if l := strings.TrimSpace(v.must(`loginctl show-user "$(id -un)" -p Linger --value`)); l != "yes" {
 			t.Fatalf("linger after enable-linger: %q", l)
 		}
-		hostdLines := strings.TrimSpace(v.must(`wc -l < ~/.twd-e2e/state/logs/hostd.log`))
-		var objs []struct {
-			ID, NodeID, MagicDNS, Status string
+		// Lines written from here on: tail -n +K is inclusive, so K = lines+1.
+		hostdLines := strconv.Itoa(atoi(strings.TrimSpace(v.must(`wc -l < ~/.twd-e2e/state/logs/hostd.log`))) + 1)
+		var ls struct {
+			Objects []cliflow.Object `json:"objects"`
 		}
-		e.MustJSON(&objs, "ls")
-		beforeNodes := map[string]string{}
-		for _, o := range objs {
-			if o.Status == "ready" {
-				beforeNodes[o.ID] = o.NodeID
+		nodeOf := func(o cliflow.Object) string {
+			if o.StableNodeID != "" {
+				return o.StableNodeID
 			}
+			return o.NodeID
+		}
+		e.MustJSON(&ls, "ls")
+		beforeNodes := map[string]string{}
+		for _, o := range ls.Objects {
+			if o.Status == "ready" {
+				beforeNodes[o.ID] = nodeOf(o)
+			}
+		}
+		if len(beforeNodes) == 0 {
+			t.Fatalf("no ready objects before the reboot: %+v", ls.Objects)
 		}
 		_, pidBefore := svcState()
 		ts := time.Now()
@@ -564,16 +574,16 @@ func TestE2ELinux(t *testing.T) {
 		// Every object rejoined from saved state: same node IDs, none re-minted.
 		deadline := time.Now().Add(scale(3 * time.Minute))
 		for {
-			e.MustJSON(&objs, "ls")
+			e.MustJSON(&ls, "ls")
 			ready := 0
-			for _, o := range objs {
-				if want, ok := beforeNodes[o.ID]; ok && o.Status == "ready" && o.NodeID == want {
+			for _, o := range ls.Objects {
+				if want, ok := beforeNodes[o.ID]; ok && o.Status == "ready" && nodeOf(o) == want {
 					ready++
 				}
 			}
 			if ready == len(beforeNodes) || time.Now().After(deadline) {
 				if ready != len(beforeNodes) {
-					t.Fatalf("after reboot only %d/%d objects are ready with their old node IDs: %+v", ready, len(beforeNodes), objs)
+					t.Fatalf("after reboot only %d/%d objects are ready with their old node IDs: %+v", ready, len(beforeNodes), ls.Objects)
 				}
 				break
 			}
@@ -647,6 +657,12 @@ func TestE2ELinux(t *testing.T) {
 	// with new node IDs. (Before this fix, they hung in tsnet.Up and failed.)
 	if doEphemeral {
 		downDone = false
+		// A fresh state dir: after `twd down --purge`, mgmt keeps the killed
+		// workload-node objects and refuses to redeploy the same workload on
+		// that state (bootstrap_failed "the workload node for agent is
+		// killed"; recorded in STATUS as a gap). The app dir is reused.
+		e.StateDir = rState + "-eph"
+		ephLog := "~/.twd-e2e/state-eph/logs/hostd.log"
 		e.MustJSON(nil, "up", "--tailnet", tailnet, "--api-key-file", rKey, "--yes", "--ephemeral",
 			"--hostname-prefix", twdPrefix, "--control-url", prodControl, "--service")
 		var dep struct {
@@ -679,7 +695,8 @@ func TestE2ELinux(t *testing.T) {
 			t.Fatalf("ephemeral: child via its own node: %d %v", c, b)
 		}
 		e.TrackObjectNodes()
-		hostdLines := strings.TrimSpace(v.must(`wc -l < ~/.twd-e2e/state/logs/hostd.log`))
+		// Lines written from here on: tail -n +K is inclusive, so K = lines+1.
+		hostdLines := strconv.Itoa(atoi(strings.TrimSpace(v.must(`wc -l < `+ephLog+``))) + 1)
 		if _, se, _, err := v.timed(R, "systemctl", "--user", "restart", "twd.service"); err != nil {
 			t.Fatalf("ephemeral: systemctl --user restart twd: %v %s", err, se)
 		}
@@ -716,9 +733,9 @@ func TestE2ELinux(t *testing.T) {
 		if answerAt == 0 {
 			t.Fatalf("ephemeral: sub-agent %s not answering this Mac within 5 min of the restart", child.MagicDNS)
 		}
-		reminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'object node ready.*reminted=true' || true`))
-		childReminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'object node ready.*object=` + child.ID + ` .*reminted=true' || true`))
-		rejected := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'saved node state rejected by control' || true`))
+		reminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` `+ephLog+` | grep -c 'object node ready.*reminted=true' || true`))
+		childReminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` `+ephLog+` | grep -c 'object node ready.*object=` + child.ID + ` .*reminted=true' || true`))
+		rejected := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` `+ephLog+` | grep -c 'saved node state rejected by control' || true`))
 		if childReminted != "1" {
 			t.Fatalf("ephemeral: hostd log has %s 'reminted=true' lines for the sub-agent %s (total reminted %s, rejected %s)", childReminted, child.ID, reminted, rejected)
 		}
@@ -741,6 +758,8 @@ func TestE2ELinux(t *testing.T) {
 	}
 	time.Sleep(2 * time.Second)
 }
+
+func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
 
 func orNone(s string) string {
 	if s == "" {
