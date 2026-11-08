@@ -90,7 +90,44 @@ func (l *Link) dial(ctx context.Context, network, addr string) (net.Conn, error)
 	if err != nil {
 		return nil, err
 	}
+	// A MagicDNS name resolves only once the peer is in this node's
+	// netmap, which can lag the first seconds after a fresh start: wait
+	// for it instead of falling back to the system resolver.
+	if host, port, err := net.SplitHostPort(addr); err == nil && net.ParseIP(host) == nil {
+		ip, err := l.peerIP(ctx, ts, host)
+		if err != nil {
+			return nil, err
+		}
+		addr = net.JoinHostPort(ip, port)
+	}
 	return ts.Dial(ctx, network, addr)
+}
+
+// peerIP finds host (a MagicDNS name) among the CLI node's peers.
+func (l *Link) peerIP(ctx context.Context, ts *tsnet.Server, host string) (string, error) {
+	lc, err := ts.LocalClient()
+	if err != nil {
+		return "", err
+	}
+	want := strings.TrimSuffix(strings.ToLower(host), ".") + "."
+	deadline := time.Now().Add(45 * time.Second)
+	for {
+		if st, err := lc.Status(ctx); err == nil {
+			for _, p := range st.Peer {
+				if strings.ToLower(p.DNSName) == want && len(p.TailscaleIPs) > 0 {
+					return p.TailscaleIPs[0].String(), nil
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("%s is not a peer of the CLI's tsnet node (no grant to it, or not in the tailnet)", host)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
 }
 
 var linkTsnetNode *tsnet.Server

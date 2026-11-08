@@ -128,3 +128,20 @@ On macOS, each process-tier workerd runs under Seatbelt (`twd-hostd -sandbox aut
 **Egress MACs (RT-04/05).** The platform signs a facet's egress with a per-object key derived from the instance root (`hex(HMAC(root, "twd-egress-object-key-v1\n" + class + "\n" + name))`); hostd verifies under that key and refuses a replayed `(class, name, nonce)` within the 2-minute skew window. The Node tier's `x-twd-caller` claims add `nonce` (refused on replay by `@twd/node`), `callerObjectId` and `lim`.
 
 **Node tier egress (RT-08).** hostd's `GET /v0/status` adds per-workload `Egress: "enforced" | "unenforced"` for `runtime: node` (enforced only under a sandbox that confines the process's TCP to the egress proxy, i.e. Linux Landlock ABI ≥ 4, or a microVM) and a top-level `InsecureSharedHost`. A Node-tier deployment on a host that serves other tenants fails with `egress_unenforced` unless `twd-hostd -insecure-shared-host` (`twd up --insecure-shared-host`). `twd-hostd -allow-sibling-egress` (`twd up --allow-sibling-egress`) lets objects reach other objects on the same host over the tailnet (hairpin; single-host tests and demos, used by `make e2e-mac`/`e2e-multi` check (d)).
+
+## M10 additions: keyless (ADR-026; backward compatible)
+
+**Tailnet listener auth (WhoIs).** mgmt's tsnet node (`twd-mgmt`, `tag:twd-mgmt`) serves the API on `:80` and, when the tailnet has HTTPS, on `:443` with the node's certificate (tailnet-only; `ListenTLS`). The Funnel listener (`:443`, Funnel-only) serves the OIDC issuer and nothing else. Every tailnet request is authenticated by WhoIs:
+- `tag:twd-host` nodes are **hosts**, bound to the hostID they registered with (unchanged);
+- a caller holding the app capability **`twd.dev/cap/admin`** toward mgmt (WhoIs `CapMap`; from any grant whose `dst` is `tag:twd-mgmt`: the base snippet grants it to `autogroup:admin`, a tenant may grant it to users, groups or tags such as a CI node) is an **admin**, whether a user or a tagged node; `-admins <logins>` is an override;
+- everyone else gets **403 `not_admin`** with `snippet` = the grant to add (`{"src": [<caller>], "dst": ["tag:twd-mgmt"], "ip": ["tcp:443","tcp:80"], "app": {"twd.dev/cap/admin": [{}]}}`) and `missing: {src, dst, cap}`.
+The unix socket keeps the per-host token (RT-03); the admin "principal" there is `local` with the `Twd-Actor` header.
+
+**Actors.** `deployedBy` on deployments (store column `deployed_by`, added in place) and `by` on kills are the principal's actor: the WhoIs login for users, `<tag> (<stableNodeID>)` for tagged admin nodes, `host:<id>` for hosts, `Twd-Actor` (or `local`) on the unix socket. The `deploy` audit record carries it as `actingFor` (so `GET /v0/audit?human=` finds deploys) and in `detail.by`. `GET /v0/deployments[/{id}]` adds `deployedBy`.
+
+- `GET /v0/whoami` (any authenticated principal, hosts included) → `{kind, login?, nodeID?, tags?, hostID?, admin, actor, mgmt: {dnsName, tailnet, https, issuer?}}`. `twd link` uses it to learn the endpoint and refuse non-admins early.
+- `PUT /v0/tenants/{id}/wif {wifClientID, wifLifecycleClientID?}` (admin) switches a tenant to (or re-keys) mint mode `wif`; cached tokens are dropped.
+- `POST /v0/tenants/{id}/wif-check` (admin) → `{mintMode, mint, mintError?, lifecycle: "ok"|"absent"|"error", lifecycleError?, policyRead, policyReadError?, issuer}`: a fresh token exchange per credential and a policy read with the lifecycle one (needs `policy_file:read`). 400 for non-wif tenants.
+- `POST /v0/tenants/{id}/preflight` answers 503 `policy_unavailable` when mgmt cannot read the policy (wif tenant without a lifecycle credential); `twd deploy` then prints `preflight skipped` and deploys (Tailscale still enforces tagOwners at mint).
+
+**twd-mgmt flags.** `-tsnet-tags` (default `tag:twd-mgmt`), `-tsnet-tls` (default on). Without `-tsnet-authkey-file`, a node state that needs an interactive login fails fast with the login URL in the error (`twd up` owns the interactive flow and hands the logged-in state dir `<state>/mgmt/tsnet` to mgmt).

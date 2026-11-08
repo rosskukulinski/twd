@@ -137,4 +137,4 @@ case ":$PATH:" in
 	;;
 esac
 say ""
-say "Next: twd doctor --tailnet <tailnet>.ts.net --api-key-file <file>   then   twd up …   (see INSTALL.md)"
+say "Next: twd doctor   then   twd up   (keyless: login URL + one trust credential; see INSTALL.md)"

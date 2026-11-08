@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -887,6 +888,8 @@ type tenantStatus struct {
 type statusResult struct {
 	StateDir   string                 `json:"stateDir"`
 	Tailnet    string                 `json:"tailnet"`
+	MintMode   string                 `json:"mintMode"`
+	MgmtNode   string                 `json:"mgmtNode,omitempty"`
 	TenantID   string                 `json:"tenantID"`
 	Tenants    []tenantStatus         `json:"tenants"`
 	MgmtSocket string                 `json:"mgmtSocket"`
@@ -911,12 +914,16 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+	if s.remote() {
+		return remoteStatus(f, s)
+	}
 	if !s.configured() {
-		return fail("not_up", "twd is not set up in "+s.Dir).withFix("twd up --tailnet <tailnet> --api-key-file <file>")
+		return fail("not_up", "twd is not set up in "+s.Dir).withFix("twd up   (on the host)", "twd link <twd-mgmt.<tailnet>.ts.net>   (on a developer machine)")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	r := statusResult{StateDir: s.Dir, Tailnet: s.Cfg.Tailnet, TenantID: s.Cfg.TenantID, Objects: map[string]int{}, MgmtSocket: s.mgmtSock()}
+	r := statusResult{StateDir: s.Dir, Tailnet: s.Cfg.Tailnet, TenantID: s.Cfg.TenantID, Objects: map[string]int{}, MgmtSocket: s.mgmtSock(),
+		MintMode: s.Cfg.mintMode(), MgmtNode: s.Cfg.MgmtDNSName}
 	r.Supervisor = s.supervisorAlive()
 	if r.Supervisor && s.mgmtHealthy(ctx) {
 		r.Mgmt = true
@@ -978,8 +985,11 @@ func cmdStatus(args []string) error {
 			}
 			return "✗"
 		}
-		fmt.Printf("twd status · %s · tailnet %s\n", s.Dir, s.Cfg.Tailnet)
+		fmt.Printf("twd status · %s · tailnet %s · mint mode %s\n", s.Dir, s.Cfg.Tailnet, r.MintMode)
 		fmt.Printf("%s supervisor  pid %d\n", mark(r.Supervisor), s.supervisorPID())
+		if r.MgmtNode != "" {
+			fmt.Printf("%s node        %s (%s; API over the tailnet, WhoIs auth)\n", mark(r.Mgmt), r.MgmtNode, mgmt.MgmtTag)
+		}
 		fmt.Printf("%s mgmt        tenant %s · mint queue %d · %.0f registrations/min · %d pending device deletes\n", mark(r.Mgmt), r.TenantID, r.MintQueue, r.Rate, r.Pending)
 		fmt.Printf("%s host        %s · heartbeat %.1fs ago · objects %v\n", mark(r.Host), s.Cfg.HostID, float64(r.HostAgeMS)/1000, r.Objects)
 		if len(r.Tenants) > 1 {
@@ -1007,6 +1017,60 @@ func cmdStatus(args []string) error {
 	})
 	if !r.Healthy {
 		return fail("unhealthy", "twd is not healthy in "+s.Dir).withFix("twd logs --component supervisor", "twd up")
+	}
+	return nil
+}
+
+// remoteStatus is `twd status` on a linked machine: who we are to mgmt,
+// its tenants and hosts, and the latest deployments.
+func remoteStatus(f *flags, s *state) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	w, err := s.whoami(ctx)
+	if err != nil {
+		return err
+	}
+	var hosts []mgmt.Host
+	s.mgmt().Do(ctx, "GET", "/v0/hosts", nil, &hosts)
+	type tenantView struct {
+		TenantRef
+		Deployments []mgmt.DeploymentView `json:"deployments"`
+	}
+	var tenants []tenantView
+	for _, t := range s.tenants() {
+		tv := tenantView{TenantRef: t}
+		s.mgmt().Do(ctx, "GET", "/v0/deployments?tenant="+url.QueryEscape(t.TenantID), nil, &tv.Deployments)
+		tenants = append(tenants, tv)
+	}
+	live := 0
+	for _, h := range hosts {
+		if h.Live(time.Now()) {
+			live++
+		}
+	}
+	res := map[string]any{"linked": s.Link, "whoami": w, "hosts": hosts, "tenants": tenants, "healthy": live > 0}
+	emit(f, res, func() {
+		fmt.Printf("twd status · linked to %s · tailnet %s · you are %s (admin by WhoIs)\n", s.Link.Endpoint, w.Mgmt.Tailnet, w.Actor)
+		for _, h := range hosts {
+			mark := "✗"
+			if h.Live(time.Now()) {
+				mark = "✓"
+			}
+			fmt.Printf("%s host        %s · heartbeat %.1fs ago · %d live nodes · tiers %s\n", mark, h.ID, time.Since(time.UnixMilli(h.LastSeen)).Seconds(), h.LiveNodes, strings.Join(h.Tiers, ","))
+		}
+		for _, t := range tenants {
+			fmt.Printf("✓ tenant      %s (%s, mint mode %s)\n", t.Tailnet, t.TenantID, mintModeName(t.MintMode))
+			for _, d := range t.Deployments {
+				by := ""
+				if d.DeployedBy != "" {
+					by = " · by " + d.DeployedBy
+				}
+				fmt.Printf("  workload    %s %s · http://%s/%s\n", d.Workload, d.Status, d.Endpoint.MagicDNS, by)
+			}
+		}
+	})
+	if live == 0 {
+		return fail("unhealthy", "no live host at "+s.Link.Endpoint).withFix("twd status on the host")
 	}
 	return nil
 }

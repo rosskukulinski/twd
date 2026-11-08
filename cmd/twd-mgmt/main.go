@@ -150,7 +150,11 @@ func run() error {
 				*issuerURL = "https://" + doms[0]
 			}
 		}
-		log.Info("tailnet node", "name", self.DNSName, "tailnet", self.Tailnet, "tags", st.Self.Tags, "https", self.HTTPS, "ips", st.TailscaleIPs)
+		tags := []string{}
+		if st.Self.Tags != nil {
+			tags = st.Self.Tags.AsSlice()
+		}
+		log.Info("tailnet node", "name", self.DNSName, "tailnet", self.Tailnet, "tags", tags, "https", self.HTTPS, "ips", st.TailscaleIPs)
 	}
 
 	var issuer *mgmt.Issuer
