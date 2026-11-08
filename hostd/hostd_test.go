@@ -512,3 +512,25 @@ func TestKillViaHeartbeat(t *testing.T) {
 	}
 	t.Logf("kill delivered via heartbeat in %v (heartbeat every 200ms)", time.Since(st))
 }
+
+// TestNodeRetriesAfterLeaseLost: a workload node whose mint is refused with
+// lease_lost (the host's lease epoch went stale while it was joining, e.g.
+// a `twd deploy` during the previous deployment's startup) is retried with
+// a refreshed epoch instead of leaving the workload active with a dead
+// entry node.
+func TestNodeRetriesAfterLeaseLost(t *testing.T) {
+	s := startSuite(t, fakemgmt.Config{NoPush: true})
+	e := s.e
+	e.FM.LeaseLostCredentials = 1
+	st := time.Now()
+	d := e.Deploy(hostdtest.Fixture("probe"), "probe", nil)
+	probe := e.WaitActive("probe", d, 60*time.Second)
+	if e.FM.CredentialCalls < 2 {
+		t.Fatalf("credential calls %d, want a retry after lease_lost", e.FM.CredentialCalls)
+	}
+	s.waitPeer(probe.IP)
+	if code, _ := s.getJSON("http://" + probe.IP + "/probe/k/"); code != 200 {
+		t.Fatalf("probe via retried node: %d", code)
+	}
+	t.Logf("node ready after a lease_lost retry in %v (%d credential calls)", time.Since(st), e.FM.CredentialCalls)
+}

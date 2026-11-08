@@ -191,7 +191,7 @@ func asAPIError(err error) *Error {
 	case errors.Is(err, ErrExists):
 		return errf(http.StatusConflict, "exists", "%v", err)
 	case errors.Is(err, ErrLeaseLost):
-		return errf(http.StatusConflict, "lease_lost", "the caller does not hold the namespace lease at this epoch")
+		return errf(http.StatusConflict, "lease_lost", "the caller does not hold the namespace lease at this epoch (%v)", err)
 	case errors.Is(err, ErrLeaseHeld):
 		return errf(http.StatusConflict, "lease_held", "%v", err)
 	}

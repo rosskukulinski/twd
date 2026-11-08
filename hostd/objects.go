@@ -46,8 +46,9 @@ type object struct {
 	Wakes     int       `json:"wakes"`
 	Created   time.Time `json:"created"`
 
-	live    bool          // node created in the netd registry (this process)
-	readyCh chan struct{} // closed on ready/failed/killed
+	live      bool          // node created in the netd registry (this process)
+	readyCh   chan struct{} // closed on ready/failed/killed
+	joinFails int           // consecutive bootstrap failures (retryNode)
 }
 
 func (o *object) namespace() string { return mgmtapi.Namespace(o.Workload, o.Class) }
@@ -301,11 +302,15 @@ func (h *Host) awaitNode(t *tenant, o *object, no *netd.Object) {
 		o.Status, o.Err, o.live = statusFailed, netd.Redact(err.Error()), false
 		ch := o.readyCh
 		o.readyCh = make(chan struct{}) // a later ensure may retry
+		o.joinFails++
+		fails := o.joinFails
 		h.mu.Unlock()
 		closeOnce(ch)
-		h.log.Warn("object node failed", "object", o.ID, "err", o.Err)
+		h.log.Warn("object node failed", "object", o.ID, "err", o.Err, "attempt", fails)
+		h.retryNode(o, fails)
 		return
 	}
+	o.joinFails = 0
 	info := no.Info()
 	o.NodeID, o.MagicDNS, o.Status, o.Err = info.NodeID, strings.TrimSuffix(info.DNSName, "."), statusReady, ""
 	if len(info.IPs) > 0 {
@@ -331,6 +336,45 @@ func (h *Host) awaitNode(t *tenant, o *object, no *netd.Object) {
 	closeOnce(ch)
 	h.saveObjects()
 	h.log.Info("object node ready", "object", o.ID, "hostname", o.Hostname, "ip", o.IP, "join_ms", info.JoinMS, "rejoined", info.Rejoined, "reminted", info.Reminted)
+}
+
+// retryNode re-joins a node whose bootstrap failed while its workload is
+// still deployed, after a backoff (1, 2, 4, 8, 16 s; 5 tries). The case
+// that needs it: a `twd deploy` while this host is still bringing up the
+// previous deployment's nodes bumps the lease epoch, so the mint in flight
+// is refused with lease_lost; nothing else would retry it and the workload
+// would stay "active" with a dead entry node ("node minted" forever). The
+// lease epoch is refreshed from mgmt's assignments before the retry.
+func (h *Host) retryNode(o *object, fails int) {
+	const maxTries = 5
+	if fails > maxTries {
+		return
+	}
+	w := h.workloadOf(o)
+	if w == nil || !w.isActive() {
+		return
+	}
+	backoff := time.Second << (fails - 1)
+	time.AfterFunc(backoff, func() {
+		if as, err := h.mgmt.Assignments(h.ctx, h.cfg.HostID); err == nil {
+			for _, a := range as {
+				if a.TenantID == w.tenantID && a.Workload == w.name {
+					w.mu.Lock()
+					if a.Epoch > w.epoch {
+						w.epoch = a.Epoch
+					}
+					w.mu.Unlock()
+				}
+			}
+		}
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if o.live || o.terminal() || o.Status == statusReady || !w.isActive() {
+			return
+		}
+		h.log.Info("object node retry", "object", o.ID, "attempt", fails+1, "epoch", w.epochNow())
+		h.startNodeLocked(o)
+	})
 }
 
 func closeOnce(ch chan struct{}) {

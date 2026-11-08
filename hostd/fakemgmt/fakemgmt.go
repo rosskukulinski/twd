@@ -76,6 +76,11 @@ type Server struct {
 	volKeys     map[string][]byte // tenant/workload -> DO volume data key
 	// VolumeKeyCalls counts GET /v0/volumes/key (tests).
 	VolumeKeyCalls int
+	// LeaseLostCredentials makes the next N credential calls fail with
+	// lease_lost (tests: a host whose lease epoch went stale mid-join).
+	LeaseLostCredentials int
+	// CredentialCalls counts GET /v0/objects/{id}/credential (tests).
+	CredentialCalls int
 }
 
 type tenant struct {
@@ -752,6 +757,13 @@ func (s *Server) credential(w http.ResponseWriter, r *http.Request) {
 	if o.Status == "killed" {
 		s.mu.Unlock()
 		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
+		return
+	}
+	s.CredentialCalls++
+	if s.LeaseLostCredentials > 0 {
+		s.LeaseLostCredentials--
+		s.mu.Unlock()
+		writeErr(w, 409, mgmtapi.CodeLeaseLost, "the caller does not hold the namespace lease at this epoch (test knob)")
 		return
 	}
 	l := s.leases[mgmtapi.LeaseName(o.TenantID, o.workload)]

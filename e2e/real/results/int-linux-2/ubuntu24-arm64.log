@@ -1,0 +1,262 @@
+09:34:37 e2e-linux[ubuntu24-arm64]: reusing twdl-ubuntu24-arm64 (TWD_E2E_REUSE_VM=1)
+time="2026-11-08T09:34:37-08:00" level=info msg="Using the existing instance `twdl-ubuntu24-arm64`"
+time="2026-11-08T09:34:37-08:00" level=info msg="Starting the instance `twdl-ubuntu24-arm64` with internal VM driver `vz`"
+time="2026-11-08T09:34:37-08:00" level=info msg="[hostagent] hostagent socket created at /Users/ross/.lima/twdl-ubuntu24-arm64/ha.sock"
+time="2026-11-08T09:34:37-08:00" level=info msg="[hostagent] Starting VZ (hint: to watch the boot progress, see `/Users/ross/.lima/twdl-ubuntu24-arm64/serial*.log`)"
+time="2026-11-08T09:34:37-08:00" level=info msg="[hostagent] [VZ] - vm state change: running"
+time="2026-11-08T09:34:38-08:00" level=info msg="[hostagent] gvproxy API request" component=services-api endpoint=/services/dhcp/leases method=GET outcome=success source=
+time="2026-11-08T09:34:43-08:00" level=info msg="[hostagent] SSH server does not seem to be running on vsock port, using usernet forwarder"
+time="2026-11-08T09:34:43-08:00" level=info msg="[hostagent] gvproxy API request" component=services-api endpoint=/services/dhcp/leases method=GET outcome=success source=
+time="2026-11-08T09:34:43-08:00" level=info msg="[hostagent] gvproxy API request" component=services-api endpoint=/services/forwarder/expose local="127.0.0.1:59136" method=POST outcome=success protocol=tcp remote="192.168.5.15:22" source=
+time="2026-11-08T09:34:43-08:00" level=info msg="[hostagent] gvproxy API request" component=services-api endpoint=/services/dns/add method=POST outcome=success source= zone=internal.
+time="2026-11-08T09:34:43-08:00" level=info msg="SSH Local Port: 59136"
+time="2026-11-08T09:34:43-08:00" level=info msg="[hostagent] Running in plain mode. Mounts, dynamic port forwarding, containerd, etc. will be ignored. Guest agent will not be running."
+time="2026-11-08T09:34:43-08:00" level=info msg="( 1/3) 🕐 SSH connection (essential)"
+time="2026-11-08T09:34:44-08:00" level=info msg="( 1/3) ✅ SSH connection"
+time="2026-11-08T09:34:44-08:00" level=info msg="( 2/3) 🕐 Persistent SSH ControlMaster (essential)"
+time="2026-11-08T09:34:44-08:00" level=info msg="( 2/3) ✅ Persistent SSH ControlMaster"
+time="2026-11-08T09:34:44-08:00" level=info msg="( 3/3) 🕐 Boot scripts to be finished"
+time="2026-11-08T09:34:44-08:00" level=info msg="( 3/3) ✅ Boot scripts to be finished"
+time="2026-11-08T09:34:44-08:00" level=info msg="READY. Run `ssh -F `/Users/ross/.lima/twdl-ubuntu24-arm64/ssh.config` lima-twdl-ubuntu24-arm64` to open the shell."
+09:34:44 e2e-linux[ubuntu24-arm64]: twdl-ubuntu24-arm64 ready in 7s
+=== RUN   TestE2ELinux
+    linux_test.go:371: install.sh:
+        ✓ installed twd 0.1.0-7e6c53aa into /home/ross.guest/.twd (1 s)
+          twd 0.1.0-7e6c53aa (linux/arm64, go1.27.3) · workerd 1.20261108.1 · esbuild 0.28.2 (built in)
+          workerd 2026-11-08 · process tier (see twd doctor for the sandbox and the microVM tier)
+        
+        Add twd to your PATH (this installer doesn't edit your shell profile):
+          echo 'export PATH="/home/ross.guest/.twd/bin:$PATH"' >> ~/.profile && export PATH="/home/ross.guest/.twd/bin:$PATH"
+        
+        Next: twd doctor --tailnet <tailnet>.ts.net --api-key-file <file>   then   twd up …   (see INSTALL.md)
+    cliflow.go:716: twd audit twd-l1-c9dae6-lookupagent-5zydbs6bdi.tail7906d5.ts.net:
+        chain: ttest-l1-c9dae6-client.tail7906d5.ts.net → twd-l1-c9dae6-supportagent-2lpcrcl4bn → twd-l1-c9dae6-lookupagent-5zydbs6bdi
+        2026-11-08T17:35:25.215Z  spawn         twd-l1-c9dae6-lookupagent-5zydbs6bdi by twd-l1-c9dae6-supportagent-2lpcrcl4bn for ttest-l1-c9dae6-client.tail7906d5.ts.net lim {"example.com/cap/mcp":{"tools":["lookup_order"]}} ttl 10m0s tags ["tag:twd-agent-support-sub"]
+        2026-11-08T17:35:25.216Z  spawn         twd-l1-c9dae6-lookupagent-5zydbs6bdi by supportagent-2lpcrcl4bn caps {"example.com/cap/mcp":{"tools":["lookup_order"]}} [h-lima-twdl-ubuntu24-arm64]
+        2026-11-08T17:35:25.359Z  mint          twd-l1-c9dae6-lookupagent-5zydbs6bdi key kZvnpauazC21CNTRL tags ["tag:twd-agent-support-sub"] (apikey)
+        2026-11-08T17:35:25.360Z  credential    twd-l1-c9dae6-lookupagent-5zydbs6bdi {"epoch":1,"host":"h-lima-twdl-ubuntu24-arm64","keyID":"kZvnpauazC21CNTRL"}
+        2026-11-08T17:35:26.632Z  ready         twd-l1-c9dae6-lookupagent-5zydbs6bdi node twd-l1-c9dae6-lookupagent-5zydbs6bdi.tail7906d5.ts.net on h-lima-twdl-ubuntu24-arm64
+        2026-11-08T17:35:32.127Z  kill          twd-l1-c9dae6-lookupagent-5zydbs6bdi by ross@lima-twdl-ubuntu24-arm64 (twd cli) "e2e: prompt injection" (cascade from twd-l1-c9dae6-supportagent-2lpcrcl4bn) · pushed
+        chain verified: 6 records · host:h-lima-twdl-ubuntu24-arm64 signature ok · mgmt ok
+    linux_test.go:685: twd deploy /home/ross.guest/.twd-e2e/work/agent: exit status 1
+        stdout: 
+        stderr: {"error":{"code":"identity_pending","message":"agent not ready after 3m0s (status active, node minted)","fix":["twd status","twd logs agent"]}}
+    linux_test.go:280: VM logs (tail):
+        == supervisor
+        2026-11-08T17:34:59Z supervisor: supervising in /home/ross.guest/.twd-e2e/state (tailnet tail7906d5.ts.net)
+        2026-11-08T17:34:59Z supervisor: started twd-mgmt pid 1320
+        2026-11-08T17:34:59Z supervisor: started twd-hostd pid 1329
+        2026-11-08T17:35:32Z supervisor: stopping: hostd first (nodes close in parallel), then mgmt (flushes pending device deletes)
+        2026-11-08T17:35:32Z supervisor: twd-hostd exited: <nil>
+        2026-11-08T17:35:32Z supervisor: twd-mgmt exited: <nil>
+        2026-11-08T17:35:32Z supervisor: stopped
+        2026-11-08T17:35:32Z supervisor: supervising in /home/ross.guest/.twd-e2e/state (tailnet tail7906d5.ts.net)
+        2026-11-08T17:35:32Z supervisor: started twd-mgmt pid 1684
+        2026-11-08T17:35:32Z supervisor: started twd-hostd pid 1701
+        2026-11-08T17:35:36Z supervisor: stopping: hostd first (nodes close in parallel), then mgmt (flushes pending device deletes)
+        2026-11-08T17:35:36Z supervisor: twd-hostd exited: <nil>
+        2026-11-08T17:35:36Z supervisor: twd-mgmt exited: <nil>
+        2026-11-08T17:35:36Z supervisor: stopped
+        2026-11-08T17:35:42Z supervisor: supervising in /home/ross.guest/.twd-e2e/state (tailnet tail7906d5.ts.net)
+        2026-11-08T17:35:42Z supervisor: started twd-mgmt pid 865
+        2026-11-08T17:35:42Z supervisor: started twd-hostd pid 891
+        2026-11-08T17:35:55Z supervisor: stopping: hostd first (nodes close in parallel), then mgmt (flushes pending device deletes)
+        2026-11-08T17:35:55Z supervisor: twd-hostd exited: <nil>
+        2026-11-08T17:35:55Z supervisor: twd-mgmt exited: <nil>
+        2026-11-08T17:35:55Z supervisor: stopped
+        2026-11-08T17:35:56Z supervisor: supervising in /home/ross.guest/.twd-e2e/state (tailnet tail7906d5.ts.net)
+        2026-11-08T17:35:56Z supervisor: started twd-mgmt pid 1304
+        2026-11-08T17:35:56Z supervisor: started twd-hostd pid 1313
+        2026-11-08T17:38:57Z supervisor: stopping: hostd first (nodes close in parallel), then mgmt (flushes pending device deletes)
+        2026-11-08T17:38:57Z supervisor: twd-hostd exited: <nil>
+        2026-11-08T17:38:57Z supervisor: twd-mgmt exited: <nil>
+        2026-11-08T17:38:57Z supervisor: stopped
+        == mgmt
+        time=2026-11-08T17:34:59.986Z level=INFO msg=serving listener=unix addr=/home/ross.guest/.twd-e2e/state/run/mgmt.sock
+        time=2026-11-08T17:35:32.678Z level=INFO msg=serving listener=unix addr=/home/ross.guest/.twd-e2e/state/run/mgmt.sock
+        time=2026-11-08T17:35:42.914Z level=INFO msg=serving listener=unix addr=/home/ross.guest/.twd-e2e/state/run/mgmt.sock
+        time=2026-11-08T17:35:56.184Z level=INFO msg=serving listener=unix addr=/home/ross.guest/.twd-e2e/state/run/mgmt.sock
+        == hostd
+        =1314 rejoined=true reminted=false
+        time=2026-11-08T17:35:34.059Z level=INFO msg="object node ready" object=mcp-cwyplau224 hostname=twd-l1-c9dae6-mcp-cwyplau224 ip=100.104.194.113 join_ms=1314.422 rejoined=true reminted=false
+        time=2026-11-08T17:35:34.060Z level=INFO msg="object node ready" object=agent-2vbl2lt2dh hostname=twd-l1-c9dae6-agent-2vbl2lt2dh ip=100.68.88.40 join_ms=1314.37 rejoined=true reminted=false
+        time=2026-11-08T17:35:36.365Z level=INFO msg="shutting down (node state kept for rejoin)"
+        time=2026-11-08T17:35:42.963Z level=INFO msg="microVM tier unavailable; process tier only" reason="no /dev/kvm: stat /dev/kvm: no such file or directory"
+        time=2026-11-08T17:35:42.969Z level=INFO msg="twd-hostd running" host=h-lima-twdl-ubuntu24-arm64 mgmt=unix:///home/ross.guest/.twd-e2e/state/run/mgmt.sock push=/home/ross.guest/.twd-e2e/state/run/h/hostd.sock workerd=/home/ross.guest/.twd/bin/workerd sandbox="landlock (ABI 4)"
+        time=2026-11-08T17:35:42.973Z level=INFO msg="tenant registry ready" tenant=tn_tail7906d5 tailnet=tail7906d5.ts.net control=https://controlplane.tailscale.com
+        time=2026-11-08T17:35:42.997Z level=INFO msg="object ready" tenant=tn_tail7906d5 object=mcp-cwyplau224 hostname=twd-l1-c9dae6-mcp-cwyplau224 ip=100.104.194.113 node=ntqthLEbNS11CNTRL join_ms=17 rejoined=true reminted=false
+        time=2026-11-08T17:35:42.998Z level=INFO msg="object ready" tenant=tn_tail7906d5 object=agent-2vbl2lt2dh hostname=twd-l1-c9dae6-agent-2vbl2lt2dh ip=100.68.88.40 node=nmbiMH2TxV11CNTRL join_ms=12 rejoined=true reminted=false
+        time=2026-11-08T17:35:43.001Z level=INFO msg="object node ready" object=mcp-cwyplau224 hostname=twd-l1-c9dae6-mcp-cwyplau224 ip=100.104.194.113 join_ms=17.193 rejoined=true reminted=false
+        time=2026-11-08T17:35:43.001Z level=INFO msg="object node ready" object=agent-2vbl2lt2dh hostname=twd-l1-c9dae6-agent-2vbl2lt2dh ip=100.68.88.40 join_ms=12.504 rejoined=true reminted=false
+        time=2026-11-08T17:35:43.074Z level=INFO msg="deployment active" workload=mcp deployment=dp_f385fd310e3d7cad epoch=1 tier=process blue_green=false ms=101
+        time=2026-11-08T17:35:43.091Z level=INFO msg="deployment active" workload=agent deployment=dp_931df5e37a268834 epoch=1 tier=process blue_green=false ms=118
+        time=2026-11-08T17:35:54.983Z level=INFO msg="object killed" tenant=tn_tail7906d5 object=agent-2vbl2lt2dh reason="twd down --purge" flows_aborted=0 abort_ms=0.01 close_ms=0 delete_ms=0 delete_err=""
+        time=2026-11-08T17:35:54.983Z level=INFO msg="object killed (tier 1)" object=agent-2vbl2lt2dh flows=0 abort_ms=0.01
+        time=2026-11-08T17:35:54.983Z level=INFO msg="object killed" object=agent-2vbl2lt2dh reason="twd down --purge" ms=0
+        time=2026-11-08T17:35:55.044Z level=INFO msg="object killed" tenant=tn_tail7906d5 object=mcp-cwyplau224 reason="twd down --purge" flows_aborted=1 abort_ms=0.038 close_ms=0 delete_ms=0 delete_err=""
+        time=2026-11-08T17:35:55.044Z level=INFO msg="object killed (tier 1)" object=mcp-cwyplau224 flows=1 abort_ms=0.038
+        time=2026-11-08T17:35:55.044Z level=INFO msg="object killed" object=mcp-cwyplau224 reason="twd down --purge" ms=59
+        time=2026-11-08T17:35:55.541Z level=INFO msg="shutting down (node state kept for rejoin)"
+        time=2026-11-08T17:35:56.235Z level=INFO msg="microVM tier unavailable; process tier only" reason="no /dev/kvm: stat /dev/kvm: no such file or directory"
+        time=2026-11-08T17:35:56.237Z level=INFO msg="twd-hostd running" host=h-lima-twdl-ubuntu24-arm64 mgmt=unix:///home/ross.guest/.twd-e2e/state/run/mgmt.sock push=/home/ross.guest/.twd-e2e/state/run/h/hostd.sock workerd=/home/ross.guest/.twd/bin/workerd sandbox="landlock (ABI 4)"
+        time=2026-11-08T17:35:56.239Z level=INFO msg="tenant registry ready" tenant=tn_tail7906d5 tailnet=tail7906d5.ts.net control=https://controlplane.tailscale.com
+        time=2026-11-08T17:35:56.244Z level=INFO msg="object created" object=mcp-cwyplau224 class="" name=mcp hostname=twd-l1-c9dae6-mcp-cwyplau224 acting_for=""
+        time=2026-11-08T17:35:56.246Z level=INFO msg="object created" object=agent-2vbl2lt2dh class="" name=agent hostname=twd-l1-c9dae6-agent-2vbl2lt2dh acting_for=""
+        time=2026-11-08T17:35:56.288Z level=INFO msg="deployment active" workload=mcp deployment=dp_f385fd310e3d7cad epoch=1 tier=process blue_green=false ms=48
+        time=2026-11-08T17:35:56.305Z level=INFO msg="deployment active" workload=agent deployment=dp_931df5e37a268834 epoch=1 tier=process blue_green=false ms=66
+        time=2026-11-08T17:35:56.827Z level=INFO msg="deployment active" workload=agent deployment=dp_54365a2635f4a11e epoch=2 tier=process blue_green=true ms=70
+        time=2026-11-08T17:35:56.840Z level=WARN msg="object join failed" tenant=tn_tail7906d5 object=agent-2vbl2lt2dh err="auth key: mgmt: lease_lost: the caller does not hold the namespace lease at this epoch"
+        time=2026-11-08T17:35:56.841Z level=WARN msg="object node failed" object=agent-2vbl2lt2dh err="netd: bootstrap_failed: auth key: mgmt: lease_lost: the caller does not hold the namespace lease at this epoch"
+        time=2026-11-08T17:35:57.960Z level=INFO msg="object ready" tenant=tn_tail7906d5 object=mcp-cwyplau224 hostname=twd-l1-c9dae6-mcp-cwyplau224 ip=100.91.147.2 node=nUbQF2oLcg11CNTRL join_ms=1275 rejoined=false reminted=false
+        time=2026-11-08T17:35:57.962Z level=INFO msg="object node ready" object=mcp-cwyplau224 hostname=twd-l1-c9dae6-mcp-cwyplau224 ip=100.91.147.2 join_ms=1275.79 rejoined=false reminted=false
+        time=2026-11-08T17:38:56.757Z level=INFO msg="object killed" tenant=tn_tail7906d5 object=mcp-cwyplau224 reason="twd down --purge" flows_aborted=0 abort_ms=0.014 close_ms=0 delete_ms=0 delete_err=""
+        time=2026-11-08T17:38:56.757Z level=INFO msg="object killed (tier 1)" object=mcp-cwyplau224 flows=0 abort_ms=0.014
+        time=2026-11-08T17:38:56.757Z level=INFO msg="object killed" object=mcp-cwyplau224 reason="twd down --purge" ms=0
+        time=2026-11-08T17:38:56.759Z level=INFO msg="object killed" object=agent-2vbl2lt2dh reason="twd down --purge" ms=0
+        time=2026-11-08T17:38:57.390Z level=INFO msg="shutting down (node state kept for rejoin)"
+        Unit twd.service could not be found.
+    linux_test.go:331: results: /Users/ross/dev/twd-int/e2e/real/results/int-linux-2/l1-linux-twdl-ubuntu24-arm64-20261108-093445-c9dae6.json
+        {
+          "run": "l1-twdl-ubuntu24-arm64-c9dae6",
+          "tailnet": "tail7906d5.ts.net",
+          "date": "2026-11-08T09:34:45-08:00",
+          "checks": {
+            "a_verified_caller": "PASS nodeId n7F8tq9wzV11CNTRL tags [tag:ttest] (workload and the object's own node twd-l1-c9dae6-supportagent-2lpcrcl4bn.tail7906d5.ts.net)",
+            "b_egress_own_node": "PASS echo WhoIs = twd-l1-c9dae6-supportagent-2lpcrcl4bn.tail7906d5.ts.net.",
+            "c_mcp_caps": "PASS lookup_order allowed; refund → cap_missing",
+            "copy": "PASS tarball + key file (0600, in a 0700 dir) via limactl copy",
+            "cross_machine": "PASS the mcp workload node reports OS linux (test client on mini, darwin); its endpoints: current path direct, private addr",
+            "d_spawn": "PASS child lookupagent-5zydbs6bdi node twd-l1-c9dae6-lookupagent-5zydbs6bdi.tail7906d5.ts.net tags [tag:twd-agent-support-sub] caps {\n        \"example.com/cap/mcp\": {\n          \"tools\": [\n            \"lookup_order\"\n          ]\n        }\n      }",
+            "deploy": "PASS agent twd-l1-c9dae6-agent-2vbl2lt2dh.tail7906d5.ts.net, mcp twd-l1-c9dae6-mcp-cwyplau224.tail7906d5.ts.net",
+            "doctor": "PASS 18 checks in 582 ms, none failed: binaries=ok glibc=ok workerd=ok bundler=ok twd_home_writable=ok state_dir_writable=ok api_key=ok sandbox=ok host_sockets=ok kernel=ok landlock=ok user_namespaces=ok kvm=skip firecracker=skip cgroups_v2=ok systemd=ok microvm_tier=warn system_tailscaled_not_used=ok",
+            "doctor_api_key": "OK the key in /home/ross.guest/.twd-e2e/tailnet1_api.env can read tail7906d5.ts.net's policy (key not shown)",
+            "doctor_binaries": "OK twd 0.1.0-7e6c53aa, twd-mgmt and twd-hostd in /home/ross.guest/.twd/bin",
+            "doctor_bundler": "OK esbuild 0.28.2 (built in, no Node.js needed) bundles every workerd template offline: agent 2206 KB, ai-agent 1492 KB, hello 6 KB, mcp 1188 KB; Node-tier templates (need Node.js to deploy): node-workflow",
+            "doctor_cgroups_v2": "OK unified hierarchy, controllers: cpuset cpu io memory hugetlb pids rdma misc; delegated to your systemd user manager: cpu memory pids",
+            "doctor_firecracker": "SKIP firecracker not found (PATH, ~/.twd/bin, /usr/local/libexec/twd, the release's share/twd/vm, /usr/local/bin); only needed for the microVM tier",
+            "doctor_glibc": "OK glibc 2.39 on Ubuntu 24.04.5 LTS (workerd needs \u003e= 2.35, twd's supported minimum; workerd's ELF imports up to GLIBC_2.27)",
+            "doctor_host_sockets": "OK this user can't reach the system tailscaled's socket or a container engine (docker/containerd/podman/lxd) and is in none of their groups",
+            "doctor_kernel": "OK Linux 6.8.0-147-generic aarch64",
+            "doctor_kvm": "SKIP /dev/kvm not present (no hardware virtualization exposed; in a VM, enable nested virtualization); only needed for the microVM tier",
+            "doctor_landlock": "OK Landlock ABI 4 (landlock_create_ruleset VERSION): filesystem and TCP rules for the process-tier sandbox (enforcement: the sandbox check)",
+            "doctor_microvm_tier": "WARN no /dev/kvm: microvm deployments fall back to the process tier",
+            "doctor_sandbox": "OK Landlock ABI 4 + seccomp work on Linux 6.8.0-147-generic: workerd starts under a twd profile, files outside it and the home dir are unreadable, raw TCP is refused (egress only via netd); workloads get no AF_UNIX sockets (seccomp), so no host unix socket is reachable (Landlock ABI 4 alone can't restrict unix connects below 9); twd up runs every tenant's workerd and Node app under it",
+            "doctor_state_dir_writable": "OK /home/ross.guest/.twd-e2e/state (not created yet; /home/ross.guest/.twd-e2e is writable)",
+            "doctor_system_tailscaled_not_used": "OK twd only ever runs tsnet nodes for the tailnet you name (no bootstrap from tailscaled)",
+            "doctor_systemd": "OK systemd user manager running; `twd up --service` installs ~/.config/systemd/user/twd.service; linger yes",
+            "doctor_twd_home_writable": "OK /home/ross.guest/.twd is writable",
+            "doctor_user_namespaces": "OK AppArmor restricts unprivileged user namespaces (Ubuntu 24.04 default); twd doesn't need them (Landlock is unprivileged)",
+            "doctor_workerd": "OK /home/ross.guest/.twd/bin/workerd: workerd 2026-11-08 (pinned 1.20261108.1)",
+            "down": "PASS twd down --purge --service: 2 objects purged, 2 devices deleted, 626ms",
+            "e_kill_cascade": "PASS cli 65ms, push 56.5 ms, new requests → 410 object_killed in ≤1ms, via workload 410 killed",
+            "f_audit_chain": "PASS \"ttest-l1-c9dae6-client.tail7906d5.ts.net → twd-l1-c9dae6-supportagent-2lpcrcl4bn → twd-l1-c9dae6-lookupagent-5zydbs6bdi\", 6 records for the sub-agent, chain verified",
+            "init_ai_agent_offline": "PASS twd init --template ai-agent in the VM (no npm); bundled offline by doctor",
+            "install": "PASS install.sh 0.4 s (again 0.5 s), no sudo, ~/.twd: 0.1.0-7e6c53aa workerd 2026-11-08",
+            "microvm_tier": "INFO no /dev/kvm: microvm deployments fall back to the process tier",
+            "os": "INFO Ubuntu 24.04.5 LTS | 6.8.0-147-generic aarch64 | glibc 2.39\n4 cpus",
+            "preflight_missing_grant": "PASS acl_denied with HuJSON snippet",
+            "reboot": "PASS enable-linger ross, limactl stop (1.1 s) + start: ssh 6.5 s, twd.service active 6.5 s (MainPID 1674 → 849), healthy 6.5 s, mcp workload answers this Mac 17.0 s; 2 objects rejoined with their old node IDs, 0 re-minted",
+            "result": "FAIL",
+            "sandbox": "PASS workloads agent:process/landlock mcp:process/landlock; doctor sandbox ok: Landlock ABI 4 + seccomp work on Linux 6.8.0-147-generic: workerd starts under a twd profile, files outside it and the home dir are unreadable, raw TCP is refused (egress only via netd); workloads get no AF_UNIX sockets (seccomp), so no host unix socket is reachable (Landlock ABI 4 alone can't restrict unix connects below 9); twd-hostd: landlock (ABI 4); active: 2/2 running process-tier workloads (workerd and Node) are under it",
+            "service": "PASS twd up --service: /home/ross.guest/.config/systemd/user/twd.service active, MainPID 1311 = supervisor (linger=yes)",
+            "service_removed": "PASS twd down --purge --service: unit disabled and removed",
+            "service_restart": "PASS systemctl --user restart twd: new MainPID 1674, healthy after 0.8 s, mcp workload answers this Mac (same tailnet IP) after 3.9 s",
+            "status": "PASS healthy",
+            "system_tailscaled_not_used": "PASS twd nodes are tsnet nodes of tail7906d5.ts.net (control https://controlplane.tailscale.com, state under /home/ross.guest/.twd-e2e/state/hostd); 5 running twd processes hold no tailscaled LocalAPI socket (/proc/\u003cpid\u003e/fd + ss -x (peer inodes))",
+            "up": "PASS tenant tn_tail7906d5 host h-lima-twdl-ubuntu24-arm64 in 646ms",
+            "up_interactive_refused": "PASS tailnet_required"
+          },
+          "numbers": {
+            "agent_egress_ms": 13.417,
+            "agent_first_request_ms": 66.145,
+            "copy_tarball_ms": 532.327,
+            "deploy_agent_active_ms": 439.245,
+            "deploy_agent_cli_ms": 1943.194,
+            "deploy_agent_ready_ms": 1888.215,
+            "deploy_mcp_cli_ms": 2555.877,
+            "deploy_mcp_ready_ms": 2525.672,
+            "doctor_ms": 581.738,
+            "down_ms": 625.671,
+            "extract_ms": 1477.535,
+            "first_object_node_ready_ms": 1577.628,
+            "install_again_ms": 520.329,
+            "install_ms": 384.94,
+            "kill_api_ms": 60.075,
+            "kill_cli_ms": 64.812,
+            "kill_push_ms": 56.516,
+            "killed_new_request_ms": 1.404,
+            "killed_via_workload_ms": 3.81,
+            "path_derp_http_ms": 9.483,
+            "path_derp_ping_ms": 8.366291,
+            "path_direct": 1,
+            "path_direct_http_ms": 2.571,
+            "path_direct_ping_ms": 0.6480840000000001,
+            "path_time_to_direct_ms": 181.285,
+            "reboot_first_call_ms": 8.989,
+            "reboot_healthy_ms": 6478.652,
+            "reboot_service_active_ms": 6466.889,
+            "reboot_serving_ms": 16991.964,
+            "reboot_ssh_ms": 6457.058,
+            "reboot_stop_ms": 1051.205,
+            "service_restart_cmd_ms": 299.032,
+            "service_restart_first_call_ms": 3009.13,
+            "service_restart_healthy_ms": 833.069,
+            "service_restart_reachable_ms": 3859.242,
+            "spawn_ready_ms": 1608.414,
+            "uninstall_ms": 847.877,
+            "up_host_ready_ms": 641.773,
+            "up_mgmt_ready_ms": 638.307,
+            "up_ready_ms": 645.538
+          },
+          "notes": [
+            "twd in Lima VM twdl-ubuntu24-arm64 (no mounts) from twd-0.1.0-7e6c53aa-linux-arm64.tar.gz; test client + echo on this Mac",
+            "policy has the scenario's tagOwners and grants (read only; not written)",
+            "VM mounts nothing from the Mac (no virtiofs/9p/sshfs in /proc/mounts)",
+            "VM has no node, go, npm or esbuild on PATH",
+            "VM: Ubuntu 24.04.5 LTS | 6.8.0-147-generic aarch64 | glibc 2.39\n4 cpus",
+            "doctor landlock: ok: Landlock ABI 4 (landlock_create_ruleset VERSION): filesystem and TCP rules for the process-tier sandbox (enforcement: the sandbox check)",
+            "path this Mac → VM mcp node: 1 DERP pings (region \"sea\", median 7.7 ms), 10 direct (direct, private addr, median 0.6 ms) after 181ms; HTTP tools/list median DERP 20.6 ms (n=1), direct 2.6 ms (n=10)",
+            "DERP-only client (TS_DEBUG_ALWAYS_USE_DERP) → VM mcp node: disco ping median 8.4 ms (n=11, regions [sea], 0 direct pongs), HTTP tools/list median 9.5 ms (n=11)"
+          ],
+          "cleanup": {
+            "devices_deleted_by_cleanup": 7,
+            "devices_left": 0,
+            "devices_tracked": 7,
+            "test_keys_minted": 3,
+            "test_keys_revoke_errors": null,
+            "twd_devices_left_after_down": 0,
+            "twd_devices_tracked": 4,
+            "twd_keys_tracked": 4,
+            "twd_keys_valid_after_down": 0,
+            "untracked_run_devices": null,
+            "vm_clean": true
+          },
+          "nodeIDs": [
+            "nmbiMH2TxV11CNTRL",
+            "ntqthLEbNS11CNTRL",
+            "nbqhhwzBAC11CNTRL",
+            "n7NswVNwXs11CNTRL"
+          ],
+          "keyIDs": [
+            "kkPYfte1De11CNTRL",
+            "kwqhTtkZs221CNTRL",
+            "kPmMNrd9TX11CNTRL",
+            "kZvnpauazC21CNTRL"
+          ]
+        }
+--- FAIL: TestE2ELinux (257.27s)
+FAIL
+FAIL	github.com/rosskukulinski/twd/e2e/linux	257.512s
+FAIL
+time="2026-11-08T09:39:02-08:00" level=info msg="Sending SIGINT to hostagent process 26446"
+time="2026-11-08T09:39:02-08:00" level=info msg="Waiting for the host agent and the driver processes to shut down"
+time="2026-11-08T09:39:02-08:00" level=info msg="[hostagent] Received SIGINT, shutting down the host agent"
+time="2026-11-08T09:39:02-08:00" level=info msg="[hostagent] Shutting down the host agent"
+time="2026-11-08T09:39:02-08:00" level=info msg="[hostagent] Shutting down VZ"
+time="2026-11-08T09:39:03-08:00" level=info msg="[hostagent] [VZ] - vm state change: stopped"
+time="2026-11-08T09:39:03-08:00" level=error msg="[hostagent] accept tcp 127.0.0.1:59272: use of closed network connection"
+time="2026-11-08T09:39:03-08:00" level=info msg="[hostagent] gvproxy API request" component=services-api endpoint=/services/forwarder/unexpose local="127.0.0.1:59272" method=POST outcome=success protocol=tcp source=
+time="2026-11-08T09:39:03-08:00" level=info msg="Waiting for the instance to shut down"
+time="2026-11-08T09:39:04-08:00" level=info msg="The instance twdl-ubuntu24-arm64 has shut down"
+09:39:04 e2e-linux[ubuntu24-arm64]: stopped twdl-ubuntu24-arm64 (kept)
+09:39:04 e2e-linux[ubuntu24-arm64]: exit 1

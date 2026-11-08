@@ -638,15 +638,17 @@ func (s *SQLStore) ListObjects(ctx context.Context, f ObjectFilter) ([]Object, e
 func (s *SQLStore) checkFence(ctx context.Context, tx *sql.Tx, f *Fence) error {
 	var holder string
 	var epoch int64
-	err := tx.QueryRowContext(ctx, s.q("SELECT holder, epoch FROM leases WHERE name=?"+s.forUpdate()), f.Lease).Scan(&holder, &epoch)
+	var expires int64
+	err := tx.QueryRowContext(ctx, s.q("SELECT holder, epoch, expires_at FROM leases WHERE name=?"+s.forUpdate()), f.Lease).Scan(&holder, &epoch, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ErrLeaseLost
+		return fmt.Errorf("%w: no lease %q (caller %q asked for epoch %d)", ErrLeaseLost, f.Lease, f.Holder, f.Epoch)
 	}
 	if err != nil {
 		return err
 	}
 	if epoch != f.Epoch || holder == "" || (f.Holder != "" && holder != f.Holder) {
-		return ErrLeaseLost
+		return fmt.Errorf("%w: lease %q is held by %q at epoch %d (expires %s); caller %q asked for epoch %d",
+			ErrLeaseLost, f.Lease, holder, epoch, time.UnixMilli(expires).UTC().Format(time.RFC3339), f.Holder, f.Epoch)
 	}
 	return nil
 }
