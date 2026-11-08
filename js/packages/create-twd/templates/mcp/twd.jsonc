@@ -1,0 +1,14 @@
+{
+  "name": "mcp",
+  "tailnet": {
+    "tags": ["tag:twd-wl-mcp"],
+    "objects": {
+      // budget counters are internal state: no tailnet node of their own
+      "TwdBudget": { "egress": "workload", "node": false }
+    }
+  }
+  // policy: grant callers the app cap, e.g.
+  //   { "src": ["tag:twd-agent-support"], "dst": ["tag:twd-wl-mcp"], "ip": ["tcp:80"],
+  //     "app": { "example.com/cap/mcp": [{ "tools": ["lookup_order", "refund"],
+  //              "limits": { "refund": { "maxUsd": 50, "perDayUsd": 200 } } }] } }
+}

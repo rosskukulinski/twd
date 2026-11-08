@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { getCaller, TailnetError } from "../src/index.js";
+import { getCaller, TailnetError } from "../dist/index.js";
 
 const req = (cf) => ({ cf });
 

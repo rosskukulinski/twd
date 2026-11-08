@@ -1,0 +1,9 @@
+{
+  "name": "twd-hello",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "create-twd build .", "deploy": "twd deploy" },
+  "dependencies": {
+    "@twd/tailnet": "^0.1.0"
+  }
+}
