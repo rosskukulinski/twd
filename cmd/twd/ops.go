@@ -535,7 +535,9 @@ func cmdLogs(args []string) error {
 			return fail("host_unavailable", "twd-hostd is not answering", err.Error()).withFix("twd status")
 		}
 		for _, w := range hv.Workloads {
-			if w.Workload == pos[0] && w.InstanceDir != "" {
+			if w.Workload == pos[0] && w.LogFile != "" {
+				path = w.LogFile // workerd.log, or app.log for runtime "node"
+			} else if w.Workload == pos[0] && w.InstanceDir != "" {
 				path = filepath.Join(w.InstanceDir, "workerd.log")
 			}
 		}

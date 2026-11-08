@@ -188,7 +188,8 @@ export async function fetch(input: string | URL | Request, init?: RequestInit): 
  * forwarded in absolute form; https:// targets tunnel via CONNECT.
  */
 export async function dispatcher(): Promise<any> {
-  const { ProxyAgent } = await import("undici" as string);
+  const spec = "undici"; // optional peer: not resolved at bundle time
+  const { ProxyAgent } = await import(spec);
   const p = proxyParts();
   return new ProxyAgent({ uri: p.uri, token: p.auth, proxyTunnel: false });
 }

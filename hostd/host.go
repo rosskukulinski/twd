@@ -83,6 +83,9 @@ type Config struct {
 	DefaultTier string
 	// VMDebug enables guest diagnostics (connectivity probes; tests).
 	VMDebug bool
+	// NodeBin is the node binary for runtime "node" deployments (default:
+	// node from PATH).
+	NodeBin string
 }
 
 // Host is a running twd-hostd.

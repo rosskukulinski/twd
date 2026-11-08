@@ -44,6 +44,24 @@ type App struct {
 	// Tier is the requested isolation tier (twd.jsonc "tier"): "" (host
 	// default), "process" or "microvm".
 	Tier string
+	// Runtime is "" (workerd) or RuntimeNode (twd.jsonc "runtime": "node").
+	Runtime string
+	// Node is the Node process tier app (Runtime == RuntimeNode).
+	Node *NodeApp
+}
+
+// RuntimeNode is the opt-in Node.js process tier (twd.jsonc "runtime": "node").
+const RuntimeNode = "node"
+
+// NodeApp is a Node process tier deployment: one supervised `node` process
+// with one tailnet identity (the workload node), per ADR-022.
+type NodeApp struct {
+	Main   string            // entry module, relative to the bundle root
+	Files  map[string][]byte // every bundle file (written to the instance dir)
+	Env    map[string]string // twd.jsonc node.env plus deploy vars
+	Listen string            // "tcp" (PORT on 127.0.0.1, default) or "unix" (TWD_SOCKET)
+	Health string            // health path (default "/"): any HTTP response means up
+	Args   []string          // extra node CLI flags (node.args)
 }
 
 // Isolation tiers.
@@ -91,6 +109,14 @@ type wranglerConfig struct {
 type twdConfig struct {
 	Name    string `json:"name"`
 	Tier    string `json:"tier"`
+	Runtime string `json:"runtime"`
+	Main    string `json:"main"`
+	Node    struct {
+		Env    map[string]string `json:"env"`
+		Listen string            `json:"listen"`
+		Health string            `json:"health"`
+		Args   []string          `json:"args"`
+	} `json:"node"`
 	Tailnet struct {
 		Tags     []string `json:"tags"`
 		Connects []string `json:"connects"`
@@ -121,6 +147,19 @@ func ValidWorkload(s string) bool { return workloadRE.MatchString(s) }
 
 // Parse parses an unpacked bundle (path -> contents).
 func Parse(files map[string][]byte) (*App, error) {
+	if tb, ok := files["twd.jsonc"]; ok {
+		var t twdConfig
+		if err := UnmarshalJSONC(tb, &t); err != nil {
+			return nil, fmt.Errorf("bundle: twd.jsonc: %w", err)
+		}
+		switch t.Runtime {
+		case "", "workerd":
+		case RuntimeNode:
+			return parseNode(files, &t)
+		default:
+			return nil, fmt.Errorf("bundle: twd.jsonc runtime %q: want \"workerd\" (default) or \"node\"", t.Runtime)
+		}
+	}
 	wb, ok := files["wrangler.jsonc"]
 	if !ok {
 		wb, ok = files["wrangler.json"]
@@ -221,6 +260,80 @@ func Parse(files map[string][]byte) (*App, error) {
 			return nil, fmt.Errorf("bundle: tailnet.objects.%s.egress must be %q or %q", name, EgressObject, EgressWorkload)
 		}
 	}
+	return a, nil
+}
+
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// parseNode parses a Node process tier bundle: twd.jsonc (runtime "node")
+// plus the built app files; main comes from twd-bundle.json or twd.jsonc.
+func parseNode(files map[string][]byte, t *twdConfig) (*App, error) {
+	a := &App{
+		Name: t.Name, Runtime: RuntimeNode, Classes: map[string]*Class{}, Modules: map[string][]byte{},
+		WorkloadTags: t.Tailnet.Tags, Internet: t.Tailnet.Egress.Internet, Tier: t.Tier,
+	}
+	if len(t.Tailnet.Objects) > 0 {
+		return nil, errors.New("bundle: runtime \"node\" has one tailnet identity per process (ADR-022); tailnet.objects is not supported")
+	}
+	switch a.Tier {
+	case "", TierProcess:
+	case TierMicroVM:
+		return nil, errors.New("bundle: runtime \"node\" runs in the process tier only (the microVM guest has no Node.js yet)")
+	default:
+		return nil, fmt.Errorf("bundle: twd.jsonc tier %q: want \"process\"", a.Tier)
+	}
+	main := t.Main
+	if bb, ok := files["twd-bundle.json"]; ok {
+		var o struct {
+			Main string            `json:"main"`
+			Env  map[string]string `json:"env"`
+		}
+		if err := json.Unmarshal(bb, &o); err != nil {
+			return nil, fmt.Errorf("bundle: twd-bundle.json: %w", err)
+		}
+		if o.Main != "" {
+			main = o.Main
+		}
+		for k, v := range o.Env {
+			if t.Node.Env == nil {
+				t.Node.Env = map[string]string{}
+			}
+			t.Node.Env[k] = v
+		}
+	}
+	if main == "" {
+		return nil, errors.New("bundle: runtime \"node\" needs \"main\" in twd.jsonc (or twd-bundle.json)")
+	}
+	main = path.Clean(strings.TrimPrefix(main, "./"))
+	if _, ok := files[main]; !ok {
+		return nil, fmt.Errorf("bundle: main module %q not in bundle", main)
+	}
+	for k := range t.Node.Env {
+		if !envKeyRE.MatchString(k) || strings.HasPrefix(k, "TWD_") {
+			return nil, fmt.Errorf("bundle: node.env %q: invalid name (TWD_* is reserved)", k)
+		}
+	}
+	for _, f := range t.Node.Args {
+		if !strings.HasPrefix(f, "--") || strings.ContainsAny(f, " \n") {
+			return nil, fmt.Errorf("bundle: node.args %q: only --flags are allowed", f)
+		}
+	}
+	switch t.Node.Listen {
+	case "":
+		t.Node.Listen = "tcp"
+	case "tcp", "unix":
+	default:
+		return nil, fmt.Errorf("bundle: node.listen %q: want \"tcp\" or \"unix\"", t.Node.Listen)
+	}
+	h := t.Node.Health
+	if h == "" {
+		h = "/"
+	}
+	if !strings.HasPrefix(h, "/") {
+		return nil, errors.New("bundle: node.health must be a path")
+	}
+	a.Main = main
+	a.Node = &NodeApp{Main: main, Files: files, Env: t.Node.Env, Listen: t.Node.Listen, Health: h, Args: t.Node.Args}
 	return a, nil
 }
 
