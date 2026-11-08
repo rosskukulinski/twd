@@ -96,3 +96,20 @@ hostSig = base64(ed25519.Sign(hostKey, utf8(hash)))
 **Ops.** `GET /v0/status` → `{ok, pendingDeviceDeletes}`; `POST /v0/flush` runs pending device deletes now.
 
 **Audit.** `kind:"principal"` (host chain): an object learned whom it acts for after it was created (its first caller-bearing request came after an RPC). `twd audit` uses create/spawn/principal `actingFor` as the head of the chain.
+
+## M7 additions: identity scope and multi-tenant hosts (backward compatible)
+
+**Object identity is `(tenant, workload, namespace = class, objectName)`.** Before M7 it was `(tenant, namespace, objectName)`, so two workloads of one tenant with the same DO class and object name shared one object and one node (M5 finding; hostd failed closed with `namespace_conflict`).
+- `POST /v0/objects` takes an optional `workload`. hostd always sends it. Without it, a spawn takes its parent's workload, the `_workload` namespace takes `objectName`, and otherwise exactly one workload of the tenant may declare the class: if several do, the answer is **409 `namespace_ambiguous`**. An unknown `(workload, class)` is 404 `unknown_namespace`. For `_workload`, `workload` must equal `objectName` (400 otherwise).
+- Create is idempotent by `(tenant, workload, namespace, objectName)`. The object ID (= node hostname) is `<class-slug>-<b32(hmac(tenant, workload, namespace, name))[:10]>`. If that ID is already taken by another identity, the answer is 409 `identity_conflict`, and mgmt never hands out the existing node.
+- Objects carry `workload`. `GET /v0/objects?tenant=&workload=&namespace=` filters by it. The create audit record's detail adds `workload`.
+- **Store migration.** A store from before M7 (no `workload` column) is migrated in place when it is opened (SQLite and Postgres): the table is renamed aside and copied back, with the workload taken from each object's deployment (`_workload` objects: their name). IDs are kept, so existing nodes keep their identity.
+- hostd keeps `namespace_conflict` as a **defensive assertion**: if mgmt ever returns an object hostd already holds for a different `(tenant, workload, class, name)`, it refuses rather than share the node.
+
+**Multi-tenant hosts.** One host serves any number of tenants, each on its own tailnet. Per tenant:
+- its own netd registry, whose key source only fetches credentials for that tenant's objects;
+- its own workerd process per workload (never shared);
+- its own state dir `tenants/<tenantID>/{nodes,workloads}`, 0700 at every level (tenant IDs must be one safe path element);
+- its own registration throttle and mint queue in mgmt.
+
+On macOS, each process-tier workerd runs under Seatbelt (`twd-hostd -sandbox auto|seatbelt|none`, plus `-sandbox-deny`). The profile denies reads, writes and unix-socket connects to the home dir, hostd's data and run dirs, twd's state dir, mgmt's socket and every tenant's API key file (`GET /v0/tenants`), except the instance's own dir and its own workload's DO storage. Host status (`GET /v0/status` on hostd) reports each workload's `PID`, `Sandbox`, `SandboxProfile` and `DOStorage`.

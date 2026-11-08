@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -53,74 +54,91 @@ func TestStoreIdentityScope(t *testing.T) {
 				t.Fatalf("GetObjectByName %v: %+v %v", c, o, err)
 			}
 		}
-		if os, _ := s.ListObjects(ctx, ObjectFilter{TenantID: "tA", Workload: "two"}); len(os) != 1 || os[0].ID != "a2" {
-			t.Fatalf("ListObjects by workload: %+v", os)
+		if objs, _ := s.ListObjects(ctx, ObjectFilter{TenantID: "tA", Workload: "two"}); len(objs) != 1 || objs[0].ID != "a2" {
+			t.Fatalf("ListObjects by workload: %+v", objs)
 		}
 	})
 }
 
-// A SQLite store from before M7 (objects unique on (tenant, namespace,
-// name), no workload column) is migrated in place: rows keep their IDs and
-// get the workload of their deployment.
+// A store from before M7 (objects unique on (tenant, namespace, name), no
+// workload column) is migrated in place: rows keep their IDs and get the
+// workload of their deployment. SQLite always; Postgres with
+// TWD_TEST_POSTGRES_DSN (make test-pg).
 func TestStoreMigratesLegacyObjects(t *testing.T) {
 	ctx := context.Background()
+	type backend struct {
+		dsn, driver, open, blob string
+		ph                      func(string) string
+	}
 	path := filepath.Join(t.TempDir(), "mgmt.db")
-	db, err := sql.Open("sqlite", "file:"+path)
-	if err != nil {
-		t.Fatal(err)
+	bs := map[string]backend{"sqlite": {dsn: path, driver: "sqlite", open: "file:" + path, blob: "BLOB", ph: func(q string) string { return q }}}
+	if dsn := os.Getenv("TWD_TEST_POSTGRES_DSN"); dsn != "" {
+		bs["postgres"] = backend{dsn: dsn, driver: "pgx", open: dsn, blob: "BYTEA", ph: (&SQLStore{d: dialectPostgres}).q}
 	}
-	legacy := strings.Replace(strings.Replace(schemaCommon, "workload TEXT NOT NULL DEFAULT '', namespace", "namespace", 1),
-		"UNIQUE (tenant_id, workload, namespace, name)", "UNIQUE (tenant_id, namespace, name)", 1)
-	if strings.Contains(legacy, "objects (\n  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, workload") {
-		t.Fatal("legacy schema still has workload")
-	}
-	for _, stmt := range splitSQL(strings.Replace(legacy, "%s", "BLOB", 1)) {
-		if _, err := db.Exec(stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
-	db.Exec(`INSERT INTO deployments (id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at) VALUES ('d1','tn','support','h','[]',0,0,1,1)`)
-	ins := `INSERT INTO objects (id, tenant_id, namespace, name, hostname, deployment_id, lease, tags, root_id, depth, status, created_at, updated_at)
-	        VALUES (?, 'tn', ?, ?, ?, ?, 'tn/support', '[]', ?, 0, 'ready', 1, 1)`
-	for _, r := range [][]any{{"supportagent-x", "SupportAgent", "alice", "supportagent-x", "d1", "supportagent-x"},
-		{"support-y", WorkloadNamespace, "support", "support-y", "d1", "support-y"},
-		{"orphan-z", WorkloadNamespace, "gone", "orphan-z", "nope", "orphan-z"}} {
-		if _, err := db.Exec(ins, r...); err != nil {
-			t.Fatal(err)
-		}
-	}
-	db.Close()
+	for name, be := range bs {
+		t.Run(name, func(t *testing.T) {
+			db, err := sql.Open(be.driver, be.open)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, tbl := range []string{"tenants", "hosts", "deployments", "objects", "objects_v0", "leases", "audit", "audit_heads", "revocations"} {
+				db.Exec("DROP TABLE IF EXISTS " + tbl + map[string]string{"sqlite": "", "postgres": " CASCADE"}[name])
+			}
+			legacy := strings.Replace(strings.Replace(schemaCommon, "workload TEXT NOT NULL DEFAULT '', namespace", "namespace", 1),
+				"UNIQUE (tenant_id, workload, namespace, name)", "UNIQUE (tenant_id, namespace, name)", 1)
+			for _, stmt := range splitSQL(strings.Replace(legacy, "%s", be.blob, 1)) {
+				if _, err := db.Exec(stmt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := db.Exec(`INSERT INTO deployments (id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at) VALUES ('d1','tn','support','h','[]',0,0,1,1)`); err != nil {
+				t.Fatal(err)
+			}
+			ins := be.ph(`INSERT INTO objects (id, tenant_id, namespace, name, hostname, deployment_id, lease, tags, root_id, depth, status, created_at, updated_at)
+			        VALUES (?, 'tn', ?, ?, ?, ?, 'tn/support', '[]', ?, 0, 'ready', 1, 1)`)
+			for _, r := range [][]any{{"supportagent-x", "SupportAgent", "alice", "supportagent-x", "d1", "supportagent-x"},
+				{"support-y", WorkloadNamespace, "support", "support-y", "d1", "support-y"},
+				{"orphan-z", WorkloadNamespace, "gone", "orphan-z", "nope", "orphan-z"}} {
+				if _, err := db.Exec(ins, r...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			db.Close()
 
-	s, err := OpenStore(ctx, path)
-	if err != nil {
-		t.Fatalf("open legacy store: %v", err)
-	}
-	defer s.Close()
-	for _, c := range []struct{ id, w string }{{"supportagent-x", "support"}, {"support-y", "support"}, {"orphan-z", "gone"}} {
-		o, err := s.GetObject(ctx, c.id)
-		if err != nil || o.Workload != c.w || o.Status != StatusReady {
-			t.Fatalf("migrated %s: %+v %v", c.id, o, err)
-		}
-	}
-	if o, err := s.GetObjectByName(ctx, "tn", "support", "SupportAgent", "alice"); err != nil || o.ID != "supportagent-x" {
-		t.Fatalf("by name after migration: %+v %v", o, err)
-	}
-	// The new uniqueness holds: same class/name in another workload is fine.
-	if err := s.CreateObject(ctx, Object{ID: "n1", TenantID: "tn", Workload: "other", Namespace: "SupportAgent", Name: "alice", RootID: "n1", Status: StatusPending}); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.CreateObject(ctx, Object{ID: "n2", TenantID: "tn", Workload: "support", Namespace: "SupportAgent", Name: "alice", RootID: "n2", Status: StatusPending}); !errors.Is(err, ErrExists) {
-		t.Fatalf("dup after migration: %v", err)
-	}
-	s.Close()
-	// Re-opening is a no-op.
-	s2, err := OpenStore(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
-	if os, _ := s2.ListObjects(ctx, ObjectFilter{TenantID: "tn"}); len(os) != 4 {
-		t.Fatalf("after reopen: %d objects", len(os))
+			s, err := OpenStore(ctx, be.dsn)
+			if err != nil {
+				t.Fatalf("open legacy store: %v", err)
+			}
+			for _, c := range []struct{ id, w string }{{"supportagent-x", "support"}, {"support-y", "support"}, {"orphan-z", "gone"}} {
+				o, err := s.GetObject(ctx, c.id)
+				if err != nil || o.Workload != c.w || o.Status != StatusReady {
+					t.Fatalf("migrated %s: %+v %v", c.id, o, err)
+				}
+			}
+			if o, err := s.GetObjectByName(ctx, "tn", "support", "SupportAgent", "alice"); err != nil || o.ID != "supportagent-x" {
+				t.Fatalf("by name after migration: %+v %v", o, err)
+			}
+			// The new uniqueness holds: same class/name in another workload is fine.
+			if err := s.CreateObject(ctx, Object{ID: "n1", TenantID: "tn", Workload: "other", Namespace: "SupportAgent", Name: "alice", RootID: "n1", Status: StatusPending}); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.CreateObject(ctx, Object{ID: "n2", TenantID: "tn", Workload: "support", Namespace: "SupportAgent", Name: "alice", RootID: "n2", Status: StatusPending}); !errors.Is(err, ErrExists) {
+				t.Fatalf("dup after migration: %v", err)
+			}
+			if err := s.CreateObject(ctx, Object{ID: "n1", TenantID: "tn", Workload: "x", Namespace: "Y", Name: "z", RootID: "n1", Status: StatusPending}); !errors.Is(err, ErrExists) {
+				t.Fatalf("primary key after migration: %v", err)
+			}
+			s.Close()
+			// Re-opening is a no-op.
+			s2, err := OpenStore(ctx, be.dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer s2.Close()
+			if objs, _ := s2.ListObjects(ctx, ObjectFilter{TenantID: "tn"}); len(objs) != 4 {
+				t.Fatalf("after reopen: %d objects", len(objs))
+			}
+		})
 	}
 }
 

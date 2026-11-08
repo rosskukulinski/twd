@@ -17,7 +17,7 @@ done
 export TWD_TEST_POSTGRES_DSN="postgres://postgres:twdtest@127.0.0.1:$port/postgres?sslmode=disable"
 # Store tests on both backends, then the API tests with the Postgres store.
 # -p 1 / no t.Parallel: the tests share one database.
-GOTOOLCHAIN=local go test -race -count=1 -run 'Lease|Audit|Store' -v ./mgmt/ >/tmp/twd-test-pg.log 2>&1
+GOTOOLCHAIN=local go test -race -count=1 -run 'Lease|Audit|Store|Migrat' -v ./mgmt/ >/tmp/twd-test-pg.log 2>&1
 st=$?
 TWD_TEST_API_POSTGRES=1 GOTOOLCHAIN=local go test -race -count=1 -run 'API|Kill|WIF|Tailnet' -v ./mgmt/ >>/tmp/twd-test-pg.log 2>&1
 st2=$?
