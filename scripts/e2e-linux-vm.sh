@@ -16,14 +16,23 @@ VERSION=$(cat VERSION)-$(git rev-parse --short=8 HEAD)$(git diff --quiet HEAD --
 REL=/tmp/twd-l3-release
 echo "e2e-linux-vm: release $VERSION, built in $DEV:$REL"
 
-# 1. release (linux-arm64 + microVM assets) in twd-dev
-limactl shell "$DEV" -- mkdir -p "$REL"
-git ls-files -co --exclude-standard | tar cf - -T - | limactl shell "$DEV" -- tar xf - -C "$REL"
-limactl shell "$DEV" -- bash -lc "cd $REL && make deps >/tmp/twd-l3-release.log 2>&1 && make vm-assets TWD_VM_KERNEL=\$HOME/fc/vmlinux >>/tmp/twd-l3-release.log 2>&1 && \
-	TWD_VM_ASSETS_arm64=$REL/dist/vm-assets-arm64 make release RELEASE_TARGETS=linux-arm64 RELEASE_VERSION=$VERSION >>/tmp/twd-l3-release.log 2>&1 || { tail -40 /tmp/twd-l3-release.log; exit 1; }"
+# 1. the release tarball. `make release` on the Mac now includes the microVM
+#    guest (scripts/vm-assets-lima.sh builds it in twd-dev), so a current
+#    dist/ tarball that has share/twd/vm is used as is: the row then tests the
+#    artifact a user gets. Otherwise (no tarball, or one without the guest),
+#    build linux-arm64 + assets inside twd-dev as before.
 TGZ=twd-$VERSION-linux-arm64.tar.gz
 mkdir -p dist
-limactl copy "$DEV:$REL/dist/$TGZ" "dist/$TGZ"
+if [ -f "dist/$TGZ" ] && tar tzf "dist/$TGZ" | grep -q 'share/twd/vm/manifest.json$'; then
+	echo "e2e-linux-vm: using dist/$TGZ (has share/twd/vm; built by make release)"
+else
+	echo "e2e-linux-vm: dist/$TGZ missing or without share/twd/vm: building it in $DEV:$REL"
+	limactl shell "$DEV" -- mkdir -p "$REL"
+	git ls-files -co --exclude-standard | tar cf - -T - | limactl shell "$DEV" -- tar xf - -C "$REL"
+	limactl shell "$DEV" -- bash -lc "cd $REL && make deps >/tmp/twd-l3-release.log 2>&1 && make vm-assets TWD_VM_KERNEL=\$HOME/fc/vmlinux >>/tmp/twd-l3-release.log 2>&1 && \
+		TWD_VM_ASSETS_arm64=$REL/dist/vm-assets-arm64 make release RELEASE_TARGETS=linux-arm64 RELEASE_VERSION=$VERSION >>/tmp/twd-l3-release.log 2>&1 || { tail -40 /tmp/twd-l3-release.log; exit 1; }"
+	limactl copy "$DEV:$REL/dist/$TGZ" "dist/$TGZ"
+fi
 ls -lh "dist/$TGZ"
 
 # 2. the fresh VM
