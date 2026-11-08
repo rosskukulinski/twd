@@ -115,3 +115,56 @@ func Trim(s string, n int) string {
 	}
 	return s
 }
+
+// NodeDeps is the pinned npm dependency dir for Node tier apps
+// (e2e/node/node_modules, installed by make test-node).
+func NodeDeps() string {
+	root, _ := nettest.FindRepoRoot()
+	return filepath.Join(root, "e2e", "node", "node_modules")
+}
+
+// BuildNode builds a runtime "node" app (create-twd lib/build-node.mjs) and
+// returns its bundle files. The app is copied to a temp dir first (the
+// Workflow SDK writes .well-known/ into the app dir), with node_modules
+// pointing at NodeDeps when the app has none.
+func BuildNode(dir string, vars map[string]string) (map[string][]byte, error) {
+	buildMu.Lock()
+	defer buildMu.Unlock()
+	root, err := nettest.FindRepoRoot()
+	if err != nil {
+		return nil, err
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		return nil, fmt.Errorf("node not found: %w", err)
+	}
+	if _, err := os.Stat(NodeDeps()); err != nil {
+		return nil, fmt.Errorf("node tier deps missing (run make test-node): %w", err)
+	}
+	tmp, err := os.MkdirTemp("", "twd-nbuild-")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmp)
+	app := filepath.Join(tmp, "app")
+	if err := os.CopyFS(app, os.DirFS(dir)); err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(filepath.Join(app, "node_modules")); err != nil {
+		if err := os.Symlink(NodeDeps(), filepath.Join(app, "node_modules")); err != nil {
+			return nil, err
+		}
+	}
+	out := filepath.Join(tmp, "out")
+	args := []string{filepath.Join(root, "js", "packages", "create-twd", "lib", "build-node.mjs"), app, out}
+	for k, v := range vars {
+		args = append(args, "--var", k+"="+v)
+	}
+	cmd := exec.Command(node, args...)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "TWD_NODE_PATH="+NodeDeps()+":"+filepath.Join(root, "node_modules"))
+	if b, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("build-node %s: %v: %s", dir, err, b)
+	}
+	return bundle.ReadDir(out, ".")
+}

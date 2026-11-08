@@ -146,6 +146,10 @@ export function proxyUrl(): string {
   return p;
 }
 
+// A plain agent: Node's global agent may itself apply HTTP_PROXY
+// (NODE_USE_ENV_PROXY), which would proxy our request to the proxy.
+const directAgent = new http.Agent({ keepAlive: true });
+
 function proxyParts() {
   const u = new URL(proxyUrl());
   const auth = u.username ? "Basic " + Buffer.from(decodeURIComponent(u.username) + ":" + decodeURIComponent(u.password)).toString("base64") : undefined;
@@ -167,7 +171,7 @@ export async function fetch(input: string | URL | Request, init?: RequestInit): 
   if (p.auth) headers["proxy-authorization"] = p.auth;
   if (body) headers["content-length"] = String(body.length);
   return new Promise((resolve, reject) => {
-    const r = http.request({ host: p.host, port: p.port, method: req.method, path: req.url, headers, signal: req.signal }, (res) => {
+    const r = http.request({ agent: directAgent, host: p.host, port: p.port, method: req.method, path: req.url, headers, signal: req.signal }, (res) => {
       const h = new Headers();
       for (const [k, v] of Object.entries(res.headers)) {
         if (Array.isArray(v)) v.forEach((x) => h.append(k, x));
@@ -182,14 +186,32 @@ export async function fetch(input: string | URL | Request, init?: RequestInit): 
 }
 
 /**
- * dispatcher returns an undici ProxyAgent for the egress proxy (needs the
- * `undici` package): `undici.fetch(url, { dispatcher: await dispatcher() })`
- * or `setGlobalDispatcher(await dispatcher())`. http:// targets are
- * forwarded in absolute form; https:// targets tunnel via CONNECT.
+ * dispatcher returns an undici ProxyAgent for the egress proxy:
+ * `undici.fetch(url, { dispatcher: await dispatcher(undici) })`. Pass your
+ * `undici` module (import * as undici from "undici"); without it, undici is
+ * imported at run time from node_modules. http:// targets are forwarded in
+ * absolute form; https:// targets tunnel via CONNECT.
  */
-export async function dispatcher(): Promise<any> {
-  const spec = "undici"; // optional peer: not resolved at bundle time
-  const { ProxyAgent } = await import(spec);
+export async function dispatcher(undici?: any): Promise<any> {
+  if (!undici) {
+    const spec = "undici"; // optional peer: not resolved at bundle time
+    undici = await import(spec);
+  }
   const p = proxyParts();
-  return new ProxyAgent({ uri: p.uri, token: p.auth, proxyTunnel: false });
+  return new undici.ProxyAgent({ uri: p.uri, token: p.auth, proxyTunnel: false });
+}
+
+/**
+ * installGlobalDispatcher routes the global fetch() (Node's built-in and
+ * undici's) through the egress proxy. Call it after importing `undici`:
+ * loading the undici package installs a plain Agent as the global
+ * dispatcher, which silently overrides NODE_USE_ENV_PROXY for every later
+ * global fetch() in the process (measured on Node 25 + undici 8).
+ */
+export async function installGlobalDispatcher(undici?: any): Promise<void> {
+  if (!undici) {
+    const spec = "undici";
+    undici = await import(spec);
+  }
+  undici.setGlobalDispatcher(await dispatcher(undici));
 }

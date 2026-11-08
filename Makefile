@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-mac e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-mac e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node
 
 all: build
 
@@ -107,3 +107,9 @@ test-m2mgmt: deps
 	rm -rf /tmp/twd-m2src && mkdir -p /tmp/twd-m2src && git fetch -q origin m2-mgmt && git archive origin/m2-mgmt | tar -x -C /tmp/twd-m2src
 	cd /tmp/twd-m2src && $(GO) build -o /tmp/twd-m2src/twd-mgmt ./cmd/twd-mgmt
 	TWD_MGMT_BIN=/tmp/twd-m2src/twd-mgmt $(GO) test -tags m2mgmt -count=1 -v -timeout 5m ./e2e/m2mgmt/...
+
+## test-node: the opt-in Node process tier + Vercel Workflow (hermetic; npm ci of the pinned deps in e2e/node).
+test-node: deps
+	cd e2e/node && npm ci --no-audit --no-fund --loglevel=error
+	npm test -w @twd/node --silent
+	$(GO) test -tags nodetier -count=1 -v -timeout 10m ./e2e/node/...

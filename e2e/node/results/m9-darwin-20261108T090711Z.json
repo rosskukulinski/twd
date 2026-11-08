@@ -1,0 +1,10 @@
+{
+  "goarch": "arm64",
+  "goos": "darwin",
+  "node": "v25.1.0",
+  "results": {
+    "nodeprobe.cold_start_spawn_to_healthy_ms": 48.752,
+    "nodeprobe.deploy_to_first_200_ms": 417
+  },
+  "when": "2026-11-08T09:07:11Z"
+}

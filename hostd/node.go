@@ -70,6 +70,8 @@ type nodeProc struct {
 	starts   int // total process starts
 	restarts int // consecutive quick restarts (backoff)
 	lastExit string
+	started  time.Time     // last process start
+	readyDur time.Duration // first start → health answered
 }
 
 func (np *nodeProc) secrets() ([]byte, string) {
@@ -83,6 +85,9 @@ func randB64(n int) string {
 	rand.Read(b)
 	return base64.RawURLEncoding.EncodeToString(b)
 }
+
+// SignCaller builds the x-twd-caller value for claims under key (tests).
+func SignCaller(key []byte, claims any) string { return signCaller(key, claims) }
 
 // signCaller builds the x-twd-caller value for claims under key.
 func signCaller(key []byte, claims any) string {
@@ -203,13 +208,13 @@ func (inst *instance) spawnNode() error {
 	}
 	if np.listen == "unix" {
 		env["TWD_SOCKET"] = np.addr
-		env["NO_PROXY"] = ""
+		env["NO_PROXY"] = np.proxy.Addr().String()
 	} else {
 		p := strconv.Itoa(np.port)
 		env["PORT"], env["HOST"] = p, "127.0.0.1"
 		// Only the app's own port bypasses the proxy (self-calls such as the
 		// Workflow local world's queue); everything else is attributed.
-		env["NO_PROXY"] = "127.0.0.1:" + p + ",localhost:" + p
+		env["NO_PROXY"] = "127.0.0.1:" + p + ",localhost:" + p + "," + np.proxy.Addr().String()
 		env["no_proxy"] = env["NO_PROXY"]
 	}
 	if wl := inst.w.currentWL(); wl != nil {
@@ -237,7 +242,7 @@ func (inst *instance) spawnNode() error {
 	}
 	ex := make(chan struct{})
 	np.mu.Lock()
-	np.key, np.token, np.pid = key, token, cmd.Process.Pid
+	np.key, np.token, np.pid, np.started = key, token, cmd.Process.Pid, time.Now()
 	np.starts++
 	np.mu.Unlock()
 	inst.mu.Lock()
@@ -321,6 +326,9 @@ func (inst *instance) waitNodeHealthy(d time.Duration) error {
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
 			cancel()
+			inst.node.mu.Lock()
+			inst.node.readyDur = time.Since(inst.node.started)
+			inst.node.mu.Unlock()
 			return nil
 		}
 		cancel()
@@ -511,9 +519,13 @@ func (inst *instance) stopNode() {
 
 // NodeInfo is the Node-tier view of a running deployment.
 type NodeInfo struct {
-	PID      int
-	Starts   int
-	Addr     string
+	PID       int
+	Starts    int
+	Addr      string // the app's listen address (127.0.0.1:port or socket)
+	ProxyAddr string // the egress proxy (credentials are not exposed)
+	StartedAt time.Time
+	// ReadyMs is the first start's process spawn → health answered.
+	ReadyMs  float64
 	LogFile  string
 	DataDir  string
 	LastExit string `json:",omitempty"`
@@ -526,5 +538,6 @@ func (inst *instance) nodeInfo() *NodeInfo {
 	}
 	np.mu.Lock()
 	defer np.mu.Unlock()
-	return &NodeInfo{PID: np.pid, Starts: np.starts, Addr: np.addr, LogFile: np.logPath, DataDir: np.dataDir, LastExit: np.lastExit}
+	return &NodeInfo{PID: np.pid, Starts: np.starts, Addr: np.addr, ProxyAddr: np.proxy.Addr().String(), StartedAt: np.started,
+		ReadyMs: float64(np.readyDur.Microseconds()) / 1000, LogFile: np.logPath, DataDir: np.dataDir, LastExit: np.lastExit}
 }
