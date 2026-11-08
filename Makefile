@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps test test-go test-js e2e-local e2e-real e2e-vm release lint hooks clean
+.PHONY: all build deps test test-go test-js e2e-local e2e-real e2e-vm release lint hooks clean gen-js test-m2mgmt
 
 all: build
 
@@ -50,6 +50,7 @@ lint:
 	$(GO) vet ./...
 	$(GO) vet -tags e2e ./e2e/local/...
 	$(GO) vet -tags e2ereal ./e2e/real/...
+	$(GO) vet -tags m2mgmt ./e2e/m2mgmt/...
 	@sh scripts/check-secrets.sh
 
 hooks:
@@ -62,3 +63,9 @@ clean:
 gen-js: $(WORKERD)
 	node_modules/.bin/esbuild js/packages/tailnet/src/runtime.ts --bundle --format=esm --platform=neutral \
 		--target=es2022 --legal-comments=none --log-level=warning --outfile=hostd/gen/js/twd-rt.js
+
+## test-m2mgmt: hostd against the real twd-mgmt built from origin/m2-mgmt (hermetic).
+test-m2mgmt: deps
+	rm -rf /tmp/twd-m2src && mkdir -p /tmp/twd-m2src && git fetch -q origin m2-mgmt && git archive origin/m2-mgmt | tar -x -C /tmp/twd-m2src
+	cd /tmp/twd-m2src && $(GO) build -o /tmp/twd-m2src/twd-mgmt ./cmd/twd-mgmt
+	TWD_MGMT_BIN=/tmp/twd-m2src/twd-mgmt $(GO) test -tags m2mgmt -count=1 -v -timeout 5m ./e2e/m2mgmt/...
