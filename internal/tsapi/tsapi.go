@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -74,8 +75,29 @@ func (k Key) String() string { return "tsapi.Key{" + k.ID + "}" }
 
 // APIError is a non-2xx response.
 type APIError struct {
-	Status  int
-	Message string
+	Status     int
+	Message    string
+	RetryAfter time.Duration // from Retry-After on 429/503, if present
+}
+
+// IsRateLimited reports a 429.
+func IsRateLimited(err error) bool {
+	var e *APIError
+	return errors.As(err, &e) && e.Status == http.StatusTooManyRequests
+}
+
+func retryAfter(h http.Header) time.Duration {
+	v := h.Get("Retry-After")
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		return time.Until(t)
+	}
+	return 0
 }
 
 func (e *APIError) Error() string { return fmt.Sprintf("tailscale api: %d %s", e.Status, e.Message) }
@@ -87,8 +109,15 @@ func IsNotFound(err error) bool {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body, out any) error {
+	_, err := c.doHdr(ctx, method, path, nil, body, out)
+	return err
+}
+
+// doHdr is do with extra request headers; it returns the response headers.
+// out may be *[]byte to receive the raw body.
+func (c *Client) doHdr(ctx context.Context, method, path string, hdr http.Header, body, out any) (http.Header, error) {
 	if c.Tailnet == "" || c.APIKey == "" {
-		return errors.New("tsapi: Tailnet and APIKey are required")
+		return nil, errors.New("tsapi: Tailnet and APIKey are required")
 	}
 	base := c.BaseURL
 	if base == "" {
@@ -98,13 +127,16 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		rd = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	for k, v := range hdr {
+		req.Header[k] = v
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	if body != nil {
@@ -116,10 +148,13 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return fmt.Errorf("tailscale api %s %s: %w", method, path, err)
+		return nil, fmt.Errorf("tailscale api %s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusNotModified {
+		return resp.Header, nil
+	}
 	if resp.StatusCode/100 != 2 {
 		var m struct {
 			Message string `json:"message"`
@@ -128,12 +163,16 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 		if m.Message == "" {
 			m.Message = http.StatusText(resp.StatusCode)
 		}
-		return &APIError{Status: resp.StatusCode, Message: m.Message}
+		return resp.Header, &APIError{Status: resp.StatusCode, Message: m.Message, RetryAfter: retryAfter(resp.Header)}
+	}
+	if raw, ok := out.(*[]byte); ok {
+		*raw = b
+		return resp.Header, nil
 	}
 	if out != nil {
-		return json.Unmarshal(b, out)
+		return resp.Header, json.Unmarshal(b, out)
 	}
-	return nil
+	return resp.Header, nil
 }
 
 func (c *Client) tailnetPath(rest string) string {
@@ -201,4 +240,85 @@ func (c *Client) DeleteDevice(ctx context.Context, id string) error {
 		return nil
 	}
 	return err
+}
+
+// GetPolicy reads the tailnet policy file as JSON (read-only; twd never
+// writes policy). With etag set it sends If-None-Match and reports
+// notModified on a 304.
+func (c *Client) GetPolicy(ctx context.Context, etag string) (body []byte, newETag string, notModified bool, err error) {
+	h := http.Header{"Accept": {"application/json"}}
+	if etag != "" {
+		h.Set("If-None-Match", etag)
+	}
+	var raw []byte
+	rh, err := c.doHdr(ctx, "GET", c.tailnetPath("/acl"), h, nil, &raw)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if raw == nil && etag != "" {
+		return nil, etag, true, nil
+	}
+	return raw, rh.Get("ETag"), false, nil
+}
+
+// TokenResponse is an OAuth access token. AccessToken must not be logged.
+type TokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+func (t TokenResponse) String() string { return "tsapi.TokenResponse{[REDACTED]}" }
+
+// ExchangeToken exchanges a workload-identity JWT for an API access token
+// (POST /api/v2/oauth/token-exchange, form client_id + jwt).
+func ExchangeToken(ctx context.Context, hc *http.Client, baseURL, clientID, idToken string) (TokenResponse, error) {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
+	}
+	if hc == nil {
+		hc = &http.Client{Timeout: 30 * time.Second}
+	}
+	form := url.Values{"client_id": {clientID}, "jwt": {idToken}}
+	req, err := http.NewRequestWithContext(ctx, "POST", baseURL+"/api/v2/oauth/token-exchange", strings.NewReader(form.Encode()))
+	if err != nil {
+		return TokenResponse{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := hc.Do(req)
+	if err != nil {
+		return TokenResponse{}, fmt.Errorf("token exchange: %w", err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode/100 != 2 {
+		var m struct {
+			Message string `json:"message"`
+			Error   string `json:"error"`
+		}
+		json.Unmarshal(b, &m)
+		msg := m.Message
+		if msg == "" {
+			msg = m.Error
+		}
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return TokenResponse{}, &APIError{Status: resp.StatusCode, Message: "token exchange: " + msg, RetryAfter: retryAfter(resp.Header)}
+	}
+	var tr TokenResponse
+	if err := json.Unmarshal(b, &tr); err != nil {
+		return TokenResponse{}, err
+	}
+	if tr.AccessToken == "" {
+		return TokenResponse{}, errors.New("token exchange: no access_token")
+	}
+	return tr, nil
+}
+
+// GetDevice fetches one device by ID / stable node ID.
+func (c *Client) GetDevice(ctx context.Context, id string) (Device, error) {
+	var d Device
+	err := c.do(ctx, "GET", "/api/v2/device/"+url.PathEscape(id), nil, &d)
+	return d, err
 }
