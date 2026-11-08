@@ -160,6 +160,34 @@ function define(ctx, tn) {
   } catch {
   }
 }
+function installAlarmShim(ctx, tw) {
+  const st = ctx?.storage;
+  if (!st || !tw) return;
+  const call = async (action, time) => {
+    const r = await tw.call("alarm", { action, time });
+    if (!r || !r.ok) throw TailnetError.from(r?.error);
+    return r.value;
+  };
+  const shim = {
+    async setAlarm(t) {
+      const ms = typeof t === "number" ? t : t instanceof Date ? t.getTime() : Number(t);
+      if (!Number.isFinite(ms)) throw new TypeError("setAlarm: invalid time");
+      await call("set", ms);
+    },
+    async getAlarm() {
+      return await call("get") ?? null;
+    },
+    async deleteAlarm() {
+      await call("delete");
+    }
+  };
+  for (const [k, fn] of Object.entries(shim)) {
+    try {
+      Object.defineProperty(st, k, { value: fn, configurable: true, writable: true });
+    } catch {
+    }
+  }
+}
 function wrapFacetClass(C, name, bindings) {
   if (typeof C !== "function") throw new Error(`twd: durable_objects class ${name} is not exported by the main module`);
   const W = {
@@ -169,7 +197,13 @@ function wrapFacetClass(C, name, bindings) {
         const e = { ...env };
         delete e.__TWD;
         define(ctx, createTailnetContext(tw, e, bindings));
+        installAlarmShim(ctx, tw);
         super(ctx, e);
+      }
+      // Called by the Host DO when the delegated alarm fires.
+      async __twd_alarm(info) {
+        const self = this;
+        if (typeof self.alarm === "function") return self.alarm(info);
       }
     }
   }[name];

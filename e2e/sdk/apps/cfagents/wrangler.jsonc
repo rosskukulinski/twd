@@ -1,0 +1,14 @@
+{
+  "name": "cfagents",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "StateAgent", "class_name": "StateAgent" },
+      { "name": "PlainAgent", "class_name": "PlainAgent" }
+    ]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["StateAgent", "PlainAgent"] }],
+  "vars": { "MCP_CAP": "example.com/cap/mcp" }
+}

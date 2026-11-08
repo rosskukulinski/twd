@@ -214,9 +214,34 @@ function makeHost(cls) {
       if (who && this.__f && !this.__ensured) this.__ctxEnsure();
       return this.__facet(!who).fetch(req);
     }
+    // Facet alarm delegation (facets cannot set alarms in workerd): the
+    // facet's ctx.storage.{set,get,delete}Alarm land here via TailnetApi
+    // "alarm", and alarm() runs the facet's alarm handler.
+    async __twd_alarm_op(action, time) {
+      if (this.__killed) throw new Error("[killed] object " + cls + "/" + this.ctx.id.name + " was killed: " + this.__killed);
+      if (action === "set") {
+        await this.ctx.storage.setAlarm(time);
+        return null;
+      }
+      if (action === "delete") {
+        await this.ctx.storage.deleteAlarm();
+        return null;
+      }
+      return await this.ctx.storage.getAlarm();
+    }
+    async alarm(info) {
+      if (this.__killed) return;
+      // AlarmInvocationInfo is not serializable; pass its fields.
+      await this.__facet(true).__twd_alarm({ retryCount: info?.retryCount ?? 0, isRetry: !!info?.isRetry });
+    }
     async __twd_kill(reason) {
       this.__killed = reason || "killed";
       this.ctx.storage.kv.put("__twd_killed", this.__killed);
+      try {
+        await this.ctx.storage.deleteAlarm();
+      } catch {
+        /* ignore */
+      }
       try {
         this.ctx.facets.abort("app", new Error("killed"));
       } catch {
@@ -294,6 +319,19 @@ export class TailnetApi extends WorkerEntrypoint {
         return { ok: false, error: errBody("bad_request", "the workload may only act as its plain-DO objects") };
       }
       as = { class: String(args.as.class), name: String(args.as.name) };
+    }
+    if (op === "alarm") {
+      // Only a facet object may manage its own (delegated) alarm.
+      if (p.kind !== "object" || !isFacet(p.class)) return { ok: false, error: errBody("bad_request", "alarm delegation is for facet objects only") };
+      const act = args.action;
+      if (!["set", "get", "delete"].includes(act)) return { ok: false, error: errBody("bad_request", "bad alarm action") };
+      if (act === "set" && !Number.isFinite(args.time)) return { ok: false, error: errBody("bad_request", "bad alarm time") };
+      try {
+        return { ok: true, value: await this.ctx.exports["Host_" + p.class].getByName(p.name).__twd_alarm_op(act, args.time) };
+      } catch (e) {
+        const m = String(e?.message ?? e);
+        return { ok: false, error: errBody(m.includes("[killed]") ? "killed" : "bad_request", m) };
+      }
     }
     if (!["ensure", "spawn", "ready", "kill", "audit", "self"].includes(op)) return { ok: false, error: errBody("bad_request", "unknown op " + op) };
     if (op === "ensure" && !as) return { ok: false, error: errBody("bad_request", "ensure needs an object") };
