@@ -251,7 +251,7 @@ Numbers (median, with the range in brackets, over the last 6 runs unless noted):
 - **Gaps M2 must close:**
   1. The workload entry node: hostd uses namespace `_workload`, which M2 needs declared explicitly, and M2 rejects bundles with no `tailnet.objects`.
   2. Kill delivery waits for a heartbeat without push.
-- Also changed: M1 e2e-real cleanup is now **ID-based** (`tsapi.Tracker`) with a per-run `ttest-m1-<run>` prefix, because suites share tailnet 1.
+- Also changed: M1 e2e-real cleanup is now **ID-based** (`tsapi.Tracker`) with a per-run `ttest-m1-<run>` prefix, because suites share tailnet 1. Re-run after the change: PASS; 7 tracked, 7 deleted, 0 left.
 
 ### Known gaps (M3)
 - **Linux/Lima not run**; macOS only.
