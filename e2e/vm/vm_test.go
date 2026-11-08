@@ -56,15 +56,16 @@ func TestE2EVM(t *testing.T) {
 	if kernel == "" || rootfs == "" {
 		t.Skip("TWD_VM_KERNEL and TWD_VM_ROOTFS must be set (make e2e-vm)")
 	}
-	vcpus := 1
+	vcpus := 2
 	if v := os.Getenv("TWD_VM_VCPUS"); v != "" {
 		fmt.Sscan(v, &vcpus)
 	}
-	be, err := vm.New(vm.Config{Kernel: kernel, Rootfs: rootfs, MemMiB: 512, VCPUs: vcpus, BootArgs: os.Getenv("TWD_VM_BOOTARGS")})
+	be, err := vm.New(vm.Config{Kernel: kernel, Rootfs: rootfs, MemMiB: 512, VCPUs: vcpus, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES")})
 	if err != nil {
 		t.Fatalf("microVM backend unavailable: %v", err)
 	}
-	res := &results{m: map[string]any{"started": time.Now().UTC().Format(time.RFC3339), "kernel": kernel, "rootfs": rootfs, "vcpus": vcpus}}
+	res := &results{m: map[string]any{"started": time.Now().UTC().Format(time.RFC3339), "kernel": kernel, "rootfs": rootfs, "vcpus": vcpus, "mem_mib": 512,
+		"hugepages": os.Getenv("TWD_VM_HUGEPAGES"), "free_hugepages_2m_at_start": vm.FreeHugePages2M()}}
 	if mb, err := os.ReadFile(filepath.Join(filepath.Dir(rootfs), "manifest.json")); err == nil {
 		var man map[string]any
 		json.Unmarshal(mb, &man)

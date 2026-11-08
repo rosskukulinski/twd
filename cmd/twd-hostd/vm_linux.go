@@ -10,15 +10,15 @@ import (
 )
 
 type vmOptions struct {
-	kernel, rootfs, firecracker string
-	memMiB                      int
+	kernel, rootfs, firecracker, hugePages string
+	memMiB, vcpus                          int
 }
 
 // vmBackend enables the microVM tier when this host can run it (KVM,
 // Firecracker, the guest image, root); otherwise microvm deployments fall
 // back to the process tier.
 func vmBackend(o vmOptions, log *slog.Logger) sandbox.Backend {
-	b, err := vm.New(vm.Config{Firecracker: o.firecracker, Kernel: o.kernel, Rootfs: o.rootfs, MemMiB: o.memMiB, Log: log})
+	b, err := vm.New(vm.Config{Firecracker: o.firecracker, Kernel: o.kernel, Rootfs: o.rootfs, MemMiB: o.memMiB, VCPUs: o.vcpus, HugePages: o.hugePages, Log: log})
 	if err != nil {
 		log.Info("microVM tier unavailable; process tier only", "reason", err)
 		return nil

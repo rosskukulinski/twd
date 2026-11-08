@@ -40,13 +40,15 @@ type Config struct {
 	Rootfs      string // guest image from guest/build-image.sh (mounted read-only by every VM)
 	RunDir      string // per-VM dirs: API socket, vsock, config drive, console log
 	MemMiB      int    // guest memory (default 512)
-	VCPUs       int    // default 1
+	VCPUs       int    // default 2 (1 vCPU: workerd's threads contend; p50 latency ~30 ms nested)
 	MTU         int    // default 1500
 	BootArgs    string // kernel cmdline (default below)
 	// HugePages backs guest memory with 2 MiB pages (needs free hugetlbfs
 	// pages on the host: vm.nr_hugepages). Far fewer stage-2 faults, which
-	// dominate workerd start-up under nested virtualization.
-	HugePages bool
+	// dominate workerd start-up under nested virtualization (measured in
+	// Lima: InstanceStart → workerd ready 3.7 s without, 0.43 s with).
+	// "auto" (the default, "") uses them when enough are free at boot.
+	HugePages string // "" | "auto" | "on" | "off"
 	// ReadyTimeout bounds boot → workerd healthy in the guest (default 30 s).
 	ReadyTimeout time.Duration
 	Log          *slog.Logger
@@ -96,7 +98,7 @@ func New(cfg Config) (*Backend, error) {
 		cfg.MemMiB = 512
 	}
 	if cfg.VCPUs == 0 {
-		cfg.VCPUs = 1
+		cfg.VCPUs = 2
 	}
 	if cfg.MTU == 0 {
 		cfg.MTU = 1500
@@ -128,8 +130,13 @@ func New(cfg Config) (*Backend, error) {
 
 func (b *Backend) machineConfig() map[string]any {
 	mc := map[string]any{"vcpu_count": b.cfg.VCPUs, "mem_size_mib": b.cfg.MemMiB}
-	if b.cfg.HugePages {
+	switch b.cfg.HugePages {
+	case "on":
 		mc["huge_pages"] = "2M"
+	case "", "auto":
+		if FreeHugePages2M()*2 >= b.cfg.MemMiB {
+			mc["huge_pages"] = "2M"
+		}
 	}
 	return mc
 }

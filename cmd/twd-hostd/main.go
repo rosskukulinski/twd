@@ -55,6 +55,8 @@ func run() error {
 		vmRootfs   = flag.String("vm-rootfs", filepath.Join(home, ".twd", "vm", "rootfs.ext4"), "microVM tier: guest image from guest/build-image.sh")
 		vmFC       = flag.String("firecracker", "/usr/local/bin/firecracker", "microVM tier: firecracker binary")
 		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
+		vmCPUs     = flag.Int("vm-vcpus", 2, "microVM tier: guest vCPUs")
+		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -77,7 +79,7 @@ func run() error {
 	h, err := hostd.New(hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
-		DefaultTier: *tier, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem}, log)})
+		DefaultTier: *tier, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
 	if err != nil {
 		return err
 	}
