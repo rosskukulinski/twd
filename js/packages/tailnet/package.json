@@ -1,0 +1,10 @@
+{
+  "name": "@twd/tailnet",
+  "version": "0.0.0",
+  "description": "Verified tailnet caller identity and per-object egress for twd Workers and Durable Objects",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": { ".": "./src/index.js" },
+  "scripts": { "test": "node --test test/*.test.js" },
+  "license": "BSD-3-Clause"
+}

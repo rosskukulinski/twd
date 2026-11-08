@@ -1,0 +1,8 @@
+{
+  "name": "create-twd",
+  "version": "0.0.0",
+  "description": "Scaffold a twd app (M4; placeholder)",
+  "type": "module",
+  "bin": { "create-twd": "bin/create-twd.js" },
+  "license": "BSD-3-Clause"
+}

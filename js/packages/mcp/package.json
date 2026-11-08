@@ -1,0 +1,10 @@
+{
+  "name": "@twd/mcp",
+  "version": "0.0.0",
+  "description": "withTailnet MCP helper (M3+; placeholder)",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": { ".": "./src/index.js" },
+  "dependencies": { "@twd/tailnet": "0.0.0" },
+  "license": "BSD-3-Clause"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "twd-monorepo",
+  "private": true,
+  "workspaces": ["js/packages/*"],
+  "scripts": {
+    "test": "npm test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "workerd": "1.20261108.1"
+  },
+  "engines": { "node": ">=20" }
+}
