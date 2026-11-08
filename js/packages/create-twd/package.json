@@ -1,10 +1,10 @@
 {
   "name": "create-twd",
   "version": "0.1.0",
-  "description": "Scaffold (templates hello, agent, mcp) and bundle twd apps",
+  "description": "Scaffold (templates hello, agent, mcp, node-workflow) and bundle twd apps",
   "type": "module",
   "bin": { "create-twd": "bin/create-twd.js" },
-  "exports": { "./build": "./lib/build.mjs" },
+  "exports": { "./build": "./lib/build.mjs", "./build-node": "./lib/build-node.mjs" },
   "files": ["bin", "lib", "templates"],
   "dependencies": { "esbuild": "0.28.2" },
   "license": "BSD-3-Clause"

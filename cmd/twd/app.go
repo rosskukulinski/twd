@@ -31,7 +31,7 @@ func workloadLabel(s string) string {
 
 func cmdInit(args []string) error {
 	f := newFlags("init")
-	tmpl := f.String("template", "hello", "hello | agent | mcp")
+	tmpl := f.String("template", "hello", "hello | agent | mcp | node-workflow")
 	name := f.String("name", "", "workload name (default: the directory name)")
 	pos, err := f.parse(args)
 	if err != nil {
@@ -68,6 +68,10 @@ func cmdInit(args []string) error {
 	if err := os.CopyFS(dir, os.DirFS(src)); err != nil {
 		return err
 	}
+	// npm-style: templates ship "gitignore" (npm drops .gitignore files).
+	if _, err := os.Stat(filepath.Join(dir, "gitignore")); err == nil {
+		os.Rename(filepath.Join(dir, "gitignore"), filepath.Join(dir, ".gitignore"))
+	}
 	// Name the workload after the directory (twd.jsonc and wrangler.jsonc).
 	for _, fn := range []string{"twd.jsonc", "wrangler.jsonc"} {
 		p := filepath.Join(dir, fn)
@@ -102,6 +106,8 @@ type app struct {
 	Cfg      *mgmt.TwdConfig
 	Wrangler map[string]any
 	TwdRaw   []byte
+	// Runtime is "node" for the Node process tier (no wrangler.jsonc).
+	Runtime string
 }
 
 func loadApp(dir, name string) (*app, error) {
@@ -116,15 +122,20 @@ func loadApp(dir, name string) (*app, error) {
 		return nil, fail("bad_request", err.Error())
 	}
 	var top struct {
-		Name string `json:"name"`
+		Name    string `json:"name"`
+		Runtime string `json:"runtime"`
 	}
 	bundle.UnmarshalJSONC(raw, &top)
-	wb, err := os.ReadFile(filepath.Join(dir, "wrangler.jsonc"))
-	if err != nil {
-		return nil, fail("bad_request", "no wrangler.jsonc in "+dir)
-	}
-	if err := bundle.UnmarshalJSONC(wb, &a.Wrangler); err != nil {
-		return nil, fail("bad_request", "wrangler.jsonc: "+err.Error())
+	a.Runtime = top.Runtime
+	a.Wrangler = map[string]any{}
+	if a.Runtime != bundle.RuntimeNode {
+		wb, err := os.ReadFile(filepath.Join(dir, "wrangler.jsonc"))
+		if err != nil {
+			return nil, fail("bad_request", "no wrangler.jsonc in "+dir)
+		}
+		if err := bundle.UnmarshalJSONC(wb, &a.Wrangler); err != nil {
+			return nil, fail("bad_request", "wrangler.jsonc: "+err.Error())
+		}
 	}
 	a.Name = name
 	if a.Name == "" {
@@ -176,6 +187,9 @@ func (a *app) build(vars map[string]string) ([]byte, int, error) {
 		return nil, 0, err
 	}
 	defer os.RemoveAll(out)
+	if a.Runtime == bundle.RuntimeNode {
+		return a.buildNode(node, ct, out, vars)
+	}
 	outfile := filepath.Join(out, "index.js")
 	cmd := exec.Command(node, filepath.Join(ct, "lib", "build.mjs"), a.Dir, outfile)
 	cmd.Dir = a.Dir
@@ -207,6 +221,28 @@ func (a *app) build(vars map[string]string) ([]byte, int, error) {
 	files["wrangler.jsonc"] = wb
 	tb, err := bundle.Pack(files)
 	return tb, len(js), err
+}
+
+// buildNode bundles a runtime "node" app with create-twd's build-node.mjs
+// (dist/server.mjs, plus the Vercel Workflow bundles when workflows/ exists).
+func (a *app) buildNode(node, ct, out string, vars map[string]string) ([]byte, int, error) {
+	args := []string{filepath.Join(ct, "lib", "build-node.mjs"), a.Dir, filepath.Join(out, "app")}
+	for k, v := range vars {
+		args = append(args, "--var", k+"="+v)
+	}
+	cmd := exec.Command(node, args...)
+	cmd.Dir = a.Dir
+	cmd.Env = append(os.Environ(), "TWD_NODE_PATH="+strings.Join(nodePaths(ct), ":"))
+	if b, err := cmd.CombinedOutput(); err != nil {
+		return nil, 0, fail("build_failed", "build-node failed for "+a.Dir, strings.Split(strings.TrimSpace(string(b)), "\n")...).
+			withFix("cd " + a.Dir + " && npm install")
+	}
+	files, err := bundle.ReadDir(filepath.Join(out, "app"), ".")
+	if err != nil {
+		return nil, 0, err
+	}
+	tb, err := bundle.Pack(files)
+	return tb, len(files["dist/server.mjs"]), err
 }
 
 // ---- deploy ----
@@ -301,7 +337,11 @@ func cmdDeploy(args []string) error {
 	res.BundleBytes = jsBytes
 	res.Timings["build"] = ms(time.Since(bs))
 	if !*f.json {
-		fmt.Printf("✓ build      dist/index.js %.1f KB (esbuild) · bundle %.1f KB\n", float64(jsBytes)/1024, float64(len(tb))/1024)
+		main := "dist/index.js"
+		if a.Runtime == bundle.RuntimeNode {
+			main = "dist/server.mjs (runtime node)"
+		}
+		fmt.Printf("✓ build      %s %.1f KB (esbuild) · bundle %.1f KB\n", main, float64(jsBytes)/1024, float64(len(tb))/1024)
 	}
 	ds := time.Now()
 	var dr mgmt.DeployResponse
