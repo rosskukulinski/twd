@@ -3,12 +3,14 @@ package tsapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestClient(t *testing.T) {
@@ -75,5 +77,56 @@ func TestLoadEnvFile(t *testing.T) {
 	}
 	if _, err := LoadEnvFile(p, "NOPE"); err == nil {
 		t.Fatal("missing var accepted")
+	}
+}
+
+func TestPolicyETagTokenExchangeRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v2/tailnet/t.ts.net/acl":
+			if r.Method != "GET" || r.Header.Get("Accept") != "application/json" {
+				w.WriteHeader(400)
+				return
+			}
+			if r.Header.Get("If-None-Match") == `"e1"` {
+				w.WriteHeader(304)
+				return
+			}
+			w.Header().Set("ETag", `"e1"`)
+			w.Write([]byte(`{"grants":[]}`))
+		case "/api/v2/oauth/token-exchange":
+			r.ParseForm()
+			if r.Form.Get("client_id") != "cid" || r.Form.Get("jwt") != "a.b.c" {
+				w.WriteHeader(401)
+				w.Write([]byte(`{"message":"bad jwt"}`))
+				return
+			}
+			w.Write([]byte(`{"access_token":"tok-secret","token_type":"Bearer","expires_in":3600}`))
+		case "/api/v2/tailnet/t.ts.net/keys":
+			w.Header().Set("Retry-After", "7")
+			w.WriteHeader(429)
+		}
+	}))
+	defer srv.Close()
+	ctx := context.Background()
+	c := &Client{BaseURL: srv.URL, Tailnet: "t.ts.net", APIKey: "x"}
+	b, etag, nm, err := c.GetPolicy(ctx, "")
+	if err != nil || etag != `"e1"` || nm || string(b) != `{"grants":[]}` {
+		t.Fatal(string(b), etag, nm, err)
+	}
+	if _, _, nm, err := c.GetPolicy(ctx, `"e1"`); err != nil || !nm {
+		t.Fatal("304", nm, err)
+	}
+	tr, err := ExchangeToken(ctx, nil, srv.URL, "cid", "a.b.c")
+	if err != nil || tr.AccessToken != "tok-secret" || tr.ExpiresIn != 3600 || strings.Contains(tr.String(), "tok-secret") {
+		t.Fatal(tr, err)
+	}
+	if _, err := ExchangeToken(ctx, nil, srv.URL, "cid", "bad"); err == nil || strings.Contains(err.Error(), "bad.") {
+		t.Fatal(err)
+	}
+	_, err = c.CreateKey(ctx, KeyOptions{Tags: []string{"tag:x"}})
+	var ae *APIError
+	if !IsRateLimited(err) || !errors.As(err, &ae) || ae.RetryAfter != 7*time.Second {
+		t.Fatalf("429: %v", err)
 	}
 }
