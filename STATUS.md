@@ -416,7 +416,7 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
   - New: `TestDevOnce` (`twd dev --once` → 200 with a verified caller), and the `internal/policy` merge/apply tests (comments and existing rules kept, idempotent, nothing written if validation fails).
   - `hostd` `KillFailsFast` now expects `410 object_killed`.
 - `make lint`: PASS.
-- **`make e2e-mac` (tailnet 1, production control, temp `--state-dir`, CLI only): PASS in 2 of 2 runs** (`e2e/real/results/m4-*.json`). Every check passed:
+- **`make e2e-mac` (tailnet 1, production control, temp `--state-dir`, CLI only): PASS in 3 of 3 runs** (`e2e/real/results/m4-*.json`; the third on the final commit: up 0.99 s, deploy→ready 1.68 s / 1.54 s, first object node 1.63 s, kill CLI 71 ms, new request → object_killed 0.98 ms, 0 leftovers). Every check passed:
   - up, with interactive mode refused (`tailnet_required`);
   - status healthy;
   - preflight refuses `hello` (`tag:db`) with the snippet;
