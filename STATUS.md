@@ -966,7 +966,7 @@ Earlier runs, kept for the record: on merge commit `a219532`, `make e2e-mac` (`8
 - **Unsupported-host rows** (`TestUnsupportedHost`):
   - **Debian 11** (glibc 2.31, kernel 5.10): install.sh is refused; `bin/twd doctor` gives `✗ glibc` (with distro and fix), `! kernel` and `! landlock` (ENOSYS).
   - **Alpine 3.24** (musl): install.sh and doctor both refuse it, naming `/lib/ld-musl-aarch64.so.1`.
-- **Verification:** `make test` is green on macOS and in Lima `twd-dev` (a clone of this branch; last checked at the commit named in the next bullet). `make lint` is clean.
+- **Verification:** `make test` is green on macOS and in Lima `twd-dev` (a clone of this branch, at `ccce991`, which includes the re-mint fix). `make lint` is clean.
 
 ### L1 findings and gaps
 - **workerd's real glibc floor is 2.27, not 2.35.** The pinned workerd's ELF imports `GLIBC_2.27` at most, on both arm64 and amd64, and `workerd --version` runs on Debian 11 (glibc 2.31). The 2.35 floor (install.sh refusal, doctor `fail`) is kept as policy: it is the oldest glibc tested. The lead may want to lower it to 2.31 after a full run on Debian 11 / RHEL 9 (2.34).
