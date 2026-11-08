@@ -1,0 +1,266 @@
+// twd platform wrapper (TRUSTED). Generated per deployment by twd-hostd from
+// this template plus twd-config.json / twd-modules.js. Tenant code never
+// runs in this isolate and never sees these bindings:
+//   LOADER       Dynamic Worker loader (facets)
+//   NETD_EGRESS  hostd's attributed egress socket (trusts x-twd-class/name + MAC)
+//   EGRESS_WL    hostd's workload egress socket (the tenant service's identity)
+//   HOSTD        hostd's local host API socket (ensure/spawn/ready/kill/audit)
+//   MAC_KEY      per-process key for egress request MACs
+//   TENANT       the tenant service (the app's default export)
+//   NS_<Class>   plain-DO namespaces (classes with "egress": "workload")
+//
+// Routing comes from request.cf.twd, which only hostd can set (ingress
+// socket cfBlobHeader; netd strips client copies).
+import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
+import CFG from "twd-config.json";
+import MODULES from "twd-modules.js";
+
+const FACET_MODULES = MODULES;
+
+const json = (status, body, extra = {}) =>
+  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...extra } });
+
+const DOC = "https://github.com/rosskukulinski/twd/blob/main/docs/errors.md#";
+const STATUS = { killed: 410, no_identity: 401, bad_request: 400, unknown_object: 404, identity_pending: 503, hostd_unavailable: 503 };
+function errBody(code, message, extra = {}) {
+  return { code, message, doc_url: DOC + code, ...extra };
+}
+function errResponse(code, message, extra = {}) {
+  return json(STATUS[code] ?? 403, errBody(code, message, extra), { "twd-error": code });
+}
+
+// hostd local API. Errors come back as typed bodies.
+async function hostd(env, op, body) {
+  let r;
+  try {
+    r = await env.HOSTD.fetch("http://hostd/v1/" + op, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+    });
+  } catch (e) {
+    throw Object.assign(new Error("hostd unavailable"), { body: errBody("hostd_unavailable", String(e)) });
+  }
+  let j;
+  try {
+    j = await r.json();
+  } catch {
+    j = errBody("hostd_unavailable", "bad hostd response (" + r.status + ")");
+  }
+  if (!r.ok) throw Object.assign(new Error(j.message ?? j.code), { body: j });
+  return j;
+}
+
+const bindingMap = Object.fromEntries(CFG.bindings.map((b) => [b.name, b.class]));
+
+function isFacet(cls) {
+  return CFG.classes[cls]?.mode === "facet";
+}
+
+function objectStub(env, ctx, cls, name) {
+  if (isFacet(cls)) return ctx.exports["Host_" + cls].getByName(name);
+  return env["NS_" + cls].getByName(name);
+}
+
+async function routeObject(env, ctx, cls, name, req) {
+  if (!CFG.classes[cls]) return errResponse("unknown_object", "no Durable Object class " + cls + " in this app");
+  if (!name) return errResponse("bad_request", "object name required");
+  return objectStub(env, ctx, cls, name).fetch(req);
+}
+
+async function admin(req, env, ctx, t) {
+  switch (t.op) {
+    case "health":
+      return json(200, { ok: true, deploymentID: CFG.deploymentID, workload: CFG.workload });
+    case "kill": {
+      try {
+        await objectStub(env, ctx, t.class, t.name).__twd_kill(t.reason || "killed");
+      } catch (e) {
+        return json(500, errBody("bad_request", "kill: " + String(e)));
+      }
+      return json(200, { ok: true });
+    }
+  }
+  return errResponse("bad_request", "unknown admin op");
+}
+
+export default {
+  async fetch(req, env, ctx) {
+    const t = req.cf?.twd;
+    if (!t || typeof t !== "object") return errResponse("no_identity", "request did not come through netd/hostd");
+    switch (t.kind) {
+      case "admin":
+        return admin(req, env, ctx, t);
+      case "object":
+        return routeObject(env, ctx, t.class, t.name, req);
+      case "workload": {
+        // /_twd/o/<Class>/<name>/... on the workload node reaches an object
+        // before (or instead of) its own node.
+        const u = new URL(req.url);
+        const m = u.pathname.match(/^\/_twd\/o\/([A-Za-z_$][\w$]*)\/([^/]+)(\/.*)?$/);
+        if (m) {
+          u.pathname = m[3] ?? "/";
+          return routeObject(env, ctx, m[1], decodeURIComponent(m[2]), new Request(u, req));
+        }
+        return env.TENANT.fetch(req);
+      }
+    }
+    return errResponse("bad_request", "unknown route kind");
+  },
+};
+
+// Host_<Class>: one platform DO per tenant object (facet mode). The tenant
+// class runs as a facet in a Dynamic Worker whose ONLY network path
+// (globalOutbound) is Egress specialised with this object's class+name.
+// Any RPC method is forwarded to the facet via a Proxy.
+function makeHost(cls) {
+  const H = class extends DurableObject {
+    constructor(ctx, env) {
+      super(ctx, env);
+      this.__f = null;
+      this.__ensured = null;
+      this.__killed = ctx.storage.kv.get("__twd_killed") ?? null;
+      const self = this;
+      return new Proxy(this, {
+        get(t, p, r) {
+          if (typeof p === "symbol" || p in t) return Reflect.get(t, p, r);
+          if (p === "then") return undefined;
+          return async (...args) => {
+            if (self.__killed) throw new Error("[killed] object " + cls + "/" + self.ctx.id.name + " was killed: " + self.__killed);
+            const f = self.__facet();
+            return f[p](...args);
+          };
+        },
+      });
+    }
+    __ensure() {
+      if (!this.__ensured) {
+        this.__ensured = hostd(this.env, "ensure", { as: { class: cls, name: this.ctx.id.name }, wake: true }).catch((e) => {
+          this.__ensured = null;
+          throw e;
+        });
+      }
+      return this.__ensured;
+    }
+    __facet() {
+      if (!this.__f) {
+        const name = this.ctx.id.name;
+        if (!name) throw new Error("[bad_request] twd objects must be addressed by name (getByName/idFromName); newUniqueId() is not supported yet");
+        const p = this.__ensure().catch(() => {});
+        try {
+          this.ctx.waitUntil(p);
+        } catch {
+          /* ignore */
+        }
+        const exp = this.ctx.exports;
+        const w = this.env.LOADER.get(CFG.deploymentID + ":" + cls + ":" + name, () => {
+          const env = { ...CFG.vars };
+          for (const b of CFG.bindings) env[b.name] = exp.NsProxy({ props: { class: b.class } });
+          env.__TWD = exp.TailnetApi({ props: { kind: "object", class: cls, name } });
+          return {
+            compatibilityDate: CFG.compatDate,
+            compatibilityFlags: CFG.compatFlags,
+            mainModule: "__twd_facet.js",
+            modules: FACET_MODULES,
+            globalOutbound: exp.Egress({ props: { class: cls, name } }),
+            env,
+          };
+        });
+        this.__f = this.ctx.facets.get("app", () => ({ class: w.getDurableObjectClass(cls) }));
+      }
+      return this.__f;
+    }
+    async fetch(req) {
+      if (this.__killed) return errResponse("killed", "object " + cls + "/" + this.ctx.id.name + " was killed: " + this.__killed);
+      return this.__facet().fetch(req);
+    }
+    async __twd_kill(reason) {
+      this.__killed = reason || "killed";
+      this.ctx.storage.kv.put("__twd_killed", this.__killed);
+      try {
+        this.ctx.facets.abort("app", new Error("killed"));
+      } catch {
+        /* not running */
+      }
+      this.__f = null;
+      return true;
+    }
+  };
+  Object.defineProperty(H, "name", { value: "Host_" + cls });
+  return H;
+}
+
+//@@HOST_CLASSES@@
+
+// NsProxy stands in for a DO namespace binding inside a facet's env:
+// env.X.getByName(name) returns the real stub (RPC promise pipelining makes
+// env.X.getByName(n).method() work).
+export class NsProxy extends WorkerEntrypoint {
+  getByName(name) {
+    return objectStub(this.env, this.ctx, this.ctx.props.class, String(name));
+  }
+}
+
+let macKey = null;
+const enc = new TextEncoder();
+async function mac(env, s) {
+  macKey ??= await crypto.subtle.importKey("raw", enc.encode(env.MAC_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", macKey, enc.encode(s)));
+  return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// Egress for a facet's fetch(). props were minted by Host_<Class>; tenant code
+// cannot change them. hostd verifies the MAC, maps class+name to the object
+// and its node, and netd dials from that node.
+export class Egress extends WorkerEntrypoint {
+  async fetch(request) {
+    const { class: cls, name } = this.ctx.props;
+    const h = new Headers(request.headers);
+    for (const k of [...h.keys()]) if (k.startsWith("x-twd") || k.startsWith("twd-") || k === "proxy-authorization") h.delete(k);
+    const ts = String(Date.now());
+    const nonce = crypto.randomUUID();
+    h.set("x-twd-class", cls);
+    h.set("x-twd-name", encodeURIComponent(name));
+    h.set("x-twd-ts", ts);
+    h.set("x-twd-nonce", nonce);
+    h.set("x-twd-mac", await mac(this.env, [cls, name, request.method, request.url, ts, nonce].join("\n")));
+    // workerd's proxy-style external sends absolute-form without Host; Go's net/http rejects that.
+    h.set("host", new URL(request.url).host);
+    return this.env.NETD_EGRESS.fetch(new Request(request.url, { method: request.method, headers: h, body: request.body, redirect: "manual" }));
+  }
+}
+
+// WorkloadEgress is the tenant service's globalOutbound: the Worker and
+// plain-DO objects egress as the workload node.
+export class WorkloadEgress extends WorkerEntrypoint {
+  async fetch(request) {
+    const h = new Headers(request.headers);
+    for (const k of [...h.keys()]) if (k.startsWith("x-twd") || k.startsWith("twd-") || k === "proxy-authorization") h.delete(k);
+    h.set("host", new URL(request.url).host);
+    return this.env.EGRESS_WL.fetch(new Request(request.url, { method: request.method, headers: h, body: request.body, redirect: "manual" }));
+  }
+}
+
+// TailnetApi backs ctx.tailnet. props: {kind:"object", class, name} for a
+// facet (unforgeable), or {kind:"workload"} for the tenant service, which may
+// act as a plain-DO object it hosts (args.as) but never as a facet object.
+export class TailnetApi extends WorkerEntrypoint {
+  async call(op, args = {}) {
+    const p = this.ctx.props ?? {};
+    let as = null;
+    if (p.kind === "object") as = { class: p.class, name: p.name };
+    else if (args.as) {
+      if (!CFG.classes[args.as.class] || isFacet(args.as.class)) {
+        return { ok: false, error: errBody("bad_request", "the workload may only act as its plain-DO objects") };
+      }
+      as = { class: String(args.as.class), name: String(args.as.name) };
+    }
+    if (!["ensure", "spawn", "ready", "kill", "audit", "self"].includes(op)) return { ok: false, error: errBody("bad_request", "unknown op " + op) };
+    if (op === "ensure" && !as) return { ok: false, error: errBody("bad_request", "ensure needs an object") };
+    try {
+      return { ok: true, value: await hostd(this.env, op, { ...args, as }) };
+    } catch (e) {
+      return { ok: false, error: e.body ?? errBody("hostd_unavailable", String(e)) };
+    }
+  }
+}

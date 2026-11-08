@@ -1,0 +1,50 @@
+{
+  "run": "m3-3a8069",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-07T23:55:39-08:00",
+  "checks": {
+    "hello_egress_is_workload_node": "PASS",
+    "hello_verified_caller": "PASS",
+    "kill_caller_fails_fast": "PASS",
+    "kill_new_request_fails": "PASS",
+    "kill_via_workload_typed_killed": "PASS",
+    "object_direct_ingress_a": "PASS",
+    "object_direct_ingress_b": "PASS",
+    "object_direct_ingress_c": "PASS",
+    "object_egress_attributed_a": "PASS",
+    "object_egress_attributed_b": "PASS",
+    "object_egress_attributed_c": "PASS",
+    "via_workload_before_node_a": "PASS",
+    "via_workload_before_node_b": "PASS",
+    "via_workload_before_node_c": "PASS"
+  },
+  "numbers": {
+    "hello_deploy_to_active_ms": 1611.469,
+    "hello_first_request_ms": 5023.465,
+    "kill_mgmt_call_ms": 200.843,
+    "kill_new_request_fail_ms": 5001.634,
+    "kill_streaming_caller_ttf_ms": 0.91,
+    "object_egress_a_ms": 50.37,
+    "object_egress_b_ms": 8.805,
+    "object_egress_c_ms": 12.329,
+    "object_node_ready_a_ms_since_first_request": 1570.719,
+    "object_node_ready_b_ms_since_first_request": 6775.928,
+    "object_node_ready_c_ms_since_first_request": 6793.758,
+    "probe_deploy_to_active_ms": 1632.824,
+    "via_workload_first_request_a_ms": 25.881,
+    "via_workload_first_request_b_ms": 14.766,
+    "via_workload_first_request_c_ms": 13.889
+  },
+  "notes": [
+    "new request after kill: Get \"http://100.93.23.112/\": context deadline exceeded (Client.Timeout exceeded while awaiting headers)"
+  ],
+  "cleanup": {
+    "delete_errors": null,
+    "devices_deleted": 7,
+    "devices_left": 0,
+    "devices_tracked": 7,
+    "keys_minted": 7,
+    "keys_revoke_errors": null,
+    "untracked_run_devices": null
+  }
+}

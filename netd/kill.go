@@ -32,6 +32,12 @@ type KillOptions struct {
 	// peers' netmaps median 206 ms vs 2.4 s, because closing an ephemeral
 	// node first waits on its control-side logout (up to 5 s).
 	CloseFirst bool
+	// Tombstone keeps the killed node up (listener closed, flows reset) for
+	// this long after the device delete before closing it, so NEW
+	// connections from peers get an immediate RST from netstack instead of
+	// black-holing until their timeout (M1 finding 3). Ignored with
+	// CloseFirst. Registry.Close still closes tombstoned nodes at once.
+	Tombstone time.Duration
 }
 
 // KillReport records what a kill did and how long each step took.
@@ -131,7 +137,17 @@ func (r *Registry) Kill(ctx context.Context, id string, opts KillOptions) (*Kill
 		doDelete()
 	} else {
 		doDelete()
-		doClose()
+		if opts.Tombstone > 0 {
+			keep := opts.KeepState
+			time.AfterFunc(opts.Tombstone, func() {
+				o.teardown()
+				if !keep {
+					os.RemoveAll(o.dir)
+				}
+			})
+		} else {
+			doClose()
+		}
 	}
 	rep.TotalMS = ms(time.Since(t0))
 	r.log.Info("object killed", "object", id, "reason", opts.Reason, "flows_aborted", rep.FlowsAborted,

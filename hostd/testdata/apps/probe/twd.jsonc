@@ -1,0 +1,11 @@
+{
+  "name": "probe",
+  "tailnet": {
+    "tags": ["tag:ttest"],
+    "objects": {
+      "Probe": { "tags": ["tag:ttest"] },
+      // plain-DO mode: alarms work, egress is the workload's
+      "Ticker": { "tags": ["tag:ttest"], "egress": "workload" },
+    },
+  },
+}

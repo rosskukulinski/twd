@@ -1,0 +1,77 @@
+// agent: a Cloudflare Agents SDK Agent. Each agent instance (one per
+// caller by default) is its own Durable Object AND its own tailnet node;
+// its fetch() leaves from that node. State (setState) and SQL (this.sql)
+// are the Agent's own SQLite storage.
+import { Agent, getAgentByName } from "agents";
+import { getCaller, tailnet, principalKey } from "@twd/tailnet";
+
+interface Env {
+  SupportAgent: DurableObjectNamespace;
+  LookupAgent: DurableObjectNamespace;
+  UPSTREAM?: string;
+}
+type DurableObjectNamespace = any;
+
+interface State {
+  visits: number;
+}
+
+export class SupportAgent extends Agent<Env, State> {
+  initialState: State = { visits: 0 };
+
+  async onRequest(req: Request): Promise<Response> {
+    const who = getCaller(req);
+    const url = new URL(req.url);
+    this.sql`create table if not exists calls (node text, path text, at integer)`;
+    this.sql`insert into calls (node, path, at) values (${who.nodeId}, ${url.pathname}, ${Date.now()})`;
+    this.setState({ visits: this.state.visits + 1 });
+    const [{ n }] = this.sql<{ n: number }>`select count(*) as n from calls`;
+
+    if (url.pathname.endsWith("/spawn")) {
+      // A sub-agent with its own node and narrower caps.
+      const child = await tailnet(this.ctx).spawn(this.env.LookupAgent, {
+        name: url.searchParams.get("child") ?? `lookup-${crypto.randomUUID().slice(0, 8)}`,
+        caps: { "example.com/cap/mcp": { tools: ["lookup_order"] } },
+        ttl: "10m",
+      });
+      await child.ready;
+      const r = await child.stub.fetch(new Request("http://child/", { headers: { "x-parent": this.name } }));
+      return Response.json({ agent: this.name, child: { name: child.name, objectId: child.objectId, reply: await r.json() } });
+    }
+
+    let upstream: unknown = null;
+    const target = url.searchParams.get("upstream") ?? this.env.UPSTREAM;
+    if (target) {
+      try {
+        const r = await tailnet(this.ctx).fetch(target);
+        upstream = { status: r.status, body: await r.json() };
+      } catch (e: any) {
+        upstream = { error: e.code ?? String(e), message: e.message };
+      }
+    }
+    return Response.json({
+      agent: this.name,
+      caller: { nodeId: who.nodeId, node: who.node, tags: who.tags, user: who.user ?? null },
+      state: this.state,
+      calls: n,
+      upstream,
+    });
+  }
+}
+
+export class LookupAgent extends Agent<Env, { lookups: number }> {
+  initialState = { lookups: 0 };
+  async onRequest(req: Request): Promise<Response> {
+    this.setState({ lookups: this.state.lookups + 1 });
+    return Response.json({ lookup: this.name, parent: req.headers.get("x-parent"), lookups: this.state.lookups });
+  }
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const who = getCaller(req);
+    const name = new URL(req.url).searchParams.get("agent") ?? principalKey(who);
+    const agent = await getAgentByName(env.SupportAgent, name);
+    return agent.fetch(req);
+  },
+};

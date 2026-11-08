@@ -1,6 +1,7 @@
 # twd STATUS (living log)
 
 Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on branch `m2-mgmt`.
+Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -247,4 +248,124 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
 ## Next steps
 - M2 follow-ups: a per-root row lock for multi-replica budgets, a warm-key pool, node certificates (§4.6), `nodeAttributes` at mint, and a real setec.
 - M3 `twd-hostd`: move `netd/testdata/workerd/platform.js` into the generated wrapper, add the egress MAC, and run the workerd supervisor.
+## M3: `twd-hostd` process tier + JS runtime packages (DONE, branch `m3-hostd`)
+
+### What's built
+- **`cmd/twd-hostd` and `hostd/`.**
+  - Registers (with `pushURL` and an ed25519 `auditPubKey`), heartbeats, and polls assignments every heartbeat or on push.
+  - Self-fences after 9 s without a heartbeat.
+  - On a lease revoke it adopts a newer same-host epoch; otherwise it fences.
+  - For each assignment it:
+    1. fetches and unpacks the bundle (`hostd/bundle`: tar, `twd.jsonc`, `wrangler.jsonc`, safe paths);
+    2. generates the workerd config (`hostd/gen`);
+    3. starts **one supervised workerd per tenant workload**, restarting it on a crash (bounded);
+    4. health-checks it, then switches.
+  - **Blue/green.** New requests wait at a gate while the old instance drains (≤10 s), then go to the new one. Both instances share DO storage, so they never serve at once.
+    - Measured: 293 requests during a redeploy, **0 failed**.
+    - The workload node and all object nodes are unchanged across the switch.
+  - Supervision runs on the process tier on macOS. Linux is not run yet (see below).
+- **Generated platform wrapper** (`hostd/gen/js/platform.js` plus generated modules):
+  - entry: `cf.twd` routing (set only by hostd), `/_twd/o/<Class>/<name>/` on the workload node;
+  - `Host_<Class>` DOs that run each tenant class **as a facet** in a Dynamic Worker, with `globalOutbound = Egress({props:{class,name}})`;
+  - RPC forwarded to the facet through a Proxy (the Agents SDK `__unsafe_ensureInitialized` works);
+  - `NsProxy` for DO bindings inside facets;
+  - `WorkloadEgress` for the tenant service;
+  - `TailnetApi`, which backs `ctx.tailnet`, with props-attested identity;
+  - per-process **egress MAC** (HMAC: class, name, method, url, ts, nonce), verified by hostd (closes the M1 gap "netd trusts x-twd-object");
+  - the platform's own globalOutbound is `deny`.
+- **Tenant service.**
+  - The app's default export runs here as a static workerd service. Its env has the real DO namespaces, and its egress is the workload node.
+  - **Plain-DO mode** (`"egress":"workload"`): the class runs here and alarms work.
+  - `"node": false` marks internal classes, such as the MCP budget DO.
+- **Objects get their own nodes.**
+  1. On the first request, `create()`/`getByName` or `spawn()`, hostd calls `POST /v0/objects` and then `GET credential?epoch`.
+  2. netd adds the node asynchronously, then hostd calls `ready`.
+  3. Until then, requests via the workload node reach the object in-process: the first request took 14–25 ms, before any node existed.
+  4. Facet egress waits for the object's node (`identity_pending` after 30 s). It never falls back to another identity.
+- **Kill.** Kills arrive by mgmt push, heartbeat `kill`/`revokeObjects`, or `ctx.tailnet.kill()`. hostd then:
+  1. runs netd tier 1 (RST all flows);
+  2. leaves the node as a **tombstone** for 10 s, so new connections get an RST (new `netd.KillOptions.Tombstone`);
+  3. sets the platform kill flag, so the object returns 410 `killed` even in-process;
+  4. writes an audit record.
+  - Device deletion (tier 2) is done by mgmt.
+- **Hibernation.** workerd evicts idle objects after ~10 s, and their nodes stay online; the next request wakes the object (`wakes` is counted). Measured: still in the client's netmap after 14 s idle, then woke.
+- **Local host API** (`hostapi.sock`, reachable only by the platform): `ensure`, `spawn` (parent = the attested caller), `ready`, `kill` (self or descendants), `audit` forwarding, and `self`.
+- **Audit.** A hash chain per host, using M2's canonical sorted-key SHA-256 and ed25519 `hostSig`. It is flushed with heartbeats and covers spawn, kill, egress deny, and app records.
+- **`hostd/fakemgmt`.** An in-memory mgmt that matches the M2 contract clarifications:
+  - one lease per (tenant, workload), and namespaces as class names;
+  - `revokeObjects`, `Twd-Host-ID`, a 410 for killed names;
+  - spawn checks (caps ⊆ parent, maxLive 64, maxDepth 3) and a registrations-per-minute token bucket;
+  - mint modes `static` (testcontrol) and `apikey` (`internal/tsapi`);
+  - optional push.
+- **JS packages** (TypeScript 7.0.2, built to ESM in `dist/`):
+  - **`@twd/tailnet`:** `getCaller`, `TailnetError` with the full typed catalog (statuses, `toJSON`/`toResponse`/`from`), `isTailnetError`, `fromResponse`, `tailnet(ctx)`.
+    - The runtime provides `ctx.tailnet.fetch/forward/spawn/kill/audit/self` plus the class and handler wrappers.
+    - hostd embeds an esbuild of `src/runtime.ts` (`make gen-js`; a test fails if it is stale).
+  - **`@twd/mcp`:** `withTailnet(handler, {path})` via AsyncLocalStorage, and `caller()`.
+    - `authorizeTool`: union of grants, max for numeric limits (a matching grant without the limit means unbounded), and `groups` gating.
+    - Errors are thrown as `TailnetError` whose **message is the JSON body**, so MCP tool results carry `{"code":"cap_missing",...}`.
+    - `budget()` is backed by the `TwdBudget` DO (`@twd/mcp/budget-do`).
+  - **`create-twd`:**
+    - templates `hello` (a Worker plus a private fetch), `agent` (an Agents SDK `Agent` with `setState`, `this.sql` and a `spawn` route) and `mcp` (`createMcpHandler` + `withTailnet` + `authorizeTool` + `budget`);
+    - `create-twd build`, a wrangler-like esbuild bundler (workerd conditions, `node:*` builtins, `cloudflare:email` stubbed).
+- **SDK versions (verified on workerd 1.20261108.1, no bump needed):** `agents` 0.33.0, `@modelcontextprotocol/server` 2.4.0, `@modelcontextprotocol/sdk` 1.32.2 (agents' peer) and `zod` 4.6.7.
+  - `agents/mcp/server`'s `createMcpHandler` takes an **MCP SDK v2** factory (`McpServer` from `@modelcontextprotocol/server`). The v1 `McpServer` path is deprecated upstream and not used.
+  - `cloudflare:email` is missing from stock workerd, so the bundler stubs it. Email is unsupported.
+- **Docs:**
+  - `docs/egress-modes.md`: the facet vs plain-DO trade-off, including alarms, attestation, the getByName caveat, and why switching modes resets storage;
+  - `docs/contracts/hostd-additions.md`: hostd additions plus two gaps for M2.
+
+### Test results (measured 2026-11-07/08, this Mac)
+- **`make test`: PASS.** It covers netd, tsapi, hostd (with `-race`), the gen integration tests (real workerd, fake hostd sockets), and the JS tests (tailnet 7/7, mcp 4/4). Hostd results from `TestHostd`:
+
+  | Check | Result |
+  |---|---|
+  | deploy `hello` → a tsnet client calls the workload node | verified caller in the response; the Worker's private fetch is attributed to the workload node (echo WhoIs) |
+  | 3 DO objects | each gets its own node and IP; direct ingress caller OK; **egress attributed to its own node** 3/3; `ctx.tailnet.fetch` attributed too, with a typed throw for `peer_not_visible` and `forbidden_destination` (self) |
+  | forged headers | client `x-twd-cf`/`x-twd-object`/`cf-*`/`x-forwarded-for`/`tailnet-assertion` stripped, tenant saw only `x-twd-object`; tenant-forged egress headers changed nothing and none reached echo |
+  | kill → fast failure | streaming caller failed **1.0 ms** after the mgmt kill; a new request was **refused in 1.1 ms** (tombstone); via the workload, 410 `killed` |
+  | `mcp` template | allowed `lookup_order` succeeds; `refund` → `isError` with `cap_missing` JSON (`missing.tool`, `have.tools`) |
+  | `agent` template | `Agent` `setState`/`this.sql` persist across requests via the Worker and the object's own node; agent egress leaves from its own node; `spawn()` of a sub-agent works |
+  | spawn | child gets its own node, lineage is recorded in mgmt, MagicDNS name returned |
+  | plain-DO mode | alarm fires; egress = workload node; ingress via own node |
+  | hibernation | node stays online, object wakes |
+  | blue/green | 0 failures |
+  | audit | spawn/kill/deny records present, chain verified |
+  | `TestKillViaHeartbeat` (no push) | delivered in 143 ms at a 200 ms heartbeat |
+- **`make test-m2mgmt`: PASS.** hostd ran against the **real twd-mgmt** built from `origin/m2-mgmt` (`git archive`; nothing checked out), with testcontrol and a fake Tailscale API.
+  - Workload node, 3 objects with attributed egress, kill via heartbeat `revokeObjects`: the stream failed **172 ms** after the kill (300 ms heartbeat), and the device was deleted by mgmt.
+  - The audit chain, including the host's ed25519 signatures, **verified**.
+- **`make e2e-real` (`TestRealHostd`, tailnet 1): PASS, 14/14 checks**, 1 run (`e2e/real/results/m3-*.json`). It used fakemgmt in apikey mode, production control and ephemeral `tag:ttest` `ttest-m3-<run>-*` nodes.
+  - hello: verified caller, egress = workload node.
+  - 3 objects:
+    - reachable via the workload in 14–26 ms before their nodes existed;
+    - nodes ready 1.6 s (a) and 6.8 s (b, c) after the first request;
+    - egress attributed 3/3 (9–50 ms).
+  - Kill: streaming caller TTF **0.91 ms**; 410 via the workload.
+  - **Cleanup:** 7 devices tracked, 7 deleted, 0 left, 0 untracked; 7 keys minted and revoked. No policy was read or written.
+  - **Not fast on production:** a *new* request to the killed object's IP timed out (5 s) instead of failing fast. mgmt deletes the device right after the push, the peer drops the node from its netmap, and then the dial black-holes (M1 finding 3). The tombstone only helps while the peer still has the node in its netmap, which is always true on testcontrol. A fix is either to delay the device delete by about the tombstone time, or to have clients treat netmap absence as dead.
+- `make lint`: PASS.
+
+### Contract notes (see `docs/contracts/hostd-additions.md`)
+- hostd and fakemgmt follow M2's clarifications: lease `<tenantID>/<workload>`, namespace = class, `revokeObjects`, `Twd-Host-ID`, canonical audit hash with ed25519, `epoch` on ready.
+- **Additions (optional):** `pushURL` and the push API, heartbeat `deployments`, `kill`, assignment `workloadTags`, `GET /v0/deployments/{id}`, `mintMode:"static"` (fakemgmt).
+- **Gaps M2 must close:**
+  1. The workload entry node: hostd uses namespace `_workload`, which M2 needs declared explicitly, and M2 rejects bundles with no `tailnet.objects`.
+  2. Kill delivery waits for a heartbeat without push.
+- Also changed: M1 e2e-real cleanup is now **ID-based** (`tsapi.Tracker`) with a per-run `ttest-m1-<run>` prefix, because suites share tailnet 1. Re-run after the change: PASS; 7 tracked, 7 deleted, 0 left.
+
+### Known gaps (M3)
+- **Linux/Lima not run**; macOS only.
+- **Facets and DO bindings.** No alarms in facet mode (use plain-DO mode). Facet env DO bindings expose only `getByName`, which must be awaited. `newUniqueId()` objects get no node.
+- **Spawn caps are not enforced on the receiving side.** They are checked by mgmt but not yet written into the node cert (`CapMap ∩ lim`). `actingFor` assertions and `forward()` act-chain re-signing are not implemented, and `ctx.tailnet.connect()` is a typed `plan_feature_missing`.
+- **Persistence and rejoin.** Object metadata persists (`objects.json`) and nodes rejoin on redeploy. Ephemeral nodes can't rejoin after a close, because tsnet logs them out.
+- **Not built yet:**
+  - egress MAC replay protection (no nonce cache; timestamp skew only);
+  - same-host object→object calls over the tailnet (refused as siblings by netd); in-process DO RPC works and is not policy-checked;
+  - cron triggers, WebSocket hibernation across deploys, internet egress (`egress.internet` is parsed but everything is denied), and `forward()` signing.
+
+## Next steps
+- M2 `twd-mgmt`: SQLite and Postgres leases with epoch fencing, the mint broker (API-key mode first, reusing `internal/tsapi`), the registration throttle and the audit log.
+- M2 follow-ups for hostd: implicit `_workload` namespace, kill push or long-poll, delayed device delete for fail-fast new requests.
+- M4 `twd` CLI on top of `create-twd build` + the deployments API; `twd up` runs twd-mgmt + twd-hostd.
 - Run `make test` in Lima `twd-dev` (Linux arm64).

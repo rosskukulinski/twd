@@ -1,10 +1,29 @@
 {
   "name": "@twd/mcp",
-  "version": "0.0.0",
-  "description": "withTailnet MCP helper (M3+; placeholder)",
+  "version": "0.1.0",
+  "description": "withTailnet, caller(), authorizeTool and budget() for stateless MCP servers on twd",
   "type": "module",
-  "main": "src/index.js",
-  "exports": { ".": "./src/index.js" },
-  "dependencies": { "@twd/tailnet": "0.0.0" },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./budget-do": {
+      "types": "./dist/budget-do.d.ts",
+      "default": "./dist/budget-do.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@twd/tailnet": "0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.js"
+  },
   "license": "BSD-3-Clause"
 }

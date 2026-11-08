@@ -1,0 +1,9 @@
+{
+  "name": "hello",
+  "tailnet": {
+    // the workload node's tags (your policy must let tag:twd own them)
+    "tags": ["tag:twd-wl-hello"],
+    // declared dependencies; `twd deploy` preflights these grants
+    "connects": ["tag:db"]
+  }
+}

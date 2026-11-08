@@ -1,0 +1,9 @@
+{
+  "name": "hello",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "vars": {
+    // a private service on your tailnet; leave empty to skip the fetch
+    "UPSTREAM": ""
+  }
+}
