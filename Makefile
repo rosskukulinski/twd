@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps test test-go test-js test-pg e2e-local e2e-real e2e-vm release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-vm release lint hooks clean gen-js test-m2mgmt
 
 all: build
 
@@ -16,8 +16,14 @@ $(WORKERD): package.json package-lock.json
 	npm ci --no-audit --no-fund
 	@touch $@
 
-deps: $(WORKERD)
+deps: $(WORKERD) js-build
 	$(GO) mod download
+
+## js-build: compile the TypeScript packages (dist/ is gitignored, so clean clones need this).
+js-build: $(WORKERD)
+	npm run -w @twd/tailnet build
+	npm run -w @twd/mcp build
+	npm run --workspaces --if-present build
 
 ## test: hermetic unit + integration tests (testcontrol + local DERP/STUN + stock workerd).
 test: deps test-go test-js
