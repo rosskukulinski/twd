@@ -238,3 +238,18 @@ delete by ~the tombstone window, and have clients treat netmap-absence as dead.
 - `attacks/rt03_mgmt_socket_test.go` — skip-marked RT-03, dials the real listener.
 
 All compile and `go vet` clean; skip-marked so CI stays green until the fixes land.
+
+---
+
+## Fix status (branch `rt-fixes`, 2026-11-08)
+
+| ID | Status | Where |
+|----|--------|-------|
+| RT-01 | **Fixed**: node certificates (ADR-010) signed by mgmt at ready; receiving netd computes `CapMap ∩ lim`, fails closed | STATUS.md "RT fixes"; `rt01_spawn_lim_test.go` un-skipped |
+| RT-02 | **Fixed**: tenant code produces only `tenant_note`/`source: tenant`; mgmt and `twd audit` enforce/show provenance | `rt02_audit_forgery_test.go` un-skipped |
+| RT-03 | **Fixed**: per-host bearer token on the unix socket, rotated on `twd up`; peercred kept as an extra check | `rt03_mgmt_socket_test.go` un-skipped |
+| RT-04 | **Partial**: per-object derived MAC keys; the root still lives in the guest, so `isolation: "object"` remains the real fix | STATUS.md |
+| RT-05 | **Fixed** for what exists: nonce caches on egress MACs and the Node caller header; OBO assertions are still unimplemented | STATUS.md |
+| RT-06 | **Fixed**: `--policy-apply` only adds `tag:twd*` tagOwners and twd-sourced grants, refuses any non-additive diff | `internal/policy` hostile table + fuzz tests |
+| RT-07 | **Documented**: kill tier 1 (RST + tombstone) is the fast path; netmap retraction stays a control-plane property | STATUS.md |
+| RT-08 | **Fixed/partial**: `@twd/node` `enforceEgress()` (cooperative); hostd reports `egress unenforced`, refuses Node-tier on multi-tenant hosts; docs say only Landlock/microVM is a boundary | `docs/node-tier.md` |
