@@ -19,26 +19,31 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/rosskukulinski/twd/guest/proto"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/hostd/vm/helper"
+	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
 	"github.com/rosskukulinski/twd/netd"
 	"golang.org/x/sys/unix"
 )
 
 // Config configures the Firecracker backend.
 type Config struct {
-	Firecracker string // firecracker binary (default /usr/local/bin/firecracker)
+	// Helper is twd-vmhelper's socket (installed by `sudo twd host setup
+	// --microvm`): the privileged netns/TAP/jailer/dm-crypt half. If it is
+	// "" and this process is root, an in-process helper is used instead
+	// (tests; Firecracker and Jailer name its binaries then).
+	Helper      string
+	Firecracker string // in-process helper only (default /usr/local/bin/firecracker)
+	Jailer      string // in-process helper only (default /usr/local/bin/jailer)
 	Kernel      string // uncompressed guest kernel (vmlinux)
 	Rootfs      string // guest image from guest/build-image.sh (mounted read-only by every VM)
-	RunDir      string // per-VM dirs: API socket, vsock, config drive, console log
+	RunDir      string // per-VM dirs: config drive, console log
 	MemMiB      int    // guest memory (default 512)
 	VCPUs       int    // default 2 (1 vCPU: workerd's threads contend; p50 latency ~30 ms nested)
 	MTU         int    // default 1500
@@ -63,29 +68,37 @@ type Backend struct {
 	cfg    Config
 	seq    atomic.Int64
 	ownDir bool
+	sock   string
+	// in-process helper (root only)
+	srv     *helper.Server
+	srvLn   *net.UnixListener
+	srvBase string
+	via     string
 }
 
-// Available reports whether this host can run microVMs (KVM, Firecracker,
-// root for network namespaces).
+// Available reports whether this host can run microVMs: KVM, the guest
+// kernel and image, and either the helper (as a normal user) or root.
 func Available(cfg Config) error {
-	if cfg.Firecracker == "" {
-		cfg.Firecracker = "/usr/local/bin/firecracker"
+	if _, err := os.Stat("/dev/kvm"); err != nil {
+		return fmt.Errorf("no /dev/kvm: %w", err)
 	}
-	if f, err := os.OpenFile("/dev/kvm", os.O_RDWR, 0); err != nil {
-		return fmt.Errorf("no usable /dev/kvm: %w", err)
-	} else {
-		f.Close()
-	}
-	for _, p := range []string{cfg.Firecracker, cfg.Kernel, cfg.Rootfs} {
+	for _, p := range []string{cfg.Kernel, cfg.Rootfs} {
 		if _, err := os.Stat(p); err != nil {
 			return err
 		}
 	}
-	if os.Geteuid() != 0 {
-		return errors.New("the microVM tier needs root (network namespaces, TAP devices)")
+	if cfg.Helper != "" {
+		r, err := helperapi.Ping(cfg.Helper)
+		if err != nil {
+			return fmt.Errorf("microVM helper at %s: %w (run `sudo twd host setup --microvm`)", cfg.Helper, err)
+		}
+		if r.Version != helperapi.Version {
+			return fmt.Errorf("microVM helper at %s speaks protocol %d, want %d (re-run `sudo twd host setup --microvm`)", cfg.Helper, r.Version, helperapi.Version)
+		}
+		return nil
 	}
-	if _, err := exec.LookPath("ip"); err != nil {
-		return err
+	if os.Geteuid() != 0 {
+		return errors.New("the microVM tier needs the twd-vmhelper service (run `sudo twd host setup --microvm`)")
 	}
 	return nil
 }
@@ -94,6 +107,9 @@ func Available(cfg Config) error {
 func New(cfg Config) (*Backend, error) {
 	if cfg.Firecracker == "" {
 		cfg.Firecracker = "/usr/local/bin/firecracker"
+	}
+	if cfg.Jailer == "" {
+		cfg.Jailer = "/usr/local/bin/jailer"
 	}
 	if cfg.MemMiB == 0 {
 		cfg.MemMiB = 512
@@ -116,36 +132,57 @@ func New(cfg Config) (*Backend, error) {
 	if err := Available(cfg); err != nil {
 		return nil, err
 	}
-	own := false
+	b := &Backend{cfg: cfg, sock: cfg.Helper, via: "twd-vmhelper " + cfg.Helper}
 	if cfg.RunDir == "" {
 		d, err := os.MkdirTemp("/tmp", "twd-vm-")
 		if err != nil {
 			return nil, err
 		}
-		cfg.RunDir, own = d, true
+		b.cfg.RunDir, b.ownDir = d, true
 	}
-	if err := os.MkdirAll(cfg.RunDir, 0o700); err != nil {
+	if err := os.MkdirAll(b.cfg.RunDir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Backend{cfg: cfg, ownDir: own}, nil
-}
-
-func (b *Backend) machineConfig() map[string]any {
-	mc := map[string]any{"vcpu_count": b.cfg.VCPUs, "mem_size_mib": b.cfg.MemMiB}
-	switch b.cfg.HugePages {
-	case "on":
-		mc["huge_pages"] = "2M"
-	case "", "auto":
-		if FreeHugePages2M()*2 >= b.cfg.MemMiB {
-			mc["huge_pages"] = "2M"
+	if b.sock == "" {
+		if err := b.startInProcessHelper(); err != nil {
+			b.Close()
+			return nil, err
 		}
 	}
-	return mc
+	return b, nil
 }
 
-// Close removes the backend's run directory if it created it. Running VMs
-// must be stopped first.
+// startInProcessHelper runs the privileged helper inside this (root)
+// process, on a private socket, with its own jail dir and resource names.
+func (b *Backend) startInProcessHelper() error {
+	inst := fmt.Sprintf("p%d", os.Getpid())
+	b.srvBase = filepath.Join("/var/lib", "twd-vm-"+inst)
+	srv, err := helper.New(helper.Config{Firecracker: b.cfg.Firecracker, Jailer: b.cfg.Jailer,
+		JailBase: filepath.Join(b.srvBase, "jail"), StateDir: b.srvBase, UIDBase: 3910000000 + (os.Getpid()%1000)*1000,
+		MaxVMs: 1000, Instance: inst, Log: b.cfg.Log.With("component", "vmhelper")})
+	if err != nil {
+		return fmt.Errorf("in-process microVM helper: %w", err)
+	}
+	b.sock = filepath.Join(b.cfg.RunDir, "helper.sock")
+	os.Remove(b.sock)
+	ln, err := net.ListenUnix("unixpacket", &net.UnixAddr{Name: b.sock, Net: "unixpacket"})
+	if err != nil {
+		return err
+	}
+	os.Chmod(b.sock, 0o600)
+	b.srv, b.srvLn, b.via = srv, ln, "in-process helper (root)"
+	go srv.Serve(ln)
+	return nil
+}
+
+// Close stops the in-process helper (if any) and removes the backend's run
+// directory if it created it. Running VMs must be stopped first.
 func (b *Backend) Close() error {
+	if b.srv != nil {
+		b.srvLn.Close()
+		b.srv.Close()
+		os.RemoveAll(b.srvBase)
+	}
 	if b.ownDir {
 		return os.RemoveAll(b.cfg.RunDir)
 	}
@@ -154,6 +191,9 @@ func (b *Backend) Close() error {
 
 // Name implements sandbox.Backend.
 func (b *Backend) Name() string { return "firecracker" }
+
+// Via says how VMs are launched (helper service or in-process).
+func (b *Backend) Via() string { return b.via }
 
 var (
 	gatewayIP = netip.MustParseAddr(proto.GatewayIP)
@@ -167,15 +207,15 @@ const guestMAC = "06:00:c0:a8:48:02"
 type Machine struct {
 	b       *Backend
 	id      string
-	ns      string
 	dir     string
 	log     *slog.Logger
-	cmd     *exec.Cmd
-	api     *http.Client
+	conn    *helperapi.Conn
+	pid     int
 	vn      *vnet
 	tapFD   int
 	vsock   net.Listener
 	ingress http.Handler
+	volume  bool
 
 	info    sandbox.Info
 	start   time.Time
@@ -200,9 +240,8 @@ type Machine struct {
 func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err error) {
 	t0 := time.Now()
 	n := b.seq.Add(1)
-	// Unique across hostd processes on this host (it names the netns).
 	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), s.ID, n)
-	m := &Machine{b: b, id: id, ns: "twd-" + id, dir: filepath.Join(b.cfg.RunDir, id), tapFD: -1,
+	m := &Machine{b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id), tapFD: -1,
 		done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}}
 	m.log = b.cfg.Log.With("vm", id)
 	if s.Log != nil {
@@ -217,90 +256,89 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	if err := os.MkdirAll(m.dir, 0o700); err != nil {
 		return nil, err
 	}
-	// 1. Network: namespace, bridge, Firecracker's TAP, our TAP, gVisor stack.
-	if err := setupNetns(m.ns, b.cfg.MTU); err != nil {
-		return nil, err
-	}
-	fd, err := openTapInNetns(m.ns, "gv0", b.cfg.MTU)
-	if err != nil {
-		return nil, err
-	}
-	m.tapFD = fd
-	m.vn, err = newVnet(fd, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, s.Handlers)
-	if err != nil {
-		return nil, err
-	}
-	m.ingress = m.ingressProxy()
-
-	// 2. Config drive: the instance dir + guest.json, as a raw tar.
+	// 1. Config drive: the instance dir + guest.json, as a raw tar.
 	drive := filepath.Join(m.dir, "config.tar")
 	if err := writeConfigDrive(drive, s, b.cfg.MTU); err != nil {
 		return nil, fmt.Errorf("config drive: %w", err)
 	}
 	m.disks = []string{b.cfg.Rootfs, drive}
 
-	// 3. vsock control channel: guestd connects to CID 2 port VsockPort,
-	// which Firecracker forwards to <uds>_<port>.
-	vs := filepath.Join(m.dir, "v.sock")
-	m.vsock, err = net.Listen("unix", fmt.Sprintf("%s_%d", vs, proto.VsockPort))
-	if err != nil {
-		return nil, err
-	}
-	go m.acceptCtl()
-
-	// 4. Firecracker, in the namespace, configured over its API socket.
-	apiSock := filepath.Join(m.dir, "fc.sock")
-	console, err := os.OpenFile(filepath.Join(m.dir, "console.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return nil, err
-	}
-	m.cmd = exec.Command("ip", "netns", "exec", m.ns, b.cfg.Firecracker, "--api-sock", apiSock, "--id", id, "--level", "Warning")
-	m.cmd.Stdout, m.cmd.Stderr = console, console
-	// No Pdeathsig: it fires when the forking *thread* exits, not hostd.
-	// Stop/Close (and teardown on every error path) kill the VMM instead.
-	m.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := m.cmd.Start(); err != nil {
-		console.Close()
-		return nil, err
-	}
-	go func() {
-		werr := m.cmd.Wait()
-		console.Close()
-		if !m.stopped.Load() {
-			m.exitErr = fmt.Errorf("firecracker exited: %v; console: %s", werr, m.consoleTail(1500))
-			m.log.Warn("microVM exited", "err", werr)
+	// 2. The files the helper puts in the jail, as open fds.
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			f.Close()
 		}
-		m.teardown()
-		close(m.done)
 	}()
-	m.api = &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", apiSock)
-	}}}
-	if err := m.waitAPI(ctx, apiSock); err != nil {
-		return nil, err
-	}
-	for _, c := range []struct {
-		path string
-		body any
-	}{
-		{"/machine-config", b.machineConfig()},
-		{"/boot-source", map[string]any{"kernel_image_path": b.cfg.Kernel, "boot_args": b.cfg.BootArgs}},
-		{"/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": b.cfg.Rootfs, "is_root_device": true, "is_read_only": true}},
-		{"/drives/config", map[string]any{"drive_id": "config", "path_on_host": drive, "is_root_device": false, "is_read_only": true}},
-		{"/network-interfaces/eth0", map[string]any{"iface_id": "eth0", "host_dev_name": "fc0", "guest_mac": guestMAC}},
-		{"/vsock", map[string]any{"guest_cid": 3, "uds_path": vs}},
-	} {
-		if err := m.call(ctx, "PUT", c.path, c.body); err != nil {
+	for _, p := range []string{b.cfg.Kernel, b.cfg.Rootfs, drive} {
+		f, err := os.Open(p)
+		if err != nil {
 			return nil, err
 		}
+		files = append(files, f)
 	}
-	m.start = time.Now()
-	if err := m.call(ctx, "PUT", "/actions", map[string]any{"action_type": "InstanceStart"}); err != nil {
+	console, err := os.OpenFile(filepath.Join(m.dir, "console.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
 		return nil, err
 	}
-	m.info.PID = m.fcPID()
+	files = append(files, console)
+	req := &helperapi.StartRequest{Name: s.ID, MemMiB: b.cfg.MemMiB, VCPUs: b.cfg.VCPUs, HugePages: b.cfg.HugePages,
+		BootArgs: b.cfg.BootArgs, MTU: b.cfg.MTU, GuestMAC: guestMAC, GuestCID: 3, VsockPort: proto.VsockPort}
+	if v := s.Volume; v != nil {
+		f, format, err := openVolume(v)
+		if err != nil {
+			return nil, fmt.Errorf("volume %s: %w", v.Name, err)
+		}
+		files = append(files, f)
+		req.Volume = &helperapi.Volume{Name: v.Name, Epoch: v.Epoch, Key: v.Key, Format: format}
+		m.disks = append(m.disks, v.Path)
+		m.volume = true
+		m.info.Volume = v.Name
+	}
 
-	// 5. Wait for guestd to report workerd healthy.
+	// 3. The helper: netns + TAPs, jail, volume, jailer → Firecracker,
+	// API config, InstanceStart.
+	m.conn, err = helperapi.Dial(b.sock)
+	if err != nil {
+		return nil, fmt.Errorf("microVM helper: %w", err)
+	}
+	resp, fds, err := m.conn.Do(helperapi.Request{Op: "start", Start: req}, files, 90*time.Second)
+	req.Volume = nil // drop our reference to the key copy
+	if err != nil {
+		return nil, fmt.Errorf("microVM start: %w; console: %s", err, m.consoleTail(1500))
+	}
+	if len(fds) != 2 {
+		for _, fd := range fds {
+			unix.Close(fd)
+		}
+		return nil, fmt.Errorf("microVM helper returned %d fds", len(fds))
+	}
+	m.tapFD = fds[0]
+	vf := os.NewFile(uintptr(fds[1]), "vsock")
+	m.vsock, err = net.FileListener(vf)
+	vf.Close()
+	if err != nil {
+		return nil, err
+	}
+	m.pid = resp.PID
+	m.start = time.Unix(0, resp.StartedAt)
+	m.info.PID = resp.PID
+	m.info.HugePages = resp.HugePages
+	m.info.VolumeNew = resp.VolumeNew
+	m.info.VolumeAttachMS = resp.Timings["volume"]
+	if j := resp.Jail; j != nil {
+		m.info.Jail = &sandbox.Jail{ID: j.ID, Chroot: j.Chroot, Cgroup: j.Cgroup, CPUMax: j.CPUMax, Seccomp: j.Seccomp,
+			Netns: j.Netns, UID: j.UID, GID: j.GID, MemMax: j.MemMax}
+	}
+	m.vn, err = newVnet(m.tapFD, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, s.Handlers)
+	if err != nil {
+		return nil, err
+	}
+	m.ingress = m.ingressProxy()
+	go m.acceptCtl()
+	go m.watch()
+
+	// 4. Wait for guestd to report workerd healthy.
 	rctx, cancel := context.WithTimeout(ctx, b.cfg.ReadyTimeout)
 	defer cancel()
 	select {
@@ -314,54 +352,70 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		return nil, fmt.Errorf("microVM not ready after %v; events %v; last %s; console: %s", b.cfg.ReadyTimeout, m.eventTypes(), le, m.consoleTail(3000))
 	}
 	m.info.Total = time.Since(t0)
-	m.log.Info("microVM ready", "boot_ms", m.info.Boot.Milliseconds(), "ready_ms", m.info.Ready.Milliseconds(), "total_ms", m.info.Total.Milliseconds())
+	m.log.Info("microVM ready", "boot_ms", m.info.Boot.Milliseconds(), "ready_ms", m.info.Ready.Milliseconds(),
+		"total_ms", m.info.Total.Milliseconds(), "jail", resp.Jail != nil, "volume", m.info.Volume, "volume_ms", m.info.VolumeAttachMS)
 	return m, nil
 }
 
-func (m *Machine) waitAPI(ctx context.Context, sock string) error {
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if c, err := net.Dial("unix", sock); err == nil {
-			c.Close()
-			return nil
-		}
-		select {
-		case <-m.done:
-			return fmt.Errorf("firecracker exited: %s", m.consoleTail(1500))
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-		if time.Now().After(deadline) {
-			return errors.New("firecracker API socket did not appear")
-		}
-		time.Sleep(2 * time.Millisecond)
+// openVolume opens the volume image, creating it (sparse) if missing.
+// format reports that it is new (or was created but never formatted).
+func openVolume(v *sandbox.Volume) (*os.File, bool, error) {
+	if len(v.Key) != 32 {
+		return nil, false, errors.New("no volume key")
 	}
-}
-
-func (m *Machine) call(ctx context.Context, method, path string, body any) error {
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(ctx, method, "http://fc"+path, bytes.NewReader(b))
-	req.Header.Set("content-type", "application/json")
-	resp, err := m.api.Do(req)
+	size := int64(v.SizeMiB) << 20
+	if size == 0 {
+		size = 1 << 30
+	}
+	if err := os.MkdirAll(filepath.Dir(v.Path), 0o700); err != nil {
+		return nil, false, err
+	}
+	f, err := os.OpenFile(v.Path, os.O_RDWR|os.O_CREATE, 0o600)
 	if err != nil {
-		return fmt.Errorf("firecracker %s %s: %w", method, path, err)
+		return nil, false, err
 	}
-	defer resp.Body.Close()
-	rb, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("firecracker %s %s: %d %s", method, path, resp.StatusCode, strings.TrimSpace(string(rb)))
+	st, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, false, err
 	}
-	return nil
+	if st.Size() == 0 {
+		if err := f.Truncate(size); err != nil {
+			f.Close()
+			return nil, false, err
+		}
+	}
+	head := make([]byte, 4096)
+	n, _ := f.ReadAt(head, 0)
+	blank := true
+	for _, c := range head[:n] {
+		if c != 0 {
+			blank = false
+			break
+		}
+	}
+	return f, blank, nil
 }
 
-// fcPID finds the firecracker process (a child of `ip netns exec`, which
-// execs it, so it is usually the same PID).
-func (m *Machine) fcPID() int {
-	if m.cmd == nil || m.cmd.Process == nil {
-		return 0
+// watch turns the helper's exit event (or a lost helper connection) into
+// the VM's exit.
+func (m *Machine) watch() {
+	var why string
+	select {
+	case ev := <-m.conn.Events():
+		why = ev.Error
+	case <-m.conn.Closed():
+		why = "helper connection closed"
 	}
-	return m.cmd.Process.Pid
+	if !m.stopped.Load() {
+		if why == "" {
+			why = "killed"
+		}
+		m.exitErr = fmt.Errorf("firecracker exited: %s; console: %s", why, m.consoleTail(1500))
+		m.log.Warn("microVM exited", "why", why)
+	}
+	m.teardown()
+	close(m.done)
 }
 
 func (m *Machine) consoleTail(n int) string {
@@ -523,27 +577,39 @@ func (m *Machine) Disks() []string { return m.disks }
 
 // RSSKB implements sandbox.VM: the firecracker process's RSS.
 func (m *Machine) RSSKB() int64 {
-	if p := m.fcPID(); p > 0 {
-		return procRSSKB(p)
+	if m.pid > 0 {
+		return procRSSKB(m.pid)
 	}
 	return 0
 }
 
-// Kill implements sandbox.VM: SIGKILL the VMM (no clean shutdown).
+// Kill implements sandbox.VM: the helper SIGKILLs the VMM (no clean
+// shutdown; the guest's volume is left as a power cut would leave it).
 func (m *Machine) Kill() {
-	if m.cmd != nil && m.cmd.Process != nil {
-		syscall.Kill(-m.cmd.Process.Pid, syscall.SIGKILL)
+	if m.conn != nil {
+		m.conn.Do(helperapi.Request{Op: "kill"}, nil, 5*time.Second)
 	}
 }
 
-// Stop implements sandbox.VM. Firecracker on arm64 has no ACPI shutdown, and
-// the guest's state is disposable (tmpfs), so stopping is a kill.
+// Stop implements sandbox.VM. With a volume, the guest first stops workerd
+// and unmounts it (so every write is on the host), then the VMM is killed
+// (arm64 Firecracker has no ACPI shutdown) and the helper releases the
+// volume, which can then be attached to the next VM. Stop returns after
+// that release.
 func (m *Machine) Stop() {
+	if m.volume && m.readyOK.Load() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		st := time.Now()
+		_, err := m.Op(ctx, proto.Msg{Op: "shutdown"})
+		cancel()
+		m.log.Info("guest released its volume", "ms", time.Since(st).Milliseconds(), "err", err)
+	}
 	m.stopped.Store(true)
 	m.Kill()
 	select {
 	case <-m.done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(15 * time.Second):
+		m.log.Warn("microVM did not exit after kill")
 	}
 	m.teardown()
 	if os.Getenv("TWD_KEEP_INSTANCES") == "" {
@@ -551,7 +617,7 @@ func (m *Machine) Stop() {
 	}
 }
 
-// teardown aborts every flow and releases the network (idempotent).
+// teardown aborts every flow and drops the helper session (idempotent).
 func (m *Machine) teardown() {
 	m.cleanup.Do(func() {
 		if m.vn != nil {
@@ -568,25 +634,36 @@ func (m *Machine) teardown() {
 			m.ctl.Close()
 		}
 		m.mu.Unlock()
-		if m.cmd != nil && m.cmd.Process != nil && m.cmd.ProcessState == nil {
-			syscall.Kill(-m.cmd.Process.Pid, syscall.SIGKILL)
+		if m.conn != nil {
+			m.conn.Close()
 		}
-		teardownNetns(m.ns)
 	})
 }
 
-// MemoryDump implements sandbox.VM via a Firecracker full snapshot.
+// MemoryDump implements sandbox.VM via a Firecracker full snapshot (taken
+// by the helper inside the jail; we get the memory file as an fd).
 func (m *Machine) MemoryDump(ctx context.Context, dir string) (string, error) {
-	mem := filepath.Join(dir, m.id+".mem")
-	snap := filepath.Join(dir, m.id+".snap")
-	if err := m.call(ctx, "PATCH", "/vm", map[string]any{"state": "Paused"}); err != nil {
+	_, fds, err := m.conn.Do(helperapi.Request{Op: "memdump"}, nil, 60*time.Second)
+	if err != nil {
 		return "", err
 	}
-	err := m.call(ctx, "PUT", "/snapshot/create", map[string]any{"snapshot_type": "Full", "snapshot_path": snap, "mem_file_path": mem})
-	if rerr := m.call(ctx, "PATCH", "/vm", map[string]any{"state": "Resumed"}); err == nil {
-		err = rerr
+	if len(fds) != 1 {
+		for _, fd := range fds {
+			unix.Close(fd)
+		}
+		return "", errors.New("memdump: no fd")
 	}
-	os.Remove(snap)
+	src := os.NewFile(uintptr(fds[0]), "mem")
+	defer src.Close()
+	mem := filepath.Join(dir, m.id+".mem")
+	out, err := os.OpenFile(mem, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", err
+	}
+	_, err = io.Copy(out, src)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
 	return mem, err
 }
 
@@ -597,6 +674,9 @@ func writeConfigDrive(path string, s sandbox.Spec, mtu int) error {
 	tw := tar.NewWriter(&buf)
 	gc := proto.GuestConfig{UnixNano: time.Now().UnixNano(), IP: proto.GuestIP, Gateway: proto.GatewayIP, Prefix: proto.PrefixLen,
 		MTU: mtu, WorkerdArgs: s.WorkerdArgs, HealthCF: s.HealthCF, Debug: s.Debug}
+	if s.Volume != nil {
+		gc.Volume = proto.VolumeDev
+	}
 	gb, _ := json.Marshal(gc)
 	if err := tw.WriteHeader(&tar.Header{Name: proto.GuestConfigFile, Mode: 0o600, Size: int64(len(gb)), Typeflag: tar.TypeReg}); err != nil {
 		return err
