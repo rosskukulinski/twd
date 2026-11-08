@@ -297,6 +297,10 @@ func TestDoctor(t *testing.T) {
 	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb == hostd.SandboxSeatbelt {
 		want["sandbox"] = "ok" // the Seatbelt probe ran and enforced a deny
 	}
+	if runtime.GOOS == "linux" {
+		// No microVM guest next to this test build: the tier is off (warn).
+		want["microvm"] = "warn"
+	}
 	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)
 	}
