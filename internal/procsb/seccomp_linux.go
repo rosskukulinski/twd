@@ -108,6 +108,15 @@ func buildFilter() []unix.SockFilter {
 	// clone: no new namespaces.
 	jClone := p.jeq(uint32(unix.SYS_CLONE))
 	jSocket := p.jeq(uint32(unix.SYS_SOCKET))
+	jKill := p.jeq(uint32(unix.SYS_KILL))
+	p.ret(retAllow)
+
+	// kill(-1, …) would signal every process of the uid (hostd, mgmt,
+	// other tenants). Signals to single pids stay allowed (apps manage
+	// their children); Landlock ABI ≥ 6 scopes those too.
+	p.target(jKill)
+	p.ld(offArgLo(0))
+	p.retIfEq(0xffffffff, retErrno(unix.EPERM))
 	p.ret(retAllow)
 
 	// clone(flags, …)

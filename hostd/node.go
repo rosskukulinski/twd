@@ -13,10 +13,11 @@ package hostd
 // Both secrets (the caller-signing key and the proxy credential) are fresh
 // for every process start and live only in that process's environment.
 //
-// Enforcement caveat: in the process tier the proxy is cooperative. A
-// malicious app can open raw sockets (loopback, LAN, internet) and ignore
-// the env proxies; the microVM tier's gVisor gateway is the enforcement
-// boundary (see docs/node-tier.md).
+// Enforcement: on Linux with Landlock ABI ≥ 4 the app runs under the procsb
+// sandbox, which allows TCP only to its own port and the egress proxy, so
+// the proxy is enforced. Elsewhere (macOS, older kernels) it is
+// cooperative: a malicious app can open raw sockets (loopback, LAN,
+// internet) and ignore the env proxies (see docs/node-tier.md).
 
 import (
 	"bufio"

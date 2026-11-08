@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
@@ -65,10 +66,28 @@ func startSuite(t *testing.T) *suite {
 	})
 	start := func(prefix string) *hostdtest.Env {
 		return hostdtest.Start(t, hostdtest.Options{ControlURL: ctl.URL, Fake: fakemgmt.Config{StaticKey: nettest.DummyKey}, Ephemeral: true,
-			HostnamePrefix: prefix, KillTombstone: 5 * time.Second,
+			HostnamePrefix: prefix, KillTombstone: 5 * time.Second, Sandbox: hostd.SandboxAuto, // twd-hostd's default
 			Tenant: mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: ctl.URL, MintMode: "static"}})
 	}
 	s := &suite{t: t, ctl: ctl, a: start("a-"), b: start("b-")}
+	// Every SDK app ran under the host's process sandbox (Seatbelt on
+	// macOS, Landlock on Linux).
+	t.Cleanup(func() {
+		want, _ := hostd.ResolveSandbox(hostd.SandboxAuto)
+		n := 0
+		for _, h := range []*hostdtest.Env{s.a, s.b} {
+			for _, w := range h.Host.Status().Workloads {
+				if w.Tier == "microvm" || w.InstanceDir == "" {
+					continue
+				}
+				n++
+				if w.Sandbox != want {
+					t.Errorf("SDK workload %s ran with sandbox %q, want %q", w.Workload, w.Sandbox, want)
+				}
+			}
+		}
+		t.Logf("sandbox %s: %d SDK workloads checked", want, n)
+	})
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	var cerr, eerr error

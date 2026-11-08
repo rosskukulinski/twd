@@ -90,17 +90,36 @@ undici, so the template uses `@twd/node` `fetch` explicitly.
 
 ### Enforcement boundary
 
-In the process tier, egress through the proxy is **cooperative**. A
-malicious or buggy Node app can ignore the env proxies, override the global
-dispatcher, or open raw sockets to loopback, the LAN, the internet or other
-local services, because it is an ordinary process with the host user's
-network. What the process tier does guarantee:
+**On Linux with Landlock (ABI ≥ 4, kernel 6.7+; Ubuntu 24.04's 6.8 has
+ABI 4), egress through the proxy is enforced, not cooperative.** twd-hostd
+starts every Node app under its Landlock sandbox (`internal/procsb`, L2):
+the app may bind and connect only its own app port (TCP listen mode) and
+connect only to its egress proxy's port. Every other TCP `connect()`, to
+loopback, the LAN or the internet, fails with `EACCES` before a packet is
+sent, and a seccomp filter refuses UDP, ICMP, raw, MPTCP and SCTP sockets.
+So the undici pitfall above, an own dispatcher, or `net.connect` can no
+longer reach anything except through netd's proxy, which attributes it to
+this deployment and applies the ADR-019 guard. `make test-node` checks this
+from inside the app: `net.connect` to 1.1.1.1:80 and :443 and to a
+host-loopback listener all fail (`EACCES`); its own port works; egress via
+the proxy is attributed as before (measured on Ubuntu 24.04, kernel 6.8,
+ABI 4). Unix sockets: on ABI < 9 Landlock can't refuse a connect to a
+pathname socket, so twd's own sockets (hostd's, mgmt's, the instance
+egress sockets) refuse sandboxed peers themselves; see INSTALL.md.
+
+**Elsewhere it is cooperative.** On macOS (Seatbelt confines files and unix
+sockets, not TCP) and on Linux kernels with Landlock ABI < 4, a malicious or
+buggy Node app can ignore the env proxies, override the global dispatcher,
+or open raw sockets to loopback, the LAN, the internet or other local
+services, because it is an ordinary process with the host user's network.
+`twd doctor` says which case applies. What the process tier guarantees
+everywhere:
 - the app holds no tailnet key;
 - it can't speak as any node except through the proxy, which attributes
   everything to this deployment;
 - it can't forge an inbound caller.
 
-The **enforcement boundary is the microVM tier**. There, the guest's only
+The strongest boundary is the **microVM tier**. There, the guest's only
 network is hostd's gVisor gateway, which exposes only the egress, workload
 and host-API ports, and every other SYN is RST'd (M8). Running Node apps
 inside the Firecracker guest is not built yet; see STATUS.md M9.

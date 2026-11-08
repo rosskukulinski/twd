@@ -96,6 +96,14 @@ func probe(op string, args []string) error {
 		return err
 	case ProbeSignal:
 		pid, _ := strconv.Atoi(arg(0))
+		if pid == -1 {
+			// Raw syscall: never signal everything if the filter failed.
+			_, _, e := unix.RawSyscall(unix.SYS_KILL, ^uintptr(0), 0, 0)
+			if e != 0 {
+				return e
+			}
+			return nil
+		}
 		return syscall.Kill(pid, 0)
 	}
 	return errors.New("unknown probe op " + op)

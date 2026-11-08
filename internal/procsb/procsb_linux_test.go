@@ -142,6 +142,7 @@ func TestSandboxProbes(t *testing.T) {
 		{procsb.ProbePtrace, []string{sibPID}, "denied"},
 		{procsb.ProbeVMRead, []string{sibPID}, "denied"},
 		{procsb.ProbeConnectUnix, []string{gsock}, "denied"},
+		{procsb.ProbeSignal, []string{"-1"}, "denied"},
 	}
 	if abi < 4 {
 		t.Logf("Landlock ABI %d < 4: TCP is not restricted", abi)

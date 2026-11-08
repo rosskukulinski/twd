@@ -4,20 +4,43 @@ These are the exact steps for an Apple-silicon Mac with nothing installed:
 no Go, no Node.js, no Homebrew packages. They were run on `mbp` (M2 Pro,
 macOS 26.6) by `make e2e-mbp`; measured numbers are in STATUS.md (M6).
 
-> **Isolation, honestly.** On macOS twd runs the **process tier**: every app
-> runs in a workerd process on your Mac, and each Durable Object gets its own
-> tailnet node and identity. V8 isolates and twd's egress guard are real
-> boundaries, but this is **dev-grade isolation**: there is no VM between
-> tenants and your user account. On macOS, twd-hostd also runs every
-> tenant's workerd **and Node app** under a generated **Seatbelt**
-> (`sandbox-exec`) profile: it can write only its own instance and data
-> dirs, and can't read your home dir (including `~/.twd`), twd's state (node
-> keys, mgmt custody, other tenants' storage), its sockets, or any tenant's
-> API key file. `twd doctor` checks that Seatbelt enforces on your Mac, and
-> while twd runs, that every workload is under it. **microVM isolation
-> (Firecracker) needs Linux with KVM** (the `linux-arm64` tarball, or a
-> Linux VM); on Linux the process tier has no per-tenant sandbox. Don't run
-> code you don't trust on the process tier.
+> **Isolation, honestly.** twd's default is the **process tier**: every app
+> runs in a workerd (or Node) process on your machine, and each Durable
+> Object gets its own tailnet node and identity. V8 isolates and twd's
+> egress guard are real boundaries, but this is **dev-grade isolation**:
+> there is no VM between tenants and your user account. On top of that,
+> twd-hostd runs every tenant's workerd **and Node app** in a per-workload
+> **process sandbox**, on by default (`twd-hostd -sandbox auto`):
+>
+> - **macOS: Seatbelt** (`sandbox-exec`, generated profile).
+> - **Linux: Landlock + seccomp** (no root and no user namespaces needed;
+>   kernel 5.13+ with Landlock enabled, e.g. Ubuntu 22.04+/24.04, Debian 12,
+>   Fedora). A small launcher in twd-hostd applies the rules, then execs
+>   workerd or node in place.
+>
+> Either way a workload can write only its own instance and data dirs, read
+> only the OS, its runtime binary and its install prefix, and can't read
+> your home dir (including `~/.twd`), twd's state (node keys, mgmt custody,
+> other tenants' storage) or any tenant's API key file, and can't use
+> mgmt's or hostd's sockets. **Linux adds more:** with Landlock ABI ≥ 4
+> (kernel 6.7+; Ubuntu 24.04's 6.8 has ABI 4) a workload may open TCP only
+> to its own app port and egress proxy, so a malicious Node app can't
+> bypass netd's proxy; a seccomp filter refuses ptrace and
+> `process_vm_readv/writev` (so no reading a sibling's memory), kexec,
+> mount, bpf, perf_event_open, keyctl, new namespaces, io_uring, and
+> UDP/ICMP/raw/MPTCP sockets; and other processes' `/proc` entries (their
+> environment, cmdline) are unreadable. On kernels with Landlock ABI < 9,
+> Landlock can't refuse a *connect* to a unix socket by path, so twd's
+> sockets (mgmt's admin socket, hostd's push socket, each instance's egress
+> sockets) refuse sandboxed peers themselves, and instance dirs have
+> unguessable names that a sandboxed process can't list.
+>
+> `twd doctor` checks that the sandbox enforces on your machine (Linux: the
+> Landlock ABI too), and while twd runs, that every workload is under it.
+> **Without a sandbox** (Linux without Landlock) `twd doctor` warns loudly,
+> and twd refuses to run a second tenant's process-tier workloads unless you
+> pass `twd up --insecure-shared-host`. **microVM isolation (Firecracker)
+> needs Linux with KVM.** Don't run code you don't trust on the process tier.
 
 ## What you need
 
@@ -78,8 +101,8 @@ twd doctor --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env
 
 It checks that workerd runs, that the built-in bundler can build every
 template offline, that `~/.twd` (and the state dir) are writable, that the
-API key can read the tailnet's policy, that the process sandbox (Seatbelt)
-works and enforces, and that twd is not using the system tailscaled. Every line has a `fix:` if it fails.
+API key can read the tailnet's policy, that the process sandbox (Seatbelt
+on macOS, Landlock + seccomp on Linux) works and enforces, and that twd is not using the system tailscaled. Every line has a `fix:` if it fails.
 
 ## 4. Start twd and deploy an app
 
@@ -109,9 +132,11 @@ twd tenant ls
 ```
 
 Each tenant gets its own netd registry (its tailnet's control plane and
-netmap only), its own workerd/Node processes, 0700 state dirs, throttles and
-audit chain. Objects of one tenant can't resolve or reach the other's
-(`peer_not_visible`).
+netmap only), its own workerd/Node processes, each in its own sandbox, 0700
+state dirs, throttles and audit chain. Objects of one tenant can't resolve
+or reach the other's (`peer_not_visible`). On a host without a process
+sandbox, `twd tenant add` refuses (`sandbox_unavailable`) unless twd was
+started with `twd up --insecure-shared-host`.
 
 ## 5. Stop and uninstall
 
@@ -132,6 +157,13 @@ twd down --purge           # kill every object and delete its devices, then stop
 - `acl_denied` on deploy: add the printed grant to your tailnet policy, or
   deploy with `--allow-missing-grants`.
 - `twd doctor` says `sandbox` failed: Seatbelt (`/usr/bin/sandbox-exec`)
-  didn't start workerd or didn't enforce a deny on this macOS version.
-  Report it; tenants are not confined until it is fixed.
+  or Landlock didn't start workerd or didn't enforce a deny on this OS
+  version. Report it; tenants are not confined until it is fixed.
+- `twd doctor` warns `NO PROCESS SANDBOX` on Linux: the kernel has no
+  Landlock (older than 5.13, or `landlock` missing from the `lsm=` boot
+  parameter; check `cat /sys/kernel/security/lsm`). Add it to the boot
+  parameters, use a newer kernel, or deploy with tier `microvm`.
+- A Node app on Linux gets `EACCES` from `net.connect` or its own
+  dispatcher: that's the sandbox; send egress through `HTTP(S)_PROXY` /
+  `@twd/node`'s `fetch`.
 - Logs: `twd logs --component mgmt|hostd|supervisor`.

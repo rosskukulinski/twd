@@ -79,7 +79,7 @@ for t in $TARGETS; do
 	cp docs/INSTALL.md "$st/INSTALL.md"
 	printf '%s\n' "$VERSION" >"$st/VERSION"
 	cat >"$st/share/twd/release.json" <<EOF
-{"version":"$VERSION","os":"$os","arch":"$arch","workerd":"$WORKERD_VERSION","esbuild":"built into twd","sandbox":"$( [ "$os" = darwin ] && echo seatbelt || echo none )","commit":"$(git rev-parse HEAD)","built":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"version":"$VERSION","os":"$os","arch":"$arch","workerd":"$WORKERD_VERSION","esbuild":"built into twd","sandbox":"$( [ "$os" = darwin ] && echo seatbelt || echo landlock )","commit":"$(git rev-parse HEAD)","built":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 
 	if [ "$os" = darwin ]; then
