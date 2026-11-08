@@ -4,6 +4,7 @@ Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on
 Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
 Last update: 2026-11-08 00:40 PT. M8 (microVM tier, Firecracker in Lima) on branch `m8-vm`: `make e2e-vm` PASS.
 Last update: 2026-11-08 00:45 PT. M4 (`twd` CLI + integrated single-machine flow, E2E-MAC on this Mac) on branch `m4-cli`.
+Last update: 2026-11-08 01:10 PT. M6 (release tarballs, `install.sh`, `twd doctor`, **E2E-MAC on `mbp`: PASS**) on branch `m6-release`.
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -553,3 +554,61 @@ Final run: `e2e/vm/results/m8-20261108T083524Z.json`.
 - **Push URLs** live in mgmt memory: after a mgmt restart, kills fall back to the heartbeat until the host re-registers (hostd re-registers only on a 404).
 - **Spawned sub-agents report `principal`** = the root's caller, not an `actingFor` assertion (RFC §4.6, still not implemented).
 - **Linux/Lima not run** for M4.
+
+## M6: release packaging + E2E-MAC on a different, clean Mac (`mbp`) (DONE, branch `m6-release`)
+
+### What's built
+- **`make release`** (`scripts/release.sh`) → `dist/twd-<version>-{darwin,linux}-arm64.tar.gz` + `dist/SHA256SUMS`. Version = `VERSION` (0.1.0) + `-<commit>` (+`-dirty`). Each tarball (87 MB darwin / 93 MB linux; 331 MB unpacked) is self-contained:
+  - `bin/twd`, `twd-mgmt`, `twd-hostd`, `twd-netd`: `CGO_ENABLED=0` (SQLite is modernc), `-trimpath`, `-X main.version`. Linux binaries are static ELF.
+  - `bin/workerd` from npm `@cloudflare/workerd-<os>-arm64@1.20261108.1` (`npm pack`, cached in `dist/cache`), **sha512-checked against `package-lock.json`**.
+  - **esbuild: built into `twd`** instead of a separate binary. `internal/esbundle` is the Go twin of `create-twd/lib/build.mjs` (esbuild 0.28.2 Go API, same options and plugin: workerd conditions, Node builtins → `node:*`, `cloudflare:email` stub). A test checks it is **byte-identical** to `build.mjs` for all three templates. `twd deploy` no longer needs Node.js (the M4 gap) on any machine.
+  - `share/twd/create-twd` (templates, build.mjs) and `share/twd/node_modules`: the templates' runtime closure (`@twd/tailnet`, `@twd/mcp`, `agents`, `@modelcontextprotocol/{server,sdk}`, `zod`: 167 packages, 57 MB), copied from the tested repo `node_modules` by `scripts/vendor-node-modules.mjs` (no network; native `os`/`cpu` packages dropped). `twd init` + `twd deploy` work fully offline.
+  - `install.sh`, `VERSION`, `SHA256SUMS` (every file), `INSTALL.md`, `share/twd/release.json`.
+  - **macOS signing:** every darwin binary is re-signed ad-hoc (`codesign --force -s -`, verified) at build time on this Mac. **Quarantine:** an scp'd tarball on mbp has **no xattrs** (checked every run), so `xattr` isn't needed for scp. `install.sh` still clears `com.apple.quarantine` on its own copy in case the tarball came from a browser. **workerd 2026-11-08 runs on macOS 26.6.2** (mbp).
+- **`install.sh`**: installs into `~/.twd` (`--prefix`/`$TWD_HOME`), refuses root, checks platform and `SHA256SUMS`, stages and swaps `bin/` and `share/` (idempotent: a re-run is an upgrade/repair; state files in `~/.twd` are kept), smoke-runs `workerd --version` and `twd version` before swapping, and **prints** the PATH line (it doesn't edit shell profiles). `--uninstall [--purge] [--force]` removes it (refuses while a supervisor runs, unless `--force`).
+- **`twd doctor`** (new) checks: binaries; workerd runs (version vs the pin; quarantine warning); **the built-in bundler builds every template offline**; `~/.twd` and the state dir are writable (it creates nothing); **the API key works** (`--tailnet/--api-key-file` or from `twd up`; reads the policy; warns on a non-0600 file; never prints the key); and **the system tailscaled is not used** (explicit tailnet + control URL, and `lsof` on the running twd processes shows no tailscaled LocalAPI socket; it never contacts tailscaled or reads its state). `twd version` is new too.
+- **`make e2e-mbp`** (`e2e/mbp`, tag `e2embp`; skips without the tailnet-1 key file or `ssh mbp`). From this Mac (`mini`):
+  1. reads tailnet 1's policy and checks the scenario's grants exist (**no policy write in M6**);
+  2. scp's the darwin tarball and pipes `tailnet1_api.env` over ssh stdin into `~/.twd-e2e/` (umask 077, checked `0600`);
+  3. on mbp: extract, `install.sh` (twice: idempotence), `twd doctor --tailnet … --api-key-file …` (all 7 ok);
+  4. on mbp: `twd up --tailnet tail7906d5.ts.net --api-key-file ~/.twd-e2e/tailnet1_api.env --yes --state-dir ~/.twd-e2e/state` (+ `--ephemeral --hostname-prefix twd-m6-<run>-`), `twd init` agent/mcp/hello, `twd deploy`;
+  5. the `tag:ttest` client and echo (`ttest-m6-<run>-*`) run **on this Mac** and run checks (a)–(f) exactly as `e2e/mac` (the same `e2e/cliflow` scenario, now with an ssh `Exec` hook; CLI wall times are measured **on mbp** with a perl wrapper, so ssh is not counted);
+  6. `twd doctor` again while twd runs (lsof: no tailscaled socket), `twd down`, uninstall, remove `~/.twd-e2e`, then leftovers by ID.
+  - Cleanup is in `t.Cleanup` **and** a shell trap (`scripts/e2e-mbp.sh`) that, on any exit, runs `twd down --purge` if still running, stops `~/.twd/bin/*` processes, uninstalls, and deletes `~/.twd-e2e` (the key file). Verified with a deliberately corrupt tarball (run `9bad25`, FAIL as intended): mbp left with no `~/.twd`, no `~/.twd-e2e`.
+  - **Cross-machine proof:** the mcp workload node's direct endpoint, as seen from this Mac, is mbp's LAN address; the host ID is mbp's (`h-rosss-macbook-pro`), the client runs on `mini`.
+  - **DERP vs direct:** the main client got a direct LAN path from its first ping. So a second client in a child process with `TS_DEBUG_ALWAYS_USE_DERP=1` (the knob is process-wide) repeats the measurement over DERP only (region `sea`); it is tracked and deleted like the others.
+
+### Test results
+- **`make e2e-mbp`: PASS in 3 of 3 runs** (`e2e/real/results/m6-mbp-*.json`: `34cd1d`, `3feb1e`, `402770` on commit `e67b9d1`, clean tree; plus the final-commit run below). All 17 checks pass: copy (0600), install, doctor, up (interactive refused with `tailnet_required`), status, preflight refuses hello, deploy agent+mcp, **(a)** verified caller (the client's nodeId + `tag:ttest`, via the workload and the object's own node), **(b)** echo's WhoIs of the agent's fetch = the agent object's own node on mbp, **(c)** `lookup_order` allowed / `refund` → `cap_missing`, **(d)** spawn → `LookupAgent` with its own node, `tag:twd-agent-support-sub`, caps `[lookup_order]`, **(e)** `kill --cascade` 2 killed, 2/2 pushed, **(f)** audit chain `ttest-m6-<run>-client → …-supportagent-… → …-lookupagent-…` verified, `--human` works, cross_machine, system_tailscaled_not_used, down.
+  - **Cleanup every run:** 4/4 twd devices gone and 4/4 twd keys consumed/revoked after `twd down` (by ID); the test's 2–3 nodes deleted by ID and keys revoked; 0 untracked `ttest-m6-<run>-*`/`twd-m6-<run>-*` devices; mbp has no `~/.twd`, `~/.twd-e2e` or twd processes left.
+- **`make test`: PASS** (new: `internal/esbundle` byte-identity + error tests, `TestDoctor`). **`make lint`: PASS** (vets `e2embp`).
+- **linux-arm64 tarball:** `install.sh --prefix` + `twd doctor` in Lima `twd-dev`: all ok (bundler offline, workerd runs). The full e2e was **not** run from the Linux tarball. The extracted copy is left in the VM's `/tmp/twd-m6-lima`.
+
+| mbp (M2 Pro, macOS 26.6.2), 3 runs | Value |
+|---|---|
+| scp tarball (87 MB, LAN) | 3.0–3.2 s |
+| extract · `install.sh` (sha256 of every file + copy) · re-run | 1.4 s · 5.1–5.2 s · 5.6–5.8 s |
+| `twd doctor` (7 checks incl. API call and 3 template builds) | 0.56–0.62 s |
+| `twd up` → ready (mgmt healthy at 1.08 s) | 1.57–1.59 s |
+| `twd deploy` → ready (build + workerd active ≤1.1 s, then mint + node join) | agent 1.69 / 5.84 / 1.68 s · mcp 1.59 / 1.60 / 6.19 s (the bimodal production join seen in M4) |
+| First object node ready (first request → node ready) | 1.69 / 1.78 / 1.73 s (the first request itself: 137–182 ms) |
+| `spawn()` → child ready | 1.8 / 6.9 / 4.6 s |
+| `twd kill --cascade` CLI wall time on mbp (mgmt API 58–60 ms, push 56–58 ms) | 73 / 68 / 72 ms |
+| New request to a killed object, from this Mac | 410 `object_killed` in 7.8–9.3 ms (via workload 410 in 6.7–7.9 ms) |
+| Cross-machine, **direct** (LAN): disco ping · HTTP MCP `tools/list` | 3.7–4.1 ms · 10.9–12.2 ms (median of 10) |
+| Cross-machine, **DERP only** (sea): disco ping · HTTP `tools/list` | 10.9–11.0 ms · 18.0–18.9 ms (median of 11) |
+| Agent egress on mbp → echo on this Mac (warm) | 24–40 ms |
+| `twd down` (purge + device deletes) · uninstall + cleanup | 0.5–3.1 s · 2.3 s |
+
+### Safety
+- **Ross's personal tailnet was not touched.** mbp's Tailscale.app was never used, queried or read: the test never runs `tailscale`, and twd on mbp runs only tsnet nodes of tailnet 1 (`twd doctor`'s lsof check passed in every run).
+- **No policy change in M6** (read-only check that M4's grants exist). No sudo on mbp; nothing installed outside `~/.twd` and `~/.twd-e2e`, and both are removed at the end. No Homebrew installs.
+- Keys: the key file goes over ssh stdin (never on a command line), mode 0600, deleted at the end even on failure. No `tskey-*` in logs or results (check-secrets).
+
+### Known gaps (M6)
+- **No separate esbuild binary in the tarball:** esbuild is linked into `twd` (Go API, same version). That is simpler and needs no Node; `create-twd build` (the JS CLI) still needs Node + npm esbuild.
+- **Signing:** ad-hoc only (no Developer ID, no notarization). A browser-downloaded tarball would hit Gatekeeper; `install.sh` clears quarantine, but notarization is the real fix for distribution.
+- **The vendored `node_modules`** cover the templates' imports (`agents`, MCP, zod, `@twd/*`). An app importing other npm packages needs its own `node_modules` (resolved from the app dir first). There is no `twd add`/npm-free package install.
+- **The linux-arm64 tarball** is install-and-doctor tested in Lima only; E2E-VM/E2E-MAC weren't run from it.
+- **`install.sh` takes ~5 s**, mostly `shasum` over 331 MB of files; acceptable, but could verify the tarball hash only.
+- Interactive `twd up`/`twd connect` (WIF) are still not built (M4 gaps), so a fresh Mac needs an API key file.

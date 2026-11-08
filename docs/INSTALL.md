@@ -30,7 +30,7 @@ different (personal) tailnet, it is left alone; `twd doctor` checks this.
 
 ## 1. Get the release
 
-The tarball is self-contained (~70 MB): the Go binaries `twd`, `twd-mgmt`,
+The tarball is self-contained (~87 MB compressed, ~300 MB installed): the Go binaries `twd`, `twd-mgmt`,
 `twd-hostd`, `twd-netd` (static, `CGO_ENABLED=0`; esbuild is built into
 `twd`, so deploys need no Node.js), the pinned `workerd` (1.20261108.1, from
 npm `@cloudflare/workerd-darwin-arm64`), the app templates and the

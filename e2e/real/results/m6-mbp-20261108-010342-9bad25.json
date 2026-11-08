@@ -1,0 +1,34 @@
+{
+  "run": "m6-mbp-9bad25",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T01:03:42-08:00",
+  "checks": {
+    "copy": "PASS tarball + key file (0600) in ~/.twd-e2e"
+  },
+  "numbers": {
+    "scp_tarball_ms": 115.747,
+    "uninstall_ms": 1015.366
+  },
+  "notes": [
+    "twd on mbp from twd-0.1.0-bad-darwin-arm64.tar.gz; test client + echo on this Mac",
+    "policy has the scenario's tagOwners and grants (read only; not written)",
+    "mbp has no node, go, npm or esbuild on PATH",
+    "mbp: 26.6.2 arm64 Apple M2 Pro",
+    "scp'd tarball has no xattrs on mbp (no com.apple.quarantine)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 0,
+    "devices_left": 0,
+    "devices_tracked": 0,
+    "mbp_clean": true,
+    "test_keys_minted": 0,
+    "test_keys_revoke_errors": null,
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 0,
+    "twd_keys_tracked": 0,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": null,
+  "keyIDs": null
+}
