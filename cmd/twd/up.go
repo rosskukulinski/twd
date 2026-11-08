@@ -70,6 +70,7 @@ func cmdUp(args []string) error {
 	hostID := f.String("host-id", defaultHostID(), "this host's ID")
 	prefix := f.String("hostname-prefix", "twd-", "prefix for every node hostname")
 	ephemeral := f.Bool("ephemeral", false, "join nodes as ephemeral; `twd down` then deletes every device (tests, demos)")
+	insecureSH := f.Bool("insecure-shared-host", false, "on a host without a process sandbox (Linux without Landlock), still serve process-tier workloads of more than one tenant; tenants are then NOT isolated from each other")
 	workerdFlag := f.String("workerd", "", "workerd binary")
 	hb := f.Duration("heartbeat", time.Second, "host heartbeat period")
 	tomb := f.Duration("kill-tombstone", 12*time.Second, "keep a killed node answering object_killed this long")
@@ -152,6 +153,7 @@ func cmdUp(args []string) error {
 	}
 	s.Cfg.APIKeyFile, s.Cfg.ControlURL, s.Cfg.TSAPIURL, s.Cfg.HostID = absKey, *control, *tsapiURL, *hostID
 	s.Cfg.HostnamePrefix, s.Cfg.Ephemeral, s.Cfg.Workerd = *prefix, *ephemeral, wd
+	s.Cfg.InsecureSharedHost = *insecureSH
 	s.Cfg.Heartbeat, s.Cfg.KillTombstone, s.Cfg.DeviceDeleteDelay = hb.String(), tomb.String(), delDelay.String()
 	if err := s.save(); err != nil {
 		return err
@@ -403,6 +405,9 @@ func cmdSupervise(args []string) error {
 			s.logDir(), s.configPath(), filepath.Join(s.Dir, "tenants"), s.runDir()}, ",")}
 	if s.Cfg.Ephemeral {
 		hargs = append(hargs, "-ephemeral")
+	}
+	if s.Cfg.InsecureSharedHost {
+		hargs = append(hargs, "-insecure-shared-host")
 	}
 	mg := &child{name: "twd-mgmt", args: margs, logPath: s.log("mgmt")}
 	hd := &child{name: "twd-hostd", args: hargs, logPath: s.log("hostd")}

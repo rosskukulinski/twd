@@ -302,3 +302,42 @@ func landlockCrossTenant(t *testing.T, ea *hostdtest.Env, a, b hostd.WorkloadSta
 	abi, _ := procsb.ABI()
 	t.Logf("landlock (ABI %d): tenant A's workerd profile denies %d cross-tenant targets; own DO storage readable", abi, len(denied))
 }
+
+// A host without a process sandbox (Linux without Landlock, or -sandbox
+// none) serves one tenant's process-tier workloads only: the second
+// tenant's deploy fails typed sandbox_unavailable. -insecure-shared-host
+// would allow it.
+func TestSharedHostWithoutSandbox(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	ctl, err := nettest.StartControl()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(ctl.Close)
+	ea := hostdtest.Start(t, hostdtest.Options{Fake: fakemgmt.Config{StaticKey: nettest.DummyKey}, Ephemeral: true, Sandbox: hostd.SandboxNone,
+		Tenant: mgmtapi.Tenant{Tailnet: "a.ts.net", ControlURL: ctl.URL, MintMode: "static"}})
+	eb := ea.AddTenant(mgmtapi.Tenant{Tailnet: "b.ts.net", ControlURL: ctl.URL, MintMode: "static"})
+	ea.WaitActive("agent", ea.Deploy(hostdtest.Template("agent"), "agent", nil), 60*time.Second)
+	depB := eb.Deploy(hostdtest.Template("agent"), "agent", nil)
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		for _, w := range ea.Host.Status().Workloads {
+			if w.TenantID == eb.TenantID && w.Status == "failed" {
+				if !strings.Contains(w.Error, "sandbox_unavailable") || !strings.Contains(w.Error, "-insecure-shared-host") {
+					t.Fatalf("tenant B failed for another reason: %s", w.Error)
+				}
+				t.Logf("tenant B refused: %s", w.Error)
+				return
+			}
+			if w.TenantID == eb.TenantID && w.Status == "active" && w.DeploymentID == depB {
+				t.Fatal("tenant B's process-tier workload runs on an unsandboxed shared host")
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tenant B's deploy neither failed nor ran")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

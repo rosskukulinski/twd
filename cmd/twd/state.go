@@ -19,19 +19,22 @@ import (
 
 // Config is <state>/twd.json, written by `twd up`.
 type Config struct {
-	Tailnet           string `json:"tailnet"`
-	TenantID          string `json:"tenantID,omitempty"`
-	APIKeyFile        string `json:"apiKeyFile"` // path only; the key itself is never copied
-	ControlURL        string `json:"controlURL"`
-	TSAPIURL          string `json:"tsapiURL,omitempty"`
-	HostID            string `json:"hostID"`
-	HostnamePrefix    string `json:"hostnamePrefix,omitempty"`
-	Ephemeral         bool   `json:"ephemeral,omitempty"`
-	Workerd           string `json:"workerd"`
-	Heartbeat         string `json:"heartbeat"`
-	KillTombstone     string `json:"killTombstone"`
-	DeviceDeleteDelay string `json:"deviceDeleteDelay"`
-	CreatedAt         string `json:"createdAt"`
+	Tailnet        string `json:"tailnet"`
+	TenantID       string `json:"tenantID,omitempty"`
+	APIKeyFile     string `json:"apiKeyFile"` // path only; the key itself is never copied
+	ControlURL     string `json:"controlURL"`
+	TSAPIURL       string `json:"tsapiURL,omitempty"`
+	HostID         string `json:"hostID"`
+	HostnamePrefix string `json:"hostnamePrefix,omitempty"`
+	Ephemeral      bool   `json:"ephemeral,omitempty"`
+	// InsecureSharedHost (twd up --insecure-shared-host): without a process
+	// sandbox, still serve process-tier workloads of several tenants.
+	InsecureSharedHost bool   `json:"insecureSharedHost,omitempty"`
+	Workerd            string `json:"workerd"`
+	Heartbeat          string `json:"heartbeat"`
+	KillTombstone      string `json:"killTombstone"`
+	DeviceDeleteDelay  string `json:"deviceDeleteDelay"`
+	CreatedAt          string `json:"createdAt"`
 	// Tenants are the tenants added with `twd tenant add` (the operator
 	// tenant above is the default for every command).
 	Tenants []TenantRef `json:"tenants,omitempty"`

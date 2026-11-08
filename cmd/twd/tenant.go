@@ -6,9 +6,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/internal/policy"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/mgmt"
@@ -133,6 +135,17 @@ func cmdTenantAdd(args []string) error {
 	s, err := openState(*f.stateDir)
 	if err != nil {
 		return err
+	}
+	// A second tenant needs a process sandbox (or the explicit opt-out):
+	// without one, every tenant's code shares one uid.
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb == hostd.SandboxNone && !s.Cfg.InsecureSharedHost {
+		why := "no process sandbox on " + runtime.GOOS
+		if runtime.GOOS == "linux" {
+			why = "Landlock is unavailable on this kernel"
+		}
+		return fail("sandbox_unavailable", "this host has no process sandbox ("+why+"), so its process tier must not serve more than one tenant",
+			"twd doctor explains the sandbox check; tenants of a shared host need Seatbelt (macOS) or Landlock (Linux)").
+			withFix("use a kernel with Landlock, deploy with tier \"microvm\", or (tenants NOT isolated) twd down && twd up --insecure-shared-host")
 	}
 	if err := s.requireUp(); err != nil {
 		return err
