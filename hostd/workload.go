@@ -230,17 +230,7 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 		w.gate = nil
 	}
 	w.mu.Unlock()
-	// Objects of this workload saved from a previous run rejoin now (nodes
-	// stay online; no auth key, no registration budget).
-	h.mu.Lock()
-	for _, o := range h.objects {
-		if o.TenantID == w.tenantID && o.Workload == w.name && !o.live && !o.terminal() {
-			if o.Class == "" || app.Classes[o.Class] != nil && app.Classes[o.Class].Node {
-				h.startNodeLocked(o)
-			}
-		}
-	}
-	h.mu.Unlock()
+	h.rejoinObjects(w, app)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
 }
@@ -289,8 +279,23 @@ func (h *Host) deploySerial(w *workload, a mgmtapi.Assignment, app *bundle.App, 
 	w.active, w.app, w.activeDep, w.status = inst, app, a.DeploymentID, "active"
 	w.mu.Unlock()
 	open()
+	h.rejoinObjects(w, app)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"runtime", app.Runtime, "tier", tier, "restart", old != nil, "ms", time.Since(st).Milliseconds())
+}
+
+// rejoinObjects: objects of this workload saved from a previous run
+// rejoin now (nodes stay online; no auth key, no registration budget).
+func (h *Host) rejoinObjects(w *workload, app *bundle.App) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, o := range h.objects {
+		if o.TenantID == w.tenantID && o.Workload == w.name && !o.live && !o.terminal() {
+			if o.Class == "" || app.Classes[o.Class] != nil && app.Classes[o.Class].Node {
+				h.startNodeLocked(o)
+			}
+		}
+	}
 }
 
 // undeploy stops serving a workload: workerd stops and its nodes close
