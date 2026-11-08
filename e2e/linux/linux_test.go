@@ -143,6 +143,8 @@ func TestE2ELinux(t *testing.T) {
 		t.Fatalf("tarball: %v (make release)", err)
 	}
 	slow, _ := strconv.ParseFloat(os.Getenv("TWD_E2E_SLOW"), 64)
+	doReboot := os.Getenv("TWD_E2E_REBOOT") == "1"       // enable-linger + limactl stop/start; the service must come back
+	doEphemeral := os.Getenv("TWD_E2E_EPHEMERAL") == "1" // a second, --ephemeral run: a sub-agent across a service restart
 	scale := func(d time.Duration) time.Duration {
 		if slow > 1 {
 			return time.Duration(float64(d) * slow)
@@ -488,6 +490,109 @@ func TestE2ELinux(t *testing.T) {
 	res.Pass("service_restart", fmt.Sprintf("systemctl --user restart twd: new MainPID %s, healthy after %.1f s, mcp workload answers this Mac (same tailnet IP) after %.1f s",
 		pid2, healthyAt.Seconds(), reachAt.Seconds()))
 
+	// Reboot survival: lingering on (sudo inside the VM only), then the VM
+	// is stopped and started from this Mac. The user service must come
+	// back by itself, every object must rejoin from saved state (same node
+	// IDs; nothing re-minted), and the workload must answer this Mac again.
+	if doReboot {
+		user := strings.TrimSpace(v.must(`id -un`))
+		if _, se, err := v.run(`sudo -n loginctl enable-linger "$(id -un)"`, nil); err != nil {
+			t.Fatalf("enable-linger: %v %s", err, se)
+		}
+		if l := strings.TrimSpace(v.must(`loginctl show-user "$(id -un)" -p Linger --value`)); l != "yes" {
+			t.Fatalf("linger after enable-linger: %q", l)
+		}
+		hostdLines := strings.TrimSpace(v.must(`wc -l < ~/.twd-e2e/state/logs/hostd.log`))
+		var objs []struct {
+			ID, NodeID, MagicDNS, Status string
+		}
+		e.MustJSON(&objs, "ls")
+		beforeNodes := map[string]string{}
+		for _, o := range objs {
+			if o.Status == "ready" {
+				beforeNodes[o.ID] = o.NodeID
+			}
+		}
+		_, pidBefore := svcState()
+		ts := time.Now()
+		if out, err := exec.Command("limactl", "stop", vmName).CombinedOutput(); err != nil {
+			t.Fatalf("limactl stop: %v %s", err, out)
+		}
+		stopDur := time.Since(ts)
+		t0 := time.Now()
+		if out, err := exec.Command("limactl", "start", "--tty=false", vmName).CombinedOutput(); err != nil {
+			t.Fatalf("limactl start: %v %s", err, out)
+		}
+		sshAt := time.Since(t0)
+		var activeAt, healthyAt, servingAt time.Duration
+		var pidAfter string
+		for time.Since(t0) < scale(5*time.Minute) {
+			if a, p := svcState(); a == "active" && p != "" && p != "0" {
+				activeAt, pidAfter = time.Since(t0), p
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if activeAt == 0 {
+			so, _, _ := v.run(`systemctl --user status twd.service 2>&1 | tail -15; loginctl list-users 2>&1`, nil)
+			t.Fatalf("twd.service not active within 5 min of boot:\n%s", so)
+		}
+		for time.Since(t0) < scale(5*time.Minute) {
+			var stt struct {
+				Healthy bool `json:"healthy"`
+			}
+			if so, _, _, err := e.Twd("status", "--json"); err == nil && json.Unmarshal([]byte(so), &stt) == nil && stt.Healthy {
+				healthyAt = time.Since(t0)
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if healthyAt == 0 {
+			t.Fatal("twd not healthy within 5 min of boot")
+		}
+		for time.Since(t0) < scale(6*time.Minute) {
+			if ms, ok := toolsList(hc, mcpIP); ok {
+				servingAt = time.Since(t0)
+				res.Numbers["reboot_first_call_ms"] = ms
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if servingAt == 0 {
+			t.Fatalf("mcp workload (%s) not answering this Mac within 6 min of boot", mcpIP)
+		}
+		// Every object rejoined from saved state: same node IDs, none re-minted.
+		deadline := time.Now().Add(scale(3 * time.Minute))
+		for {
+			e.MustJSON(&objs, "ls")
+			ready := 0
+			for _, o := range objs {
+				if want, ok := beforeNodes[o.ID]; ok && o.Status == "ready" && o.NodeID == want {
+					ready++
+				}
+			}
+			if ready == len(beforeNodes) || time.Now().After(deadline) {
+				if ready != len(beforeNodes) {
+					t.Fatalf("after reboot only %d/%d objects are ready with their old node IDs: %+v", ready, len(beforeNodes), objs)
+				}
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		joins := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'object node ready.*rejoined=true reminted=false' || true`))
+		reminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'reminted=true' || true`))
+		if joins != strconv.Itoa(len(beforeNodes)) || reminted != "0" {
+			t.Fatalf("hostd log after reboot: %s rejoins (want %d), %s reminted", joins, len(beforeNodes), reminted)
+		}
+		res.Numbers["reboot_stop_ms"] = msOf(stopDur)
+		res.Numbers["reboot_ssh_ms"] = msOf(sshAt)
+		res.Numbers["reboot_service_active_ms"] = msOf(activeAt)
+		res.Numbers["reboot_healthy_ms"] = msOf(healthyAt)
+		res.Numbers["reboot_serving_ms"] = msOf(servingAt)
+		res.Pass("reboot", fmt.Sprintf("enable-linger %s, limactl stop (%.1f s) + start: ssh %.1f s, twd.service active %.1f s (MainPID %s → %s), healthy %.1f s, mcp workload answers this Mac %.1f s; %d objects rejoined with their old node IDs, 0 re-minted",
+			user, stopDur.Seconds(), sshAt.Seconds(), activeAt.Seconds(), pidBefore, pidAfter, healthyAt.Seconds(), servingAt.Seconds(), len(beforeNodes)))
+	}
+
 	// doctor while twd runs: no twd process holds tailscaled's socket; the
 	// workloads have no sandbox yet (L2).
 	so, se, _, err = e.Twd("doctor", "--json")
@@ -533,6 +638,107 @@ func TestE2ELinux(t *testing.T) {
 	}
 	res.Pass("service_removed", "twd down --purge --service: unit disabled and removed")
 	downDone = true
+
+	// Ephemeral nodes across a service restart. A second `twd up` on the
+	// same state, now --ephemeral: the agent plus a spawned sub-agent, then
+	// `systemctl --user restart twd`. Control removes ephemeral devices that
+	// go offline, so their saved state is rejected (NeedsLogin): hostd must
+	// re-mint under the same hostname and both must answer this Mac again
+	// with new node IDs. (Before this fix, they hung in tsnet.Up and failed.)
+	if doEphemeral {
+		downDone = false
+		e.MustJSON(nil, "up", "--tailnet", tailnet, "--api-key-file", rKey, "--yes", "--ephemeral",
+			"--hostname-prefix", twdPrefix, "--control-url", prodControl, "--service")
+		var dep struct {
+			Endpoint struct{ MagicDNS string } `json:"endpoint"`
+		}
+		e.MustJSON(&dep, "deploy", rWork+"/agent")
+		agentIP := cliflow.PeerIP(t, client, dep.Endpoint.MagicDNS, scale(90*time.Second))
+		getJSON := func(u string) (int, map[string]any) {
+			resp, err := hc.Get(u)
+			if err != nil {
+				return 0, nil
+			}
+			defer resp.Body.Close()
+			var m map[string]any
+			b, _ := io.ReadAll(resp.Body)
+			json.Unmarshal(b, &m)
+			return resp.StatusCode, m
+		}
+		if c, _ := getJSON("http://" + agentIP + "/?agent=e1"); c != 200 {
+			t.Fatalf("ephemeral: agent e1 via workload: %d", c)
+		}
+		parent := e.WaitObjectReady("SupportAgent", "e1", scale(90*time.Second))
+		parentIP := cliflow.PeerIP(t, client, parent.MagicDNS, scale(60*time.Second))
+		if c, b := getJSON("http://" + parentIP + "/spawn?child=e2"); c != 200 || fmt.Sprint(b["child"].(map[string]any)["reply"].(map[string]any)["lookup"]) != "e2" {
+			t.Fatalf("ephemeral: spawn: %d %v", c, b)
+		}
+		child := e.WaitObjectReady("LookupAgent", "e2", scale(90*time.Second))
+		childIP := cliflow.PeerIP(t, client, child.MagicDNS, scale(60*time.Second))
+		if c, b := getJSON("http://" + childIP + "/"); c != 200 || b["lookup"] != "e2" {
+			t.Fatalf("ephemeral: child via its own node: %d %v", c, b)
+		}
+		e.TrackObjectNodes()
+		hostdLines := strings.TrimSpace(v.must(`wc -l < ~/.twd-e2e/state/logs/hostd.log`))
+		if _, se, _, err := v.timed(R, "systemctl", "--user", "restart", "twd.service"); err != nil {
+			t.Fatalf("ephemeral: systemctl --user restart twd: %v %s", err, se)
+		}
+		t0 := time.Now()
+		var child2 cliflow.Object
+		var readyAt time.Duration
+		for time.Since(t0) < scale(4*time.Minute) {
+			if o, ok := e.FindObject("LookupAgent", "e2"); ok && o.Status == "ready" && o.StableNodeID != "" && o.StableNodeID != child.StableNodeID {
+				child2, readyAt = o, time.Since(t0)
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if readyAt == 0 {
+			o, _ := e.FindObject("LookupAgent", "e2")
+			t.Fatalf("ephemeral: sub-agent not ready with a new node ID within 4 min of the restart: %+v (was node %s)", o, child.StableNodeID)
+		}
+		if child2.MagicDNS != child.MagicDNS || child2.Hostname != child.Hostname {
+			t.Fatalf("ephemeral: sub-agent came back as %s / %s, want the same hostname %s / %s", child2.Hostname, child2.MagicDNS, child.Hostname, child.MagicDNS)
+		}
+		// Its predecessor's netmap entry may linger briefly: try every IP
+		// the client has for that name until one answers.
+		var answerAt time.Duration
+		var childIP2 string
+		for time.Since(t0) < scale(5*time.Minute) && answerAt == 0 {
+			for _, ip := range cliflow.PeerIPs(client, child.MagicDNS) {
+				if c, b := getJSON("http://" + ip + "/"); c == 200 && b["lookup"] == "e2" {
+					answerAt, childIP2 = time.Since(t0), ip
+					break
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if answerAt == 0 {
+			t.Fatalf("ephemeral: sub-agent %s not answering this Mac within 5 min of the restart", child.MagicDNS)
+		}
+		reminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'object node ready.*reminted=true' || true`))
+		childReminted := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'object node ready.*object=` + child.ID + ` .*reminted=true' || true`))
+		rejected := strings.TrimSpace(v.must(`tail -n +` + hostdLines + ` ~/.twd-e2e/state/logs/hostd.log | grep -c 'saved node state rejected by control' || true`))
+		if childReminted != "1" {
+			t.Fatalf("ephemeral: hostd log has %s 'reminted=true' lines for the sub-agent %s (total reminted %s, rejected %s)", childReminted, child.ID, reminted, rejected)
+		}
+		e.TrackObjectNodes()
+		res.Numbers["eph_restart_child_ready_ms"] = msOf(readyAt)
+		res.Numbers["eph_restart_child_answer_ms"] = msOf(answerAt)
+		res.Pass("ephemeral_remint_after_restart", fmt.Sprintf("--ephemeral: sub-agent %s (node %s, %s) across systemctl --user restart: saved state rejected (%s netd rejections, %s nodes re-minted), back as the same hostname with node %s after %.1f s, answering this Mac (%s → %s) after %.1f s",
+			child.ID, child.StableNodeID, child.MagicDNS, rejected, reminted, child2.StableNodeID, readyAt.Seconds(), childIP, childIP2, answerAt.Seconds()))
+		var dr2 struct {
+			Killed         []string `json:"killed"`
+			Flushed        int      `json:"devicesDeleted"`
+			ServiceRemoved bool     `json:"serviceRemoved"`
+		}
+		e.MustJSON(&dr2, "down", "--purge", "--service")
+		if !dr2.ServiceRemoved {
+			t.Fatal("ephemeral: twd down --purge --service: serviceRemoved false")
+		}
+		res.Pass("ephemeral_down", fmt.Sprintf("%d objects purged, %d devices deleted, unit removed", len(dr2.Killed), dr2.Flushed))
+		downDone = true
+	}
 	time.Sleep(2 * time.Second)
 }
 

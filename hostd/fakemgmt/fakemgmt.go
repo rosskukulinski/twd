@@ -71,6 +71,7 @@ type Server struct {
 	byName      map[string]string // tenant|workload|ns|name -> objectID
 	audit       map[string][]mgmtapi.AuditRecord
 	nodeIDs     map[string]string // stable node ID -> objectID (every node that reported ready)
+	remints     int               // POST /remint calls (rejoins rejected by control)
 	pushes      []string
 }
 
@@ -145,6 +146,7 @@ func New(cfg Config) *Server {
 	m.HandleFunc("GET /v0/objects/{id}", s.getObject)
 	m.HandleFunc("GET /v0/objects/{id}/credential", s.credential)
 	m.HandleFunc("POST /v0/objects/{id}/ready", s.ready)
+	m.HandleFunc("POST /v0/objects/{id}/remint", s.remint)
 	m.HandleFunc("POST /v0/objects/{id}/kill", s.kill)
 	m.HandleFunc("POST /v0/audit", s.postAudit)
 	m.HandleFunc("GET /v0/audit", s.getAudit)
@@ -764,6 +766,31 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 	if req.StableNodeID != "" {
 		s.nodeIDs[req.StableNodeID] = o.ObjectID
 	}
+	writeJSON(w, 200, mgmtapi.OK{OK: true})
+}
+
+// remint: the host's rejoin was rejected by control; back to pending so the
+// next credential call mints again (same hostname).
+func (s *Server) remint(w http.ResponseWriter, r *http.Request) {
+	var req mgmtapi.RemintRequest
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "bad_request", err.Error())
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	o := s.objects[r.PathValue("id")]
+	if o == nil {
+		writeErr(w, 404, mgmtapi.CodeNotFound, "no such object")
+		return
+	}
+	if o.Status == "killed" {
+		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
+		return
+	}
+	delete(s.nodeIDs, o.NodeID)
+	o.Status, o.NodeID, o.MagicDNS = "pending", "", ""
+	s.remints++
 	writeJSON(w, 200, mgmtapi.OK{OK: true})
 }
 

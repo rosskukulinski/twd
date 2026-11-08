@@ -281,6 +281,59 @@ func (e *testEnv) asHost(id string) *apiClient {
 	return &c
 }
 
+// TestRemintAfterRejectedRejoin: a ready object's device is gone from
+// control (its saved node state was rejected). The host POSTs /remint: the
+// object goes back to pending, a new key is minted under the SAME hostname,
+// the credential is released again, and /ready records the new node ID.
+func TestRemintAfterRejectedRejoin(t *testing.T) {
+	e := newTestEnv(t, nil)
+	c, h1 := e.c, e.asHost("h1")
+	var tn struct{ TenantID string }
+	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 100, "tiers": []string{"process"}}, nil)
+	bundle := makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "support", "bundle": bundle}, nil)
+	var root CreateObjectResponse
+	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, &root)
+	var cred Credential
+	h1.ok("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, &cred)
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/ready", map[string]any{"nodeID": "1", "stableNodeID": "nOLD", "magicDNS": root.ObjectID + ".t.ts.net"}, nil)
+	h1.fail("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, 409, "already_joined")
+
+	// Other hosts can't remint it; a stale epoch can't either.
+	e.asHost("h2").fail("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "x"}, 409, "lease_lost")
+	h1.fail("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 2, "reason": "x"}, 409, "lease_lost")
+	var ro Object
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "saved node state rejected (NeedsLogin)"}, &ro)
+	if ro.Status != StatusPending || ro.StableNodeID != "" || ro.NodeID != "" || ro.Hostname != root.ObjectID {
+		t.Fatalf("after remint: %+v", ro)
+	}
+	var cred2 Credential
+	h1.ok("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, &cred2)
+	if cred2.AuthKey == "" || cred2.AuthKey == cred.AuthKey || cred2.Hostname != root.ObjectID {
+		t.Fatalf("second credential: hostname %q, same key %v", cred2.Hostname, cred2.AuthKey == cred.AuthKey)
+	}
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/ready", map[string]any{"nodeID": "2", "stableNodeID": "nNEW", "magicDNS": root.ObjectID + ".t.ts.net"}, nil)
+	c.ok("GET", "/v0/objects/"+root.ObjectID, nil, &ro)
+	if ro.Status != StatusReady || ro.StableNodeID != "nNEW" || ro.Hostname != root.ObjectID {
+		t.Fatalf("after second ready: %+v", ro)
+	}
+	h1.fail("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, 409, "already_joined")
+	// Idempotent while pending; refused once killed.
+	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "again"}, &ro)
+	c.ok("POST", "/v0/objects/"+root.ObjectID+"/kill", map[string]any{"reason": "test"}, nil)
+	h1.fail("POST", "/v0/objects/"+root.ObjectID+"/remint", map[string]any{"epoch": 1, "reason": "x"}, 410, "killed")
+	var audit struct{ Records []AuditRecord }
+	c.ok("GET", "/v0/audit?objectID="+root.ObjectID, nil, &audit)
+	kinds := map[string]int{}
+	for _, r := range audit.Records {
+		kinds[r.Kind]++
+	}
+	if kinds["remint"] < 1 || kinds["ready"] != 2 {
+		t.Fatalf("audit kinds %v", kinds)
+	}
+}
+
 func TestAPIEndToEnd(t *testing.T) {
 	e := newTestEnv(t, nil)
 	c, h1 := e.c, e.asHost("h1")

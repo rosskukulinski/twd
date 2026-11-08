@@ -1151,6 +1151,56 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 	return o, nil
 }
 
+// RemintRequest is POST /v0/objects/{id}/remint: the host's rejoin from
+// saved node state was rejected by control (the device expired or was
+// removed; ephemeral nodes that are offline during a restart), so the
+// object needs a fresh key under the same hostname. Live objects only: the
+// object goes back to "pending" with its node IDs cleared and is queued
+// for a mint; the host then takes the credential and reports ready with
+// the new node ID as usual.
+type RemintRequest struct {
+	Epoch  int64  `json:"epoch,omitempty"`
+	Reason string `json:"reason"`
+}
+
+func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (Object, error) {
+	old, err := m.store.GetObject(ctx, id)
+	if err != nil {
+		return old, err
+	}
+	switch old.Status {
+	case StatusKilled:
+		return old, errf(410, "killed", "object %s was killed (%s)", id, old.KillReason)
+	case StatusFailed:
+		return old, errf(502, "bootstrap_failed", "minting a key for %s failed", id)
+	}
+	var fence *Fence
+	if r.Epoch > 0 {
+		fence = &Fence{Lease: old.Lease, Holder: hostID, Epoch: r.Epoch}
+	}
+	o, err := m.store.UpdateObject(ctx, id, fence, func(o *Object) error {
+		if !o.Live() || o.Status == StatusPending {
+			return nil
+		}
+		o.Status, o.NodeID, o.StableNodeID, o.MagicDNS, o.KeyID, o.KeyExpires = StatusPending, "", "", "", "", 0
+		o.UpdatedAt = m.now().UnixMilli()
+		return nil
+	})
+	if err != nil {
+		return o, err
+	}
+	if old.Status == StatusMinted {
+		m.revokeKey(ctx, old) // an unused key for a node that no longer exists
+	}
+	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "remint"},
+		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID, "hostname": o.Hostname})
+	if old.Status != StatusPending {
+		m.enqueue(o.TenantID, id)
+	}
+	m.notify(id)
+	return o, nil
+}
+
 // ---- kill ----
 
 // KillRequest is POST /v0/objects/{id}/kill.

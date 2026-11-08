@@ -167,6 +167,13 @@ type Credential struct {
 // String never prints the key.
 func (c Credential) String() string { return "mgmtapi.Credential{redacted}" }
 
+// RemintRequest is POST /v0/objects/{id}/remint: the saved node state was
+// rejected by control; mint again under the same hostname.
+type RemintRequest struct {
+	Epoch  int64  `json:"epoch,omitempty"`
+	Reason string `json:"reason"`
+}
+
 type ReadyRequest struct {
 	NodeID       string `json:"nodeID"`
 	StableNodeID string `json:"stableNodeID"`

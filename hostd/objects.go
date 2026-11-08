@@ -325,7 +325,7 @@ func (h *Host) awaitNode(t *tenant, o *object, no *netd.Object) {
 	rcancel()
 	closeOnce(ch)
 	h.saveObjects()
-	h.log.Info("object node ready", "object", o.ID, "hostname", o.Hostname, "ip", o.IP, "join_ms", info.JoinMS, "rejoined", info.Rejoined)
+	h.log.Info("object node ready", "object", o.ID, "hostname", o.Hostname, "ip", o.IP, "join_ms", info.JoinMS, "rejoined", info.Rejoined, "reminted", info.Reminted)
 }
 
 func closeOnce(ch chan struct{}) {

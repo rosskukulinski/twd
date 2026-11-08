@@ -311,6 +311,13 @@ func (s *Server) Handler() http.Handler {
 		}
 		return m.Ready(r.Context(), r.PathValue("id"), hostOf(r), req)
 	}))
+	mux.HandleFunc("POST /v0/objects/{id}/remint", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		var req RemintRequest
+		if err := readJSON(r, &req); err != nil {
+			return nil, err
+		}
+		return m.Remint(r.Context(), r.PathValue("id"), hostOf(r), req)
+	}))
 	mux.HandleFunc("POST /v0/objects/{id}/kill", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req KillRequest
 		if err := readJSON(r, &req); err != nil {

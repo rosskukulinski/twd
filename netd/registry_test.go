@@ -153,6 +153,87 @@ func TestRejoinFromSavedState(t *testing.T) {
 	}
 }
 
+// TestRejoinRejectedRemints: an ephemeral node's saved state is rejected by
+// control after a "restart" (control expired/removed the device, which is
+// what happens to an ephemeral node that is offline for a while). tsnet.Up
+// would wait forever; netd must notice NeedsLogin, ask the KeySource for a
+// key with Remint set, and join again as the SAME hostname (a new node ID).
+// A persistent node whose state is accepted rejoins as before, with no key.
+//
+// testcontrol never refuses a node key by itself (an unknown key is simply
+// re-registered), so rejection is forced with SetExpireAllNodes(true), and
+// lifted inside the Remint callback, which only runs once NeedsLogin was
+// detected. Joins are serialized so the persistent node registers after.
+func TestRejoinRejectedRemints(t *testing.T) {
+	ctl := startControl(t)
+	root := filepath.Join(newRundir(t), "state")
+	mint := &countingMint{}
+	cfg := netd.Config{ControlURL: ctl.URL, StateRoot: root, Keys: mint.source(), Ephemeral: false, JoinParallel: 1}
+	reg, err := netd.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	eph := true
+	for id, opts := range map[string]netd.ObjectOptions{"gone": {Ephemeral: &eph}, "kept": {}} {
+		o, _ := reg.Create(id, opts)
+		if err := o.Ready(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := map[string]netd.ObjectInfo{}
+	for _, in := range reg.Objects() {
+		before[in.ID] = in
+	}
+	reg.Close()
+	ctl.Server.SetExpireAllNodes(true)
+
+	var mu sync.Mutex
+	var remints []netd.KeyRequest
+	cfg.Keys = netd.MintFunc(func(ctx context.Context, req netd.KeyRequest) (string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !req.Remint {
+			return "", errors.New("a plain rejoin must not request a key")
+		}
+		remints = append(remints, req)
+		ctl.Server.SetExpireAllNodes(false) // the device is "back" for the fresh registration
+		return nettest.DummyKey, nil
+	})
+	reg2, err := netd.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg2.Close()
+	ids, err := reg2.Rejoin() // ReadDir order: gone, then kept (JoinParallel 1)
+	if err != nil || len(ids) != 2 {
+		t.Fatalf("Rejoin: %v %v", ids, err)
+	}
+	st := time.Now()
+	for _, id := range ids {
+		if err := reg2.Get(id).Ready(ctx); err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+	}
+	t.Logf("both ready %v after Rejoin", time.Since(st).Round(time.Millisecond))
+	gone, kept := reg2.Get("gone").Info(), reg2.Get("kept").Info()
+	if !gone.Reminted || gone.Rejoined || gone.Hostname != before["gone"].Hostname || gone.NodeID == before["gone"].NodeID || !gone.Ephemeral {
+		t.Errorf("gone: %+v (before node %s)", gone, before["gone"].NodeID)
+	}
+	if kept.Reminted || !kept.Rejoined || kept.NodeID != before["kept"].NodeID || kept.IPs[0] != before["kept"].IPs[0] {
+		t.Errorf("kept: %+v (before %+v)", kept, before["kept"])
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(remints) != 1 || remints[0].ObjectID != "gone" || remints[0].Hostname != before["gone"].Hostname || !remints[0].Ephemeral {
+		t.Errorf("remint requests: %+v", remints)
+	}
+	if mint.calls.Load() != 2 {
+		t.Errorf("first run minted %d keys, want 2", mint.calls.Load())
+	}
+}
+
 func TestKillPendingObject(t *testing.T) {
 	ctl := startControl(t)
 	release := make(chan struct{})

@@ -327,6 +327,56 @@ func mcpCall(hc *http.Client, ip, tool string, args map[string]any) (map[string]
 	return m, nil
 }
 
+// Object is a row of `twd ls --all` (exported for harnesses that drive extra
+// phases, e.g. e2e-linux's ephemeral restart).
+type Object = object
+
+// WaitObjectReady waits until ns/name is ready with a MagicDNS name.
+func (e *Env) WaitObjectReady(ns, name string, timeout time.Duration) Object {
+	e.T.Helper()
+	return e.waitObjectReady(ns, name, timeout)
+}
+
+// FindObject returns ns/name from `twd ls --all`.
+func (e *Env) FindObject(ns, name string) (Object, bool) { return e.findObject(ns, name) }
+
+// PeerIPs returns every IPv4 the client's netmap has for magicDNS (a device
+// that was re-minted may briefly coexist with its predecessor's entry).
+func PeerIPs(n *nettest.Node, magicDNS string) []string {
+	want := strings.TrimSuffix(magicDNS, ".") + "."
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	st, err := n.LC.Status(ctx)
+	if err != nil {
+		return nil
+	}
+	var ips []string
+	for _, p := range st.Peer {
+		if strings.EqualFold(p.DNSName, want) && len(p.TailscaleIPs) > 0 {
+			ips = append(ips, p.TailscaleIPs[0].String())
+		}
+	}
+	return ips
+}
+
+// PeerIP waits until magicDNS is in n's netmap and returns its IPv4.
+func PeerIP(t testing.TB, n *nettest.Node, magicDNS string, timeout time.Duration) string {
+	t.Helper()
+	return peerIP(t, n, magicDNS, timeout)
+}
+
+// TrackObjectNodes records every object node ID twd reports (live or
+// killed) in Res.NodeIDs for the leftover check.
+func (e *Env) TrackObjectNodes() {
+	for _, o := range e.objects() {
+		for _, id := range []string{o.StableNodeID, o.NodeID} {
+			if id != "" && !slices.Contains(e.Res.NodeIDs, id) {
+				e.Res.NodeIDs = append(e.Res.NodeIDs, id)
+			}
+		}
+	}
+}
+
 // Run executes the scenario. Cleanup of test-created nodes is the caller's;
 // `twd down` (in Down) removes twd's own devices.
 func (e *Env) Run() {

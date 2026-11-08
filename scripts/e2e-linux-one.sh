@@ -21,8 +21,11 @@ OUT=${TWD_E2E_OUT:-$ROOT/e2e/real/results/linux}
 mkdir -p "$OUT"
 vm=twdl-$distro
 arch=arm64 vmtype=vz slow=1 extra=
+# The reference row also proves reboot survival (enable-linger + limactl
+# stop/start) and ephemeral nodes across a service restart (re-mint).
+reboot=0 ephemeral=0
 case $distro in
-ubuntu24-arm64) tmpl=ubuntu-24.04 ;;
+ubuntu24-arm64) tmpl=ubuntu-24.04 reboot=1 ephemeral=1 ;;
 ubuntu22-arm64) tmpl=ubuntu-22.04 ;;
 debian12-arm64) tmpl=debian-12 ;;
 fedora-arm64) tmpl=fedora ;;
@@ -91,7 +94,8 @@ debian11-arm64 | alpine-arm64)
 	;;
 *)
 	TWD_E2E_LIMA_VM=$vm TWD_E2E_TARBALL=$tarball TWD_E2E_SLOW=$slow TWD_E2E_RESULTS_DIR=$OUT TWD_E2E_VM_READY_S=$vm_ready_s \
-		go test -tags e2elinux -count=1 -v -timeout "$((30 * slow))m" -run '^TestE2ELinux$' ./e2e/linux/... >>"$log" 2>&1
+		TWD_E2E_REBOOT=${TWD_E2E_REBOOT:-$reboot} TWD_E2E_EPHEMERAL=${TWD_E2E_EPHEMERAL:-$ephemeral} \
+		go test -tags e2elinux -count=1 -v -timeout "$((45 * slow))m" -run '^TestE2ELinux$' ./e2e/linux/... >>"$log" 2>&1
 	;;
 esac
 rc=$?
