@@ -75,6 +75,12 @@ func sbQuote(p string) string {
 // own, and reads of each of readOnly (Seatbelt: the last matching rule
 // wins). The ancestors of own stay stat-able (workerd resolves its paths).
 func SeatbeltProfile(own, readOnly, deny []string) string {
+	return seatbeltProfile(own, readOnly, nil, deny)
+}
+
+// seatbeltProfile is SeatbeltProfile plus readOnlyTrees: dirs readable (not
+// writable) below, such as a node install prefix under the home dir.
+func seatbeltProfile(own, readOnly, readOnlyTrees, deny []string) string {
 	var b strings.Builder
 	b.WriteString("(version 1)\n(allow default)\n")
 	var denyR []string
@@ -92,7 +98,7 @@ func SeatbeltProfile(own, readOnly, deny []string) string {
 		fmt.Fprintf(&b, "(deny network-outbound (remote unix-socket (subpath %s)))\n", sbQuote(r))
 	}
 	var meta []string
-	for _, o := range own {
+	for _, o := range append(append([]string{}, own...), readOnlyTrees...) {
 		r := realPath(o)
 		for d := filepath.Dir(r); d != "/" && d != "."; d = filepath.Dir(d) {
 			if !slices.Contains(meta, d) {
@@ -107,6 +113,9 @@ func SeatbeltProfile(own, readOnly, deny []string) string {
 		for _, p := range []string{o, realPath(o)} {
 			fmt.Fprintf(&b, "(allow file-read* (literal %s))\n", sbQuote(p))
 		}
+	}
+	for _, o := range readOnlyTrees {
+		fmt.Fprintf(&b, "(allow file-read* (subpath %s))\n", sbQuote(realPath(o)))
 	}
 	for _, o := range own {
 		r := realPath(o)
@@ -150,15 +159,44 @@ func (h *Host) sandboxDeny() []string {
 // workerdCommand builds the instance's workerd command line, wrapped in its
 // tenant's sandbox.
 func (inst *instance) workerdCommand() (*exec.Cmd, error) {
-	args := []string{"serve", inst.res.Config, "--experimental"}
-	if inst.h.sandbox != SandboxSeatbelt {
-		return exec.Command(inst.h.cfg.WorkerdBin, args...), nil
+	return inst.sandboxed(inst.h.cfg.WorkerdBin, []string{"serve", inst.res.Config, "--experimental"},
+		[]string{inst.dir, inst.doStorage}, []string{inst.h.cfg.WorkerdBin}, nil)
+}
+
+// nodeCommand builds the Node tier's command line under the same sandbox as
+// workerd: tenant code too. It may write only its instance dir and its own
+// data dir; it may read the node binary and, when node lives in a
+// "<prefix>/bin" dir (nvm, Homebrew, a tarball), that install prefix.
+func (inst *instance) nodeCommand(args []string) (*exec.Cmd, error) {
+	np := inst.node
+	return inst.sandboxed(np.bin, args, []string{inst.dir, np.dataDir}, []string{np.bin}, nodePrefix(np.bin))
+}
+
+// nodePrefix is node's install prefix (…/bin/node → …), if it has one.
+func nodePrefix(bin string) []string {
+	r := realPath(bin)
+	if d := filepath.Dir(r); filepath.Base(d) == "bin" {
+		if p := filepath.Dir(d); p != "/" && p != "/usr" && p != "." {
+			return []string{p}
+		}
 	}
-	prof := SeatbeltProfile([]string{inst.dir, inst.doStorage}, []string{inst.h.cfg.WorkerdBin}, inst.h.sandboxDeny())
+	return nil
+}
+
+// sandboxed returns bin args, run under the host's sandbox (Seatbelt:
+// sandbox-exec execs bin in place, so the pid is bin's). The profile is
+// written to the instance dir and recorded as inst.profile.
+func (inst *instance) sandboxed(bin string, args, own, readOnly, readOnlyTrees []string) (*exec.Cmd, error) {
+	if inst.h.sandbox != SandboxSeatbelt {
+		return exec.Command(bin, args...), nil
+	}
+	prof := seatbeltProfile(own, readOnly, readOnlyTrees, inst.h.sandboxDeny())
 	p := filepath.Join(inst.dir, "sandbox.sb")
 	if err := os.WriteFile(p, []byte(prof), 0o600); err != nil {
 		return nil, err
 	}
+	inst.mu.Lock()
 	inst.profile = p
-	return exec.Command(sandboxExec, append([]string{"-f", p, inst.h.cfg.WorkerdBin}, args...)...), nil
+	inst.mu.Unlock()
+	return exec.Command(sandboxExec, append([]string{"-f", p, bin}, args...)...), nil
 }

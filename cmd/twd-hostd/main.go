@@ -60,6 +60,7 @@ func run() error {
 		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
 		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd sandbox: auto (seatbelt on macOS) | seatbelt | none")
 		sbDeny     = flag.String("sandbox-deny", "", "comma-separated extra paths no workerd may read, write or connect to (twd up: its state and run dirs)")
+		nodeBin    = flag.String("node", "", "Node process tier (runtime \"node\"): node binary (default: $TWD_NODE, or node on PATH)")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -75,6 +76,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	if *nodeBin == "" {
+		*nodeBin = os.Getenv("TWD_NODE")
+	}
 	mc, err := mgmtapi.NewClient(*mgmtAddr)
 	if err != nil {
 		return err
@@ -83,7 +87,7 @@ func run() error {
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
 		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny),
-		DefaultTier: *tier, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
+		DefaultTier: *tier, NodeBin: *nodeBin, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
 	if err != nil {
 		return err
 	}

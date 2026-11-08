@@ -47,6 +47,8 @@ func init() {
 		{name: "kill", usage: "kill <object> [--tenant <tailnet>] [--cascade] [--reason <text>]", help: "kill an object (and with --cascade its sub-agents)", run: cmdKill},
 		{name: "audit", usage: "audit [--tenant <tailnet>] <object> | --human <login> | --trace <id> | --all", help: "show the hash-chained audit trail", run: cmdAudit},
 		{name: "logs", usage: "logs [workload] [--tenant <tailnet>] [--component mgmt|hostd|supervisor] [-n 50] [-f]", help: "show logs (workerd for a workload, else the daemons)", run: cmdLogs},
+		{name: "doctor", usage: "doctor [--tailnet <tailnet> --api-key-file <file>]", help: "check this machine: workerd runs, bundler offline, ~/.twd writable, API key works, process sandbox active, system tailscaled not used", run: cmdDoctor},
+		{name: "version", usage: "version", help: "print the twd version (and the pinned workerd / built-in esbuild)", run: cmdVersion},
 		{name: "__supervise", hidden: true, run: cmdSupervise},
 	}
 }
@@ -64,6 +66,9 @@ func usage(w io.Writer) {
 
 func main() {
 	args := os.Args[1:]
+	if len(args) == 1 && (args[0] == "--version" || args[0] == "-v") {
+		args = []string{"version"}
+	}
 	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
 		usage(os.Stdout)
 		return

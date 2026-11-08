@@ -138,6 +138,16 @@ func (e *Env) Deploy(appDir, workload string, vars map[string]string) string {
 	return resp.DeploymentID
 }
 
+// DeployNode builds a runtime "node" app and deploys it as workload.
+func (e *Env) DeployNode(appDir, workload string, vars map[string]string) string {
+	e.T.Helper()
+	files, err := BuildNode(appDir, vars)
+	if err != nil {
+		e.T.Fatal(err)
+	}
+	return e.DeployFiles(files, workload)
+}
+
 // DeployFiles deploys already-built bundle files as workload.
 func (e *Env) DeployFiles(files map[string][]byte, workload string) string {
 	e.T.Helper()

@@ -89,6 +89,9 @@ type Config struct {
 	// SandboxDeny are extra paths no workerd may read, write or connect to
 	// (twd up: its whole state dir, which holds mgmt's custody and socket).
 	SandboxDeny []string
+	// NodeBin is the node binary for runtime "node" deployments (default:
+	// node from PATH).
+	NodeBin string
 }
 
 // Host is a running twd-hostd.

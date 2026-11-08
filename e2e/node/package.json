@@ -1,0 +1,17 @@
+{
+  "name": "twd-e2e-node",
+  "private": true,
+  "type": "module",
+  "description": "Pinned npm deps for make test-node (the node-workflow template + Node tier fixtures). Kept out of the root workspace so make test stays light.",
+  "dependencies": {
+    "@twd/node": "file:../../js/packages/node",
+    "workflow": "5.4.0",
+    "@workflow/world-local": "5.2.1",
+    "@ai-sdk/workflow": "2.0.97",
+    "@ai-sdk/provider": "4.0.37",
+    "@ai-sdk/provider-utils": "5.0.76",
+    "ai": "7.0.165",
+    "zod": "4.6.7",
+    "undici": "8.12.4"
+  }
+}

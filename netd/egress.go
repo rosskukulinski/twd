@@ -86,6 +86,38 @@ func (r *Registry) EgressHandler() http.Handler {
 	})
 }
 
+// DialEgress opens a raw TCP flow from object id's own node to hostport
+// (a netmap name or tailnet IP, with an explicit port), under the same
+// ADR-019 policy as EgressHandler. It backs CONNECT tunnels (the Node process
+// tier's env proxies). The flow is tracked, so a kill RSTs it.
+func (r *Registry) DialEgress(ctx context.Context, id, hostport string) (net.Conn, error) {
+	o := r.Get(id)
+	if o == nil {
+		return nil, &Error{Code: CodeUnknownObject, Detail: "egress request does not name a known object", Object: id}
+	}
+	if _, port, err := net.SplitHostPort(hostport); err != nil || port == "" {
+		return nil, &Error{Code: CodeBadRequest, Detail: "CONNECT needs host:port", Object: id, Destination: hostport}
+	}
+	rctx, cancel := context.WithTimeout(ctx, r.cfg.ReadyTimeout)
+	err := o.Ready(rctx)
+	cancel()
+	if err != nil {
+		e, _ := AsError(err)
+		e.Object, e.Destination = id, hostport
+		return nil, e
+	}
+	c, err := o.dialEgress(ctx, "tcp", hostport)
+	if err != nil {
+		if _, ok := AsError(err); ok {
+			return nil, err
+		}
+		e := newErr(CodeDialFailed, err.Error())
+		e.Object, e.Destination = id, hostport
+		return nil, e
+	}
+	return c, nil
+}
+
 type objectKey struct{}
 
 func objectFrom(ctx context.Context) *Object {

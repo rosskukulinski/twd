@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/hostd/gen"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
@@ -396,6 +398,11 @@ type WorkloadStatus struct {
 	Sandbox        string `json:",omitempty"`
 	SandboxProfile string `json:",omitempty"`
 	DOStorage      string `json:",omitempty"`
+	// Runtime is "node" for the Node process tier ("" = workerd).
+	Runtime string    `json:",omitempty"`
+	Node    *NodeInfo `json:",omitempty"`
+	// LogFile is the app's log (workerd.log, or app.log for runtime node).
+	LogFile string `json:",omitempty"`
 }
 
 // StatusView is GET /v0/status.
@@ -424,6 +431,10 @@ func (h *Host) Status() StatusView {
 			ws.Requests = w.active.reqs.Load()
 			ws.InstanceDir = w.active.dir
 			ws.Tier = w.active.tier
+			ws.LogFile = filepath.Join(w.active.dir, "workerd.log")
+			if w.active.node != nil {
+				ws.Runtime, ws.Node, ws.LogFile = bundle.RuntimeNode, w.active.nodeInfo(), w.active.node.logPath
+			}
 			ws.DOStorage = w.active.doStorage
 			w.active.mu.Lock()
 			if w.active.cmd != nil && w.active.cmd.Process != nil {

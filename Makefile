@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node
 
 all: build
 
@@ -91,8 +91,26 @@ e2e-multi: deps
 		TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2emulti -count=1 -v -timeout 25m ./e2e/multi/...
 
-release:
-	@echo "release: not implemented yet (milestone M6)"; exit 1
+## release: self-contained tarballs in dist/ (darwin-arm64 + linux-arm64): Go binaries
+## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
+## install.sh, VERSION, SHA256SUMS. darwin binaries are ad-hoc signed (run on macOS).
+RELEASE_VERSION ?= $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
+RELEASE_TARGETS ?= darwin-arm64 linux-arm64
+release: deps
+	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS
+	sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
+
+## e2e-mbp: E2E-MAC on the clean MacBook `mbp` from the release tarball (skips without
+## the tailnet-1 key file or `ssh mbp`). twd runs on mbp; the test client + echo run here.
+MBP ?= mbp
+e2e-mbp: release
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-mbp: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	if ! ssh -o BatchMode=yes -o ConnectTimeout=10 $(MBP) true 2>/dev/null; then \
+		echo "e2e-mbp: SKIPPED (ssh $(MBP) not reachable)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" TWD_E2E_SSH_HOST="$(MBP)" \
+		TWD_E2E_TARBALL="$(CURDIR)/dist/twd-$(RELEASE_VERSION)-darwin-arm64.tar.gz" \
+		sh scripts/e2e-mbp.sh $(MBP) -tags e2embp -count=1 -v -timeout 25m ./e2e/mbp/...
 
 lint:
 	@out=$$(gofmt -l $$(git ls-files -co --exclude-standard '*.go')); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
@@ -104,7 +122,9 @@ lint:
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
+	$(GO) vet -tags e2embp ./e2e/mbp/...
 	$(GO) vet -tags sdk ./e2e/sdk/...
+	$(GO) vet -tags nodetier ./e2e/node/...
 	@sh scripts/check-secrets.sh
 
 hooks:
@@ -123,3 +143,9 @@ test-m2mgmt: deps
 	rm -rf /tmp/twd-m2src && mkdir -p /tmp/twd-m2src && git fetch -q origin m2-mgmt && git archive origin/m2-mgmt | tar -x -C /tmp/twd-m2src
 	cd /tmp/twd-m2src && $(GO) build -o /tmp/twd-m2src/twd-mgmt ./cmd/twd-mgmt
 	TWD_MGMT_BIN=/tmp/twd-m2src/twd-mgmt $(GO) test -tags m2mgmt -count=1 -v -timeout 5m ./e2e/m2mgmt/...
+
+## test-node: the opt-in Node process tier + Vercel Workflow (hermetic; npm ci of the pinned deps in e2e/node).
+test-node: deps
+	cd e2e/node && npm ci --no-audit --no-fund --loglevel=error
+	npm test -w @twd/node --silent
+	$(GO) test -tags nodetier -count=1 -v -timeout 10m ./e2e/node/...

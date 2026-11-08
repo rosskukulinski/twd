@@ -57,3 +57,40 @@ func TestSeatbeltProfile(t *testing.T) {
 		t.Fatalf("symlinks not resolved: %s", rd)
 	}
 }
+
+// The Node tier's profile: the node install prefix is readable (nvm puts it
+// under the denied home dir), never writable, and denies still precede it.
+func TestSeatbeltProfileNodePrefix(t *testing.T) {
+	dir := realPath(t.TempDir())
+	bin := dir + "/home/.nvm/versions/node/v25/bin/node"
+	if got := nodePrefix(bin); len(got) != 1 || got[0] != dir+"/home/.nvm/versions/node/v25" {
+		t.Fatalf("nodePrefix(%s) = %v", bin, got)
+	}
+	for _, b := range []string{"/usr/bin/node", "/node", "/opt/node/node"} {
+		if got := nodePrefix(b); got != nil {
+			t.Fatalf("nodePrefix(%s) = %v, want none", b, got)
+		}
+	}
+	p := seatbeltProfile([]string{dir + "/run/i2", dir + "/data/tenants/A/workloads/w/node"}, []string{bin}, nodePrefix(bin),
+		[]string{dir + "/home", dir + "/data", dir + "/run"})
+	lines := strings.Split(p, "\n")
+	at := func(s string) int {
+		for i, l := range lines {
+			if l == s {
+				return i
+			}
+		}
+		t.Fatalf("profile lacks %q:\n%s", s, p)
+		return -1
+	}
+	deny := at(`(deny file-read* file-write* (subpath "` + dir + `/home"))`)
+	tree := at(`(allow file-read* (subpath "` + dir + `/home/.nvm/versions/node/v25"))`)
+	at(`(allow file-read* file-write* (subpath "` + dir + `/data/tenants/A/workloads/w/node"))`)
+	at(`(allow file-read-metadata (literal "` + dir + `/home/.nvm/versions"))`)
+	if tree < deny {
+		t.Fatal("the node prefix must be allowed after the denies")
+	}
+	if strings.Contains(p, `file-write* (subpath "`+dir+`/home/.nvm`) {
+		t.Fatal("node prefix must be read-only")
+	}
+}

@@ -1,0 +1,16 @@
+{
+  // node-workflow: a durable Vercel Workflow ("use workflow") on twd's opt-in
+  // Node process tier. One supervised node process, one tailnet node.
+  "name": "node-workflow",
+  "runtime": "node",
+  "main": "src/server.ts",
+  "node": { "health": "/healthz" },
+  "tailnet": {
+    "tags": ["tag:twd-wl-node-workflow"],
+    // the twd MCP server this workflow's agent calls (deploy the mcp template)
+    "connects": ["tag:twd-wl-mcp"]
+  }
+  // policy: grant this workload the MCP app cap, e.g.
+  //   { "src": ["tag:twd-wl-node-workflow"], "dst": ["tag:twd-wl-mcp"], "ip": ["tcp:80"],
+  //     "app": { "example.com/cap/mcp": [{ "tools": ["lookup_order"] }] } }
+}

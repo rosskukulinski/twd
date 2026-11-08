@@ -66,6 +66,12 @@ func (w *workload) isActive() bool {
 	return w.status == "active" || w.status == "starting"
 }
 
+func (w *workload) currentWL() *object {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.wl
+}
+
 func (w *workload) current() *instance {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -187,6 +193,10 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	w.mu.Unlock()
 
 	tier := h.tierFor(app, t)
+	if app.Runtime == bundle.RuntimeNode {
+		h.deployNode(w, a, app, st)
+		return
+	}
 	inst, err := h.startInstance(w, a.DeploymentID, app, tier)
 	if err != nil {
 		w.fail(a.DeploymentID, err)
@@ -231,6 +241,53 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	h.mu.Unlock()
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
+}
+
+// deployNode switches a Node-tier workload stop-then-start: durable Node
+// runtimes (Vercel Workflow's local World, SQLite files) assume one process
+// per data directory, so the old process exits before the new one starts.
+// New requests wait at the gate meanwhile.
+func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st time.Time) {
+	w.mu.Lock()
+	old := w.active
+	gate := make(chan struct{})
+	w.gate = gate
+	w.mu.Unlock()
+	open := func() {
+		w.mu.Lock()
+		if w.gate == gate {
+			close(gate)
+			w.gate = nil
+		}
+		w.mu.Unlock()
+	}
+	if old != nil {
+		old.drain(h.cfg.DrainTimeout)
+		old.stop()
+	}
+	inst, err := h.startInstance(w, a.DeploymentID, app, bundle.TierProcess)
+	w.mu.Lock()
+	if old != nil && w.active == old {
+		w.active = nil
+	}
+	w.mu.Unlock()
+	if err != nil {
+		open()
+		w.fail(a.DeploymentID, err)
+		return
+	}
+	w.mu.Lock()
+	if w.deploymentID != a.DeploymentID { // superseded while starting
+		w.mu.Unlock()
+		open()
+		inst.stop()
+		return
+	}
+	w.active, w.app, w.activeDep, w.status = inst, app, a.DeploymentID, "active"
+	w.mu.Unlock()
+	open()
+	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
+		"runtime", bundle.RuntimeNode, "restart", old != nil, "ms", time.Since(st).Milliseconds())
 }
 
 // undeploy stops serving a workload: workerd stops and its nodes close
@@ -284,6 +341,8 @@ type instance struct {
 	doStorage string
 	profile   string
 
+	node *nodeProc // Node process tier (runtime "node"); nil for workerd
+
 	inflight atomic.Int64
 	reqs     atomic.Int64
 	stopping atomic.Bool
@@ -302,6 +361,9 @@ type instance struct {
 // process (with a warning) when this host has no microVM backend (macOS, no
 // KVM, not root).
 func (h *Host) tierFor(app *bundle.App, t *tenant) string {
+	if app.Runtime == bundle.RuntimeNode {
+		return bundle.TierProcess // the microVM guest has no Node.js (see STATUS.md M9)
+	}
 	tier := app.Tier
 	if tier == "" && t != nil {
 		tier = t.info.Tier
@@ -324,6 +386,9 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	h.instSeq++
 	n := h.instSeq
 	h.mu.Unlock()
+	if app.Runtime == bundle.RuntimeNode {
+		return h.startNodeInstance(w, depID, app, n)
+	}
 	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
 	opts := gen.Options{
 		Dir:          dir,
@@ -453,6 +518,9 @@ func (inst *instance) bootVM() error {
 }
 
 func (inst *instance) spawn() error {
+	if inst.node != nil {
+		return inst.spawnNode()
+	}
 	if inst.tier == bundle.TierMicroVM {
 		return inst.bootVM()
 	}
@@ -567,6 +635,13 @@ func (inst *instance) drain(timeout time.Duration) {
 
 func (inst *instance) stop() {
 	if !inst.stopping.CompareAndSwap(false, true) {
+		return
+	}
+	if inst.node != nil {
+		inst.stopNode()
+		if os.Getenv("TWD_KEEP_INSTANCES") == "" {
+			os.RemoveAll(inst.dir)
+		}
 		return
 	}
 	inst.mu.Lock()

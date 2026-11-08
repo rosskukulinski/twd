@@ -1,0 +1,15 @@
+{
+  "name": "twd-node-workflow",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "create-twd build-node .", "deploy": "twd deploy" },
+  "dependencies": {
+    "@twd/node": "^0.1.0",
+    "workflow": "5.4.0",
+    "@workflow/world-local": "5.2.1",
+    "@ai-sdk/workflow": "2.0.97",
+    "@ai-sdk/provider": "4.0.37",
+    "ai": "7.0.165",
+    "zod": "4.6.7"
+  }
+}

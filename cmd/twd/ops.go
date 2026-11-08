@@ -569,7 +569,12 @@ func cmdLogs(args []string) error {
 			return err
 		}
 		for _, w := range hv.Workloads {
-			if w.TenantID == tn.TenantID && w.Workload == pos[0] && w.InstanceDir != "" {
+			if w.TenantID != tn.TenantID || w.Workload != pos[0] {
+				continue
+			}
+			if w.LogFile != "" {
+				path = w.LogFile // workerd.log, or app.log for runtime "node"
+			} else if w.InstanceDir != "" {
 				path = filepath.Join(w.InstanceDir, "workerd.log")
 			}
 		}

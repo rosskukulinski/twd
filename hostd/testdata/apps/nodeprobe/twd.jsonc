@@ -1,0 +1,8 @@
+{
+  // Node process tier probe (hostd + make test-node): caller, egress, crash.
+  "name": "nodeprobe",
+  "runtime": "node",
+  "main": "src/server.mjs",
+  "node": { "env": { "PROBE_GREETING": "hi" } },
+  "tailnet": { "tags": ["tag:twd-wl-nodeprobe"] }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "@twd/node",
+  "version": "0.1.0",
+  "description": "twd Node process tier SDK: verified caller (x-twd-caller), attributed egress (proxy fetch / undici dispatcher)",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "peerDependencies": {
+    "undici": ">=6"
+  },
+  "peerDependenciesMeta": {
+    "undici": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "node --test test/*.test.js"
+  },
+  "license": "BSD-3-Clause"
+}

@@ -2,6 +2,7 @@
 // create-twd: scaffold a twd app from a template, or bundle one.
 //   npm create twd@latest <dir> -- --template hello|agent|mcp|ai-agent
 //   create-twd build [dir]        (bundles wrangler.jsonc main → dist/index.js)
+//   create-twd build-node [dir] [outdir]  (runtime "node" apps: dist/server.mjs + Workflow bundles)
 import { cpSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +15,14 @@ if (args[0] === "build") {
   const { buildApp } = await import("../lib/build.mjs");
   const r = await buildApp(path.resolve(args[1] ?? "."));
   console.log(`built ${r.outfile} (${r.bytes} bytes)`);
+  process.exit(0);
+}
+
+if (args[0] === "build-node") {
+  const { buildNodeApp } = await import("../lib/build-node.mjs");
+  const dir = path.resolve(args[1] ?? ".");
+  const r = await buildNodeApp(dir, path.resolve(args[2] ?? path.join(dir, ".twd-build")));
+  console.log(`built ${r.outdir}/${r.main} (${r.bytes} bytes${r.workflows ? ", with Vercel Workflow bundles" : ""})`);
   process.exit(0);
 }
 
