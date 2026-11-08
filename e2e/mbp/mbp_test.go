@@ -218,6 +218,23 @@ func TestE2EMbp(t *testing.T) {
 		}}
 	e.OnPeers = func(client *nettest.Node, hc *http.Client, agentIP, mcpIP string) {
 		measurePath(t, res, client, hc, agentIP, mcpIP)
+		// mbp's LAN address must be the direct endpoint: the workload
+		// really runs on the other Mac.
+		if lan := strings.TrimSpace(r.must(`ipconfig getifaddr en0 || ipconfig getifaddr en1; true`)); lan != "" && lastEndpoint != "" {
+			if ap, err := netip.ParseAddrPort(lastEndpoint); err == nil && ap.Addr().String() == lan {
+				res.Pass("cross_machine", "the mcp workload node's direct endpoint is mbp's LAN address (twd host "+strings.TrimSpace(r.must(`hostname -s`))+", test client on "+localHost()+")")
+			} else {
+				res.Notes = append(res.Notes, "direct endpoint is not mbp's en0/en1 address (another interface or NAT)")
+			}
+		}
+		// DERP: the same requests from a second client that may only use
+		// DERP (TS_DEBUG_ALWAYS_USE_DERP=1, a separate process: the knob is
+		// process-wide).
+		k, err := minter.AuthKey(ctx, netd.KeyRequest{ObjectID: "derp", Tags: []string{cliflow.TestTag}, Ephemeral: true})
+		if err != nil {
+			t.Fatalf("mint derp: %v", netd.RedactError(err))
+		}
+		derpProbe(t, res, tracker, k, testPrefix+"derp", mcpIP, work)
 	}
 
 	t.Cleanup(func() {
@@ -393,6 +410,7 @@ func measurePath(t testing.TB, res *cliflow.Results, client *nettest.Node, hc *h
 	ip := netip.MustParseAddr(mcpIP)
 	var derpPing, directPing, derpHTTP, directHTTP []float64
 	var region, endpoint string
+	defer func() { lastEndpoint = endpoint }()
 	start := time.Now()
 	var toDirect time.Duration
 	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
@@ -465,6 +483,120 @@ func measurePath(t testing.TB, res *cliflow.Results, client *nettest.Node, hc *h
 		t.Fatalf("no HTTP request to the mcp node (%s) succeeded", mcpIP)
 	}
 	_ = agentIP
+}
+
+var lastEndpoint string
+
+func localHost() string { h, _ := os.Hostname(); h, _, _ = strings.Cut(h, "."); return h }
+
+// pathSample is one ping + one HTTP request.
+type probeOut struct {
+	NodeID  string    `json:"nodeID"`
+	Ping    []float64 `json:"pingMs"`
+	HTTP    []float64 `json:"httpMs"`
+	Regions []string  `json:"regions"`
+	Direct  int       `json:"directPongs"`
+	Err     string    `json:"err,omitempty"`
+}
+
+// derpProbe re-runs this test binary as TestDERPProbe with DERP forced.
+func derpProbe(t testing.TB, res *cliflow.Results, tracker *tsapi.Tracker, key, hostname, target, work string) {
+	dir := filepath.Join(work, "derp")
+	os.MkdirAll(dir, 0o700)
+	kf, out := filepath.Join(dir, "key"), filepath.Join(dir, "out.json")
+	if err := os.WriteFile(kf, []byte(key), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var env []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "TWD_E2E_") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "TS_DEBUG_ALWAYS_USE_DERP=1", "TWD_PROBE_KEY_FILE="+kf, "TWD_PROBE_HOSTNAME="+hostname,
+		"TWD_PROBE_TARGET="+target, "TWD_PROBE_OUT="+out, "TWD_PROBE_DIR="+dir)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestDERPProbe$", "-test.count=1", "-test.timeout=3m")
+	cmd.Env = env
+	b, err := cmd.CombinedOutput()
+	os.Remove(kf)
+	var po probeOut
+	jb, _ := os.ReadFile(out)
+	json.Unmarshal(jb, &po)
+	if po.NodeID != "" {
+		tracker.Track(po.NodeID, "derp")
+	}
+	if err != nil || po.Err != "" || len(po.HTTP) == 0 {
+		t.Fatalf("derp probe: %v %s\n%s", err, po.Err, netd.Redact(string(b)))
+	}
+	res.Numbers["path_derp_ping_ms"] = median(po.Ping)
+	res.Numbers["path_derp_http_ms"] = median(po.HTTP)
+	res.Notes = append(res.Notes, fmt.Sprintf("DERP-only client (TS_DEBUG_ALWAYS_USE_DERP) → mbp mcp node: disco ping median %.1f ms (n=%d, regions %v, %d direct pongs), HTTP tools/list median %.1f ms (n=%d)",
+		median(po.Ping), len(po.Ping), slices.Compact(po.Regions), po.Direct, median(po.HTTP), len(po.HTTP)))
+}
+
+// TestDERPProbe is derpProbe's child process (skipped otherwise).
+func TestDERPProbe(t *testing.T) {
+	kf := os.Getenv("TWD_PROBE_KEY_FILE")
+	if kf == "" {
+		t.Skip("child of TestE2EMbp only")
+	}
+	var po probeOut
+	defer func() {
+		b, _ := json.Marshal(po)
+		os.WriteFile(os.Getenv("TWD_PROBE_OUT"), b, 0o600)
+	}()
+	key, err := os.ReadFile(kf)
+	if err != nil {
+		po.Err = err.Error()
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	n, err := nettest.NewNode(ctx, prodControl, strings.TrimSpace(string(key)), os.Getenv("TWD_PROBE_HOSTNAME"), os.Getenv("TWD_PROBE_DIR"))
+	if err != nil {
+		po.Err = netd.Redact(err.Error())
+		return
+	}
+	defer n.Close()
+	if st, err := n.LC.StatusWithoutPeers(ctx); err == nil && st.Self != nil {
+		po.NodeID = string(st.Self.ID)
+		b, _ := json.Marshal(po)
+		os.WriteFile(os.Getenv("TWD_PROBE_OUT"), b, 0o600)
+	}
+	target := os.Getenv("TWD_PROBE_TARGET")
+	if err := n.WaitPeers(ctx, target); err != nil {
+		po.Err = "netmap: " + err.Error()
+		return
+	}
+	ip := netip.MustParseAddr(target)
+	hc := n.HTTPClient(20 * time.Second)
+	body := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
+	for i := 0; i < 12; i++ {
+		pctx, pcancel := context.WithTimeout(ctx, 5*time.Second)
+		pr, err := n.LC.Ping(pctx, ip, tailcfg.PingDisco)
+		pcancel()
+		if err == nil && pr.Err == "" && i > 0 { // the first includes path setup
+			po.Ping = append(po.Ping, pr.LatencySeconds*1000)
+			po.Regions = append(po.Regions, pr.DERPRegionCode)
+			if pr.Endpoint != "" {
+				po.Direct++
+			}
+		}
+		req, _ := http.NewRequest("POST", "http://"+target+"/mcp", bytes.NewReader(body))
+		req.Header.Set("content-type", "application/json")
+		req.Header.Set("accept", "application/json, text/event-stream")
+		req.Header.Set("mcp-protocol-version", "2025-06-18")
+		st := time.Now()
+		resp, err := hc.Do(req)
+		if err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			if resp.StatusCode == 200 && i > 0 {
+				po.HTTP = append(po.HTTP, msOf(time.Since(st)))
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
 }
 
 // redactEndpoint keeps only whether the direct path is LAN or not.
