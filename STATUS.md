@@ -653,7 +653,7 @@ Full matrix: `docs/COMPAT.md`.
 - **`make test-sdk`: PASS.** `SameClassAcrossWorkloadsFailsClosed` became `SameClassAcrossWorkloadsDistinctIdentities`: the two `ai-agent` workloads' `AiAgent/dup` get two nodes, and each one's MCP calls leave from its own node.
 - **`make e2e-mac`: PASS** (tailnet 1; run `35f16c`, with Seatbelt on), so the single-tenant flow is unchanged.
 - `make lint`: PASS (now also vets `-tags e2emulti`).
-- **`make e2e-multi`: PASS in 3 of 3 runs** (`1678f2`, `d4aad9`, and a third on the final commit; `e2e/real/results/m7-*.json`).
+- **`make e2e-multi`: PASS in 3 of 3 runs** (`1678f2`, `d4aad9`, and `44d336` on commit `adf4cf2`; later commits change only docs and results; `e2e/real/results/m7-*.json`).
   - Setup: `twd up` with tailnet 1 = tenant A, then `twd tenant add tail2c3a48.ts.net` = tenant B. The same `agent` template directory (workload `agent`, `SupportAgent/a1`) was deployed to both. Test clients and echoes are tsnet `tag:ttest` nodes, each in its own tenant's tailnet, with prefix `ttest-m7-<run>-`.
   - **Tailnet-2's name** is discovered at run time. Its API key's device list was empty, so the name came from the MagicDNS name of a test client joined with an API-minted key. It is checked against an allow list, with the personal tailnet refused, before anything is written.
 
