@@ -4,6 +4,7 @@ Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on
 Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
 Last update: 2026-11-08 00:40 PT. M8 (microVM tier, Firecracker in Lima) on branch `m8-vm`: `make e2e-vm` PASS.
 Last update: 2026-11-08 00:45 PT. M4 (`twd` CLI + integrated single-machine flow, E2E-MAC on this Mac) on branch `m4-cli`.
+Last update: 2026-11-08 01:20 PT. M9 (opt-in Node process tier + Vercel Workflow) on branch `m9-node`: `make test-node` PASS on macOS and Lima.
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -553,3 +554,89 @@ Final run: `e2e/vm/results/m8-20261108T083524Z.json`.
 - **Push URLs** live in mgmt memory: after a mgmt restart, kills fall back to the heartbeat until the host re-registers (hostd re-registers only on a 404).
 - **Spawned sub-agents report `principal`** = the root's caller, not an `actingFor` assertion (RFC §4.6, still not implemented).
 - **Linux/Lima not run** for M4.
+
+## M9: opt-in Node process tier + Vercel Workflow (DONE, branch `m9-node`)
+`make test-node` **passes on macOS** (Node 25.1) **and in Lima `twd-dev`** (Linux arm64, Node 24.22; fresh clone of `m9-node`). It is hermetic: testcontrol + local DERP, fakemgmt, real hostd, real node. `make test` stays green on macOS and in Lima; `make lint` is green. Design and caveats are in `docs/node-tier.md`.
+
+### What's built
+- **`"runtime": "node"` in twd.jsonc** (`hostd/bundle`: `App.Runtime`, `App.Node`).
+  - The bundle is the built app dir; `main` comes from twd.jsonc or twd-bundle.json. Also parsed: `node.env`, `listen` (`tcp`/`unix`), `health` and `args`.
+  - Rejected: `tailnet.objects` (ADR-022: one identity per process), `tier: microvm`, reserved `TWD_*` env and non-flag args.
+  - The real mgmt accepts it unchanged; it only needs `tailnet.tags`.
+- **hostd Node tier** (`hostd/node.go`).
+  - **Process.** One supervised `node` process per deployment; the identity is the **workload node** (no per-object nodes). It runs in its own process group with a clean env: hostd's environment is not inherited, and a canary test checks this.
+    - App data dir: `<data>/tenants/<t>/workloads/<w>/node`.
+    - Logs go to `app.log`, which `twd logs <workload>` reads via the new `WorkloadStatus.LogFile`.
+    - Status reports `Runtime` and `Node{PID,Starts,ReadyMs,Addr,ProxyAddr,LogFile}`.
+    - `twd-hostd -node` (or `$TWD_NODE`) picks the binary; the default is PATH.
+  - **Ingress.** netd (WhoIs, strip) → hostd → app on 127.0.0.1:PORT (or a unix socket), with `x-twd-caller: v1.<claims>.<HMAC-SHA256>`. The per-process key `TWD_CALLER_KEY` is fresh on every start, and hostd also drops any inbound `x-twd-*`/`twd-*`.
+  - **Egress.** A per-process HTTP proxy on loopback with fresh Basic credentials, exported as `HTTP(S)_PROXY`/`TWD_EGRESS_PROXY` with `NODE_USE_ENV_PROXY=1`. `NO_PROXY` covers only the app's own port and the proxy.
+    - Absolute-form requests go to netd egress.
+    - **CONNECT** tunnels go through new `netd.Registry.DialEgress`: the same ADR-019 guard, tracked so a kill RSTs them. Node's built-in `fetch` uses CONNECT even for `http://`.
+  - **Supervision.** Restart with exponential backoff (250 ms → 10 s, reset after 30 s up), never giving up; requests get 503 `upstream_unavailable` while the app is down. Deploys are **stop-then-start**, because durable runtimes assume one process per data dir.
+- **`@twd/node`** (`js/packages/node`, 3 node tests):
+  - caller: `verifyCaller`/`getCaller`/`requireCaller`/`signCaller`/`CallerError`;
+  - egress: `fetch` (absolute form via the proxy), `dispatcher(undici)` and `installGlobalDispatcher(undici)`;
+  - `proxyUrl`.
+- **Build.** `create-twd build-node` (`lib/build-node.mjs`).
+  - It esbuilds `main` for Node into `dist/server.mjs`.
+  - If `workflows/` exists, it runs Vercel Workflow's `StandaloneBuilder` (the builder behind `workflow build`), ships `.well-known/workflow/v1/flow.mjs`, and applies the SDK's step-mode SWC transform to app code, as the rollup, Vite and Nitro integrations do.
+  - The `twd` CLI's `deploy`/`dev`/`init` handle `runtime: node` (no wrangler.jsonc).
+- **Template `node-workflow`** (`create-twd`; `twd init --template node-workflow`). It is a plain `node:http` server with a `"use workflow"` `supportWorkflow`:
+  1. an AI SDK **`WorkflowAgent`** with a scripted mock `LanguageModelV4` (no keys; serializable via `Symbol.for("workflow-serialize")`) calls the **twd MCP** tools `lookup_order` and `refund` over the tailnet as `"use step"` functions;
+  2. then `sleep("3s")`;
+  3. then a `createHook` approval, resumed by `POST /hooks/<token>`.
+  - The World is **`@workflow/world-local`** (filesystem), in the deployment data dir, and the server calls `world.start()` at boot to re-enqueue in-flight runs.
+  - Versions: `workflow` 5.4.0, `@workflow/world-local` 5.2.1, `@ai-sdk/workflow` 2.0.97, `ai` 7.0.165, pinned in `e2e/node/package.json` (kept out of the root workspace, so `make test` doesn't pull ~264 MB).
+
+### Test results: `make test-node`
+Result files: `e2e/node/results/m9-*.json`.
+
+| Check | Result |
+|---|---|
+| Verified caller | `/whoami` over the tailnet: `nodeId` = the client's; capMap present; deploy `--var` reaches env |
+| Forged header via tailnet | client-sent `x-twd-caller` and `x-twd-cf` are stripped; the app still sees the real caller |
+| Forged header bypassing netd (direct to the app port) | none, forged, wrong key: **401 `no_identity`**; `getCaller` → null |
+| Env hygiene | `TWD_*`/proxy vars present; hostd's canary env var **absent** |
+| Egress attribution | echo's WhoIs = the deployment's node for `@twd/node` fetch, global `fetch` (env proxy → CONNECT), `node:http` (env proxy, absolute form) and undici `ProxyAgent` |
+| SSRF via proxy | 127.0.0.1 (the proxy's own port), ::1, 169.254.169.254, a host LAN IP, the app's own tailnet IP, 1.1.1.1 and `localhost`, via absolute form, raw CONNECT and global fetch: all refused, typed 403 `forbidden_destination` / `peer_not_visible` (global fetch over a refused CONNECT throws) |
+| Proxy auth | no credentials or a wrong token: **407** |
+| Supervision + logs | crash (`exit 3`) → restarted and serving; the rotated caller key still verifies; `app.log` has the app's output and no `tskey-` |
+| **Vercel Workflow resumes after a kill** | SIGKILL during the durable sleep → hostd restarts the process → the run reaches the hook; SIGKILL again at the hook → restart → `resumeHook` → **completed**. Steps ran in **3 different PIDs** |
+| **MCP from the workflow, authorized by caller caps** | the workflow node holds `{"tools":["lookup_order"]}`: `lookup_order` OK (`shipped`); `refund` → **`cap_missing`**, and the denial's caller chain names the workflow's own node |
+
+**Measurements** (macOS M5 Pro, Node 25.1 / Lima, Node 24.22):
+
+| Metric | macOS | Lima |
+|---|---|---|
+| **RSS per Node deployment**, plain app (`nodeprobe`, after undici loaded) | 68–106 MiB | 87 MiB |
+| **RSS per Node deployment**, Workflow + AI SDK (`node-workflow`) | **293–321 MiB** | 293 MiB |
+| **Cold start**, spawn → health, plain app | 45–48 ms | 45 ms |
+| **Cold start**, spawn → health, `node-workflow` (8 MB server + 22 MB flow bundle) | 444–538 ms | 587 ms |
+| Deploy → first 200 over the tailnet, plain app (includes node join) | 0.41–0.47 s | 3.1 s |
+| Build + deploy `node-workflow` (StandaloneBuilder ~2.7 s) | 3.1–3.4 s | 4.2 s |
+| Crash → serving again (250 ms backoff + start) | 308–321 ms | 327 ms |
+| Workflow: kill → restarted (backoff + start) | 733–748 ms | 844 ms |
+| **Workflow resume time**: restart → first post-sleep step ran (recovery + replay) | **564–638 ms** | 757 ms |
+| Workflow: `resumeHook` → run completed | 69–78 ms | 113 ms |
+| Egress p1 through the proxy (sdk / global CONNECT / http / undici) | 6–7 / 5–9 / 1–2 / 10–13 ms | 8 / 9 / 1 / 14 ms |
+
+### Findings
+1. **Importing `undici` silently disables env proxies.** Measured with Node 25.1 and undici 8.12: loading the `undici` package installs a plain `Agent` as the global dispatcher, so every later global `fetch()` goes **direct**. The test reached 1.1.1.1 that way before the fix. `@twd/node` `installGlobalDispatcher(undici)` restores the proxy. The Workflow bundles carry their own undici, so the template uses `@twd/node` `fetch`. This is the concrete reason the process tier is not an enforcement boundary.
+2. **Node's built-in `fetch` uses CONNECT for `http://` targets** with `NODE_USE_ENV_PROXY`, so the M1 "CONNECT refused" behaviour made env proxies useless. CONNECT is now tunnelled for the Node tier via `DialEgress`, under the same ADR-019 checks.
+3. **Node's global `http` agent applies env proxies too.** An explicit request *to* the proxy was itself proxied and its URL mangled (the target host got the proxy's port). `@twd/node` uses its own `http.Agent`, and `NO_PROXY` includes the proxy.
+4. **Vercel Workflow needs two non-obvious things outside a framework:**
+   - `world.start()` at boot, or in-flight runs are never recovered after a crash;
+   - **real paths** when computing workflow IDs. macOS `/tmp` → `/private/tmp` made the IDs differ between the SDK's bundler and the app transform, giving `WorkflowNotRegisteredError`.
+   - world-local also reads `<bundle dir>/../package.json` for its version, so the build writes one.
+5. A Workflow app is **~3× the RSS** of a plain Node app: ~300 MiB against the research doc's ~100 MB for `ai` alone, because of the 22 MB `flow.mjs` plus the `node:vm` workflow sandbox. That is ~100× an isolate. One process per deployment (ADR-022) is right; per-object would not be.
+
+### Gaps / follow-ups (M9)
+- **Node apps don't run in the microVM yet.** The guest image has no Node.js, and `runtime: node` + `tier: microvm` is rejected. That needs Node in `guest/build-image.sh` plus a guestd process mode; the gVisor gateway would then make egress enforcement real. Until then, a malicious Node app can bypass the proxy (raw sockets, its own dispatcher) and reach loopback, LAN and internet. It still can't use a tailnet identity or forge a caller (`docs/node-tier.md`).
+- **Ingress is HTTP only** (no raw TCP/WebSocket upgrade tested). The app's loopback port is reachable by other local processes; the HMAC header makes that safe only if the app verifies.
+- **Replay window:** a captured `x-twd-caller` verifies for 60 s (no nonce cache); exposure is local-only.
+- **World:** only `@workflow/world-local` is tested. It is single-process and its queue is in memory, with recovery on `start()`. `@workflow/world-postgres` (5.1.1), the SDK's self-hosting option, is not wired or tested (no Postgres in Lima); it would also allow blue/green deploys for Node.
+- **Deploy restarts:** Node deploys are stop-then-start, so there is a short gap (requests wait at the gate). Whether a step in flight during a deploy is retried was not tested (recovery after SIGKILL was).
+- No CPU or memory limits (cgroups) on the node process; no per-deployment Node version pinning (it uses hostd's `node`).
+- `docs/COMPAT.md` lives on `m5-sdk` (not this branch). To avoid an add/add conflict, the M9 compatibility table is in `docs/node-tier.md` § Compatibility; append it to COMPAT.md when the branches merge.
+- `twd dev` / `twd deploy` of `node-workflow` outside the repo need the app's own `npm install` (the Workflow builder resolves from the app dir). `@twd/node` is not published, so it resolves via twd's `node_modules` (`TWD_NODE_PATH`).
