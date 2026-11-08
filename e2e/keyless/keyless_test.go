@@ -443,6 +443,15 @@ func TestE2EKeyless(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(noadmin.StateDir, "link.json")); !os.IsNotExist(err) {
 		t.Fatal("a refused link was saved")
 	}
+	// The refused CLI node's ID never reached us (the link failed): find
+	// its ephemeral device by this run's hostname and track it for cleanup.
+	if devs, err := api.ListDevices(ctx); err == nil {
+		for _, dv := range devs {
+			if dv.Hostname == testPrefix+"noadmin" || strings.HasPrefix(dv.Name, testPrefix+"noadmin.") {
+				tracker.Track(dv.NodeID, "noadmin-node")
+			}
+		}
+	}
 
 	// 12. Down (purge: ephemeral) and leftovers (in Cleanup).
 	host.TrackObjectNodes()
