@@ -167,6 +167,14 @@ type Credential struct {
 // String never prints the key.
 func (c Credential) String() string { return "mgmtapi.Credential{redacted}" }
 
+// VolumeKey is GET /v0/volumes/key (L3): a workload's DO volume data key.
+type VolumeKey struct {
+	Key []byte `json:"key"`
+}
+
+// String never prints the key.
+func (VolumeKey) String() string { return "mgmtapi.VolumeKey{redacted}" }
+
 type ReadyRequest struct {
 	NodeID       string `json:"nodeID"`
 	StableNodeID string `json:"stableNodeID"`

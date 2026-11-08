@@ -86,7 +86,7 @@ func (v *volumes) attach(f *os.File, req *helperapi.Volume, uid int, dmName stri
 	v.busy[key] = dmName
 	v.mu.Unlock()
 	// Our own dup: the request's fds are closed when start returns.
-	nfd, err := unix.Dup(int(f.Fd()))
+	nfd, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		v.unbusy(key)
 		return nil, err

@@ -304,6 +304,19 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Cache-Control", "no-store")
 		return m.Credential(r.Context(), r.PathValue("id"), hostOf(r), epoch, wait)
 	}))
+	mux.HandleFunc("GET /v0/volumes/key", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		q := r.URL.Query()
+		epoch, err := strconv.ParseInt(q.Get("epoch"), 10, 64)
+		if err != nil || epoch <= 0 {
+			return nil, errf(400, "bad_request", "epoch query parameter required")
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		key, err := m.VolumeKey(r.Context(), q.Get("tenant"), q.Get("workload"), hostOf(r), epoch)
+		if err != nil {
+			return nil, err
+		}
+		return VolumeKeyResponse{Key: key}, nil
+	}))
 	mux.HandleFunc("POST /v0/objects/{id}/ready", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req ReadyRequest
 		if err := readJSON(r, &req); err != nil {

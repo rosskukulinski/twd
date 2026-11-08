@@ -266,6 +266,11 @@ func ParseRights(oob []byte) []int {
 	var fds []int
 	for _, m := range msgs {
 		if f, err := syscall.ParseUnixRights(&m); err == nil {
+			for _, fd := range f {
+				// Never leak a passed fd (a volume's lock, a vsock
+				// listener) into a child process (another VM's jailer).
+				syscall.CloseOnExec(fd)
+			}
 			fds = append(fds, f...)
 		}
 	}

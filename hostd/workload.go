@@ -193,8 +193,10 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	w.mu.Unlock()
 
 	tier := h.tierFor(app, t)
-	if app.Runtime == bundle.RuntimeNode {
-		h.deployNode(w, a, app, st)
+	if app.Runtime == bundle.RuntimeNode || tier == bundle.TierMicroVM {
+		// One process / one VM per data directory or volume: the old one
+		// releases it before the new one starts.
+		h.deploySerial(w, a, app, tier, st)
 		return
 	}
 	inst, err := h.startInstance(w, a.DeploymentID, app, tier)
@@ -243,11 +245,12 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
 }
 
-// deployNode switches a Node-tier workload stop-then-start: durable Node
-// runtimes (Vercel Workflow's local World, SQLite files) assume one process
-// per data directory, so the old process exits before the new one starts.
-// New requests wait at the gate meanwhile.
-func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st time.Time) {
+// deploySerial switches a workload stop-then-start. Node-tier runtimes
+// (Vercel Workflow's local World, SQLite files) assume one process per
+// data directory; a microVM's DO volume (L3) can be attached to one VM
+// only, so the old VM drains, unmounts and releases it (helper) before the
+// new one attaches it. New requests wait at the gate meanwhile.
+func (h *Host) deploySerial(w *workload, a mgmtapi.Assignment, app *bundle.App, tier string, st time.Time) {
 	w.mu.Lock()
 	old := w.active
 	gate := make(chan struct{})
@@ -265,7 +268,7 @@ func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st
 		old.drain(h.cfg.DrainTimeout)
 		old.stop()
 	}
-	inst, err := h.startInstance(w, a.DeploymentID, app, bundle.TierProcess)
+	inst, err := h.startInstance(w, a.DeploymentID, app, tier)
 	w.mu.Lock()
 	if old != nil && w.active == old {
 		w.active = nil
@@ -287,7 +290,7 @@ func (h *Host) deployNode(w *workload, a mgmtapi.Assignment, app *bundle.App, st
 	w.mu.Unlock()
 	open()
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
-		"runtime", bundle.RuntimeNode, "restart", old != nil, "ms", time.Since(st).Milliseconds())
+		"runtime", app.Runtime, "tier", tier, "restart", old != nil, "ms", time.Since(st).Milliseconds())
 }
 
 // undeploy stops serving a workload: workerd stops and its nodes close
@@ -399,8 +402,8 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	vmTier := tier == bundle.TierMicroVM
 	if vmTier {
 		// The guest's workerd listens on its NIC and reaches hostd only via
-		// the gateway (host netd's userspace stack); DO storage is
-		// guest-local (tmpfs; see STATUS.md M8 gaps).
+		// the gateway (host netd's userspace stack); DO storage is the
+		// workload's persistent volume, mounted at proto.DODir (L3).
 		gw := proto.GatewayIP
 		opts.Guest = &gen.GuestNet{
 			Ingress:   fmt.Sprintf("*:%d", proto.IngressPort),
@@ -415,6 +418,23 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 		return nil, err
 	}
 	inst := &instance{h: h, w: w, depID: depID, dir: dir, app: app, res: res, tier: tier, doStorage: opts.DOStorage}
+	var vol *sandbox.Volume
+	if vmTier {
+		// The DO volume's key comes from mgmt custody, released only to the
+		// namespace lease holder at this epoch; it stays in hostd memory
+		// and the helper (dm-crypt), never on disk or in the guest.
+		w.mu.Lock()
+		epoch := w.epoch
+		w.mu.Unlock()
+		ctx, cancel := context.WithTimeout(h.ctx, 30*time.Second)
+		key, err := h.mgmt.VolumeKey(ctx, w.tenantID, w.name, epoch)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("DO volume key: %w", err)
+		}
+		vol = &sandbox.Volume{Path: h.volumePath(w), Name: w.tenantID + "/" + w.name, Epoch: epoch, Key: key, SizeMiB: h.cfg.VMVolumeMiB}
+		inst.doStorage = "volume:" + vol.Path
+	}
 	if vmTier {
 		inst.ingress = http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 			vm := inst.currentVM()
@@ -438,6 +458,7 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 			WorkerdArgs: []string{"serve", "config.capnp", "--experimental"},
 			HealthCF:    string(hc),
 			Debug:       h.cfg.VMDebug,
+			Volume:      vol,
 			Log:         h.log.With("workload", w.name),
 			Handlers: map[uint16]http.Handler{
 				proto.EgressObj: h.egressObjHandler(inst),
@@ -475,6 +496,12 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 		return nil, err
 	}
 	return inst, nil
+}
+
+// volumePath is the (tenant, workload) DO volume image (microVM tier): a
+// LUKS2 image under the tenant's 0700 dir.
+func (h *Host) volumePath(w *workload) string {
+	return filepath.Join(h.tenantDir(w.tenantID), "workloads", w.name, "do.img")
 }
 
 func (inst *instance) currentVM() sandbox.VM {

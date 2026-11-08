@@ -71,6 +71,7 @@ type Mgmt struct {
 	depStatus map[string]DeploymentStatus
 	pushURLs  map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
 	pending   map[string]*pendingDelete
+	volMu     sync.Mutex // VolumeKey create-if-absent
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -1596,4 +1597,63 @@ func (m *Mgmt) Preflight(ctx context.Context, tenantID string, r PreflightReques
 	}
 	res.OK = len(res.Missing) == 0 && len(res.MissingTagOwners) == 0
 	return res, nil
+}
+
+// VolumeKeyResponse is GET /v0/volumes/key.
+type VolumeKeyResponse struct {
+	Key []byte `json:"key"`
+}
+
+// String never prints the key.
+func (VolumeKeyResponse) String() string { return "mgmt.VolumeKeyResponse{[REDACTED]}" }
+
+// volumeKeyName is the custody name of a workload's DO volume data key.
+func volumeKeyName(tenantID, workload string) string {
+	return "twd/" + tenantID + "/volumes/" + workload + "/dek"
+}
+
+// VolumeKey returns the 256-bit data key of the (tenant, workload) DO
+// volume (microVM tier: dm-crypt on the host), creating it in custody on
+// first use. Only the host holding the workload's namespace lease at epoch
+// gets it (fenced like Credential, ADR-011); hostID "" (unix-socket callers
+// that don't name themselves) fences on the epoch alone.
+func (m *Mgmt) VolumeKey(ctx context.Context, tenantID, workload, hostID string, epoch int64) ([]byte, error) {
+	if tenantID == "" || workload == "" || strings.ContainsAny(tenantID+workload, "/\x00") {
+		return nil, errf(400, "bad_request", "tenant and workload are required")
+	}
+	l, err := m.store.GetLease(ctx, LeaseName(tenantID, workload))
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			return nil, errf(409, "lease_lost", "no lease for %s/%s", tenantID, workload)
+		}
+		return nil, err
+	}
+	if l.Epoch != epoch || (hostID != "" && l.Holder != hostID) || l.ExpiresAt < m.now().UnixMilli() {
+		m.audit(ctx, AuditRecord{TenantID: tenantID, Kind: "deny", Code: "lease_lost"},
+			map[string]any{"host": hostID, "epoch": epoch, "volume": workload})
+		return nil, errf(409, "lease_lost", "the lease on %s/%s is not held by %q at epoch %d", tenantID, workload, hostID, epoch)
+	}
+	m.volMu.Lock()
+	defer m.volMu.Unlock()
+	name := volumeKeyName(tenantID, workload)
+	key, err := m.custody.Get(ctx, name)
+	created := false
+	if errors.Is(err, ErrNotFound) {
+		key = make([]byte, 32)
+		if _, err := rand.Read(key); err != nil {
+			return nil, err
+		}
+		if err := m.custody.Put(ctx, name, key); err != nil {
+			return nil, fmt.Errorf("custody: %w", err)
+		}
+		created = true
+	} else if err != nil {
+		return nil, fmt.Errorf("custody: %w", err)
+	}
+	if len(key) != 32 {
+		return nil, errors.New("custody: volume key has the wrong length")
+	}
+	m.audit(ctx, AuditRecord{TenantID: tenantID, Kind: "volume_key"},
+		map[string]any{"host": hostID, "epoch": epoch, "workload": workload, "created": created})
+	return key, nil
 }

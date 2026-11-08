@@ -145,7 +145,7 @@ func (s *Server) start(c *net.UnixConn, uid int, req *helperapi.StartRequest, fd
 	if err != nil {
 		return nil, resp, nil, err
 	}
-	vsFD, err := unix.Dup(int(lf.Fd()))
+	vsFD, err := unix.FcntlInt(lf.Fd(), unix.F_DUPFD_CLOEXEC, 0)
 	lf.Close()
 	if err != nil {
 		return nil, resp, nil, err

@@ -37,6 +37,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/hostd/vm"
+	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
 	"github.com/rosskukulinski/twd/netd/nettest"
 )
 
@@ -60,7 +61,8 @@ func TestE2EVM(t *testing.T) {
 	if v := os.Getenv("TWD_VM_VCPUS"); v != "" {
 		fmt.Sscan(v, &vcpus)
 	}
-	be, err := vm.New(vm.Config{Kernel: kernel, Rootfs: rootfs, MemMiB: 512, VCPUs: vcpus, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES")})
+	be, err := vm.New(vm.Config{Kernel: kernel, Rootfs: rootfs, MemMiB: 512, VCPUs: vcpus, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES"),
+		Helper: os.Getenv("TWD_VM_HELPER")})
 	if err != nil {
 		t.Fatalf("microVM backend unavailable: %v", err)
 	}
@@ -220,6 +222,69 @@ func TestE2EVM(t *testing.T) {
 		res.set("egress_attributed_per_object", fmt.Sprintf("%d/%d", attributed, len(objs)))
 	})
 
+	// L3: DO storage on the workload's persistent volume.
+	stamp := fmt.Sprint(time.Now().UnixNano())
+	t.Run("StorageWrite", func(t *testing.T) {
+		for _, kind := range []string{"kv", "sql"} {
+			if code, r := getJSON("http://" + objIP["a"] + "/" + kind + "/put?k=persist&v=" + stamp); code != 200 || r["ok"] != true {
+				t.Fatalf("%s put: %d %v", kind, code, r)
+			}
+			if code, r := getJSON("http://" + objIP["a"] + "/" + kind + "/get?k=persist"); code != 200 || r["v"] != stamp {
+				t.Fatalf("%s get: %d %v", kind, code, r)
+			}
+		}
+		// DO write latency over the tailnet (each put is one storage
+		// transaction; workerd answers after it commits).
+		lat := map[string]any{}
+		for _, kind := range []string{"kv", "sql"} {
+			lat[kind+"_put"] = measure(t, hc, "http://"+objIP["a"]+"/"+kind+"/put?k=bench&v="+stamp, 100)
+		}
+		lat["kv_get"] = measure(t, hc, "http://"+objIP["a"]+"/kv/get?k=persist", 100)
+		// Raw volume latency inside the guest (4 KiB write + fdatasync,
+		// through virtio-blk → dm-crypt → the image on the host).
+		v := e.Host.Sandbox(e.TenantID, "probe")
+		br, err := v.Op(ctx, proto.Msg{Op: "fsbench", N: 200})
+		if err != nil || br.Bench == nil || !strings.HasPrefix(br.Bench.FS, proto.VolumeDev+" ext4") {
+			t.Fatalf("fsbench: %v %+v", err, br.Bench)
+		}
+		lat["guest_fsbench_us"] = br.Bench
+		res.set("storage_latency", lat)
+		t.Logf("DO storage on %s: %v", br.Bench.FS, lat)
+	})
+
+	t.Run("Jailed", func(t *testing.T) {
+		m := map[string]any{}
+		for _, w := range []string{"hello", "probe"} {
+			ws := wstatus(w)
+			j := ws.VM.Jail
+			if j == nil || j.UID < 1000 || j.Chroot == "" || j.Cgroup == "" {
+				t.Fatalf("%s: not jailed: %+v", w, j)
+			}
+			m[w] = checkJailed(t, ws.VM.PID, j)
+		}
+		res.set("jail", m)
+	})
+
+	t.Run("VolumeNeverDoubleMounted", func(t *testing.T) {
+		var path string
+		for _, w := range e.Host.Status().Workloads {
+			if w.Workload == "probe" {
+				path = strings.TrimPrefix(w.DOStorage, "volume:")
+			}
+		}
+		key := e.FM.VolumeKeyOf(e.TenantID, "probe")
+		if path == "" || len(key) != 32 {
+			t.Fatalf("probe volume %q, key %d bytes", path, len(key))
+		}
+		app := t.TempDir()
+		_, err := be.Boot(ctx, sandbox.Spec{ID: "intruder", AppDir: app, WorkerdArgs: []string{"--version"}, HealthCF: "{}",
+			Volume: &sandbox.Volume{Path: path, Name: e.TenantID + "/probe", Epoch: wstatusEpoch(e, "probe"), Key: key}})
+		if !helperapi.IsCode(err, helperapi.CodeVolumeBusy) {
+			t.Fatalf("second VM on probe's volume: want volume_busy, got %v", err)
+		}
+		res.set("volume_double_mount", "refused: "+err.Error())
+	})
+
 	t.Run("RSSPerVM" /* before the memory dump, which faults in all guest RAM */, func(t *testing.T) {
 		m := map[string]any{}
 		for _, w := range []string{"hello", "probe"} {
@@ -242,8 +307,23 @@ func TestE2EVM(t *testing.T) {
 
 	t.Run("NoKeysInGuest", func(t *testing.T) {
 		needles := keyNeedles(t, filepath.Join(e.Dir, "data"))
+		// The DO volume's data key (L3): it stays in hostd and the helper.
+		vk := e.FM.VolumeKeyOf(e.TenantID, "probe")
+		if len(vk) != 32 {
+			t.Fatal("no volume key in fakemgmt")
+		}
+		needles["volume key raw"] = vk
+		needles["volume key hex"] = []byte(hex.EncodeToString(vk))
+		needles["volume key base64"] = []byte(base64.StdEncoding.EncodeToString(vk))
 		res.set("key_needles", len(needles))
-		// Disks: the rootfs image and the config drive, byte for byte.
+		// Disks: the rootfs image, the config drive and the volume image,
+		// byte for byte. The volume is ciphertext on the host: the value the
+		// DO wrote is not in it.
+		if d := vmProbe.Disks(); len(d) != 3 {
+			t.Fatalf("disks %v: want rootfs, config, volume", d)
+		} else if hit := scanFile(t, d[2], map[string][]byte{"plaintext DO value": []byte(stamp)}); hit != "" {
+			t.Fatal("the DO value is in the volume image in plaintext: not encrypted")
+		}
 		for _, d := range vmProbe.Disks() {
 			if hit := scanFile(t, d, needles); hit != "" {
 				t.Fatalf("key material (%s) on guest disk %s", hit, d)
@@ -276,8 +356,8 @@ func TestE2EVM(t *testing.T) {
 		os.Remove(mem)
 		res.set("no_keys_in_guest", map[string]any{"needles": len(needles), "fsscan_files": r.Scanned, "memdump_mb": fi.Size() >> 20,
 			"memdump_ms": dumpMS, "disks": vmProbe.Disks()})
-		t.Logf("%d needles (tskey-, the test auth key, %d node/machine private keys as text and raw bytes): none in %d guest files, 2 disks or %d MiB of guest RAM",
-			len(needles), (len(needles)-2)/2, r.Scanned, fi.Size()>>20)
+		t.Logf("%d needles (tskey-, the test auth key, node/machine private keys as text and raw bytes, the volume key): none in %d guest files, 3 disks or %d MiB of guest RAM",
+			len(needles), r.Scanned, fi.Size()>>20)
 		// After the pause/resume the guest still serves.
 		if code, _ := getJSON("http://" + objIP["a"] + "/"); code != 200 {
 			t.Fatalf("after snapshot: %d", code)
@@ -420,6 +500,10 @@ func TestE2EVM(t *testing.T) {
 		br, closeFn := openStream(t, hc, "http://"+objIP["b"]+"/stream")
 		defer closeFn()
 		failed := watchFail(br)
+		// An acknowledged write just before the crash must survive it.
+		if code, r := getJSON("http://" + objIP["a"] + "/kv/put?k=lastack&v=" + stamp); code != 200 || r["ok"] != true {
+			t.Fatalf("put before kill: %d %v", code, r)
+		}
 		st := time.Now()
 		old.Kill() // SIGKILL the VMM: a guest crash
 		select {
@@ -452,6 +536,11 @@ func TestE2EVM(t *testing.T) {
 				if code, r := getJSON("http://" + objIP["b"] + "/"); code == 200 && r["name"] == "b" {
 					res.set("vm_restart_to_serving_ms", time.Since(st).Milliseconds())
 					t.Logf("VM restarted and serving %v after the kill", time.Since(st))
+					checkPersisted(t, getJSON, objIP["a"], stamp, "after the VM kill")
+					if code, r := getJSON("http://" + objIP["a"] + "/kv/get?k=lastack"); code != 200 || r["v"] != stamp {
+						t.Fatalf("the write acknowledged just before the crash is lost: %d %v", code, r)
+					}
+					res.set("storage_after_vm_kill", "kv+sql present, incl. the write acknowledged right before SIGKILL")
 					break
 				}
 			}
@@ -461,6 +550,95 @@ func TestE2EVM(t *testing.T) {
 			time.Sleep(50 * time.Millisecond)
 		}
 	})
+
+	t.Run("RedeployKeepsStorage", func(t *testing.T) {
+		old := e.Host.Sandbox(e.TenantID, "probe")
+		st := time.Now()
+		d := e.Deploy(hostdtest.Fixture("probe"), "probe", nil)
+		e.WaitActive("probe", d, 90*time.Second)
+		activeMS := time.Since(st).Milliseconds()
+		nv := e.Host.Sandbox(e.TenantID, "probe")
+		if nv == nil || nv == old {
+			t.Fatal("redeploy did not replace the VM")
+		}
+		select {
+		case <-old.Done():
+		default:
+			t.Fatal("the old VM is still running after the new one became active")
+		}
+		var first time.Duration
+		for i := 0; i < 400; i++ {
+			if code, _ := getJSON("http://" + objIP["a"] + "/kv/get?k=persist"); code == 200 {
+				first = time.Since(st)
+				break
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		checkPersisted(t, getJSON, objIP["a"], stamp, "after the redeploy")
+		info := nv.Info()
+		res.set("redeploy", map[string]any{"deploy_to_active_ms": activeMS, "deploy_to_serving_ms": first.Milliseconds(),
+			"new_vm_ready_ms": info.Ready.Milliseconds(), "volume_attach_ms": info.VolumeAttachMS, "storage": "kv+sql present"})
+		t.Logf("redeploy: active %d ms, serving %v, volume attach %.1f ms; storage present", activeMS, first, info.VolumeAttachMS)
+	})
+}
+
+// checkPersisted: object ip's KV and SQLite values written earlier are there.
+func checkPersisted(t *testing.T, getJSON func(string) (int, map[string]any), ip, stamp, when string) {
+	t.Helper()
+	for _, kind := range []string{"kv", "sql"} {
+		if code, r := getJSON("http://" + ip + "/" + kind + "/get?k=persist"); code != 200 || r["v"] != stamp {
+			t.Fatalf("%s: %s value lost: %d %v", when, kind, code, r)
+		}
+	}
+}
+
+func wstatusEpoch(e *hostdtest.Env, w string) int64 {
+	for _, ws := range e.Host.Status().Workloads {
+		if ws.Workload == w {
+			return ws.Epoch
+		}
+	}
+	return 0
+}
+
+// checkJailed: the VMM runs as its jail uid, chrooted, under seccomp, in
+// its cgroup with cpu.max and memory.max set.
+func checkJailed(t *testing.T, pid int, j *sandbox.Jail) map[string]any {
+	t.Helper()
+	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]any{"uid": j.UID, "chroot": j.Chroot, "cgroup": j.Cgroup}
+	for _, ln := range strings.Split(string(st), "\n") {
+		f := strings.Fields(ln)
+		if len(f) > 1 && f[0] == "Uid:" && f[1] != fmt.Sprint(j.UID) {
+			t.Fatalf("VMM uid %s, want %d", f[1], j.UID)
+		}
+		if len(f) > 1 && f[0] == "Seccomp:" {
+			if f[1] != "2" {
+				t.Fatalf("VMM seccomp mode %s, want 2", f[1])
+			}
+			out["seccomp"] = "filter (mode 2)"
+		}
+	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root/api.sock", pid)); err != nil {
+		t.Fatalf("VMM not in its jail: %v", err)
+	}
+	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root/etc/passwd", pid)); err == nil {
+		t.Fatal("VMM sees the host's /etc")
+	}
+	cg, _ := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if !strings.Contains(string(cg), j.Cgroup) {
+		t.Fatalf("VMM cgroup %s, want %s", cg, j.Cgroup)
+	}
+	cpu, _ := os.ReadFile(filepath.Join("/sys/fs/cgroup", j.Cgroup, "cpu.max"))
+	mem, _ := os.ReadFile(filepath.Join("/sys/fs/cgroup", j.Cgroup, "memory.max"))
+	out["cpu.max"], out["memory.max"] = strings.TrimSpace(string(cpu)), strings.TrimSpace(string(mem))
+	if out["cpu.max"] == "max 100000" || out["memory.max"] == "max" {
+		t.Fatalf("cgroup limits not set: %v", out)
+	}
+	return out
 }
 
 type hostdtestWS struct {
@@ -642,7 +820,7 @@ func writeResults(t *testing.T, r *results) {
 	r.m["passed"] = !t.Failed()
 	b, _ := json.MarshalIndent(r.m, "", "  ")
 	os.MkdirAll("results", 0o755)
-	p := filepath.Join("results", "m8-"+time.Now().UTC().Format("20060102T150405Z")+".json")
+	p := filepath.Join("results", "l3-"+time.Now().UTC().Format("20060102T150405Z")+".json")
 	os.WriteFile(p, b, 0o644)
 	t.Logf("results: %s\n%s", p, b)
 }
