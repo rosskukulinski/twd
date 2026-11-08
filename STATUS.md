@@ -951,6 +951,18 @@ Also in this branch: `twd up --allow-sibling-egress` / `twd-hostd -allow-sibling
 - **Host token and the service.** The supervisor starts mgmt with `-rotate-host-token`, so every mgmt start (`twd up`, `twd up --service` restart, a systemd/supervisor restart) mints a fresh token; hostd re-reads the 0600 file when it changes and the CLI per call, so a running hostd is never stranded (at most one heartbeat retried). `twd-vmhelper` never talks to mgmt; hostd's `GET /v0/volumes/key` uses the same token-bearing client.
 - **RT-08 × L2.** `EgressEnforcement` reports `enforced` only under Landlock (TCP pinned to the proxy); Seatbelt is `unenforced` but counts as a process sandbox, so the Node-tier refusal (`egress_unenforced`) applies only to hosts with **no** sandbox serving other tenants; L2's `sharedHostCheck` (`sandbox_unavailable`) governs everything else. The `nodeprobe` fixture's `/net` sandbox probe uses the unpatched `net.connect` so L2's Landlock checks still measure the OS sandbox, not `enforceEgress()`.
 
+**Verification after the `int-linux` merge (commits 06e1b5f…e3dcbf6, 2026-11-08):**
+
+| Where | Target | Result |
+|---|---|---|
+| macOS | `make lint`, `make test`, `make test-node`, `make test-sdk` | **PASS** |
+| macOS | `make e2e-mac` (`ttest-rtf-012eab`, `e2e/real/results/m4-20261108-093833-012eab.json`) | **PASS** 38 s; (d) child `refund` → `cap_missing`, `lookup_order` ok, parent admitted; no policy written; 0 `tskey-` |
+| macOS | `make e2e-multi` (`TWD_E2E_NO_POLICY_WRITE=1`, `ttest-rtf-22c034`, `e2e/real/results/rtf-20261108-093912-22c034.json`) | **PASS** 43 s, 15/15 incl. `d_lim_enforced_{A,B}`; read-only policy check on both tailnets; 0 `tskey-` |
+| Lima `twd-dev` (Ubuntu 24.04 arm64, Landlock ABI 4; fresh clone of `rt-fixes`) | `make test` | **PASS** (all packages incl. `security/attacks`, hostd 136 s; `TestDoctor` after restoring int-linux's Linux expectations) |
+| | `make test-node` | **PASS**: `TestNodeTier` (Landlock checks via the raw-connect probe), `TestNodeWorkflow`, `TestNodeTierSharedHostRefused` (`Egress: enforced` under Landlock; the no-sandbox refusal and the `-insecure-shared-host` override) |
+| | `make test-sdk` | **PASS** (89 s) |
+| | `make e2e-vm` | **PASS**: TestSmoke, TestVolume, TestE2EVM (`e2e/vm/results/l3-20261108T174458Z.json`); microVM senders pass through the same `applyCert` path; no keys in the guest (29 needles) |
+
 **Not done / honest limits.** RT-04 is partial (root MAC key still in the guest). The `@twd/node` enforcement is cooperative by construction. Same-host object→object calls still need `--allow-sibling-egress` (off by default) to go over the tailnet; the in-process policy-checked path of RFC §4.5 is not built. OBO per-request assertions (RFC §4.6) remain unimplemented.
 ## L2: Linux process-tier sandbox, Landlock + seccomp (DONE, branch `l2-landlock`)
 Parity with the macOS Seatbelt sandbox (M7) for the Linux process tier, measured in a fresh Lima VM **`twdl-sbx-u24`** (Ubuntu 24.04 arm64, `vz`, 4 CPU / 6 GiB, kernel 6.8.0-147, **Landlock ABI 4**; `apparmor_restrict_unprivileged_userns=1`, so no user namespaces; Go 1.27.3, Node 24.22). The VM mounts this worktree; tests ran on an rsync'd VM-local copy so the Mac's `node_modules` stay darwin. It is **stopped, not deleted**.
