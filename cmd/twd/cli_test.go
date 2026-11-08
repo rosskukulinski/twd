@@ -168,3 +168,30 @@ func TestCLIEndToEnd(t *testing.T) {
 	b, _ := json.MarshalIndent(res, "", "  ")
 	t.Logf("results:\n%s", b)
 }
+
+func TestDevOnce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	wd, err := nettest.WorkerdBinary()
+	if err != nil || !hostdtest.HasNode() {
+		t.Skip("needs workerd and node (make deps)")
+	}
+	t.Setenv("TWD_WORKERD", wd)
+	bin := cliflow.BuildBinaries(t)
+	work := t.TempDir()
+	e := &cliflow.Env{T: t, BinDir: bin, StateDir: filepath.Join(work, "state"), WorkDir: work}
+	e.MustJSON(nil, "init", filepath.Join(work, "hello"), "--template", "hello")
+	var r struct {
+		Smoke struct {
+			Status float64 `json:"status"`
+			Caller struct {
+				NodeID string `json:"nodeId"`
+			} `json:"caller"`
+		} `json:"smoke"`
+	}
+	e.MustJSON(&r, "dev", filepath.Join(work, "hello"), "--once", "--port", "0")
+	if r.Smoke.Status != 200 || r.Smoke.Caller.NodeID == "" {
+		t.Fatalf("twd dev --once: %+v", r)
+	}
+}

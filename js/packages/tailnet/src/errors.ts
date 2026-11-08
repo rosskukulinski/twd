@@ -18,6 +18,7 @@ export type TailnetErrorCode =
   | "derp_unreachable"
   | "plan_feature_missing"
   | "killed"
+  | "object_killed"
   | "no_identity"
   | "lease_lost"
   | "bad_request"
@@ -49,6 +50,7 @@ export const CATALOG: Readonly<Record<TailnetErrorCode, CatalogEntry>> = Object.
   derp_unreachable: { status: 502, title: "no direct path and no reachable DERP relay" },
   plan_feature_missing: { status: 501, title: "the tailnet's plan or control server lacks a feature twd can use" },
   killed: { status: 410, title: "the object was killed" },
+  object_killed: { status: 410, title: "a new request reached a killed object (its node's tombstone answered)" },
   no_identity: { status: 401, title: "the request carries no verified tailnet caller" },
   lease_lost: { status: 409, title: "this host no longer holds the namespace lease" },
   bad_request: { status: 400, title: "the request is malformed" },

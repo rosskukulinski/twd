@@ -89,13 +89,10 @@ func cmdInit(args []string) error {
 	res := map[string]string{"dir": dir, "template": *tmpl, "workload": wl}
 	emit(f, res, func() {
 		fmt.Printf("✓ created %s from template %s (workload %q)\n", dir, *tmpl, wl)
-		rel, _ := filepath.Rel(mustWD(), dir)
-		fmt.Printf("  cd %s && twd deploy        # or `twd dev` for a local run with no tailnet\n", rel)
+		fmt.Printf("  cd %s && twd deploy        # or `twd dev` for a local run with no tailnet\n", pos[0])
 	})
 	return nil
 }
-
-func mustWD() string { wd, _ := os.Getwd(); return wd }
 
 // ---- app + build ----
 

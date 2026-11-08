@@ -46,3 +46,11 @@ These extend `mgmt-api.md` (v0 + the M2 "v0 clarifications"). All of them are op
 - `egress-obj.sock` (facets): `x-twd-class`, `x-twd-name`, `x-twd-ts`, `x-twd-nonce` and `x-twd-mac`.
   - The MAC is HMAC-SHA256 under a per-process key over `class\nname\nmethod\nurl\nts\nnonce`, with ±2 min skew allowed.
 - `egress-wl.sock`: the Worker and plain-DO objects. This socket is the workload node's identity.
+
+## M4 status of the gaps
+Both gaps are closed in twd-mgmt (see `mgmt-api.md` § "M4 additions"): `_workload` is implicit from `tailnet.tags`, and mgmt pushes kills to `pushURL`.
+
+**M4 hostd changes.**
+- Hostnames: when mgmt names the node (M2: the object ID), hostd still prepends `-hostname-prefix` (`twd-` by default under `twd up`; `twd-e2e-<run>-` in E2E-MAC).
+- `actingFor`: the platform sends the first caller-bearing request's principal (the untagged caller's login, else the caller's node name) with `ensure`; hostd passes it to `POST /v0/objects`. A spawn acts for `principal` if given, else the parent's. If the object already existed (an RPC such as the Agents SDK's `__unsafe_ensureInitialized` came first), hostd writes a host audit record `kind:"principal"`.
+- Kill tombstone: the killed node's ingress port now answers every new request with `410 {"code":"object_killed"}` (`twd-error: object_killed`, `Connection: close`) for the tombstone window, instead of a bare RST. Via the workload node, a call into a killed object is a typed `410 killed` (the runtime maps the platform's `[killed]` exception) instead of a 500.

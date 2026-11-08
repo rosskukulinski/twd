@@ -2,6 +2,7 @@
 
 Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on branch `m2-mgmt`.
 Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
+Last update: 2026-11-08 00:45 PT. M4 (`twd` CLI + integrated single-machine flow, E2E-MAC on this Mac) on branch `m4-cli`.
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -369,3 +370,98 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
 - M2 follow-ups for hostd: implicit `_workload` namespace, kill push or long-poll, delayed device delete for fail-fast new requests.
 - M4 `twd` CLI on top of `create-twd build` + the deployments API; `twd up` runs twd-mgmt + twd-hostd.
 - Run `make test` in Lima `twd-dev` (Linux arm64).
+
+## M4: `twd` CLI and the integrated single-machine flow (DONE on this Mac, branch `m4-cli`)
+
+### What's built
+- **`twd up`** (`cmd/twd/up.go`). Non-interactive test mode: `twd up --tailnet <tailnet> --api-key-file <file> --yes` (tenant mint mode `apikey`; the key file path is stored, never the key).
+  - It checks the key can read the tailnet's policy, writes `<state>/twd.json`, and starts a detached supervisor (`twd __supervise`, own session) that runs **twd-mgmt** (SQLite store, file custody) and **twd-hostd** (process tier) with restart-with-backoff (≤10 restarts / 5 min). Logs: `<state>/logs/{supervisor,mgmt,hostd}.log`.
+  - Then it creates the tenant (`tn_<tailnet label>`), waits until the host is registered and heartbeating, and checks the base policy snippet (`tag:twd` tagOwners). It **prints** the snippet if missing; `--policy-apply` applies it (validate, then If-Match; `internal/policy`).
+  - `--state-dir` (or `$TWD_STATE_DIR`) overrides `~/.twd`. Sockets go to `<state>/run`, or to `/tmp/twd-<hash>` when the state path is too long for macOS's 104-byte socket limit.
+  - **It never uses the system tailscaled.** Every node is a tsnet node with an explicit control URL (production by default). Interactive mode (bootstrap from tailscaled) is **not built**: `twd up` without `--tailnet` fails with `tailnet_required` and the fix line.
+  - `--ephemeral` and `--hostname-prefix` (default `twd-`) for tests and demos.
+- **`twd down`** stops hostd first (nodes close in parallel), then mgmt (flushes pending device deletes). `--purge` (the default with `--ephemeral`) first kills every live root with `--cascade` (audit reason `twd down --purge`) and flushes the device deletes. **`twd status`** reports supervisor, mgmt, host heartbeat age, mint queue and rate, pending device deletes, workloads and objects; it exits 1 when unhealthy.
+- **`twd init <dir> --template hello|agent|mcp`** copies a create-twd template and names the workload after the directory.
+- **`twd deploy [dir]`**:
+  1. **Preflight** via `POST /v0/tenants/{id}/preflight`: every declared `tailnet.connects` tag needs an `ip` grant from each of the app's tags, and every tag must be in `tagOwners`. If not, it prints the DX-style `› preflight: tag:a → tag:db tcp:80 … ✗ no grant` plus the HuJSON snippet and fails with `acl_denied` unless `--allow-missing-grants`.
+  2. Bundles with create-twd's esbuild bundler (as hostd/gen expects). Apps outside the repo resolve `@twd/*`, `agents` and so on from twd's own `node_modules` via esbuild `nodePaths` (`TWD_NODE_PATH`).
+  3. `POST /v0/deployments`, then polls `GET /v0/deployments/{id}` until the host reports `active` and the workload node is `ready`. `--var K=V` overrides wrangler vars; `--no-wait` returns early.
+- **`twd kill <object> [--cascade] [--reason]`**: the object can be an ID, node name, MagicDNS name or `Class/name`. It prints tiers 1, 2 and 3 and the `revoked: principal → agent → sub-agent` chain.
+- **`twd audit <object> | --human <principal> | --trace <id>`**: the object plus its descendants, both chains (mgmt and host), and `chain verified`.
+- **`twd ls`** (`--all` includes killed objects), **`twd logs [workload] [--component mgmt|hostd|supervisor] [-n] [-f]`** (workerd's log for a workload).
+- **`twd dev [dir]`**: the real hostd process tier against an embedded control plane (testcontrol + local DERP/STUN on 127.0.0.1) and an in-memory mgmt. A localhost proxy (`--port`, default 8787) forwards via a dev client node, so `getCaller()` sees a real caller. Edits reload (blue/green redeploy, mtime poll). `--once` is a smoke mode.
+  - **Embedded policy evaluator: SKIPPED (stretch).** Every dev node sees every other and gets the same test caps. Mock peers from `twd.dev.jsonc` are not built either.
+- **Every command takes `--json`.** Errors print in the DX.md catalog format (`error [code]: …`, detail lines, `fix:`, `trace · https://twd.dev/e/<code>`), or as JSON with `--json`. Keys are redacted from all output.
+- **Not built** (M4 plan items outside tonight's scope): `twd host add/ls/doctor`, `twd tenant set`, `twd connect`/WIF onboarding from the CLI, interactive `twd up`.
+
+### Gaps fixed (from M2/M3)
+- **(a) Worker-only bundles and the workload node.** mgmt implicitly declares `_workload` from `tailnet.tags`. Objects in it resolve to their own workload's deployment (it used to be "the tenant's latest", which was wrong with two apps). `"node": false` classes need no tags. Assignments carry `workloadTags`.
+- **(b) Kill push.** mgmt keeps each host's `pushURL` (unix only) and pushes every kill to the lease holder, in parallel, **before** the device delete; the heartbeat stays the fallback.
+  - The device delete is deferred by `-device-delete-delay` (8 s under `twd up`, below hostd's 12 s tombstone).
+  - The tombstoned node now **answers new requests with a typed `410 object_killed`** (netd `serveTombstone`) instead of an RST, and peers still have it in their netmaps. That fixes M3's "a new request to a killed object times out (5 s) on production".
+  - Through the workload node, a call into a killed object is a typed `410 killed` instead of a 500: the runtime maps the platform's `[killed]` exception.
+  - Pending deletes flush on mgmt shutdown and `POST /v0/flush`, so `twd down` leaves no devices.
+- **(c) Also needed for the e2e:**
+  - deployment status from heartbeats, and `GET /v0/deployments/{id}`;
+  - assignment push on deploy;
+  - hostd keeps its hostname prefix when mgmt names the node;
+  - `actingFor` plumbing, so audit has a human or caller at the head of the chain. It comes from the platform: the first caller-bearing request's principal, with a host `principal` record when an RPC created the object first. Two bugs found on the way: the wire `user` is a string, and the Host DO Proxy answered unknown own properties with an RPC forwarder;
+  - tsapi gained `GetPolicyHuJSON`, `ValidatePolicy`, `SetPolicy(If-Match)` and `GetKey`;
+  - `mgmtapi.Client.DoHeaders`;
+  - `object_killed` was added to the TS `TailnetError` catalog.
+
+### Test results
+- **`make test`: PASS** (netd, internal incl. the new `internal/policy`, cmd, mgmt, hostd with `-race`, gen, and JS 7/7 + 4/4).
+  - New: `TestCLIEndToEnd` runs the **same scenario as E2E-MAC** through the real binaries against testcontrol and a fake Tailscale API, in about 8 s. It checks that no policy is written without `--policy-apply`, and that every device twd created is deleted by `twd down`.
+  - New: `TestDevOnce` (`twd dev --once` → 200 with a verified caller), and the `internal/policy` merge/apply tests (comments and existing rules kept, idempotent, nothing written if validation fails).
+  - `hostd` `KillFailsFast` now expects `410 object_killed`.
+- `make lint`: PASS.
+- **`make e2e-mac` (tailnet 1, production control, temp `--state-dir`, CLI only): PASS in 2 of 2 runs** (`e2e/real/results/m4-*.json`). Every check passed:
+  - up, with interactive mode refused (`tailnet_required`);
+  - status healthy;
+  - preflight refuses `hello` (`tag:db`) with the snippet;
+  - deploy `agent` (with `connects: [tag:ttest]`, preflight ✓) and `mcp`;
+  - **(a)** the verified caller (the `tag:ttest` client's nodeId and tags) comes back, via the workload and via the agent object's own node;
+  - **(b)** the private echo's WhoIs of the agent's fetch is **the agent object's own node**;
+  - **(c)** `lookup_order` is allowed and `refund` gets `cap_missing`;
+  - **(d)** `spawn` creates a `LookupAgent` with its own node and IP, `tag:twd-agent-support-sub`, and caps `{"example.com/cap/mcp":{"tools":["lookup_order"]}}` (narrower than the parent's `[lookup_order, refund]`, checked by mgmt against tailnet 1's real policy). The child answers on its own node;
+  - **(e)** `twd kill --cascade` kills 2, pushes 2/2, and the CLI returns in **63–68 ms**. New requests to both killed nodes get **410 `object_killed` in 0.8–1.1 ms**; via the workload, 410 `killed` in 3–4 ms;
+  - **(f)** `twd audit` shows `twd-e2e-<run>-client.tail7906d5.ts.net → …-supportagent-… → …-lookupagent-…` with spawn (with `lim`), mint, ready and kill records, and the chain verified; `--human` works.
+  - **Cleanup:** after `twd down`, 0 of the 4 twd devices and 0 of the 4 twd keys remain (checked by ID: device 404, key consumed or revoked). Then the test's own client and echo were deleted by ID, and their 2 keys revoked: 0 devices left, 0 untracked.
+
+| Timing (2 runs, this Mac → production control) | Value |
+|---|---|
+| `twd up` → ready (CLI wall time; mgmt healthy at ~0.83 s) | 1.20 s, 1.22 s |
+| `twd deploy` → ready (workerd active at ~0.43 s; then mint + workload node join) | agent 6.96 s / 1.68 s · mcp 1.66 s / 6.36 s (bimodal join on production control) |
+| First object node ready (first request → node ready) | 2.86 s, 1.62 s (first request itself served in 62–63 ms, before the node existed) |
+| `spawn()` → child ready (includes the child's node join) | 9.6 s, 6.2 s |
+| Kill: `twd kill --cascade` CLI wall time | 68 ms, 63 ms (mgmt API 56–58 ms, of which the push is 54–56 ms: netd's 50 ms `KillFlushDelay` after aborting the client's keep-alive flow) |
+| Kill: a new request to a killed object | 410 `object_killed` in 0.8–1.1 ms |
+| Agent egress to the private echo (warm) | 12–13 ms |
+| `twd down` (purge + device deletes + stop) | 0.47 s, 4.3 s (device delete is bimodal, as in M1/M2) |
+
+### Policy change on tailnet 1 (recorded per BUILD-PLAN safety rule 2)
+- **When and how:** applied once, by `make e2e-mac` run `66f527` (2026-11-08 00:31 PT), through `internal/policy.Apply`. It read the policy with its ETag, merged **additions only** (comments and every existing rule kept), validated via `POST /acl/validate`, and wrote with `If-Match: "f80a31b1…"`. Later runs find nothing missing and don't write.
+- **Backups:** the copy from before the change is in `~/.config/tailnet-agents-design/tailnet1_acl.pre-m4-66f527.hujson`; the original backup is untouched.
+- **Added tagOwners:**
+  - `tag:twd-wl-agent`, `tag:twd-wl-mcp` and `tag:twd-agent-support`, owned by `["autogroup:admin","tag:twd"]`;
+  - `tag:twd-agent-support-sub`, owned by `["autogroup:admin","tag:twd","tag:twd-agent-support"]`.
+- **Added grants** (all `tcp:80`):
+  1. `tag:ttest` → the four twd tags above;
+  2. `tag:ttest` → `tag:twd-wl-mcp` with app `example.com/cap/mcp: [{tools:[lookup_order]}]`;
+  3. `tag:twd-wl-agent`, `tag:twd-agent-support` and `tag:twd-agent-support-sub` → `tag:ttest` (the echo);
+  4. `tag:twd-agent-support` → `tag:twd-wl-mcp`, app `{tools:[lookup_order, refund]}`;
+  5. `tag:twd-agent-support-sub` → `tag:twd-wl-mcp`, app `{tools:[lookup_order]}`.
+- The snippet is `cliflow.Policy()` in `e2e/cliflow`. **Ross's personal tailnet was not touched**, and the system tailscaled was never used.
+
+### Known gaps (M4)
+- **Not yet run on `mbp`:** that needs M6 (release tarball, `install.sh`). twd finds `twd-mgmt`/`twd-hostd` next to itself, and workerd and create-twd via `$TWD_WORKERD`/`$TWD_CREATE_TWD`, next to the binary, or by walking up to a repo checkout. A release must ship `share/twd/create-twd` plus its `node_modules`. Deploy also needs `node` on the machine (esbuild).
+- **`twd dev`** has no embedded policy evaluator and no mock peers (see above).
+- **Interactive `twd up`** is refused (`tailnet_required`), and there is no `twd connect`, so WIF has to be set up through the API. `host add/ls/doctor` and `tenant set` are not built.
+- **Kill:**
+  - tier 3 (posture) is not available; the CLI prints `plan_feature_missing`;
+  - after the tombstone window (12 s), a direct dial to the dead node's IP black-holes again, because the device is deleted and peers drop it (M1 finding 3). twd clients should treat netmap absence as dead;
+  - the push path costs the 50 ms flush delay whenever the object had open flows.
+- **Push URLs** live in mgmt memory: after a mgmt restart, kills fall back to the heartbeat until the host re-registers (hostd re-registers only on a 404).
+- **Spawned sub-agents report `principal`** = the root's caller, not an `actingFor` assertion (RFC §4.6, still not implemented).
+- **Linux/Lima not run** for M4.

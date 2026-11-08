@@ -81,3 +81,18 @@ hostSig = base64(ed25519.Sign(hostKey, utf8(hash)))
 - `POST /v0/audit` requires `kind` and `hash` on every record, and responds `{ok, accepted, chain:{chain, ok, records, brokenAt?, error?}}`.
 - `GET /v0/audit` also filters by `tenant=`, `chain=` and `limit=`, and responds `{records, chains:[status…], verified}`. `GET /v0/audit/verify` covers every chain.
 - The store rejects UPDATE/DELETE on audit rows (triggers). Verification detects modified, removed, reordered and truncated records.
+
+## M4 additions (twd CLI; backward compatible)
+**Workload entry node (closes hostd gap 1).** If `twd.jsonc` has `tailnet.tags`, mgmt declares the namespace `_workload` with those tags for every deploy, so a Worker-only bundle (no `tailnet.objects`, e.g. `hello`) deploys. `POST /v0/objects {namespace:"_workload", objectName:<workload>}` resolves to *that workload's* latest deployment (not the tenant's latest `_workload`). Its object ID slug is the workload name (`agent-<b32>`). Assignments carry it as `workloadTags` and omit it from `namespaces`. Classes with `"node": false` (e.g. `TwdBudget`) are not namespaces and need no tags. A bundle with neither `tailnet.tags` nor `tailnet.objects` is still a 400.
+
+**Kill push (closes hostd gap 2).** `POST /v0/hosts/register` accepts `pushURL` (only `unix:///…`; kept in memory, hosts re-register on restart). Kill pushes `POST /v0/push/kill {objectID, reason}` to the lease holder for every killed object, in parallel, *before* any device delete (bounded by 2 s per push; heartbeat `revokeObjects` stays the fallback). Deploy pushes `POST /v0/push/assignments`.
+- `twd-mgmt -device-delete-delay D` defers tier 2 by D after the push, so the host's tombstone (hostd `-kill-tombstone` > D) answers *new* connections with a typed `410 object_killed` while peers still have the node in their netmaps (M1 finding 3). Pending deletes run at once on `Close` (SIGTERM) and on `POST /v0/flush`. Each one writes an audit record `kind:"device_delete"`.
+- The kill response adds `pushed:[ids]`, `pushMs`, `devicesDeleting:[ids]`; the kill audit detail adds `pushed` and `deviceDeleteIn`.
+
+**Deployments.** The heartbeat's `deployments:[{deploymentID,status,error}]` is now read (in memory). New `GET /v0/deployments/{id}` → `{deploymentID, tenantID, workload, host, epoch, status:"assigned"|"starting"|"active"|"failed"|"superseded"|…, error, namespaces, endpoint:{objectID, node, magicDNS, status}}` (endpoint = the `_workload` object). `GET /v0/deployments?tenant=` lists the latest deployment per workload.
+
+**Preflight.** `POST /v0/tenants/{id}/preflight {srcTags, connects, port?}` → `{ok, missing:[{src,dst,snippet}], missingTagOwners, tagOwnersSnippet, unchecked}`. A `connects` entry that is a tag (or `*`) needs a grant with an `ip` part whose `src` matches each src tag (or `*`); names are reported `unchecked`. Every src tag must be in `tagOwners`. Read-only (policy cache).
+
+**Ops.** `GET /v0/status` → `{ok, pendingDeviceDeletes}`; `POST /v0/flush` runs pending device deletes now.
+
+**Audit.** `kind:"principal"` (host chain): an object learned whom it acts for after it was created (its first caller-bearing request came after an RPC). `twd audit` uses create/spawn/principal `actingFor` as the head of the chain.
