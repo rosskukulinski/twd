@@ -16,7 +16,7 @@ twd never uses the Mac's Tailscale app or login. Every twd node is a tsnet node 
 ## What was verified (measured, final runs on master)
 | Acceptance test | Result |
 |---|---|
-| **E2E-MAC on mbp** (M2 Pro, macOS 26.6.2, clean). twd from the release tarball on mbp; test client + echo on this Mac over the tailnet | **20/20 checks, 7 of 7 runs green** (last run by me on master). Install 5.7 s · `twd up` → ready 1.57 s · deploy → ready ~1.6 s · first object node 1.7 s · spawn 2.0 s · kill 79 ms · request to a killed object gets a typed 410 in 8 ms · zero leftovers |
+| **E2E-MAC on mbp** (M2 Pro, macOS 26.6.2, clean). twd from the release tarball on mbp; test client + echo on this Mac over the tailnet | **all checks green in 9 of 9 runs** (5 by M6, 2 by the integration agent, 2 by me; the last one on master had 20/20 checks). Install 5.7 s · `twd up` → ready 1.57 s · deploy → ready ~1.6 s · first object node 1.7 s · spawn 2.0 s · kill 79 ms · request to a killed object gets a typed 410 in 8 ms · zero leftovers |
 | E2E-MULTI (tenant A on tailnet 1 + tenant B on tailnet-2, one host, same app names) | 5/5 runs. Cross-tenant reach, by name or IP, in both directions: `peer_not_visible` 8/8 · per-tenant audit · kill isolation · **Seatbelt sandbox** blocks reading other tenants' state, keys and the mgmt socket |
 | Unit / integration (`make test`, hermetic) | Green on macOS and Linux (Lima), 10 Go packages + JS |
 | E2E-VM: Firecracker in Lima (nested virt) | VM boot → ready 0.60 s · ~120 MiB per VM · request p50 0.69 ms (vs 0.37 ms in-process) · **no key material in guest disks, fs or a RAM snapshot** · guest can't reach the host network |
