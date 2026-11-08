@@ -322,8 +322,10 @@ func TestE2EVM(t *testing.T) {
 	})
 
 	t.Run("LatencyVsProcessTier", func(t *testing.T) {
+		// Object names are per tenant and class (fakemgmt namespace = class),
+		// so the process-tier copy uses its own name.
 		pa := map[string]string{}
-		for _, n := range []string{"a"} {
+		for _, n := range []string{"pa"} {
 			code, r := getJSON("http://" + probep.IP + "/probe/" + n + "/")
 			if code != 200 {
 				t.Fatalf("process tier probe: %d %v", code, r)
@@ -333,7 +335,7 @@ func TestE2EVM(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitPeer(o.IP)
-			pa[n] = o.IP
+			pa["a"] = o.IP
 		}
 		lat := map[string]any{}
 		for name, url := range map[string]string{
