@@ -389,10 +389,27 @@ func (h *Host) nodeIngress(inst *instance, tr http.RoundTripper) http.Handler {
 				r.Header.Del(k)
 			}
 		}
-		r.Header.Set(CallerHeader, signCaller(key, map[string]any{
+		// The caller's capMap was already narrowed by netd (RT-01); the
+		// sender's certificate summary rides inside `caller.twd` and its lim
+		// is repeated at the top level. The nonce lets @twd/node refuse a
+		// replayed header (RT-05).
+		claims := map[string]any{
 			"v": 1, "caller": blob.Tailscale.Caller, "objectId": blob.Twd.ObjectID, "workload": inst.w.name,
-			"traceId": blob.TraceID, "iat": time.Now().UnixMilli(),
-		}))
+			"traceId": blob.TraceID, "iat": time.Now().UnixMilli(), "nonce": randB64(16),
+		}
+		var sender struct {
+			Twd *struct {
+				ObjectID string          `json:"objectId"`
+				Lim      json.RawMessage `json:"lim"`
+			} `json:"twd"`
+		}
+		if json.Unmarshal(blob.Tailscale.Caller, &sender) == nil && sender.Twd != nil {
+			claims["callerObjectId"] = sender.Twd.ObjectID
+			if len(sender.Twd.Lim) > 0 {
+				claims["lim"] = sender.Twd.Lim
+			}
+		}
+		r.Header.Set(CallerHeader, signCaller(key, claims))
 		rp.ServeHTTP(w, r)
 	})
 }

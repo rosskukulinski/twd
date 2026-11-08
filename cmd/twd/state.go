@@ -31,7 +31,13 @@ type Config struct {
 	Heartbeat         string `json:"heartbeat"`
 	KillTombstone     string `json:"killTombstone"`
 	DeviceDeleteDelay string `json:"deviceDeleteDelay"`
-	CreatedAt         string `json:"createdAt"`
+	// InsecureSharedHost (RT-08): run Node-tier apps for several tenants on
+	// this host although their egress is not enforced here.
+	InsecureSharedHost bool `json:"insecureSharedHost,omitempty"`
+	// AllowSiblingEgress: objects may reach other objects on this host over
+	// the tailnet (single-host tests/demos).
+	AllowSiblingEgress bool   `json:"allowSiblingEgress,omitempty"`
+	CreatedAt          string `json:"createdAt"`
 	// Tenants are the tenants added with `twd tenant add` (the operator
 	// tenant above is the default for every command).
 	Tenants []TenantRef `json:"tenants,omitempty"`
@@ -108,6 +114,7 @@ func (s *state) runDir() string {
 }
 
 func (s *state) mgmtSock() string       { return filepath.Join(s.runDir(), "mgmt.sock") }
+func (s *state) hostTokenFile() string  { return filepath.Join(s.Dir, "hostd", "mgmt.token") }
 func (s *state) hostdRunDir() string    { return filepath.Join(s.runDir(), "h") }
 func (s *state) hostdSock() string      { return filepath.Join(s.hostdRunDir(), "hostd.sock") }
 func (s *state) logDir() string         { return filepath.Join(s.Dir, "logs") }
@@ -132,8 +139,12 @@ func pidAlive(pid int) bool {
 
 func (s *state) supervisorAlive() bool { return pidAlive(s.supervisorPID()) }
 
+// mgmt is the CLI's client for mgmt's unix socket. It presents the same
+// per-host token hostd uses (RT-03): same-uid peercred alone admits
+// nobody, and the token file is readable only by the twd user.
 func (s *state) mgmt() *mgmtapi.Client {
 	c, _ := mgmtapi.NewClient("unix://" + s.mgmtSock())
+	c.TokenFile = s.hostTokenFile()
 	return c
 }
 

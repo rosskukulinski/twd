@@ -57,6 +57,9 @@ func TestE2EMac(t *testing.T) {
 	rand.Read(b)
 	run := hex.EncodeToString(b)
 	prefix := "twd-e2e-" + run + "-"
+	if p := os.Getenv("TWD_E2E_PREFIX"); p != "" { // e.g. ttest-rtf-: name test nodes per run
+		prefix = p + run + "-"
+	}
 	root, _ := nettest.FindRepoRoot()
 	res := cliflow.NewResults("m4-"+run, tailnet)
 	resultsTo := filepath.Join(root, "e2e", "real", "results", "m4-"+time.Now().Format("20060102-150405")+"-"+run+".json")
@@ -64,7 +67,7 @@ func TestE2EMac(t *testing.T) {
 	defer cancel()
 
 	// Policy: add what the scenario needs (no-op if present).
-	ar, err := policy.Apply(ctx, api, cliflow.Policy())
+	ar, err := policy.ApplyWith(ctx, api, cliflow.Policy(), policy.Options{AllowTags: []string{cliflow.TestTag}})
 	if err != nil {
 		t.Fatalf("policy: %v", netd.RedactError(err))
 	}
@@ -84,7 +87,7 @@ func TestE2EMac(t *testing.T) {
 	work := t.TempDir()
 	var nodes []*nettest.Node
 	e := &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, Tailnet: tailnet, APIKeyFile: keyFile,
-		ControlURL: prodControl, Prefix: prefix, Res: res, ClientTagged: true,
+		ControlURL: prodControl, Prefix: prefix, Res: res, ClientTagged: true, PolicyGrantsParentRefund: true,
 		NewNode: func(role string) *nettest.Node {
 			k, err := minter.AuthKey(ctx, netd.KeyRequest{ObjectID: role, Tags: []string{cliflow.TestTag}, Ephemeral: true})
 			if err != nil {

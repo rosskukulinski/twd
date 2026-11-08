@@ -88,22 +88,46 @@ undici, call `installGlobalDispatcher(undici)` afterwards, or use
 `@twd/node`'s `fetch`. The Vercel Workflow bundles include their own copy of
 undici, so the template uses `@twd/node` `fetch` explicitly.
 
-### Enforcement boundary
+### Enforcement boundary (read this before sharing a host)
 
-In the process tier, egress through the proxy is **cooperative**. A
-malicious or buggy Node app can ignore the env proxies, override the global
-dispatcher, or open raw sockets to loopback, the LAN, the internet or other
-local services, because it is an ordinary process with the host user's
-network. What the process tier does guarantee:
+**Only an OS sandbox that confines the process's network, i.e. Linux
+Landlock (ABI ≥ 4, pinning the process's TCP connects to the proxy port),
+or a microVM, makes the egress proxy an enforcement boundary.** Everywhere
+else (macOS Seatbelt, Linux without Landlock, `-sandbox none`) egress
+through the proxy is **cooperative**: a malicious or buggy Node app can
+ignore the env proxies, override the global dispatcher, or open raw sockets
+to loopback, the LAN, cloud metadata, the internet or other local services,
+because it is an ordinary process with the host user's network (red-team
+finding RT-08). What the process tier does guarantee even then:
 - the app holds no tailnet key;
 - it can't speak as any node except through the proxy, which attributes
   everything to this deployment;
 - it can't forge an inbound caller.
 
-The **enforcement boundary is the microVM tier**. There, the guest's only
-network is hostd's gVisor gateway, which exposes only the egress, workload
-and host-API ports, and every other SYN is RST'd (M8). Running Node apps
-inside the Firecracker guest is not built yet; see STATUS.md M9.
+`@twd/node` closes the *accidental* bypasses in-process: `enforceEgress()`
+(also run by `installGlobalDispatcher()`; the `node-workflow` template calls
+it at startup) patches `net`/`tls` so that any TCP connect to something
+other than the proxy or the app's own port becomes a CONNECT tunnel through
+the proxy (so netd's ADR-019 guard still applies and the destination still
+sees this deployment's node), makes direct `dns.lookup`/`dns.resolve*` and
+UDP sockets fail with `forbidden_destination`, and refuses unix sockets
+other than the app's own. It runs inside the app's process, so hostile code
+can undo it; it is defence in depth, not a boundary. Verified callers:
+`x-twd-caller` now carries a `nonce` and `@twd/node` refuses a replayed
+header (RT-05), plus `callerObjectId`/`lim` when the caller is a twd object
+whose caps were narrowed by its node certificate (RT-01).
+
+hostd makes the state visible and refuses the dangerous combination:
+- `twd status` and `GET /v0/status` show `egress unenforced` for every
+  Node-tier workload on such a host; `twd doctor` warns (`node_egress`);
+- a Node-tier deployment on a host that **serves other tenants** fails with
+  `egress_unenforced` unless the operator starts the host with
+  `twd up --insecure-shared-host` (`twd-hostd -insecure-shared-host`).
+
+Running Node apps inside the Firecracker guest is not built yet; see
+STATUS.md M9. The Landlock sandbox for the Linux process tier lands on the
+`l2-landlock` branch; when a host runs under it, status reports
+`egress enforced`.
 
 ## Supervision and logs
 

@@ -12,7 +12,9 @@ package fakemgmt
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -30,6 +32,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/nodecert"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd"
 )
@@ -72,6 +75,8 @@ type Server struct {
 	audit       map[string][]mgmtapi.AuditRecord
 	nodeIDs     map[string]string // stable node ID -> objectID (every node that reported ready)
 	pushes      []string
+	oboKey      ed25519.PrivateKey // one OBO root key for every tenant (node certs, RT-01)
+	certDenied  map[string]bool    // stable node IDs whose cert lookup fails (tests: fail closed)
 }
 
 type tenant struct {
@@ -126,11 +131,13 @@ func New(cfg Config) *Server {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
 	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(),
 		tenants: map[string]*tenant{}, hosts: map[string]*host{}, deployments: map[string]*deployment{},
 		leases: map[string]*lease{}, objects: map[string]*object{}, byName: map[string]string{},
-		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}}
+		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, oboKey: priv, certDenied: map[string]bool{}}
 	m := s.mux
+	m.HandleFunc("GET /v0/certs/{nodeID}", s.nodeCert)
 	m.HandleFunc("POST /v0/tenants", s.createTenant)
 	m.HandleFunc("GET /v0/tenants", s.listTenants)
 	m.HandleFunc("GET /v0/tenants/{id}", s.getTenant)
@@ -222,9 +229,10 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"tenantID": tn.TenantID})
 }
 
-func (t *tenant) public() mgmtapi.Tenant {
+func (s *Server) public(t *tenant) mgmtapi.Tenant {
 	p := t.Tenant
 	p.APIKeyFile = ""
+	p.OBOPublicKey = base64.StdEncoding.EncodeToString(s.oboKey.Public().(ed25519.PublicKey))
 	return p
 }
 
@@ -232,7 +240,7 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	out := []mgmtapi.Tenant{}
 	for _, t := range s.tenants {
-		out = append(out, t.public())
+		out = append(out, s.public(t))
 	}
 	s.mu.Unlock()
 	writeJSON(w, 200, out)
@@ -246,7 +254,7 @@ func (s *Server) getTenant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, mgmtapi.CodeNotFound, "no such tenant")
 		return
 	}
-	writeJSON(w, 200, t.public())
+	writeJSON(w, 200, s.public(t))
 }
 
 // ---- hosts ----
@@ -868,6 +876,13 @@ func (s *Server) postAudit(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "bad_request", err.Error())
 		return
 	}
+	// RT-02 provenance contract, as twd-mgmt enforces it.
+	for i, rec := range b.Records {
+		if (rec.Source == "tenant") != (rec.Kind == "tenant_note") || rec.Source == "mgmt" {
+			writeErr(w, 400, "bad_request", fmt.Sprintf("record %d: source %q with kind %q violates the audit provenance contract", i, rec.Source, rec.Kind))
+			return
+		}
+	}
 	host := "host:" + r.Header.Get("Twd-Host-ID")
 	s.mu.Lock()
 	s.audit[host] = append(s.audit[host], b.Records...)
@@ -1038,4 +1053,52 @@ func URLQuery(kv ...string) string {
 		v.Set(kv[i], kv[i+1])
 	}
 	return v.Encode()
+}
+
+// ---- node certificates (RT-01) ----
+
+// DenyCert makes the certificate lookup of stableNodeID fail (a 500), so
+// the receiving host must fail closed (tests).
+func (s *Server) DenyCert(stableNodeID string, deny bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if deny {
+		s.certDenied[stableNodeID] = true
+	} else {
+		delete(s.certDenied, stableNodeID)
+	}
+}
+
+func (s *Server) nodeCert(w http.ResponseWriter, r *http.Request) {
+	nodeID, tenantID := r.PathValue("nodeID"), r.URL.Query().Get("tenant")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.certDenied[nodeID] {
+		writeErr(w, 500, "internal", "certificate lookup failed (test)")
+		return
+	}
+	o := s.objects[s.nodeIDs[nodeID]]
+	if o == nil || o.TenantID != tenantID {
+		writeErr(w, 404, mgmtapi.CodeNotFound, "no object of that tenant has node "+nodeID)
+		return
+	}
+	if o.Status == "killed" {
+		writeErr(w, 410, mgmtapi.CodeKilled, "object "+o.ObjectID+" was killed")
+		return
+	}
+	now := time.Now()
+	root := o.ObjectID
+	if len(o.Lineage) > 0 {
+		root = o.Lineage[0]
+	}
+	p := nodecert.Payload{TenantID: o.TenantID, ObjectID: o.ObjectID, StableNodeID: nodeID, Tags: o.Tags, Lim: o.Caps,
+		ParentID: o.Parent, RootID: root, IAT: now.Unix(), EXP: now.Add(nodecert.TTL).Unix()}
+	c, err := nodecert.Sign(s.oboKey, p)
+	if err != nil {
+		writeErr(w, 500, "internal", err.Error())
+		return
+	}
+	writeJSON(w, 200, mgmtapi.NodeCert{TenantID: o.TenantID, ObjectID: o.ObjectID, StableNodeID: nodeID, Status: o.Status, Cert: c,
+		Payload:      &mgmtapi.NodeCertPayload{V: 1, TenantID: p.TenantID, ObjectID: p.ObjectID, StableNodeID: p.StableNodeID, Tags: p.Tags, Lim: p.Lim, ParentID: p.ParentID, RootID: p.RootID, IAT: p.IAT, EXP: p.EXP},
+		OBOPublicKey: base64.StdEncoding.EncodeToString(s.oboKey.Public().(ed25519.PublicKey))})
 }

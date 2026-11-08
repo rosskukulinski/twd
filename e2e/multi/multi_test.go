@@ -70,6 +70,9 @@ func TestE2EMulti(t *testing.T) {
 	rand.Read(b)
 	run := hex.EncodeToString(b)
 	prefix := "ttest-m7-" + run + "-"
+	if p := os.Getenv("TWD_E2E_PREFIX"); p != "" {
+		prefix = p + run + "-"
+	}
 	root, _ := nettest.FindRepoRoot()
 	resultsTo := filepath.Join(root, "e2e", "real", "results", "m7-"+time.Now().Format("20060102-150405")+"-"+run+".json")
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -202,7 +205,7 @@ func TestE2EMulti(t *testing.T) {
 
 	// Policy: add what the scenario needs to each tailnet (no-op if present).
 	for _, s := range []*side{A, B} {
-		ar, err := policy.Apply(ctx, s.api, cliflow.MultiPolicy())
+		ar, err := policy.ApplyWith(ctx, s.api, cliflow.MultiPolicy(), policy.Options{AllowTags: []string{cliflow.TestTag}})
 		if err != nil {
 			t.Fatalf("policy %s: %v", s.tailnet, netd.RedactError(err))
 		}
@@ -229,7 +232,7 @@ func TestE2EMulti(t *testing.T) {
 			}}
 	}
 	m = &cliflow.MultiEnv{Env: &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, Prefix: prefix,
-		ClientTagged: true, Res: cliflow.NewResults("m7-"+run, tailnetA+"+"+tailnetB)},
+		ClientTagged: true, PolicyGrantsParentRefund: true, Res: cliflow.NewResults("m7-"+run, tailnetA+"+"+tailnetB)},
 		A: mk(A), B: mk(B), RequireSandbox: true, GlobalNodeIDs: true}
 	m.Run()
 	m.Down()

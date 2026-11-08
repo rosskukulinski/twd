@@ -106,7 +106,7 @@ func (s *statusRecorder) Flush() {
 // and hand the request to netd, which dials from the object's own node.
 func (h *Host) egressObjHandler(inst *instance) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cls, name, ok := gen.VerifyEgress(inst.res.MACKey, r.Header, r.Method, r.RequestURI, time.Now())
+		cls, name, ok := gen.VerifyEgressOnce(inst.res.MACKey, r.Header, r.Method, r.RequestURI, time.Now(), &inst.nonces)
 		if !ok {
 			writeAPIError(w, &apiError{Code: "unknown_object", Detail: "egress request failed platform authentication"})
 			return
@@ -154,6 +154,42 @@ func (h *Host) serveEgress(w http.ResponseWriter, r *http.Request, inst *instanc
 	if code := rec.Header().Get(netd.HeaderError); code != "" {
 		h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "deny", Dst: r.URL.Host, Code: code, TraceID: newTraceID()})
 	}
+}
+
+// maxTenantNotesPerCall bounds one ctx.tailnet.audit() call.
+const maxTenantNotesPerCall = 64
+
+// maxTenantNoteBytes bounds the stored note (the tenant's record, as JSON).
+const maxTenantNoteBytes = 4096
+
+// TenantAuditRecord builds the only audit record tenant code can produce
+// (RT-02): kind tenant_note, source tenant, with the object, trace ID and
+// acting principal assigned by the platform. The tenant's record is kept
+// as the detail (truncated), including any kind/traceID/actingFor/grant it
+// claimed, so a forged "allow" is visibly a note that *says* "allow".
+func TenantAuditRecord(objectID, traceID, actingFor string, rec map[string]any) mgmtapi.AuditRecord {
+	ar := mgmtapi.AuditRecord{ObjectID: objectID, Kind: kindTenantNote, Source: sourceTenant, TraceID: traceID, ActingFor: actingFor}
+	if rec == nil {
+		rec = map[string]any{}
+	}
+	if k, _ := rec["kind"].(string); k != "" {
+		rec["claimedKind"] = k
+		delete(rec, "kind")
+	}
+	if t, _ := rec["traceID"].(string); t != "" {
+		rec["parentHint"] = t // RFC §4.10: a guest-supplied trace ID is only a hint
+		delete(rec, "traceID")
+	}
+	b, err := json.Marshal(rec)
+	if err != nil {
+		b = []byte(`{"error":"unmarshalable note"}`)
+	}
+	if len(b) > maxTenantNoteBytes {
+		q, _ := json.Marshal(string(b[:maxTenantNoteBytes]) + "…")
+		b = []byte(`{"truncated":true,"note":` + string(q) + `}`)
+	}
+	ar.Detail = string(b)
+	return ar
 }
 
 // ---- local host API (platform ⇄ hostd) ----
@@ -332,23 +368,19 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 				fail(err)
 				return
 			}
+			// RT-02: tenant code can only add tenant_note records. netd/hostd
+			// assign the trace ID, the acting principal, the object and the
+			// timestamp; whatever the tenant sent is kept verbatim as the
+			// note, never as a platform decision.
+			n := 0
 			for _, rec := range req.Records {
-				kind, _ := rec["kind"].(string)
-				if kind != "allow" && kind != "deny" && kind != "egress" {
-					continue
+				if n >= maxTenantNotesPerCall {
+					break
 				}
-				ar := mgmtapi.AuditRecord{ObjectID: o.ID, Kind: kind, TraceID: newTraceID()}
-				ar.Dst, _ = rec["dst"].(string)
-				ar.Grant, _ = rec["grant"].(string)
-				ar.Code, _ = rec["code"].(string)
-				ar.Detail, _ = rec["detail"].(string)
-				ar.ActingFor, _ = rec["actingFor"].(string)
-				if tid, _ := rec["traceID"].(string); tid != "" {
-					ar.TraceID = tid
-				}
-				h.audit.add(ar)
+				h.audit.add(TenantAuditRecord(o.ID, newTraceID(), o.ActingFor, rec))
+				n++
 			}
-			writeJSON(w, 200, map[string]any{"ok": true})
+			writeJSON(w, 200, map[string]any{"ok": true, "accepted": n, "kind": kindTenantNote})
 		default:
 			fail(&apiError{Code: "bad_request", Detail: "unknown op"})
 		}
@@ -401,8 +433,35 @@ type WorkloadStatus struct {
 	// Runtime is "node" for the Node process tier ("" = workerd).
 	Runtime string    `json:",omitempty"`
 	Node    *NodeInfo `json:",omitempty"`
+	// Egress (Node tier) says whether egress attribution is an enforcement
+	// boundary on this host: "enforced" only under a sandbox that confines
+	// the process's network to the egress proxy (Landlock ABI ≥ 4 on Linux,
+	// or a microVM); otherwise "unenforced": the proxy is cooperative and a
+	// hostile app can bypass it with raw sockets (RT-08, docs/node-tier.md).
+	Egress string `json:",omitempty"`
 	// LogFile is the app's log (workerd.log, or app.log for runtime node).
 	LogFile string `json:",omitempty"`
+}
+
+// Egress enforcement states (WorkloadStatus.Egress).
+const (
+	EgressEnforced   = "enforced"
+	EgressUnenforced = "unenforced"
+)
+
+// EgressEnforcement reports whether a Node-tier process under the given
+// sandbox can only reach the network through hostd's egress proxy. Neither
+// "none" nor macOS Seatbelt (which confines files, not TCP) does that; the
+// Linux Landlock sandbox (ABI ≥ 4, pinning the process's TCP connects to
+// the proxy port) is the only process-tier sandbox that makes the proxy an
+// enforcement boundary, and a microVM the only other one. Until a sandbox
+// of that kind reports itself here, the Node tier's egress is advisory.
+func EgressEnforcement(sandbox string) string {
+	switch sandbox {
+	case "landlock":
+		return EgressEnforced
+	}
+	return EgressUnenforced
 }
 
 // StatusView is GET /v0/status.
@@ -410,12 +469,14 @@ type StatusView struct {
 	HostID    string
 	Objects   []ObjectStatus
 	Workloads []WorkloadStatus
+	// InsecureSharedHost echoes Config.InsecureSharedHost.
+	InsecureSharedHost bool `json:",omitempty"`
 }
 
 // Status returns a snapshot.
 func (h *Host) Status() StatusView {
 	h.mu.Lock()
-	v := StatusView{HostID: h.cfg.HostID}
+	v := StatusView{HostID: h.cfg.HostID, InsecureSharedHost: h.cfg.InsecureSharedHost}
 	for _, o := range h.objects {
 		v.Objects = append(v.Objects, ObjectStatus{o.ID, o.NetdID, o.TenantID, o.Workload, o.Class, o.Name, o.Hostname, o.Status, o.NodeID, o.MagicDNS, o.IP, o.Err, o.Parent, o.Wakes})
 	}
@@ -445,6 +506,9 @@ func (h *Host) Status() StatusView {
 				if w.active.profile != "" {
 					ws.Sandbox = SandboxSeatbelt
 				}
+			}
+			if ws.Runtime == bundle.RuntimeNode {
+				ws.Egress = EgressEnforcement(ws.Sandbox)
 			}
 			w.active.mu.Unlock()
 			if vm := w.active.currentVM(); vm != nil {

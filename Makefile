@@ -29,7 +29,7 @@ js-build: $(WORKERD)
 test: deps test-go test-js
 
 test-go:
-	$(GO) test -race -count=1 ./netd/... ./internal/... ./cmd/... ./mgmt/... ./hostd/...
+	$(GO) test -race -count=1 ./netd/... ./internal/... ./cmd/... ./mgmt/... ./hostd/... ./security/...
 
 test-js:
 	npm test --silent

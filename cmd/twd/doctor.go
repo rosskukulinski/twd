@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/internal/esbundle"
 	"github.com/rosskukulinski/twd/internal/tsapi"
@@ -209,6 +210,39 @@ func cmdDoctor(args []string) error {
 	})
 
 	run("sandbox", func() (string, string, string) { return doctorSandbox(s) })
+
+	run("node_egress", func() (string, string, string) {
+		// RT-08: the Node tier's egress proxy is a boundary only under a
+		// network-confining sandbox (Landlock ABI ≥ 4) or a microVM.
+		if s == nil || !s.configured() || !s.supervisorAlive() {
+			return "skip", "twd is not running here", ""
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		var hv hostd.StatusView
+		if err := s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv); err != nil {
+			return "skip", "hostd status unavailable: " + firstLine(err.Error()), ""
+		}
+		var unenforced []string
+		tenants := map[string]bool{}
+		for _, w := range hv.Workloads {
+			tenants[w.TenantID] = true
+			if w.Runtime == "node" && w.Egress != hostd.EgressEnforced {
+				unenforced = append(unenforced, w.Workload)
+			}
+		}
+		if len(unenforced) == 0 {
+			return "ok", "no Node-tier workload with unenforced egress (" + runtime.GOOS + ": workerd apps egress only via netd)", ""
+		}
+		d := fmt.Sprintf("Node-tier egress is UNENFORCED for %s: the HTTP(S) proxy is cooperative; a hostile app can open raw sockets to loopback, LAN, metadata and the internet (RT-08, docs/node-tier.md)", strings.Join(unenforced, ", "))
+		if len(tenants) > 1 {
+			d += fmt.Sprintf("; this host serves %d tenants", len(tenants))
+			if hv.InsecureSharedHost {
+				d += " with --insecure-shared-host"
+			}
+		}
+		return "warn", d, "run Node apps on Linux with Landlock (ABI ≥ 4) or in a microVM; keep them off multi-tenant hosts"
+	})
 
 	run("system_tailscaled_not_used", func() (string, string, string) {
 		var notes []string

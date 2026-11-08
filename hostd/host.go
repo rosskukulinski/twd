@@ -92,6 +92,18 @@ type Config struct {
 	// NodeBin is the node binary for runtime "node" deployments (default:
 	// node from PATH).
 	NodeBin string
+	// AllowSiblingEgress lets an object's egress reach other objects hosted
+	// by this host over the tailnet (a hairpin). Off by default (ADR-019
+	// rule 2: same-host object calls go through the platform); single-host
+	// tests and demos turn it on so that objects can exercise each other's
+	// tailnet-facing authorization (e.g. e2e check (d), RT-01).
+	AllowSiblingEgress bool
+	// InsecureSharedHost lets this host run Node-tier (runtime "node")
+	// deployments while it serves more than one tenant even though the
+	// Node tier's egress is not enforced here (RT-08): a hostile Node app
+	// can open raw sockets past the egress proxy. Default: refused with
+	// egress_unenforced.
+	InsecureSharedHost bool
 }
 
 // Host is a running twd-hostd.

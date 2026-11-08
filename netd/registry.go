@@ -58,6 +58,11 @@ type Config struct {
 	// Upstream receives attributed ingress requests (e.g. UnixUpstream to the
 	// workerd ingress socket). Nil answers 503 upstream_unavailable.
 	Upstream http.Handler
+	// CallerCerts resolves callers' node certificates (RT-01, ADR-010): a
+	// twd object's WhoIs CapMap is narrowed to CapMap ∩ cert.lim before it
+	// reaches Upstream; a lookup failure withholds the caps. Nil: callers'
+	// policy caps apply unchanged (no spawn narrowing is enforced).
+	CallerCerts CertSource
 	// IngressPort is the TCP port each object node listens on. Default 80.
 	IngressPort int
 	// JoinParallel bounds concurrent node joins. Default 16.

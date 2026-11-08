@@ -24,11 +24,26 @@ const maxPendingAudit = 10000
 
 func newAuditLog(key ed25519.PrivateKey) *auditLog { return &auditLog{key: key} }
 
+// Audit sources (RT-02). Every record this host signs says who produced
+// its content; the field is part of the hashed body.
+const (
+	sourceHost   = "host"
+	sourceTenant = "tenant"
+	// kindTenantNote is the only kind tenant code can produce.
+	kindTenantNote = "tenant_note"
+)
+
 func (a *auditLog) add(r mgmtapi.AuditRecord) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if r.TS == "" {
 		r.TS = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if r.Source == "" {
+		r.Source = sourceHost
+	}
+	if r.Source == sourceTenant && r.Kind != kindTenantNote {
+		r.Kind = kindTenantNote // defence in depth: never a privileged kind from tenant content
 	}
 	r.PrevHash = a.prev
 	r.Hash = mgmtapi.ChainHash(a.prev, r)

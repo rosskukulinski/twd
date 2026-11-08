@@ -178,7 +178,8 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: mgmt.LocalHandler((&mgmt.Server{M: m}).Handler())}
+	hostToken := mgmt.NewHostToken()
+	srv := &http.Server{Handler: mgmt.LocalHandler((&mgmt.Server{M: m}).Handler(), hostToken)}
 	go srv.Serve(ln)
 	defer srv.Close()
 	hc := &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -193,6 +194,7 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 		}
 		req, _ := http.NewRequestWithContext(ctx, method, "http://twd-mgmt"+path, rd)
 		req.Header.Set("Twd-Host-ID", hostID)
+		req.Header.Set(mgmt.HostTokenHeader, hostToken)
 		resp, err := hc.Do(req)
 		if err != nil {
 			t.Fatalf("%s %s: %v", method, path, err)

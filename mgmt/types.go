@@ -115,9 +115,12 @@ type Object struct {
 	KeyID        string          `json:"-"`
 	KeyExpires   int64           `json:"-"`
 	KillReason   string          `json:"killReason,omitempty"`
-	CreatedAt    int64           `json:"createdAt"`
-	UpdatedAt    int64           `json:"updatedAt"`
-	Children     []string        `json:"children,omitempty"` // filled by list endpoints
+	// Cert is the node certificate (internal/nodecert) signed at ready with
+	// the tenant's OBO root key; it binds Caps (lim) to StableNodeID.
+	Cert      string   `json:"cert,omitempty"`
+	CreatedAt int64    `json:"createdAt"`
+	UpdatedAt int64    `json:"updatedAt"`
+	Children  []string `json:"children,omitempty"` // filled by list endpoints
 }
 
 // Live reports whether the object is not terminal.
@@ -134,12 +137,18 @@ type Lease struct {
 // AuditRecord is one hash-chained audit entry. Fields are those of the
 // contract's POST /v0/audit plus the chain/seq the server assigns.
 type AuditRecord struct {
-	Seq       int64           `json:"seq"`
-	Chain     string          `json:"chain"` // "mgmt" or "host:<id>"
-	TS        string          `json:"ts"`
-	TenantID  string          `json:"tenantID,omitempty"`
-	ObjectID  string          `json:"objectID,omitempty"`
-	Kind      string          `json:"kind"`
+	Seq      int64  `json:"seq"`
+	Chain    string `json:"chain"` // "mgmt" or "host:<id>"
+	TS       string `json:"ts"`
+	TenantID string `json:"tenantID,omitempty"`
+	ObjectID string `json:"objectID,omitempty"`
+	Kind     string `json:"kind"`
+	// Source is who produced the record's content: "mgmt" (mgmt chain),
+	// "host" (netd/hostd security records) or "tenant" (a tenant_note
+	// submitted by tenant code via ctx.tailnet.audit; its content is
+	// unverified). Host records carry it in the hashed body; mgmt fills it
+	// on read for older records.
+	Source    string          `json:"source,omitempty"`
 	Dst       string          `json:"dst,omitempty"`
 	Grant     string          `json:"grant,omitempty"`
 	Code      string          `json:"code,omitempty"`

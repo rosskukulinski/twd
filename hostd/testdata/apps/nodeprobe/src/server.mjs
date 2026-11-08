@@ -1,6 +1,7 @@
 import http from "node:http";
 import fs from "node:fs";
-import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher } from "@twd/node";
+import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher, enforceEgress } from "@twd/node";
+enforceEgress();
 
 const port = Number(process.env.PORT);
 const json = (res, code, v) => { res.writeHead(code, { "content-type": "application/json" }); res.end(JSON.stringify(v)); };

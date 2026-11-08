@@ -2,9 +2,13 @@ package mgmt
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -176,12 +180,27 @@ func (s *Server) Handler() http.Handler {
 		if err != nil {
 			return nil, err
 		}
+		pub, err := m.OBOPublicKey(r.Context(), t.ID)
+		if err != nil {
+			return nil, err
+		}
 		return struct {
 			Tenant
 			WIF           map[string]any `json:"wif,omitempty"`
 			MintQueue     int            `json:"mintQueue"`
 			EffectiveRate float64        `json:"effectiveRegistrationsPerMinute"`
-		}{t, m.IssuerInfo(t), m.QueueDepth(t.ID), m.throttle(t).Rate()}, nil
+			// OBOPublicKey (RT-01) verifies this tenant's node certificates
+			// (GET /v0/certs/{stableNodeID}); hosts pin it per tenant.
+			OBOPublicKey string `json:"oboPublicKey"`
+		}{t, m.IssuerInfo(t), m.QueueDepth(t.ID), m.throttle(t).Rate(), pub}, nil
+	}))
+
+	// Node certificates (ADR-010, RT-01): the receiving host fetches the
+	// sender's certificate by its WhoIs stable node ID and narrows the
+	// sender's CapMap by cert.lim.
+	mux.HandleFunc("GET /v0/certs/{nodeID}", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		w.Header().Set("Cache-Control", "no-store")
+		return m.NodeCert(r.Context(), r.URL.Query().Get("tenant"), r.PathValue("nodeID"))
 	}))
 
 	// Hosts.
@@ -431,12 +450,74 @@ func (l *uidListener) Accept() (net.Conn, error) {
 	}
 }
 
-// LocalHandler wraps h so every request is the "local" principal (use
-// with ListenUnix).
-func LocalHandler(h http.Handler) http.Handler {
+// HostTokenHeader carries the per-host bearer token on the unix socket
+// (RT-03). Same-uid peercred alone admits nobody: every request, host or
+// admin, must present the token mgmt minted into the host's token file.
+const HostTokenHeader = "Twd-Host-Token"
+
+// LocalHandler wraps h for the unix socket: a request becomes the "local"
+// principal only if it carries HostTokenHeader equal to token (constant
+// time). An empty token fails closed: nothing is admitted.
+func LocalHandler(h http.Handler, token string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := r.Header.Get(HostTokenHeader)
+		if token == "" {
+			writeErr(w, r, errf(503, "host_token_unconfigured", "twd-mgmt has no host token configured (-host-token-file); the unix socket admits nobody"))
+			return
+		}
+		if got == "" {
+			writeErr(w, r, errf(401, "host_token_required", "missing %s (twd-mgmt's unix socket needs the per-host token from the token file)", HostTokenHeader))
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+			writeErr(w, r, errf(403, "host_token_invalid", "%s does not match this twd-mgmt's token", HostTokenHeader))
+			return
+		}
 		h.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), Principal{Kind: "local"})))
 	})
+}
+
+// LoadOrCreateHostToken reads the per-host token file (0600; 64 hex chars),
+// creating it (and its 0700 directory) if missing. With rotate, a fresh
+// token replaces any existing one. The token is never logged.
+func LoadOrCreateHostToken(path string, rotate bool) (string, error) {
+	if !rotate {
+		if b, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(b))) == 64 {
+			if st, err := os.Stat(path); err == nil && st.Mode().Perm()&0o077 != 0 {
+				return "", fmt.Errorf("host token %s must be mode 0600 (is %v)", path, st.Mode().Perm())
+			}
+			return strings.TrimSpace(string(b)), nil
+		}
+	}
+	tok := NewHostToken()
+	if err := os.MkdirAll(dirOf(path), 0o700); err != nil {
+		return "", err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(tok+"\n"), 0o600); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	return tok, nil
+}
+
+// NewHostToken returns a fresh 256-bit token as 64 hex characters.
+func NewHostToken() string {
+	b := make([]byte, 32)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// ReadHostToken reads a token file written by LoadOrCreateHostToken ("" if absent).
+func ReadHostToken(path string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // WhoIsFunc resolves a tailnet caller (tsnet LocalClient.WhoIs).

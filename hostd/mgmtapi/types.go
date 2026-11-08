@@ -38,6 +38,35 @@ type Tenant struct {
 	// Tier (v0.1, optional) is the tenant's default isolation tier
 	// ("process" | "microvm"); a deployment's twd.jsonc "tier" overrides it.
 	Tier string `json:"tier,omitempty"`
+	// OBOPublicKey (RT-01) is the base64 Ed25519 key that verifies this
+	// tenant's node certificates. hostd pins it when it opens the tenant.
+	OBOPublicKey string `json:"oboPublicKey,omitempty"`
+}
+
+// NodeCert is GET /v0/certs/{stableNodeID}?tenant= (RT-01): the sender's
+// node certificate, signed by the tenant's OBO root key, and its payload.
+type NodeCert struct {
+	TenantID     string           `json:"tenantID"`
+	ObjectID     string           `json:"objectID"`
+	StableNodeID string           `json:"stableNodeID"`
+	Status       string           `json:"status"`
+	Cert         string           `json:"cert"`
+	Payload      *NodeCertPayload `json:"payload,omitempty"`
+	OBOPublicKey string           `json:"oboPublicKey,omitempty"`
+}
+
+// NodeCertPayload mirrors internal/nodecert.Payload.
+type NodeCertPayload struct {
+	V            int             `json:"v"`
+	TenantID     string          `json:"tenant"`
+	ObjectID     string          `json:"objectID"`
+	StableNodeID string          `json:"stableNodeID"`
+	Tags         []string        `json:"tags"`
+	Lim          json.RawMessage `json:"lim,omitempty"`
+	ParentID     string          `json:"parent,omitempty"`
+	RootID       string          `json:"root"`
+	IAT          int64           `json:"iat"`
+	EXP          int64           `json:"exp"`
 }
 
 type RegisterRequest struct {
@@ -200,9 +229,14 @@ type Object struct {
 }
 
 type AuditRecord struct {
-	TS        string `json:"ts"`
-	ObjectID  string `json:"objectID"`
-	Kind      string `json:"kind"` // allow | deny | spawn | kill | egress
+	TS       string `json:"ts"`
+	ObjectID string `json:"objectID"`
+	Kind     string `json:"kind"` // allow | deny | spawn | kill | egress | principal | tenant_note
+	// Source (RT-02) is the record's provenance and is part of the hashed
+	// body: "host" for netd/hostd security records, "tenant" for a
+	// tenant_note submitted by tenant code (unverified content). mgmt
+	// rejects a "tenant" source with any other kind.
+	Source    string `json:"source,omitempty"`
 	Dst       string `json:"dst,omitempty"`
 	Grant     string `json:"grant,omitempty"`
 	Code      string `json:"code,omitempty"`

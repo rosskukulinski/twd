@@ -5,7 +5,7 @@
 //   NETD_EGRESS  hostd's attributed egress socket (trusts x-twd-class/name + MAC)
 //   EGRESS_WL    hostd's workload egress socket (the tenant service's identity)
 //   HOSTD        hostd's local host API socket (ensure/spawn/ready/kill/audit)
-//   MAC_KEY      per-process key for egress request MACs
+//   MAC_KEY      per-process root key; per-object egress MAC keys are derived from it (RT-04)
 //   TENANT       the tenant service (the app's default export)
 //   NS_<Class>   plain-DO namespaces (classes with "egress": "workload")
 //
@@ -266,12 +266,31 @@ export class NsProxy extends WorkerEntrypoint {
   }
 }
 
-let macKey = null;
 const enc = new TextEncoder();
-async function mac(env, s) {
-  macKey ??= await crypto.subtle.importKey("raw", enc.encode(env.MAC_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", macKey, enc.encode(s)));
-  return [...sig].map((b) => b.toString(16).padStart(2, "0")).join("");
+const hex = (u8) => [...u8].map((b) => b.toString(16).padStart(2, "0")).join("");
+async function hmacKey(secret) {
+  return crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+}
+let rootKey = null;
+const objectKeys = new Map(); // "class\nname" -> CryptoKey
+// objectKey derives this object's egress key from the instance root key
+// (hostd gen.ObjectMACKey): hex(HMAC(root, "twd-egress-object-key-v1\n" +
+// class + "\n" + name)). hostd verifies a (class, name) MAC only under that
+// object's key.
+async function objectKey(env, cls, name) {
+  const k = cls + "\n" + name;
+  let ck = objectKeys.get(k);
+  if (!ck) {
+    rootKey ??= await hmacKey(env.MAC_KEY);
+    const derived = hex(new Uint8Array(await crypto.subtle.sign("HMAC", rootKey, enc.encode("twd-egress-object-key-v1\n" + k))));
+    ck = await hmacKey(derived);
+    objectKeys.set(k, ck);
+  }
+  return ck;
+}
+async function mac(env, cls, name, s) {
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", await objectKey(env, cls, name), enc.encode(s)));
+  return hex(sig);
 }
 
 // Egress for a facet's fetch(). props were minted by Host_<Class>; tenant code
@@ -288,7 +307,7 @@ export class Egress extends WorkerEntrypoint {
     h.set("x-twd-name", encodeURIComponent(name));
     h.set("x-twd-ts", ts);
     h.set("x-twd-nonce", nonce);
-    h.set("x-twd-mac", await mac(this.env, [cls, name, request.method, request.url, ts, nonce].join("\n")));
+    h.set("x-twd-mac", await mac(this.env, cls, name, [cls, name, request.method, request.url, ts, nonce].join("\n")));
     // workerd's proxy-style external sends absolute-form without Host; Go's net/http rejects that.
     h.set("host", new URL(request.url).host);
     return this.env.NETD_EGRESS.fetch(new Request(request.url, { method: request.method, headers: h, body: request.body, redirect: "manual" }));

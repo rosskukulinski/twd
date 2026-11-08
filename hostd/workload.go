@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -194,6 +196,17 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 
 	tier := h.tierFor(app, t)
 	if app.Runtime == bundle.RuntimeNode {
+		// RT-08: without a network-confining sandbox, a Node app's egress is
+		// only cooperatively attributed; on a host that serves other
+		// tenants that is a cross-tenant SSRF vector, so refuse unless the
+		// operator accepted it explicitly.
+		if others := h.otherTenants(w.tenantID); len(others) > 0 && !h.cfg.InsecureSharedHost && EgressEnforcement(h.sandbox) != EgressEnforced {
+			w.fail(a.DeploymentID, &apiError{Code: "egress_unenforced", Detail: fmt.Sprintf(
+				"runtime \"node\" on a host serving %d other tenant(s) (%s) with sandbox %q: the Node tier's egress proxy is not an enforcement boundary here (raw sockets bypass it); "+
+					"use the workerd runtime, a single-tenant host, Linux with Landlock, or start twd-hostd with -insecure-shared-host (twd up --insecure-shared-host)",
+				len(others), strings.Join(others, ","), h.sandbox)})
+			return
+		}
 		h.deployNode(w, a, app, st)
 		return
 	}
@@ -241,6 +254,23 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	h.mu.Unlock()
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
+}
+
+// otherTenants lists the tenants other than tenantID with a workload
+// assigned to this host.
+func (h *Host) otherTenants(tenantID string) []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	seen := map[string]bool{}
+	var out []string
+	for _, w := range h.workloads {
+		if w.tenantID != tenantID && !seen[w.tenantID] {
+			seen[w.tenantID] = true
+			out = append(out, w.tenantID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // deployNode switches a Node-tier workload stop-then-start: durable Node
@@ -352,6 +382,7 @@ type instance struct {
 	vm       sandbox.VM // microVM tier: the running sandbox
 	exited   chan struct{}
 	servers  []*http.Server
+	nonces   gen.NonceCache // egress MAC replay cache (RT-05)
 	restarts int
 	started  time.Time
 }

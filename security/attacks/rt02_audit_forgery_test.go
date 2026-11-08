@@ -1,56 +1,31 @@
 package attacks
 
-// RT-02 regression test (High): the host API `audit` op
-// (hostd/http.go, case "audit") lets tenant code submit audit records via
-// ctx.tailnet.audit([...]). ObjectID is forced to the attested caller (good),
-// but for kinds allow|deny|egress the handler copies attacker-controlled
-// `traceID`, `actingFor`, `dst`, `grant`, `code`, and `detail` verbatim into
-// the SAME hash chain as platform-generated security records:
+// RT-02 regression test (High): the host API `audit` op (hostd/http.go,
+// case "audit") used to let tenant code (ctx.tailnet.audit) submit
+// allow|deny|egress records whose `traceID`, `actingFor`, `grant`, `code`
+// and `detail` were copied verbatim into the SAME hash chain as platform
+// security records. A prompt-injected agent could fabricate an "allow" for a
+// cap it never had, frame a human via actingFor, and re-point its records
+// into a victim's trace while `chain verified` stayed true.
 //
-//     if tid, _ := rec["traceID"].(string); tid != "" { ar.TraceID = tid }
-//     ar.ActingFor, _ = rec["actingFor"].(string)
-//     ar.Grant, _  = rec["grant"].(string)
-//     ar.Code, _   = rec["code"].(string)
-//
-// A prompt-injected agent can therefore fabricate "allow" records with a
-// forged grant to make an exfiltration look authorized, frame a human via
-// `actingFor`, and inject fake/foreign trace IDs so `twd audit --trace <id>`
-// cross-links its fabricated entries into a victim principal's trace. The hash
-// chain stays valid, so `chain verified` is TRUE while the content is forged.
-//
-// Desired invariant (post-fix), encoded below: an app-submitted record must be
-// provenance-marked (e.g. Kind carries an "app." namespace or a dedicated
-// Source field) so it can never be confused with a platform authorization
-// decision, and a caller-supplied traceID must not silently override the
-// request's real trace. Skip-marked with the finding ID.
+// Fixed invariant: tenant code can only produce records of kind
+// `tenant_note` with source `tenant`; the platform assigns the object, the
+// trace ID and the acting principal; the tenant's claims survive only
+// inside the note's detail (claimedKind, parentHint). twd-mgmt refuses any
+// host-submitted record whose source is "tenant" with another kind, and
+// `twd audit` renders tenant notes distinctly. This test calls the real
+// sanitizer hostd uses (hostd.TenantAuditRecord) and mgmt's ingest check.
 
 import (
 	"strings"
 	"testing"
 
-	mgmtapi "github.com/rosskukulinski/twd/mgmt"
+	"github.com/rosskukulinski/twd/hostd"
+	"github.com/rosskukulinski/twd/mgmt"
 )
 
-// appAudit mirrors exactly what hostd/http.go does with a tenant-submitted
-// record of kind "allow" (the vulnerable field copy). It is reproduced here
-// because the handler is unexported; the real fix must change the handler.
-func appAudit(objectID, realTraceID string, rec map[string]any) mgmtapi.AuditRecord {
-	kind, _ := rec["kind"].(string)
-	ar := mgmtapi.AuditRecord{ObjectID: objectID, Kind: kind, TraceID: realTraceID}
-	ar.Dst, _ = rec["dst"].(string)
-	ar.Grant, _ = rec["grant"].(string)
-	ar.Code, _ = rec["code"].(string)
-	ar.ActingFor, _ = rec["actingFor"].(string)
-	if tid, _ := rec["traceID"].(string); tid != "" {
-		ar.TraceID = tid // attacker overrides the real trace
-	}
-	return ar
-}
-
 func TestRT02_AppAuditCannotForgeAuthorization(t *testing.T) {
-	t.Skip("RT-02: app audit records accept attacker traceID/actingFor/grant/code and are indistinguishable from platform records. Remove skip to reproduce.")
-
-	forged := appAudit("obj-attacker", "trace-REAL", map[string]any{
+	forged := hostd.TenantAuditRecord("obj-attacker", "trace-REAL", "alice@tenant.example", map[string]any{
 		"kind":      "allow",
 		"grant":     "example.com/cap/mcp: refund", // a cap it was never granted
 		"actingFor": "ceo@victim.example",          // frame a human
@@ -58,14 +33,49 @@ func TestRT02_AppAuditCannotForgeAuthorization(t *testing.T) {
 		"detail":    "wired $1M",
 	})
 
-	// DESIRED post-fix behaviour:
-	// 1. app records are provenance-namespaced so they can't masquerade as
-	//    platform authorization decisions.
-	if !strings.HasPrefix(forged.Kind, "app.") {
-		t.Fatalf("RT-02: app-submitted record kind %q is not provenance-marked; it is indistinguishable from a platform %q record", forged.Kind, forged.Kind)
+	// 1. Provenance: never a privileged kind, always marked as tenant content.
+	if forged.Kind != mgmt.KindTenantNote || forged.Source != mgmt.SourceTenant {
+		t.Fatalf("RT-02: tenant-submitted record is kind %q source %q; it must be %q/%q", forged.Kind, forged.Source, mgmt.KindTenantNote, mgmt.SourceTenant)
 	}
-	// 2. a caller must not be able to re-point its record at another trace.
+	// 2. The tenant cannot re-point its record at another trace or principal.
 	if forged.TraceID != "trace-REAL" {
 		t.Fatalf("RT-02: tenant overrode the trace ID to %q, polluting a victim's audit trail", forged.TraceID)
+	}
+	if forged.ActingFor != "alice@tenant.example" {
+		t.Fatalf("RT-02: tenant set actingFor to %q", forged.ActingFor)
+	}
+	if forged.Grant != "" || forged.Code != "" || forged.Dst != "" {
+		t.Fatalf("RT-02: tenant controlled platform fields: %+v", forged)
+	}
+	// 3. What it claimed is kept, visibly as a claim.
+	if !strings.Contains(forged.Detail, `"claimedKind":"allow"`) || !strings.Contains(forged.Detail, `"parentHint":"trace-of-victim"`) ||
+		!strings.Contains(forged.Detail, "ceo@victim.example") {
+		t.Fatalf("RT-02: the note lost the tenant's claims (needed for forensics): %s", forged.Detail)
+	}
+
+	// 4. mgmt's ingest contract: a "tenant" source may carry only a
+	// tenant_note; a tenant_note must say it is tenant-sourced; nothing a
+	// host submits may claim to be mgmt.
+	for _, c := range []struct {
+		source, kind string
+		ok           bool
+	}{
+		{"tenant", "tenant_note", true},
+		{"tenant", "allow", false},
+		{"tenant", "deny", false},
+		{"tenant", "kill", false},
+		{"tenant", "spawn", false},
+		{"tenant", "egress", false},
+		{"host", "tenant_note", false},
+		{"", "tenant_note", false},
+		{"host", "deny", true},
+		{"", "allow", true},
+		{"mgmt", "kill", false},
+		{"attacker", "allow", false},
+	} {
+		got := mgmt.CheckAuditSourceForTest(c.source, c.kind) == nil
+		if got != c.ok {
+			t.Fatalf("RT-02: ingest of source %q kind %q: accepted=%v, want %v", c.source, c.kind, got, c.ok)
+		}
 	}
 }

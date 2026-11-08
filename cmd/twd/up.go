@@ -74,6 +74,8 @@ func cmdUp(args []string) error {
 	hb := f.Duration("heartbeat", time.Second, "host heartbeat period")
 	tomb := f.Duration("kill-tombstone", 12*time.Second, "keep a killed node answering object_killed this long")
 	delDelay := f.Duration("device-delete-delay", 8*time.Second, "delete a killed object's device this long after the kill (< --kill-tombstone)")
+	siblings := f.Bool("allow-sibling-egress", false, "let objects reach other objects on this host over the tailnet (hairpin; single-host tests and demos)")
+	insecure := f.Bool("insecure-shared-host", false, "allow Node-tier (runtime \"node\") apps for several tenants on this host although their egress is not enforced here (RT-08; see docs/node-tier.md)")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -153,11 +155,16 @@ func cmdUp(args []string) error {
 	s.Cfg.APIKeyFile, s.Cfg.ControlURL, s.Cfg.TSAPIURL, s.Cfg.HostID = absKey, *control, *tsapiURL, *hostID
 	s.Cfg.HostnamePrefix, s.Cfg.Ephemeral, s.Cfg.Workerd = *prefix, *ephemeral, wd
 	s.Cfg.Heartbeat, s.Cfg.KillTombstone, s.Cfg.DeviceDeleteDelay = hb.String(), tomb.String(), delDelay.String()
+	s.Cfg.InsecureSharedHost, s.Cfg.AllowSiblingEgress = *insecure, *siblings
 	if err := s.save(); err != nil {
 		return err
 	}
 	res := upResult{StateDir: s.Dir, Tailnet: *tailnet, HostID: *hostID, Timings: timings}
 	if !s.supervisorAlive() {
+		// RT-03: a fresh per-host token for mgmt's unix socket on every
+		// (re)start. mgmt mints it into <state>/hostd/mgmt.token (0600);
+		// hostd and this CLI read it. Workload sandboxes deny that dir.
+		os.Remove(s.hostTokenFile())
 		if err := startSupervisor(s); err != nil {
 			return err
 		}
@@ -390,11 +397,11 @@ func cmdSupervise(args []string) error {
 		return err
 	}
 	margs := []string{mgmtBin, "-state-dir", filepath.Join(s.Dir, "mgmt"), "-socket", s.mgmtSock(),
-		"-device-delete-delay", s.Cfg.DeviceDeleteDelay}
+		"-host-token-file", s.hostTokenFile(), "-device-delete-delay", s.Cfg.DeviceDeleteDelay}
 	if s.Cfg.TSAPIURL != "" {
 		margs = append(margs, "-tsapi-url", s.Cfg.TSAPIURL)
 	}
-	hargs := []string{hostdBin, "-mgmt", "unix://" + s.mgmtSock(), "-host-id", s.Cfg.HostID,
+	hargs := []string{hostdBin, "-mgmt", "unix://" + s.mgmtSock(), "-mgmt-token-file", s.hostTokenFile(), "-host-id", s.Cfg.HostID,
 		"-data-dir", filepath.Join(s.Dir, "hostd"), "-run-dir", s.hostdRunDir(), "-workerd", s.Cfg.Workerd,
 		"-heartbeat", s.Cfg.Heartbeat, "-kill-tombstone", s.Cfg.KillTombstone, "-hostname-prefix", s.Cfg.HostnamePrefix,
 		// No tenant's workerd may touch twd's state (mgmt custody, every
@@ -403,6 +410,12 @@ func cmdSupervise(args []string) error {
 			s.logDir(), s.configPath(), filepath.Join(s.Dir, "tenants"), s.runDir()}, ",")}
 	if s.Cfg.Ephemeral {
 		hargs = append(hargs, "-ephemeral")
+	}
+	if s.Cfg.InsecureSharedHost {
+		hargs = append(hargs, "-insecure-shared-host")
+	}
+	if s.Cfg.AllowSiblingEgress {
+		hargs = append(hargs, "-allow-sibling-egress")
 	}
 	mg := &child{name: "twd-mgmt", args: margs, logPath: s.log("mgmt")}
 	hd := &child{name: "twd-hostd", args: hargs, logPath: s.log("hostd")}
@@ -691,6 +704,12 @@ func cmdStatus(args []string) error {
 			sb := ""
 			if w.Sandbox != "" {
 				sb = ", sandbox " + w.Sandbox
+			}
+			if w.Egress != "" {
+				sb += ", egress " + w.Egress
+				if w.Egress == hostd.EgressUnenforced {
+					sb += " (Node tier: the egress proxy is cooperative here, not a boundary)"
+				}
 			}
 			fmt.Printf("%s workload    %s %s (tenant %s, %s, epoch %d, %d requests%s)%s\n", mark(w.Status == "active"), w.Workload, w.Status, w.TenantID, w.DeploymentID, w.Epoch, w.Requests, sb, e)
 		}

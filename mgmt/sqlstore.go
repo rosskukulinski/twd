@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS objects (
   status TEXT NOT NULL, node_id TEXT NOT NULL DEFAULT '', stable_node_id TEXT NOT NULL DEFAULT '',
   magic_dns TEXT NOT NULL DEFAULT '', key_id TEXT NOT NULL DEFAULT '', key_expires BIGINT NOT NULL DEFAULT 0,
   kill_reason TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+  cert TEXT NOT NULL DEFAULT '',
   UNIQUE (tenant_id, workload, namespace, name));
 CREATE INDEX IF NOT EXISTS objects_parent ON objects (parent_id);
 CREATE INDEX IF NOT EXISTS objects_root ON objects (root_id, status);
@@ -164,19 +165,40 @@ func (s *SQLStore) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, ddl+trig); err != nil {
 			return err
 		}
-		return s.copyLegacyObjects(ctx, legacy)
-	}
-	for _, stmt := range splitSQL(ddl) {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("%w: %s", err, stmt)
+	} else {
+		for _, stmt := range splitSQL(ddl) {
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return fmt.Errorf("%w: %s", err, stmt)
+			}
+		}
+		for _, stmt := range strings.Split(strings.TrimSpace(trig), "\n") {
+			if _, err := s.db.ExecContext(ctx, stmt); err != nil {
+				return err
+			}
 		}
 	}
-	for _, stmt := range strings.Split(strings.TrimSpace(trig), "\n") {
-		if _, err := s.db.ExecContext(ctx, stmt); err != nil {
-			return err
+	if err := s.copyLegacyObjects(ctx, legacy); err != nil {
+		return err
+	}
+	return s.addColumns(ctx)
+}
+
+// addColumns adds columns introduced after a store was created (additive
+// migrations; both dialects accept ADD COLUMN with a default).
+func (s *SQLStore) addColumns(ctx context.Context) error {
+	for _, c := range []struct{ table, col, ddl string }{
+		{"objects", "cert", "ALTER TABLE objects ADD COLUMN cert TEXT NOT NULL DEFAULT ''"}, // RT-01 node certificates
+	} {
+		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
+		if err == nil {
+			rows.Close()
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, c.ddl); err != nil {
+			return fmt.Errorf("%w: %s", err, c.ddl)
 		}
 	}
-	return s.copyLegacyObjects(ctx, legacy)
+	return nil
 }
 
 // Object identity is (tenant, workload, namespace = class, name) since M7.
@@ -225,8 +247,8 @@ func (s *SQLStore) copyLegacyObjects(ctx context.Context, legacy bool) error {
 	if !legacy {
 		return nil
 	}
-	old := strings.Replace(objectCols, "workload, ", "", 1)
-	ins := "INSERT INTO objects (" + objectCols + ") SELECT " +
+	old := strings.Replace(objectColsV1, "workload, ", "", 1)
+	ins := "INSERT INTO objects (" + objectColsV1 + ") SELECT " +
 		strings.Replace(prefixCols("o.", old), "o.tenant_id, ", "o.tenant_id, COALESCE((SELECT d.workload FROM deployments d WHERE d.id=o.deployment_id), ''), ", 1) +
 		" FROM objects_v0 o"
 	if _, err := s.db.ExecContext(ctx, ins); err != nil {
@@ -501,7 +523,10 @@ func (s *SQLStore) FindClass(ctx context.Context, tenantID, workload, class stri
 
 // ---- objects ----
 
-const objectCols = "id, tenant_id, workload, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
+// objectColsV1 are the columns of the M7 schema; cert (RT-01) was added later
+// and is filled by addColumns on older stores.
+const objectColsV1 = "id, tenant_id, workload, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
+const objectCols = objectColsV1 + ", cert"
 
 func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var o Object
@@ -509,7 +534,7 @@ func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var depth, eph int64
 	err := sc.Scan(&o.ID, &o.TenantID, &o.Workload, &o.Namespace, &o.Name, &o.Hostname, &o.DeploymentID, &o.Lease, &tags, &caps,
 		&o.ParentID, &o.RootID, &depth, &o.TTLSeconds, &eph, &o.Status, &o.NodeID, &o.StableNodeID, &o.MagicDNS,
-		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt)
+		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -528,11 +553,11 @@ func objectArgs(o Object) []any {
 	}
 	return []any{o.ID, o.TenantID, o.Workload, o.Namespace, o.Name, o.Hostname, o.DeploymentID, o.Lease, jsonStr(o.Tags), string(o.Caps),
 		o.ParentID, o.RootID, o.Depth, o.TTLSeconds, eph, o.Status, o.NodeID, o.StableNodeID, o.MagicDNS,
-		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt}
+		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert}
 }
 
 func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -565,6 +590,9 @@ func (s *SQLStore) ListObjects(ctx context.Context, f ObjectFilter) ([]Object, e
 	}
 	if f.RootID != "" {
 		add("root_id=?", f.RootID)
+	}
+	if f.StableNodeID != "" {
+		add("stable_node_id=?", f.StableNodeID)
 	}
 	if f.HasParent {
 		where = append(where, "parent_id<>''")

@@ -35,19 +35,31 @@ type suite struct {
 }
 
 func startSuite(t *testing.T, fake fakemgmt.Config) *suite {
+	// Every node gets the test cap; MCP callers get lookup_order only.
+	return startSuiteCaps(t, fake, tailcfg.PeerCapMap{
+		nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue},
+		mcpCap:          []tailcfg.RawMessage{`{"tools":["lookup_order"]}`},
+	})
+}
+
+func startSuiteCaps(t *testing.T, fake fakemgmt.Config, caps tailcfg.PeerCapMap) *suite {
+	return startSuiteCapsOpts(t, fake, caps, nil)
+}
+
+func startSuiteCapsOpts(t *testing.T, fake fakemgmt.Config, caps tailcfg.PeerCapMap, mod func(*hostdtest.Options)) *suite {
 	ctl, err := nettest.StartControl()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(ctl.Close)
-	// Every node gets the test cap; MCP callers get lookup_order only.
-	ctl.Server.SetGlobalAppCaps(tailcfg.PeerCapMap{
-		nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue},
-		mcpCap:          []tailcfg.RawMessage{`{"tools":["lookup_order"]}`},
-	})
+	ctl.Server.SetGlobalAppCaps(caps)
 	fake.StaticKey = nettest.DummyKey
-	e := hostdtest.Start(t, hostdtest.Options{ControlURL: ctl.URL, Fake: fake, Ephemeral: true, KillTombstone: 5 * time.Second,
-		Tenant: mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: ctl.URL, MintMode: "static"}})
+	opts := hostdtest.Options{ControlURL: ctl.URL, Fake: fake, Ephemeral: true, KillTombstone: 5 * time.Second,
+		Tenant: mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: ctl.URL, MintMode: "static"}}
+	if mod != nil {
+		mod(&opts)
+	}
+	e := hostdtest.Start(t, opts)
 	s := &suite{t: t, ctl: ctl, e: e}
 	ctx := context.Background()
 	var wg sync.WaitGroup
