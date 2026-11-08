@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-vm release lint hooks clean gen-js test-m2mgmt
+.PHONY: all build deps js-build test test-go test-js test-pg e2e-local e2e-real e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt
 
 all: build
 
@@ -51,8 +51,24 @@ e2e-real: deps
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2ereal -count=1 -v -timeout 15m ./e2e/real/...
 
-e2e-vm:
-	@echo "e2e-vm: not implemented yet (milestone M8)"; exit 1
+## guest-image: the microVM guest rootfs (Linux only; reproducible): workerd + twd-guestd.
+GUEST_OUT ?= guest/out
+guest-image: $(WORKERD)
+	guest/build-image.sh $(GUEST_OUT)
+
+## e2e-vm: the microVM tier in Firecracker (Linux + KVM; run inside Lima twd-dev, needs sudo).
+TWD_VM_KERNEL ?= $(HOME)/fc/vmlinux
+# 2 MiB pages for guest RAM (runtime sysctl inside the Lima VM, not persisted):
+# without them, workerd start-up under nested virt is ~8x slower.
+VM_HUGEPAGES ?= 2048
+VM_ENV = PATH="$$PATH" TWD_VM_KERNEL="$(TWD_VM_KERNEL)" TWD_VM_ROOTFS="$(CURDIR)/$(GUEST_OUT)/rootfs.ext4"
+e2e-vm: deps guest-image
+	@[ "$$(uname -s)" = Linux ] || { echo "e2e-vm: Linux only; run it inside Lima twd-dev"; exit 1; }
+	@[ "$$(cat /proc/sys/vm/nr_hugepages)" -ge $(VM_HUGEPAGES) ] || sudo sysctl -qw vm.nr_hugepages=$(VM_HUGEPAGES)
+	$(GO) test -c -tags e2evm -o bin/e2evm.test ./e2e/vm
+	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
+	sudo env $(VM_ENV) bin/vmsmoke.test -test.v -test.count=1
+	cd e2e/vm && sudo env $(VM_ENV) ../../bin/e2evm.test -test.v -test.count=1 -test.timeout 15m
 
 release:
 	@echo "release: not implemented yet (milestone M6)"; exit 1
@@ -63,6 +79,8 @@ lint:
 	$(GO) vet -tags e2e ./e2e/local/...
 	$(GO) vet -tags e2ereal ./e2e/real/...
 	$(GO) vet -tags m2mgmt ./e2e/m2mgmt/...
+	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/...
+	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	@sh scripts/check-secrets.sh
 
 hooks:

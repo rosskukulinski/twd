@@ -11,6 +11,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd/gen"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -373,6 +374,8 @@ type WorkloadStatus struct {
 	Epoch                                           int64
 	Requests                                        int64
 	InstanceDir                                     string
+	Tier                                            string
+	VM                                              *sandbox.Info `json:",omitempty"`
 }
 
 // StatusView is GET /v0/status.
@@ -400,6 +403,11 @@ func (h *Host) Status() StatusView {
 		if w.active != nil {
 			ws.Requests = w.active.reqs.Load()
 			ws.InstanceDir = w.active.dir
+			ws.Tier = w.active.tier
+			if vm := w.active.currentVM(); vm != nil {
+				info := vm.Info()
+				ws.VM = &info
+			}
 		}
 		w.mu.Unlock()
 		v.Workloads = append(v.Workloads, ws)
@@ -407,6 +415,22 @@ func (h *Host) Status() StatusView {
 	sort.Slice(v.Objects, func(i, j int) bool { return v.Objects[i].Hostname < v.Objects[j].Hostname })
 	sort.Slice(v.Workloads, func(i, j int) bool { return v.Workloads[i].Workload < v.Workloads[j].Workload })
 	return v
+}
+
+// Sandbox returns the running microVM of a workload's active instance (nil
+// in the process tier).
+func (h *Host) Sandbox(tenantID, workload string) sandbox.VM {
+	h.mu.Lock()
+	w := h.workloads[tenantID+"/"+workload]
+	h.mu.Unlock()
+	if w == nil {
+		return nil
+	}
+	inst := w.current()
+	if inst == nil {
+		return nil
+	}
+	return inst.currentVM()
 }
 
 // Object returns the status of the object (class, name) of a workload.

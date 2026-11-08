@@ -35,6 +35,9 @@ type Tenant struct {
 	WIFClientID            string `json:"wifClientID,omitempty"`
 	RegistrationsPerMinute int    `json:"registrationsPerMinute,omitempty"`
 	MaxObjects             int    `json:"maxObjects,omitempty"`
+	// Tier (v0.1, optional) is the tenant's default isolation tier
+	// ("process" | "microvm"); a deployment's twd.jsonc "tier" overrides it.
+	Tier string `json:"tier,omitempty"`
 }
 
 type RegisterRequest struct {

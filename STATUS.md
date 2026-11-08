@@ -2,6 +2,7 @@
 
 Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on branch `m2-mgmt`.
 Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
+Last update: 2026-11-08 00:40 PT. M8 (microVM tier, Firecracker in Lima) on branch `m8-vm`: `make e2e-vm` PASS.
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -369,3 +370,91 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
 - M2 follow-ups for hostd: implicit `_workload` namespace, kill push or long-poll, delayed device delete for fail-fast new requests.
 - M4 `twd` CLI on top of `create-twd build` + the deployments API; `twd up` runs twd-mgmt + twd-hostd.
 - Run `make test` in Lima `twd-dev` (Linux arm64).
+
+## M8: microVM tier, Firecracker in Lima (DONE, branch `m8-vm`)
+`make e2e-vm` **passes** inside Lima `twd-dev`: 9/9 subtests plus the VM smoke test, 4 consecutive green runs at ~5 s per suite. macOS `make test` and `make lint` stay green; `make test` is also green in Lima (Linux arm64; first Linux run of the process tier).
+
+### What's built
+- **Guest image (`guest/`, `make guest-image`).** `guest/build-image.sh` builds a 189 MiB read-only ext4 with no journal. It holds:
+  - pinned **workerd 1.20261108.1**, the npm linux-arm64 binary at the lockfile version;
+  - glibc 2.39 copied from the CI Ubuntu 24.04 rootfs (`~/fc/rootfs`), plus its CA bundle;
+  - static **`twd-guestd`** as init.
+  - No tailscale, tsnet or key material.
+  - **Reproducible:** fixed UUID and hash seed, `SOURCE_DATE_EPOCH` mtimes, and ctimes/atimes pinned per inode with debugfs. Two builds gave the same sha256 (`6c91243…`). `manifest.json` records the input and output hashes.
+- **`twd-guestd`** (`guest/twd-guestd`, PID 1):
+  1. mounts proc, sys, devtmpfs and tmpfs;
+  2. sets the clock from the config drive (egress MACs are timestamped);
+  3. extracts the config drive (`/dev/vdb`, a raw tar of the generated instance dir plus `guest.json`);
+  4. brings up `eth0` with static config via rtnetlink: 192.168.72.2/24, with a default route via .1;
+  5. supervises workerd, restarting it up to 5 times;
+  6. speaks NDJSON over **vsock** (CID 2, port 1024). It reports `boot`, `ready` (workerd healthy) and `workerd-exit`, and answers `stats`, `fsscan` and, in debug mode only, `probe`.
+  - The contract is in `guest/proto`.
+- **Host side (`hostd/vm`, Linux only; `hostd/sandbox` is the portable interface).** One Firecracker VM per workload instance, driven through its **API socket**:
+  - machine-config, boot-source, rootfs (ro), config drive (ro), eth0 and vsock, then `InstanceStart`;
+  - stop = SIGKILL of the VMM (arm64 has no ACPI shutdown; guest state is disposable);
+  - **snapshot**: `MemoryDump` (pause, full snapshot, resume) is used by the key scan. Restore is not used.
+- **Networking, tailvisor-style.** Each VM gets its **own network namespace** containing `fc0` (Firecracker's TAP) and `gv0` (hostd's TAP) on bridge `br0`. There is no IP, no IPv6 and no host listener in it.
+  - hostd runs a **gVisor stack** on `gv0` (`fdbased` + ARP/IPv4/TCP). It is adapted from tailvisor `netd/stack.go`/`proxy.go` with BSD-3 attribution in `vnet_linux.go`. tailvisor's package wasn't imported as a library: it is one-VM-one-tsnet, has no go.mod, and needs gopacket.
+  - The stack is the guest's only gateway. **Only `192.168.72.1:3128/3129/3130` exist**: facet egress (MAC'd object attribution), workload egress and host API. These are served by hostd's existing handlers, so netd maps each request to that object's `tsnet.Server.Dial` with the ADR-019 guard.
+  - Every other TCP SYN, to any address or port, gets a **RST and is recorded**. UDP and ICMP aren't registered.
+  - **Ingress:** netd (node listener, WhoIs, header strip, cf blob) → hostd routing → a reverse proxy that dials `192.168.72.2:8080` through the gVisor stack. That socket is the only one with `cfBlobHeader`.
+  - **Per-object attribution inside one VM** is unchanged from M3: the facet's platform Egress sends `x-twd-class`/`x-twd-name` plus an HMAC over the TAP path, hostd verifies them, and egress leaves from the object's node.
+- **Tier selection.**
+  - Order: `"tier"` in twd.jsonc, then `Tenant.Tier` (mgmt contract addition, optional), then `hostd.Config.DefaultTier` (`twd-hostd -default-tier`), then `process`.
+  - `microvm` falls back to `process` with a warning when there's no backend. That covers macOS, no KVM, not root, or no image.
+  - Hosts register `tiers: ["process","microvm"]` when the backend is available. `WorkloadStatus` reports `Tier` and the VM boot info.
+  - twd-hostd flags: `-vm-kernel -vm-rootfs -firecracker -vm-mem-mib -vm-vcpus -vm-hugepages`.
+- **VM crash = workerd crash.** When the VMM exits, every flow into the guest is aborted, new requests get a typed 503 `upstream_unavailable`, and hostd reboots the VM with the bounded restart policy. Object nodes and their identities are untouched.
+
+### Test results: `make e2e-vm` (hermetic: testcontrol + local DERP/STUN, fakemgmt, real hostd, real Firecracker v1.17.0, 2 vCPU / 512 MiB guests)
+Final run: `e2e/vm/results/m8-20261108T083524Z.json`.
+
+| Check | Result |
+|---|---|
+| Tier selection | hello and probe run in `microvm` (tenant tier); `probep` runs in `process` (twd.jsonc override) |
+| `hello` in a VM | a tsnet client gets a verified caller (`nodeId` matches); the Worker's fetch from inside the guest is attributed to the workload node (echo WhoIs) |
+| 3 DO objects in one VM | each gets its own node; direct ingress delivers the verified caller; **egress attributed to each object's own node 3/3**; forged `x-twd-*`/MAC headers from object a still leave as a |
+| **No keys in the guest** | 26 needles: `tskey-`, the test auth key, and 12 node/machine private keys from host state, as text and raw bytes. **None** found in the rootfs, the config drive, 73 guest files (`fsscan`), or a **512 MiB full RAM snapshot**. Positive controls: the keys are found on the host, and the instance MAC key is found in the dump |
+| **ADR-019: no host network or loopback** | raw TCP from the guest is refused for: gateway :22/:80/canary, Lima's IPs :22/canary, 10.0.2.2:22 (the Mac), 127.0.0.1, 169.254.169.254, 1.1.1.1, 192.168.72.3, and the echo node's 100.x IP. A canary listener on every host interface got **0 connections**. Through the platform path, egress to 127.0.0.1, the host IP and metadata gets 403 `forbidden_destination`; example.com gets `peer_not_visible` |
+| Kill an object (mgmt) | streaming caller into the VM failed after **0.27 ms**; a new request failed in 0.2 ms (tombstone RST) |
+| Kill the VM (SIGKILL the VMM) | streaming caller failed after **14 ms**; the next request got 503 `upstream_unavailable` in <1 ms; the VM was rebooted and serving the same object node again **0.87 s** after the kill |
+
+**Measurements** (Lima on an M5 Pro; nested virtualization):
+
+| Metric | Value |
+|---|---|
+| **Boot → ready**, InstanceStart → guest init | 173–188 ms |
+| InstanceStart → workerd healthy in the guest | **0.60–0.62 s** |
+| Whole `Boot()` (netns, TAPs, stack, VMM, API calls, boot, workerd) | 0.61–0.64 s |
+| Deploy of 3 workloads → all active | 0.71 s |
+| **Latency** (p50 / p95, 200 sequential requests over tsnet) | object in a VM 0.69 / 1.57 ms vs process tier 0.37 / 0.47 ms; object egress to echo 1.44 / 1.71 ms vs 0.80 / 0.89 ms; workload `hello` in a VM 1.35 / 2.30 ms |
+| **RSS per VM** (Firecracker VmRSS + hugetlb) | 116 MiB (hello), 128 MiB (probe). Guest used 33/43 MiB, guest workerd RSS 49/63 MiB |
+| Full memory snapshot (512 MiB) | 126–223 ms |
+
+**`make e2e-real` microVM variant** (`TWD_E2E_TIER=microvm`, tailnet 1, production control, ephemeral `tag:ttest` `ttest-m8-972ff3-*`): **16/16 checks PASS** (`e2e/real/results/m8-20261108-003440-972ff3.json`).
+- hello: verified caller, workload egress.
+- 3 objects: own nodes, ingress, attributed egress.
+- Kill: streaming caller TTF **0.53 ms**.
+- VM InstanceStart → ready 0.60/0.62 s.
+- **Cleanup:** 7 devices tracked, 7 deleted, 0 left, 0 untracked; 7 keys minted and revoked. No policy was read or written.
+- The API key file was piped into Lima (`/tmp`, 0600), never printed, and deleted right after the run.
+- As in M3, a *new* request to the killed node's IP on production black-holed for 5 s (M1 finding 3).
+
+### Findings
+1. **Huge pages are decisive under nested virt.** With 4 KiB pages, InstanceStart → workerd healthy took **3.7 s** for a trivial config and 6.5–7.3 s for the platform wrapper. With 2 MiB hugetlbfs pages it takes **0.43 s** and 0.60 s, because stage-2 faults dominate.
+   - `HugePages: "auto"` (the default) uses them when `vm.nr_hugepages` has room.
+   - `make e2e-vm` reserves 2048 pages with a runtime sysctl inside Lima (not persisted).
+2. **1 vCPU is too few for workerd.** Its threads contend: p50 was 31 ms (object) and 50 ms (egress). With 2 vCPUs it is 0.7 ms and 1.4 ms. The default is now 2.
+3. **`Pdeathsig` is per thread, not per process.** Creating the TAP inside a namespace needs a locked OS thread. Letting that thread exit once SIGKILLed *another* VM's Firecracker, because that thread had forked it. Fix: restore the namespace and unlock the thread, and drop `Pdeathsig`.
+4. workerd won't start without a system CA store, even though it makes no TLS calls. The image ships the base CA bundle; `https://` egress is still originated by host netd.
+5. Object names are per tenant *and class* (fakemgmt namespace = class). Two workloads of one tenant that share a class name share object names; the test uses distinct names.
+
+### Known gaps (M8)
+- **DO storage is guest tmpfs.** It is lost when the VM restarts or redeploys; `stord` over vsock (RFC §4.8) isn't built. Blue/green still works, but state isn't carried over.
+- **No jailer.** Firecracker runs as root through `ip netns exec`, with no chroot, cgroups or seccomp profile beyond its built-in one. The whole tier needs root on the host (netns, TAP).
+- **No snapshot restore** (warm empty VMs) and no wake-on-connection resume. Boot is about 0.6 s cold.
+- One VM per workload instance. `isolation: "principal" | "object"` placement (RFC §4.8 residual risk) isn't implemented, so a V8 escape could impersonate the other objects in the same VM.
+- `ctx.tailnet.connect()` and raw TCP over the TAP are not supported; HTTP(S) egress only, as in M1.
+- The config drive and egress MAC key are readable inside the guest (by design: not a tailnet credential). A guest compromise can forge attribution among its own VM's objects only.
+- The kernel is the Firecracker CI 6.1 build from `~/fc/vmlinux`, not built by `guest/`. The image builder takes glibc from `~/fc/rootfs` (`BASE_ROOTFS`).
+- The tier is not offered on macOS (Virtualization.framework, per ADR-007, isn't built); microvm requests fall back to process there.
