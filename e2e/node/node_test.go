@@ -31,6 +31,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
 )
@@ -277,15 +278,17 @@ func TestNodeTier(t *testing.T) {
 	t.Run("Sandbox", func(t *testing.T) {
 		// Node apps are tenant code too: on macOS they run under the same
 		// Seatbelt profile shape as workerd (own instance + data dir only).
+		// On Linux: Landlock (+ seccomp), the same allow list plus TCP ports.
 		ws := e.nodeStatus(e.a, "nodeprobe")
-		if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxSeatbelt {
+		sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto)
+		if sb == hostd.SandboxNone {
 			if ws.Sandbox != hostd.SandboxNone {
-				t.Fatalf("sandbox without Seatbelt: %q", ws.Sandbox)
+				t.Fatalf("sandbox %q on a host without one", ws.Sandbox)
 			}
-			t.Skip("no Seatbelt on this OS (Node tier dirs are 0700; the microVM tier is the isolation answer)")
+			t.Skip("no process sandbox on this OS (Node tier dirs are 0700; the microVM tier is the isolation answer)")
 		}
-		if ws.Sandbox != hostd.SandboxSeatbelt || ws.SandboxProfile == "" {
-			t.Fatalf("node app not sandboxed: %q %q", ws.Sandbox, ws.SandboxProfile)
+		if ws.Sandbox != sb || ws.SandboxProfile == "" {
+			t.Fatalf("node app not sandboxed: %q %q (want %s)", ws.Sandbox, ws.SandboxProfile, sb)
 		}
 		fsop := func(op, path string) map[string]any {
 			code, _, b := do(e.hc, "GET", base+"/fs?op="+op+"&path="+url.QueryEscape(path), nil)
@@ -317,11 +320,16 @@ func TestNodeTier(t *testing.T) {
 			"home_list":         {"list", home},
 		}
 		for name, c := range denied {
-			if m := fsop(c[0], c[1]); m["ok"] != false || m["code"] != "EPERM" {
+			// Seatbelt: EPERM; Landlock: EACCES.
+			if m := fsop(c[0], c[1]); m["ok"] != false || (m["code"] != "EPERM" && m["code"] != "EACCES") {
 				t.Fatalf("%s (%s %s) not denied: %v", name, c[0], c[1], m)
 			}
 		}
-		e.record("nodeprobe.sandbox", map[string]any{"sandbox": ws.Sandbox, "own_rw": true, "denied": len(denied)})
+		rec := map[string]any{"sandbox": ws.Sandbox, "own_rw": true, "denied": len(denied)}
+		if sb == hostd.SandboxLandlock {
+			rec["landlock"] = e.landlockNodeChecks(t, ws, base)
+		}
+		e.record("nodeprobe.sandbox", rec)
 	})
 
 	t.Run("EgressAttributed", func(t *testing.T) {
@@ -566,4 +574,85 @@ func TestNodeWorkflow(t *testing.T) {
 	slept := int64(marks[1].(map[string]any)["at"].(float64))
 	e.record("workflow.resume_after_restart_ms", slept-max(readyAt.UnixMilli(), triaged+2000))
 	e.record("workflow.mcp_caller_node", wf.NodeID)
+}
+
+// landlockNodeChecks: from inside the sandboxed Node app (Linux), raw TCP
+// that bypasses the egress proxy fails (the internet, a host-loopback
+// listener), unix sockets of hostd fail, its own app port works; under the
+// app's profile, ptrace of a sibling fails. Egress through netd is checked
+// by EgressAttributed, which runs under the same sandbox.
+func (e *env) landlockNodeChecks(t *testing.T, ws hostd.WorkloadStatus, base string) map[string]string {
+	t.Helper()
+	netop := func(q string) map[string]any {
+		code, _, b := do(e.hc, "GET", base+"/net?"+q, nil)
+		if code != 200 {
+			t.Fatalf("net %s: %d %s", q, code, b)
+		}
+		return obj(b)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	lport := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	got := map[string]string{}
+	for name, q := range map[string]string{
+		"tcp_1.1.1.1:80":    "host=1.1.1.1&port=80",
+		"tcp_1.1.1.1:443":   "host=1.1.1.1&port=443",
+		"tcp_host_loopback": "host=127.0.0.1&port=" + lport,
+		"unix_hostd_push_a": "path=" + url.QueryEscape(e.a.Host.PushSocket()),
+		"unix_hostd_push_b": "path=" + url.QueryEscape(e.b.Host.PushSocket()),
+	} {
+		m := netop(q)
+		if m["ok"] != false && !strings.HasPrefix(name, "unix_") {
+			t.Fatalf("node app (Landlock) %s: connected, bypassing the egress proxy", name)
+		}
+		got[name] = fmt.Sprint(m["code"])
+		if m["ok"] == true {
+			// A unix connect may complete (Landlock < ABI 9); a guarded
+			// server then closes it at once without answering.
+			got[name] = "accepted-then-closed"
+		}
+	}
+	// The app's own port is allowed (self-calls).
+	if m := netop("host=127.0.0.1&port=" + strings.TrimPrefix(ws.Node.Addr, "127.0.0.1:")); m["ok"] != true {
+		t.Fatalf("node app can't connect to its own port %s: %v", ws.Node.Addr, m)
+	}
+	// Guarded sockets really refuse it: an HTTP request through hostd's push
+	// socket from the app's profile gets no answer.
+	for _, sock := range []string{e.a.Host.PushSocket(), e.b.Host.PushSocket()} {
+		cmd, err := procsb.ProbeCommand(ws.SandboxProfile, procsb.ProbeConnectUnix, sock)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out, _ := cmd.Output(); strings.TrimSpace(string(out)) == "ok" {
+			t.Fatalf("hostd push socket %s answers a sandboxed peer", sock)
+		}
+	}
+	sib := exec.Command("sleep", "30")
+	if err := sib.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer sib.Process.Kill()
+	cmd, _ := procsb.ProbeCommand(ws.SandboxProfile, procsb.ProbePtrace, strconv.Itoa(sib.Process.Pid))
+	if out, _ := cmd.Output(); strings.TrimSpace(string(out)) == "ok" {
+		t.Fatal("ptrace of a sibling allowed under the node app's profile")
+	} else {
+		got["ptrace_sibling"] = strings.TrimSpace(string(out))
+	}
+	if !procsb.Sandboxed(ws.Node.PID) {
+		t.Fatalf("node pid %d carries no sandbox marker", ws.Node.PID)
+	}
+	t.Logf("landlock node app: %v", got)
+	return got
 }

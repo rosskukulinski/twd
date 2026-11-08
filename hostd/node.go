@@ -125,7 +125,7 @@ func (h *Host) startNodeInstance(w *workload, depID string, app *bundle.App, n i
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
+	dir := h.instanceDir(n)
 	if err := os.MkdirAll(filepath.Join(dir, "tmp"), 0o700); err != nil {
 		return nil, err
 	}

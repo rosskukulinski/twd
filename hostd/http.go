@@ -392,8 +392,9 @@ type WorkloadStatus struct {
 	InstanceDir                                     string
 	Tier                                            string
 	VM                                              *sandbox.Info `json:",omitempty"`
-	// Process tier: the workerd pid, its sandbox ("none" | "seatbelt"),
-	// the Seatbelt profile, and its DO storage dir.
+	// Process tier: the workerd (or node) pid, its sandbox ("none" |
+	// "seatbelt" | "landlock"), the profile (.sb / .json), and its DO
+	// storage dir.
 	PID            int    `json:",omitempty"`
 	Sandbox        string `json:",omitempty"`
 	SandboxProfile string `json:",omitempty"`
@@ -407,7 +408,10 @@ type WorkloadStatus struct {
 
 // StatusView is GET /v0/status.
 type StatusView struct {
-	HostID    string
+	HostID string
+	// Sandbox is the host's process sandbox: "seatbelt", "landlock (ABI n)"
+	// or "none".
+	Sandbox   string `json:",omitempty"`
 	Objects   []ObjectStatus
 	Workloads []WorkloadStatus
 }
@@ -415,7 +419,7 @@ type StatusView struct {
 // Status returns a snapshot.
 func (h *Host) Status() StatusView {
 	h.mu.Lock()
-	v := StatusView{HostID: h.cfg.HostID}
+	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo()}
 	for _, o := range h.objects {
 		v.Objects = append(v.Objects, ObjectStatus{o.ID, o.NetdID, o.TenantID, o.Workload, o.Class, o.Name, o.Hostname, o.Status, o.NodeID, o.MagicDNS, o.IP, o.Err, o.Parent, o.Wakes})
 	}
@@ -441,10 +445,7 @@ func (h *Host) Status() StatusView {
 				ws.PID = w.active.cmd.Process.Pid
 			}
 			if w.active.tier != "microvm" {
-				ws.Sandbox, ws.SandboxProfile = SandboxNone, w.active.profile
-				if w.active.profile != "" {
-					ws.Sandbox = SandboxSeatbelt
-				}
+				ws.Sandbox, ws.SandboxProfile = sandboxOf(w.active.profile), w.active.profile
 			}
 			w.active.mu.Unlock()
 			if vm := w.active.currentVM(); vm != nil {

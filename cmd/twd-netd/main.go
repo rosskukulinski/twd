@@ -28,6 +28,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd"
 )
@@ -166,7 +167,7 @@ func listenUnix(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	return ln, os.Chmod(path, 0o600)
+	return procsb.Guard(ln, nil), os.Chmod(path, 0o600)
 }
 
 func readKeyFile(path string) (string, error) {

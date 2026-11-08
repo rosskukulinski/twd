@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +19,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
 )
@@ -158,8 +161,10 @@ func TestMultiTenant(t *testing.T) {
 			t.Fatalf("tenant A's sandbox can't list its own DO storage: %v", err)
 		}
 		t.Logf("seatbelt: tenant A's workerd profile denies tenant B's state dir, node state and DO storage")
+	} else if sb == hostd.SandboxLandlock {
+		landlockCrossTenant(t, ea, ws["a"], ws["b"], filepath.Join(data, "tenants", eb.TenantID), objs["b"].NetdID)
 	} else {
-		t.Log("no Seatbelt on this OS: sandbox checks skipped (dirs are 0700)")
+		t.Log("no process sandbox on this OS: sandbox checks skipped (dirs are 0700)")
 	}
 
 	// (c) Isolation: tenant A's agent can't reach tenant B's echo by name
@@ -236,4 +241,64 @@ func waitPeerOf(t *testing.T, n *nettest.Node, ip string) {
 	if err := n.WaitPeers(ctx, ip); err != nil {
 		t.Fatalf("peer %s: %v", ip, err)
 	}
+}
+
+// landlockCrossTenant is (d) on Linux: under tenant A's live Landlock
+// profile (the rules, seccomp filter and no_new_privs A's workerd runs
+// with), tenant B's state, hostd's keys, the home dir and the run dir are
+// unreadable; hostd's push socket and B's egress sockets refuse A; B's
+// workerd can't be ptraced; A's own DO storage stays usable.
+func landlockCrossTenant(t *testing.T, ea *hostdtest.Env, a, b hostd.WorkloadStatus, bState, bNetdID string) {
+	t.Helper()
+	if a.Sandbox != hostd.SandboxLandlock || filepath.Ext(a.SandboxProfile) != ".json" {
+		t.Fatalf("tenant A workerd not under Landlock: %+v", a)
+	}
+	if !procsb.Sandboxed(a.PID) || !procsb.Sandboxed(b.PID) {
+		t.Fatalf("workerd pids %d/%d carry no sandbox (no_new_privs + seccomp)", a.PID, b.PID)
+	}
+	pr := func(op string, args ...string) string {
+		cmd, err := procsb.ProbeCommand(a.SandboxProfile, op, args...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, _ := cmd.Output()
+		return strings.TrimSpace(string(out))
+	}
+	data := filepath.Join(ea.Dir, "data")
+	home, _ := os.UserHomeDir()
+	denied := map[string][2]string{
+		"B state dir":       {procsb.ProbeList, bState},
+		"B node state":      {procsb.ProbeList, filepath.Join(bState, "nodes", bNetdID)},
+		"B DO storage":      {procsb.ProbeList, b.DOStorage},
+		"B instance dir":    {procsb.ProbeList, b.InstanceDir},
+		"hostd audit key":   {procsb.ProbeRead, filepath.Join(data, "audit.key")},
+		"home dir":          {procsb.ProbeList, home},
+		"hostd run dir":     {procsb.ProbeList, filepath.Dir(a.InstanceDir)},
+		"hostd push socket": {procsb.ProbeConnectUnix, ea.Host.PushSocket()},
+		"B egress-wl.sock":  {procsb.ProbeConnectUnix, filepath.Join(b.InstanceDir, "egress-wl.sock")},
+		"B egress-obj.sock": {procsb.ProbeConnectUnix, filepath.Join(b.InstanceDir, "egress-obj.sock")},
+		"B hostapi.sock":    {procsb.ProbeConnectUnix, filepath.Join(b.InstanceDir, "hostapi.sock")},
+		"ptrace B workerd":  {procsb.ProbePtrace, strconv.Itoa(b.PID)},
+		"B process memory":  {procsb.ProbeVMRead, strconv.Itoa(b.PID)},
+		"B /proc environ":   {procsb.ProbeRead, "/proc/" + strconv.Itoa(b.PID) + "/environ"},
+		"TCP to 1.1.1.1":    {procsb.ProbeConnectTCP, "1.1.1.1:80"},
+	}
+	for what, c := range denied {
+		if got := pr(c[0], c[1]); got == "ok" {
+			t.Fatalf("(d) tenant A's Landlock sandbox can reach %s (%s %s)", what, c[0], c[1])
+		} else {
+			t.Logf("landlock: A → %s: %s", what, got)
+		}
+	}
+	if got := pr(procsb.ProbeList, a.DOStorage); got != "ok" {
+		t.Fatalf("tenant A's sandbox can't list its own DO storage: %s", got)
+	}
+	// Control: outside the sandbox, the push socket and B's dirs are fine.
+	if c, err := net.Dial("unix", ea.Host.PushSocket()); err != nil {
+		t.Fatalf("control: push socket unreachable unsandboxed: %v", err)
+	} else {
+		c.Close()
+	}
+	abi, _ := procsb.ABI()
+	t.Logf("landlock (ABI %d): tenant A's workerd profile denies %d cross-tenant targets; own DO storage readable", abi, len(denied))
 }

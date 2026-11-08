@@ -3,6 +3,7 @@ package hostd
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -22,6 +24,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/gen"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -193,6 +196,12 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	w.mu.Unlock()
 
 	tier := h.tierFor(app, t)
+	if tier == bundle.TierProcess {
+		if err := h.sharedHostCheck(w.tenantID); err != nil {
+			w.fail(a.DeploymentID, err)
+			return
+		}
+	}
 	if app.Runtime == bundle.RuntimeNode {
 		h.deployNode(w, a, app, st)
 		return
@@ -389,7 +398,7 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	if app.Runtime == bundle.RuntimeNode {
 		return h.startNodeInstance(w, depID, app, n)
 	}
-	dir := filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d", n))
+	dir := h.instanceDir(n)
 	opts := gen.Options{
 		Dir:          dir,
 		DOStorage:    filepath.Join(h.tenantDir(w.tenantID), "workloads", w.name, "do"),
@@ -461,6 +470,9 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 				return nil, err
 			}
 			os.Chmod(sock, 0o600)
+			// Only this instance's own (sandboxed) workerd may use its
+			// egress and host API sockets, not another tenant's.
+			ln = procsb.Guard(ln, inst.ownsPID)
 			srv := &http.Server{Handler: hd, ReadHeaderTimeout: 30 * time.Second}
 			inst.servers = append(inst.servers, srv)
 			go srv.Serve(ln)
@@ -475,6 +487,60 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 		return nil, err
 	}
 	return inst, nil
+}
+
+// sharedHostCheck refuses a process-tier deployment of tenant when this
+// host has no process sandbox (Linux without Landlock, or -sandbox none)
+// and another tenant already runs process-tier workloads here: without a
+// sandbox, tenants' code shares one uid and could read each other's keys.
+// Config.InsecureSharedHost (twd-hostd -insecure-shared-host) allows it.
+func (h *Host) sharedHostCheck(tenant string) error {
+	if h.sandbox != SandboxNone || h.cfg.InsecureSharedHost {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, o := range h.workloads {
+		if o.tenantID == tenant {
+			continue
+		}
+		o.mu.Lock()
+		busy := o.active != nil && o.active.tier != bundle.TierMicroVM
+		o.mu.Unlock()
+		if busy {
+			return fmt.Errorf("sandbox_unavailable: this host has no process sandbox (%s), so it runs process-tier workloads of one tenant only, and tenant %s already runs here; enable Landlock, deploy with tier \"microvm\", or start twd-hostd with -insecure-shared-host (tenants are then NOT isolated from each other)", h.noSandboxReason(), o.tenantID)
+		}
+	}
+	return nil
+}
+
+func (h *Host) noSandboxReason() string {
+	if h.cfg.Sandbox == SandboxNone {
+		return "started with -sandbox none"
+	}
+	if runtime.GOOS == "linux" {
+		_, err := procsb.ABI()
+		return fmt.Sprintf("Landlock unavailable: %v", err)
+	}
+	return "no sandbox on " + runtime.GOOS
+}
+
+// instanceDir is a fresh instance's run dir. Its name is unguessable: on
+// Linux kernels whose Landlock can't refuse unix-socket connects (ABI < 9),
+// a sandboxed workload can't list the run dir or read /proc/net/unix, so it
+// can't find another instance's workerd ingress socket either.
+func (h *Host) instanceDir(n int) string {
+	var b [8]byte
+	rand.Read(b[:])
+	return filepath.Join(h.cfg.RunDir, fmt.Sprintf("i%d-%x", n, b))
+}
+
+// ownsPID reports whether pid is this instance's process or a descendant.
+func (inst *instance) ownsPID(pid int) bool {
+	inst.mu.Lock()
+	cmd := inst.cmd
+	inst.mu.Unlock()
+	return cmd != nil && cmd.Process != nil && procsb.Descends(pid, cmd.Process.Pid)
 }
 
 func (inst *instance) currentVM() sandbox.VM {

@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/tailscale/peercred"
+
+	"github.com/rosskukulinski/twd/internal/procsb"
 )
 
 // Principal is the authenticated caller of an API request.
@@ -398,7 +400,10 @@ func ListenUnix(path string) (net.Listener, error) {
 		ln.Close()
 		return nil, err
 	}
-	return &uidListener{Listener: ln, uid: strconv.Itoa(os.Getuid())}, nil
+	// Sandboxed workloads (Linux: procsb) are refused too, even with our
+	// uid: on kernels whose Landlock can't refuse unix-socket connects
+	// (ABI < 9), this is what keeps tenant code off the admin API.
+	return procsb.Guard(&uidListener{Listener: ln, uid: strconv.Itoa(os.Getuid())}, nil), nil
 }
 
 func dirOf(p string) string {

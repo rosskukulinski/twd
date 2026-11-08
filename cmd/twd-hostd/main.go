@@ -58,7 +58,8 @@ func run() error {
 		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
 		vmCPUs     = flag.Int("vm-vcpus", 2, "microVM tier: guest vCPUs")
 		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
-		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd sandbox: auto (seatbelt on macOS) | seatbelt | none")
+		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd/Node sandbox: auto (seatbelt on macOS, landlock on Linux) | seatbelt | landlock | none")
+		insecureSH = flag.Bool("insecure-shared-host", false, "without a process sandbox, still run process-tier workloads of more than one tenant (tenants are NOT isolated from each other)")
 		sbDeny     = flag.String("sandbox-deny", "", "comma-separated extra paths no workerd may read, write or connect to (twd up: its state and run dirs)")
 		nodeBin    = flag.String("node", "", "Node process tier (runtime \"node\"): node binary (default: $TWD_NODE, or node on PATH)")
 	)
@@ -86,7 +87,7 @@ func run() error {
 	h, err := hostd.New(hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
-		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny),
+		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH,
 		DefaultTier: *tier, NodeBin: *nodeBin, VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
 	if err != nil {
 		return err
@@ -97,7 +98,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("twd-hostd running", "host", *hostID, "mgmt", *mgmtAddr, "push", h.PushSocket(), "workerd", wd)
+	log.Info("twd-hostd running", "host", *hostID, "mgmt", *mgmtAddr, "push", h.PushSocket(), "workerd", wd, "sandbox", h.SandboxInfo())
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig

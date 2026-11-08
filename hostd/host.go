@@ -33,6 +33,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -83,9 +84,16 @@ type Config struct {
 	DefaultTier string
 	// VMDebug enables guest diagnostics (connectivity probes; tests).
 	VMDebug bool
-	// Sandbox confines process-tier workerds: "none" (default),
-	// "seatbelt" (macOS) or "auto".
+	// Sandbox confines process-tier workerds and Node apps: "none"
+	// (default), "seatbelt" (macOS), "landlock" (Linux) or "auto".
 	Sandbox string
+	// SandboxLauncher is the binary that applies Landlock profiles
+	// (default: this executable, which imports internal/procsb).
+	SandboxLauncher string
+	// InsecureSharedHost lets a host without a process sandbox run
+	// process-tier workloads of more than one tenant. Without it such a host
+	// refuses the second tenant's deployment (typed sandbox_unavailable).
+	InsecureSharedHost bool
 	// SandboxDeny are extra paths no workerd may read, write or connect to
 	// (twd up: its whole state dir, which holds mgmt's custody and socket).
 	SandboxDeny []string
@@ -198,6 +206,9 @@ func (h *Host) Start(ctx context.Context) error {
 		return err
 	}
 	os.Chmod(h.pushSock, 0o600)
+	// No sandboxed workload may use the push API (Linux: Landlock < ABI 9
+	// can't refuse the connect itself).
+	ln = procsb.Guard(ln, nil)
 	h.pushSrv = &http.Server{Handler: h.pushAPI(), ReadHeaderTimeout: 10 * time.Second}
 	go h.pushSrv.Serve(ln)
 	if err := h.register(ctx); err != nil {

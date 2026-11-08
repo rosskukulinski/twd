@@ -1,5 +1,6 @@
 import http from "node:http";
 import fs from "node:fs";
+import net from "node:net";
 import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher } from "@twd/node";
 
 const port = Number(process.env.PORT);
@@ -53,6 +54,19 @@ http.createServer(async (req, res) => {
           if (op === "list") return json(res, 200, { ok: true, n: fs.readdirSync(p).length });
           return json(res, 200, { ok: true, n: fs.readFileSync(p).length });
         } catch (e) { return json(res, 200, { ok: false, code: e.code ?? String(e) }); }
+      }
+      case "/net": {
+        // Sandbox probe: raw TCP (host+port) or unix-socket (path) connect,
+        // bypassing the egress proxy. Only the outcome is returned.
+        const p = u.searchParams.get("path");
+        const opts = p ? { path: p } : { host: u.searchParams.get("host"), port: Number(u.searchParams.get("port")) };
+        const r = await new Promise((resolve) => {
+          const s = net.connect(opts);
+          const t = setTimeout(() => { s.destroy(); resolve({ ok: false, code: "TIMEOUT" }); }, 3000);
+          s.on("connect", () => { clearTimeout(t); s.destroy(); resolve({ ok: true }); });
+          s.on("error", (e) => { clearTimeout(t); resolve({ ok: false, code: e.code ?? String(e) }); });
+        });
+        return json(res, 200, r);
       }
       case "/log": console.log("probe-log-line", u.searchParams.get("m")); return json(res, 200, { ok: true });
       case "/crash": json(res, 200, { bye: process.pid }); setTimeout(() => process.exit(3), 10); return;
