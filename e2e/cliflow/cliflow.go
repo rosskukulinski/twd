@@ -104,6 +104,11 @@ type Env struct {
 	Exec func(args []string) (stdout, stderr string, dur time.Duration, err error)
 	// PatchFile, if set, edits a file in WorkDir (which is then remote).
 	PatchFile func(path string, edit func([]byte) []byte) error
+	// Tier, if set, is written into the agent and mcp apps' twd.jsonc
+	// ("tier": "microvm" for e2e-linux-vm).
+	Tier string
+	// OnDeployed, if set, runs right after the agent and mcp deploys.
+	OnDeployed func()
 	// OnPeers, if set, runs once the client sees the agent and mcp
 	// workload nodes (e2e-mbp measures the cross-machine path there).
 	OnPeers func(client *nettest.Node, hc *http.Client, agentIP, mcpIP string)
@@ -356,13 +361,23 @@ func (e *Env) Run() {
 		return bytes.Replace(b, []byte(`"tags": ["tag:twd-wl-agent"],`), []byte(`"tags": ["tag:twd-wl-agent"],
     "connects": ["`+TestTag+`"],`), 1)
 	}
-	if e.PatchFile != nil {
-		if err := e.PatchFile(tj, addConnects); err != nil {
-			t.Fatalf("patch %s: %v", tj, err)
+	patch := func(path string, edit func([]byte) []byte) {
+		if e.PatchFile != nil {
+			if err := e.PatchFile(path, edit); err != nil {
+				t.Fatalf("patch %s: %v", path, err)
+			}
+		} else {
+			b, _ := os.ReadFile(path)
+			os.WriteFile(path, edit(b), 0o644)
 		}
-	} else {
-		b, _ := os.ReadFile(tj)
-		os.WriteFile(tj, addConnects(b), 0o644)
+	}
+	patch(tj, addConnects)
+	if e.Tier != "" {
+		for _, d := range []string{agentDir, mcpDir} {
+			patch(filepath.Join(d, "twd.jsonc"), func(b []byte) []byte {
+				return bytes.Replace(b, []byte("{"), []byte("{\n  \"tier\": \""+e.Tier+"\","), 1)
+			})
+		}
 	}
 
 	// Preflight refuses hello (tailnet.connects tag:db has no grant).
@@ -395,6 +410,9 @@ func (e *Env) Run() {
 	res.Numbers["deploy_mcp_cli_ms"] = msOf(d)
 	res.Numbers["deploy_mcp_ready_ms"] = mcp.Timings["ready"]
 	res.pass("deploy", fmt.Sprintf("agent %s, mcp %s", agent.Endpoint.MagicDNS, mcp.Endpoint.MagicDNS))
+	if e.OnDeployed != nil {
+		e.OnDeployed()
+	}
 
 	client := e.NewNode("client")
 	echo := e.NewNode("echo")

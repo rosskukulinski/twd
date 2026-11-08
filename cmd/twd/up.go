@@ -9,6 +9,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -245,7 +247,7 @@ func cmdUp(args []string) error {
 			started = "started"
 		}
 		fmt.Printf("✓ mgmt     twd-mgmt %s · leases in SQLite (%s) · custody: file (homelab mode)\n", started, filepath.Join(s.Dir, "mgmt", "mgmt.db"))
-		fmt.Printf("✓ host     this machine (%s) · tier: process [macOS: process tier, dev-grade isolation]\n", *hostID)
+		fmt.Printf("✓ host     this machine (%s) · %s\n", *hostID, tierLine(s))
 		fmt.Printf("✓ tenant   %s connected (tenant %s) · control %s\n", *tailnet, tid, *control)
 		switch {
 		case res.Applied:
@@ -699,4 +701,18 @@ func cmdStatus(args []string) error {
 		return fail("unhealthy", "twd is not healthy in "+s.Dir).withFix("twd logs --component supervisor", "twd up")
 	}
 	return nil
+}
+
+// tierLine describes the isolation tiers the running host offers.
+func tierLine(s *state) string {
+	if runtime.GOOS == "darwin" {
+		return "tier: process [macOS: process tier under Seatbelt, dev-grade isolation]"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var hv hostd.StatusView
+	if s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv) == nil && slices.Contains(hv.Tiers, "microvm") {
+		return "tiers: process, microvm (Firecracker, jailed, via " + hv.VMVia + "; \"tier\": \"microvm\" in twd.jsonc)"
+	}
+	return "tier: process [microVM tier off: see `twd doctor`, or run `sudo ~/.twd/bin/twd host setup --microvm` once]"
 }

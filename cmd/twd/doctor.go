@@ -209,6 +209,9 @@ func cmdDoctor(args []string) error {
 	})
 
 	run("sandbox", func() (string, string, string) { return doctorSandbox(s) })
+	if runtime.GOOS == "linux" {
+		run("microvm", func() (string, string, string) { return doctorMicroVM(s) })
+	}
 
 	run("system_tailscaled_not_used", func() (string, string, string) {
 		var notes []string

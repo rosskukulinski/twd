@@ -190,11 +190,13 @@ func checkJailed(t *testing.T, pid int, j *sandbox.Jail) {
 	if !strings.Contains(string(cg), j.Cgroup) {
 		t.Fatalf("VMM cgroup %s, want %s", cg, j.Cgroup)
 	}
-	// Its root is the jail: the API socket is there, the host's /etc isn't.
-	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root/api.sock", pid)); err != nil {
+	// Its root is the jail: the API socket is there, the host's /etc isn't
+	// (only root may look: the jail is another uid's).
+	if os.Geteuid() != 0 {
+		t.Log("not root: skipping the /proc/<pid>/root check")
+	} else if _, err := os.Stat(fmt.Sprintf("/proc/%d/root/api.sock", pid)); err != nil {
 		t.Fatalf("VMM root has no api.sock: not chrooted? %v", err)
-	}
-	if _, err := os.Stat(fmt.Sprintf("/proc/%d/root/etc/passwd", pid)); err == nil {
+	} else if _, err := os.Stat(fmt.Sprintf("/proc/%d/root/etc/passwd", pid)); err == nil {
 		t.Fatal("VMM root has /etc/passwd: not chrooted")
 	}
 	cpu, _ := os.ReadFile(filepath.Join("/sys/fs/cgroup", j.Cgroup, "cpu.max"))
