@@ -78,6 +78,15 @@ E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -F -t ext4 -O ^has_journal,^
   -U "$FS_UUID" -E "hash_seed=$FS_UUID,root_owner=0:0,lazy_itable_init=0,nodiscard" \
   -L twd-guest -m 0 -b 4096 -I 256 -d "$STAGE" "$IMG" "${SIZE_KB}k"
 
+# mke2fs -d copies each file's ctime, which touch can't set: pin them (and
+# the root's) with debugfs so the image depends only on its inputs.
+TS=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S)
+{ echo "sif / ctime $TS"; echo "sif /lost+found ctime $TS"; echo "sif /lost+found mtime $TS"; echo "sif /lost+found atime $TS"
+  (cd "$STAGE" && find . -mindepth 1 | sed 's|^\.||' | LC_ALL=C sort) | while read -r p; do echo "sif \"$p\" ctime $TS"; done
+} >"$STAGE.debugfs"
+E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH debugfs -w -f "$STAGE.debugfs" "$IMG" >/dev/null 2>&1
+rm -f "$STAGE.debugfs"
+
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 cat >"$OUT/manifest.json" <<EOF
 {
