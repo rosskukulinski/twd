@@ -210,3 +210,46 @@ export function budget(ns: { getByName(name: string): unknown }, who: Caller, to
     },
   };
 }
+
+export interface McpFetchOptions {
+  /** Extra headers on every MCP request. */
+  headers?: Record<string, string>;
+  /** Trace ID to propagate as W3C `traceparent` (default: the current withTailnet caller's traceId, if any). */
+  traceId?: string;
+}
+
+/**
+ * mcpFetch returns a `fetch` for MCP clients running on twd (for example
+ * `createMCPClient({ transport: { type: "http", url, fetch: mcpFetch(ctx) } })`
+ * from `@ai-sdk/mcp`). Requests leave through `ctx.tailnet.fetch`, so they
+ * carry the calling object's (or workload's) own node identity, and a twd
+ * egress refusal (`peer_not_visible`, `forbidden_destination`, `acl_denied`,
+ * `identity_pending`…) throws a typed TailnetError instead of surfacing as an
+ * opaque "HTTP 403" from the MCP SDK. The trace ID is propagated as
+ * `traceparent` so the server's audit can join the hop.
+ *
+ * Not implemented yet (RFC §4.6): signed on-behalf-of (`actingFor`)
+ * assertions. The MCP server sees this node as the caller; it cannot yet
+ * verify which human the call is for.
+ */
+export function mcpFetch(ctx: { tailnet?: { fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> } } | null | undefined, opts: McpFetchOptions = {}) {
+  const tn = ctx?.tailnet;
+  if (!tn) throw new TailnetError("no_identity", "mcpFetch: ctx.tailnet is not available (not running on twd?)");
+  return async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    // workerd rejects redirect: "error" (the @ai-sdk/mcp default); emulate it
+    // with "manual" plus a check.
+    const wantErr = init?.redirect === "error";
+    const req = new Request(input as any, init ? { ...init, redirect: wantErr ? "manual" : init.redirect } : undefined);
+    const h = new Headers(req.headers);
+    for (const [k, v] of Object.entries(opts.headers ?? {})) h.set(k, v);
+    const trace = opts.traceId ?? als.getStore()?.caller.traceId;
+    if (trace && /^[0-9a-f]{32}$/.test(trace) && !h.has("traceparent")) {
+      const span = [...crypto.getRandomValues(new Uint8Array(8))].map((b) => b.toString(16).padStart(2, "0")).join("");
+      h.set("traceparent", `00-${trace}-${span}-01`);
+    }
+    const hasBody = req.method !== "GET" && req.method !== "HEAD";
+    const r = await tn.fetch(req.url, { method: req.method, headers: h, body: hasBody ? await req.arrayBuffer() : undefined, signal: init?.signal ?? undefined, redirect: req.redirect });
+    if (wantErr && r.status >= 300 && r.status < 400) throw new TypeError(`mcpFetch: redirect (${r.status}) refused (redirect: "error")`);
+    return r;
+  };
+}

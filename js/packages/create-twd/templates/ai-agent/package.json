@@ -1,0 +1,14 @@
+{
+  "name": "twd-ai-agent",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "create-twd build .", "deploy": "twd deploy" },
+  "dependencies": {
+    "@twd/tailnet": "^0.1.0",
+    "@twd/mcp": "^0.1.0",
+    "ai": "7.0.165",
+    "@ai-sdk/mcp": "2.0.93",
+    "@ai-sdk/provider": "4.0.37",
+    "zod": "^4.6.7"
+  }
+}

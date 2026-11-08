@@ -1,0 +1,4 @@
+{
+  "name": "vercel-mcp",
+  "tailnet": { "tags": ["tag:ttest"] }
+}

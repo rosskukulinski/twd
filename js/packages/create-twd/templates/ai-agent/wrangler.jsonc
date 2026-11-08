@@ -1,0 +1,10 @@
+{
+  "name": "ai-agent",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "AiAgent", "class_name": "AiAgent" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["AiAgent"] }],
+  // MCP_URL: a twd MCP server on the tailnet (e.g. the `mcp` template's node)
+  "vars": { "MCP_URL": "http://mcp/mcp" }
+}
