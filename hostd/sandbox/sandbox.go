@@ -77,6 +77,9 @@ type Info struct {
 	// Jail is how the VMM is confined (microVM tier: jailer chroot,
 	// uid/gid, cgroup limits, seccomp).
 	Jail *Jail `json:",omitempty"`
+	// Console is the host file with the guest's serial console (guestd and
+	// workerd output).
+	Console string `json:",omitempty"`
 	// HugePages: guest RAM is backed by 2 MiB pages.
 	HugePages bool
 	// Volume: the persistent DO volume ("" if none); VolumeNew if it was

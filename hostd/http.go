@@ -475,6 +475,9 @@ func (h *Host) Status() StatusView {
 				info := vm.Info()
 				ws.VM = &info
 				ws.VMRSSKB = vm.RSSKB()
+				if info.Console != "" {
+					ws.LogFile = info.Console // guest workerd logs to the serial console
+				}
 			}
 		}
 		w.mu.Unlock()

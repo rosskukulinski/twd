@@ -282,6 +282,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		return nil, err
 	}
 	files = append(files, console)
+	m.info.Console = console.Name()
 	req := &helperapi.StartRequest{Name: s.ID, MemMiB: b.cfg.MemMiB, VCPUs: b.cfg.VCPUs, HugePages: b.cfg.HugePages,
 		BootArgs: b.cfg.BootArgs, MTU: b.cfg.MTU, GuestMAC: guestMAC, GuestCID: 3, VsockPort: proto.VsockPort}
 	if v := s.Volume; v != nil {
