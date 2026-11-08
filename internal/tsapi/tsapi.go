@@ -322,3 +322,40 @@ func (c *Client) GetDevice(ctx context.Context, id string) (Device, error) {
 	err := c.do(ctx, "GET", "/api/v2/device/"+url.PathEscape(id), nil, &d)
 	return d, err
 }
+
+// FederatedOptions describes a workload-identity-federation trust credential
+// (POST /keys with keyType "federated"; needs the federated_keys scope).
+type FederatedOptions struct {
+	Scopes      []string
+	Tags        []string
+	Issuer      string
+	Subject     string
+	Audience    string // optional; Tailscale generates api.tailscale.com/<clientID>
+	Description string
+}
+
+// FederatedCredential is a created trust credential. ID is the client ID
+// used at token exchange.
+type FederatedCredential struct {
+	ID       string `json:"id"`
+	Audience string `json:"audience"`
+}
+
+// CreateFederated creates a trust credential. It holds no secret.
+func (c *Client) CreateFederated(ctx context.Context, o FederatedOptions) (FederatedCredential, error) {
+	body := map[string]any{"keyType": "federated", "scopes": o.Scopes, "tags": o.Tags, "issuer": o.Issuer, "subject": o.Subject}
+	if o.Audience != "" {
+		body["audience"] = o.Audience
+	}
+	if o.Description != "" {
+		body["description"] = o.Description
+	}
+	var fc FederatedCredential
+	if err := c.do(ctx, "POST", c.tailnetPath("/keys"), body, &fc); err != nil {
+		return fc, err
+	}
+	if fc.ID == "" {
+		return fc, errors.New("tsapi: federated credential response missing id")
+	}
+	return fc, nil
+}

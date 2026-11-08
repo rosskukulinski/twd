@@ -1,0 +1,32 @@
+{
+  "run": "fa3ffa",
+  "suite": "m2-mgmt-wif",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-07T23:41:08-08:00",
+  "checks": {
+    "audience_is_default_generated": "PASS",
+    "audit_chain_verifies": "PASS",
+    "create_lifecycle_trust_credential": "PASS",
+    "create_mint_trust_credential": "PASS",
+    "device_tagged_ttest": "PASS",
+    "device_verified_gone": "PASS",
+    "issuer_public_via_funnel": "PASS",
+    "kill_deleted_device_via_lifecycle_credential": "PASS",
+    "mint_via_token_exchange": "PASS",
+    "no_key_in_logs": "PASS",
+    "node_joined_with_wif_minted_key": "PASS",
+    "public_jwks_verifies_issued_jwt": "PASS"
+  },
+  "numbers": {
+    "funnel_first_fetch_ms": 92582.781,
+    "kill_ms": 286.859,
+    "wif_exchange_and_mint_ms": 1512.889
+  },
+  "cleanup": {
+    "auth_keys": 2,
+    "devices_left": 0,
+    "devices_tracked": 2,
+    "errors": null,
+    "federated_credentials_deleted": 2
+  }
+}

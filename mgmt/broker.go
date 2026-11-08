@@ -26,6 +26,11 @@ const (
 	purposePolicy    = "policy"
 )
 
+// WIFAudience is the audience Tailscale generates for a federated trust
+// credential by default: "api.tailscale.com/<clientID>" (so every tenant's
+// tokens are bound to its own client ID).
+func WIFAudience(clientID string) string { return "api.tailscale.com/" + clientID }
+
 // ErrNoLifecycle means the tenant has no credential that can delete devices.
 var ErrNoLifecycle = errors.New("tenant has no lifecycle credential (kill tier 2 / reaper device delete unavailable)")
 
@@ -102,7 +107,7 @@ func (b *Broker) token(ctx context.Context, tenantID, clientID, subject string) 
 		return ct.token, nil
 	}
 	b.mu.Unlock()
-	jwt, err := b.Issuer.Sign(tenantID, subject, clientID)
+	jwt, err := b.Issuer.Sign(tenantID, subject, WIFAudience(clientID))
 	if err != nil {
 		return "", err
 	}

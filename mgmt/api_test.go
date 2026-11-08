@@ -58,7 +58,7 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		f.tokenExchanges++
 		claims, err := VerifyJWT(r.Form.Get("jwt"), f.issuerJWKS(), time.Now())
-		if err != nil || claims["aud"] != r.Form.Get("client_id") || !strings.HasPrefix(claims["sub"].(string), "twd:tenant:") ||
+		if err != nil || claims["aud"] != "api.tailscale.com/"+r.Form.Get("client_id") || !strings.HasPrefix(claims["sub"].(string), "twd:tenant:") ||
 			!strings.Contains(claims["iss"].(string), "/t/") {
 			w.WriteHeader(401)
 			fmt.Fprintf(w, `{"message":"invalid token: %v"}`, err)
