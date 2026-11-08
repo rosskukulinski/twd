@@ -25,11 +25,33 @@ import (
 
 // Principal is the authenticated caller of an API request.
 type Principal struct {
-	Kind   string   // "local" (unix socket, same uid), "host" (tag:twd-host), "user" (operator-tailnet human)
+	Kind   string   // "local" (unix socket + host token), "host" (tag:twd-host), "user" (tailnet admin: autogroup:admin / twd.dev/cap/admin)
 	HostID string   // hosts: the registered hostID (tsnet), or Twd-Host-ID (unix)
 	NodeID string   // tsnet: caller's stable node ID
-	Login  string   // users
+	Login  string   // users: the WhoIs login (tagged admin nodes: their first tag)
 	Tags   []string // tsnet: caller's tags
+	// Caps are the app capabilities the caller holds toward mgmt (WhoIs
+	// CapMap): twd.dev/cap/admin makes a tailnet caller an admin.
+	Caps []string
+}
+
+// Actor names the principal for audit records (deployedBy, kill by):
+// the WhoIs login (or tag + node) over the tailnet, the Twd-Actor header
+// on the unix socket.
+func (p Principal) Actor(r *http.Request) string {
+	switch p.Kind {
+	case "user":
+		if p.NodeID != "" && len(p.Tags) > 0 {
+			return p.Login + " (" + p.NodeID + ")"
+		}
+		return p.Login
+	case "host":
+		return "host:" + p.HostID
+	}
+	if a := r.Header.Get("Twd-Actor"); a != "" {
+		return a
+	}
+	return "local"
 }
 
 type principalKey struct{}
@@ -47,11 +69,38 @@ func WithPrincipal(ctx context.Context, p Principal) context.Context {
 // HostTag is the tag hosts carry on the operator tailnet.
 const HostTag = "tag:twd-host"
 
+// MgmtTag is mgmt's own tag; the admin grant targets it.
+const MgmtTag = "tag:twd-mgmt"
+
+// AdminCap is the app capability that makes a tailnet caller a twd admin.
+// It is granted to tag:twd-mgmt; autogroup:admin members get it from the
+// base snippet, and any group, user or tag may be granted it too.
+const AdminCap = "twd.dev/cap/admin"
+
+// AdminGrantSnippet is the policy grant that admits a source to mgmt's
+// API (network path and the admin cap). src is "autogroup:admin" in the
+// base snippet.
+func AdminGrantSnippet(src string) string {
+	return `{"src": ["` + src + `"], "dst": ["` + MgmtTag + `"], "ip": ["tcp:443", "tcp:80"], "app": {"` + AdminCap + `": [{}]}}`
+}
+
 // Server is the v0 HTTP API.
 type Server struct {
 	M *Mgmt
-	// Admins, if set, restricts operator-tailnet human callers to these logins.
+	// Admins, if set, are tailnet logins admitted as admins even without
+	// AdminCap (an operator override; the cap is the normal path).
 	Admins []string
+	// Self describes mgmt's own tailnet node (GET /v0/whoami).
+	Self SelfInfo
+}
+
+// SelfInfo is mgmt's own identity, reported to callers so `twd link` can
+// learn the endpoint and tailnet.
+type SelfInfo struct {
+	DNSName string `json:"dnsName,omitempty"` // twd-mgmt.<tailnet>.ts.net
+	Tailnet string `json:"tailnet,omitempty"` // MagicDNS suffix
+	HTTPS   bool   `json:"https"`             // the API is served on :443 with the node's cert
+	Issuer  string `json:"issuer,omitempty"`  // WIF issuer base URL (Funnel)
 }
 
 func decodeB64(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }
@@ -105,7 +154,7 @@ func (s *Server) allowed(p Principal, roles int) bool {
 		if roles&roleAdmin == 0 {
 			return false
 		}
-		return len(s.Admins) == 0 || slices.Contains(s.Admins, p.Login)
+		return slices.Contains(p.Caps, AdminCap) || slices.Contains(s.Admins, p.Login)
 	}
 	return false
 }
@@ -148,11 +197,34 @@ func hostOf(r *http.Request) string {
 	return r.URL.Query().Get("host")
 }
 
+// WhoAmI is GET /v0/whoami.
+type WhoAmI struct {
+	Kind   string   `json:"kind"`
+	Login  string   `json:"login,omitempty"`
+	NodeID string   `json:"nodeID,omitempty"`
+	Tags   []string `json:"tags,omitempty"`
+	HostID string   `json:"hostID,omitempty"`
+	Admin  bool     `json:"admin"`
+	Actor  string   `json:"actor"`
+	Mgmt   SelfInfo `json:"mgmt"`
+}
+
 // Handler returns the API mux.
 func (s *Server) Handler() http.Handler {
 	m := s.M
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) })
+	// whoami answers every authenticated principal (hosts included): it
+	// tells a caller who mgmt thinks they are and where mgmt lives.
+	mux.HandleFunc("GET /v0/whoami", func(w http.ResponseWriter, r *http.Request) {
+		p := principalOf(r.Context())
+		if p.Kind == "" {
+			writeErr(w, r, errf(401, "no_identity", "unauthenticated"))
+			return
+		}
+		writeJSON(w, 200, WhoAmI{Kind: p.Kind, Login: p.Login, NodeID: p.NodeID, Tags: p.Tags, HostID: p.HostID,
+			Admin: s.allowed(p, roleAdmin), Actor: p.Actor(r), Mgmt: s.Self})
+	})
 
 	// Tenants.
 	mux.HandleFunc("POST /v0/tenants", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
@@ -195,6 +267,21 @@ func (s *Server) Handler() http.Handler {
 			// (GET /v0/certs/{stableNodeID}); hosts pin it per tenant.
 			OBOPublicKey string `json:"oboPublicKey"`
 		}{t, m.IssuerInfo(t), m.QueueDepth(t.ID), m.throttle(t).Rate(), pub}, nil
+	}))
+
+	mux.HandleFunc("PUT /v0/tenants/{id}/wif", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		var u WIFUpdate
+		if err := readJSON(r, &u); err != nil {
+			return nil, err
+		}
+		t, err := m.UpdateTenantWIF(r.Context(), r.PathValue("id"), u)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"tenantID": t.ID, "mintMode": t.MintMode, "wif": m.IssuerInfo(t)}, nil
+	}))
+	mux.HandleFunc("POST /v0/tenants/{id}/wif-check", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		return m.WIFCheck(r.Context(), r.PathValue("id"))
 	}))
 
 	// Node certificates (ADR-010, RT-01): the receiving host fetches the
@@ -248,6 +335,7 @@ func (s *Server) Handler() http.Handler {
 		if err := readJSON(r, &req); err != nil {
 			return nil, err
 		}
+		req.By = principalOf(r.Context()).Actor(r)
 		return m.Deploy(r.Context(), req)
 	}))
 	mux.HandleFunc("GET /v0/deployments/{id}", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
@@ -361,11 +449,8 @@ func (s *Server) Handler() http.Handler {
 			return nil, err
 		}
 		p := principalOf(r.Context())
-		switch p.Kind {
-		case "user":
-			req.By = p.Login
-		case "host":
-			req.By = "host:" + p.HostID
+		req.By = p.Actor(r)
+		if p.Kind == "host" {
 			// Hosts may only kill objects in namespaces they hold.
 			o, err := m.store.GetObject(r.Context(), r.PathValue("id"))
 			if err != nil {
@@ -373,11 +458,6 @@ func (s *Server) Handler() http.Handler {
 			}
 			if l, err := m.store.GetLease(r.Context(), o.Lease); err != nil || l.Holder != p.HostID {
 				return nil, errf(403, "forbidden", "host %s does not hold %s", p.HostID, o.Lease)
-			}
-		default:
-			req.By = r.Header.Get("Twd-Actor")
-			if req.By == "" {
-				req.By = "local"
 			}
 		}
 		return m.Kill(r.Context(), r.PathValue("id"), req)
@@ -548,38 +628,67 @@ func ReadHostToken(path string) string {
 	return strings.TrimSpace(string(b))
 }
 
-// WhoIsFunc resolves a tailnet caller (tsnet LocalClient.WhoIs).
-type WhoIsFunc func(ctx context.Context, remoteAddr string) (nodeID string, tags []string, login string, err error)
+// WhoIsInfo is what WhoIs tells mgmt about a tailnet caller.
+type WhoIsInfo struct {
+	NodeID string   // stable node ID
+	Name   string   // MagicDNS name
+	Tags   []string // tagged nodes
+	Login  string   // UserProfile.LoginName (tagged nodes: "tagged-devices")
+	Caps   []string // app capabilities the caller holds toward mgmt (CapMap keys)
+}
 
-// TailnetHandler authenticates operator-tailnet callers by WhoIs: tagged
-// tag:twd-host nodes are hosts (bound to the hostID they registered with),
-// untagged nodes are human users, other tagged nodes are refused.
+// WhoIsFunc resolves a tailnet caller (tsnet LocalClient.WhoIs).
+type WhoIsFunc func(ctx context.Context, remoteAddr string) (WhoIsInfo, error)
+
+// TailnetHandler authenticates tailnet callers by WhoIs (ADR-026):
+//   - tag:twd-host nodes are hosts, bound to the hostID they registered with;
+//   - callers holding AdminCap (granted to tag:twd-mgmt; autogroup:admin
+//     members get it from the base snippet) or listed in Admins are admins,
+//     whether users or tagged nodes;
+//   - everyone else is refused with 403 not_admin and the grant to add.
 func (s *Server) TailnetHandler(whois WhoIsFunc, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		nodeID, tags, login, err := whois(r.Context(), r.RemoteAddr)
+		wi, err := whois(r.Context(), r.RemoteAddr)
 		if err != nil {
 			writeErr(w, r, errf(401, "no_identity", "WhoIs failed for %s", r.RemoteAddr))
 			return
 		}
-		p := Principal{NodeID: nodeID, Tags: tags}
+		p := Principal{NodeID: wi.NodeID, Tags: wi.Tags, Caps: wi.Caps}
 		switch {
-		case slices.Contains(tags, HostTag):
+		case slices.Contains(wi.Tags, HostTag):
 			p.Kind = "host"
 			hosts, _ := s.M.store.ListHosts(r.Context())
 			for _, hst := range hosts {
-				if hst.NodeID == nodeID {
+				if hst.NodeID == wi.NodeID {
 					p.HostID = hst.ID
 				}
 			}
 			if p.HostID == "" && r.URL.Path != "/v0/hosts/register" {
-				writeErr(w, r, errf(403, "host_not_registered", "node %s must POST /v0/hosts/register first", nodeID))
+				writeErr(w, r, errf(403, "host_not_registered", "node %s must POST /v0/hosts/register first", wi.NodeID))
 				return
 			}
-		case len(tags) == 0 && login != "":
-			p.Kind, p.Login = "user", login
 		default:
-			writeErr(w, r, errf(403, "forbidden", "tagged node %v is not a twd host", tags))
-			return
+			p.Kind = "user"
+			p.Login = wi.Login
+			if len(wi.Tags) > 0 {
+				p.Login = wi.Tags[0]
+			}
+			if !s.allowed(p, roleAdmin) {
+				who := wi.Login
+				src := wi.Login
+				if len(wi.Tags) > 0 {
+					who = "node " + strings.TrimSuffix(wi.Name, ".") + " " + fmt.Sprint(wi.Tags)
+					src = wi.Tags[0]
+				}
+				e := errf(403, "not_admin", "%s is not a twd admin: no %s capability from a grant to %s (and not in -admins)", who, AdminCap, MgmtTag)
+				e.Snippet = AdminGrantSnippet(src)
+				if src == "" {
+					e.Snippet = AdminGrantSnippet("autogroup:admin")
+				}
+				e.Missing = map[string]any{"src": src, "dst": MgmtTag, "cap": AdminCap}
+				writeErr(w, r, e)
+				return
+			}
 		}
 		h.ServeHTTP(w, r.WithContext(WithPrincipal(r.Context(), p)))
 	})

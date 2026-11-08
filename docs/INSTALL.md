@@ -56,18 +56,24 @@ macOS 26.6) by `make e2e-mbp`; measured numbers are in STATUS.md (M6).
 ### What you need
 
 - macOS 14 or later on Apple silicon (arm64). For Linux, see [Linux](#linux).
-- A tailnet you control, and a **Tailscale API access token** for it in a
-  file, as `TS_API_KEY=tskey-api-…`, mode `0600`. twd mints its nodes' auth
-  keys with it (homelab "apikey" mint mode). It is read when needed and never
-  copied, logged or printed.
-- Your tailnet policy must let `tag:twd` own the tags your apps use. `twd up`
-  prints the snippet if it's missing (`--policy-apply` writes it, validated,
-  with If-Match).
+- A tailnet you control, where you are an **admin** (`autogroup:admin`),
+  with **HTTPS certificates enabled** (admin console › DNS › HTTPS
+  Certificates). twd's keyless setup needs no API key: mgmt joins your
+  tailnet as its own node through a normal browser login, and node keys
+  are minted through a **trust credential** (workload identity federation)
+  you create once in the admin console. The [API-key mode](#alternative-api-key-mode)
+  remains as an explicit alternative.
+- A policy snippet in your tailnet policy (printed by `twd up` before the
+  login; [below](#keyless-setup-recommended)).
 
 twd **never uses your Mac's Tailscale app or tailscaled**, its login, its
-state, or its LocalAPI. Every twd node is a separate in-process (tsnet) node
-of the tailnet you name with `--tailnet`. If Tailscale.app is running on a
-different (personal) tailnet, it is left alone; `twd doctor` checks this.
+state, or its LocalAPI. Every twd node (mgmt's own node and every object
+node) is a separate in-process (tsnet) node of the tailnet you log in to.
+If Tailscale.app is running on a different (personal) tailnet, it is left
+alone; `twd doctor` checks this. The one place your machine's own Tailscale
+*is* used is a **developer machine** running `twd link`: there the CLI is
+not a node at all; it talks to mgmt over your existing Tailscale
+connection, which is exactly the identity mgmt wants to see.
 
 ### 1. Get the release
 
@@ -107,32 +113,147 @@ nothing outside `~/.twd`.
 ### 3. Check the machine
 
 ```sh
-twd doctor --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env
+twd doctor
 ```
 
 It checks that workerd runs, that the built-in bundler can build every
 template offline, that `~/.twd` (and the state dir) are writable, that the
-API key can read the tailnet's policy, that the process sandbox (Seatbelt
-on macOS, Landlock + seccomp on Linux) works and enforces, and that twd is not using the system tailscaled. Every line has a `fix:` if it fails.
+process sandbox (Seatbelt on macOS, Landlock + seccomp on Linux) works and
+enforces, and that twd is not using the system tailscaled. Every line has
+a `fix:` if it fails. Once twd is up, the `mint_mode` row says which mode
+is active (`wif (keyless)` or `apikey`) and `api_key` is `skip` in keyless
+mode: there is no key on the machine.
 
-### 4. Start twd and deploy an app
+### Keyless setup (recommended)
+
+Two machines appear below: the **host** (runs `twd up`: mgmt, the host
+agent, your apps' nodes) and a **developer machine** (your laptop: `twd
+link`, `twd deploy`). They can be the same machine; then skip `twd link`.
+
+#### On the host: `twd up`
 
 ```sh
-twd up --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env --yes
-twd init support --template agent        # or hello, mcp, ai-agent; node-workflow needs Node.js on this machine
-cd support && twd deploy
-twd status
+twd up                    # add --service to install a LaunchAgent (starts at login)
 ```
+
+What happens, in order (each line is a step you'll see):
+
+1. **Policy snippet.** `twd up` prints what your tailnet policy needs and
+   waits for nothing: add it in the admin console › Access controls before
+   you log in, or the login will be refused (the account you log in with
+   must be allowed to own `tag:twd-mgmt`):
+   ```jsonc
+   "tagOwners": {
+     "tag:twd":      ["autogroup:admin"],
+     "tag:twd-mgmt": ["autogroup:admin"],
+     "tag:twd-host": ["autogroup:admin", "tag:twd"],
+   },
+   "grants": [
+     // admins may use twd over the tailnet (twd link); ip: the API ports, app: the twd admin capability
+     {"src": ["autogroup:admin"], "dst": ["tag:twd-mgmt"], "ip": ["tcp:443", "tcp:80"], "app": {"twd.dev/cap/admin": [{}]}},
+   ],
+   "nodeAttrs": [
+     // Funnel publishes mgmt's OIDC issuer, so Tailscale can verify its tokens
+     {"target": ["tag:twd-mgmt"], "attr": ["funnel"]},
+   ],
+   ```
+   Your apps' tags (`tag:twd-wl-<name>`, object class tags) are added as
+   usual: `twd deploy` preflights them and prints the snippet.
+2. **Login URL.** mgmt's node `twd-mgmt` joins your tailnet with
+   `tag:twd-mgmt`. twd prints a `https://login.tailscale.com/a/…` URL;
+   open it and sign in as a tailnet admin. The node's state is kept under
+   `~/.twd/mgmt/tsnet`, so later `twd up` runs need no login. The tailnet
+   name is read from the login (no `--tailnet`). If the tailnet has no
+   HTTPS certificates, or `tag:twd-mgmt` has no Funnel attribute, `twd up`
+   stops here and says exactly what to enable; the node stays joined.
+3. **Trust credential.** mgmt starts and publishes its OIDC issuer over
+   Funnel at `https://twd-mgmt.<tailnet>.ts.net/t/tn_<tailnet>`. twd prints
+   the exact admin-console steps: Settings › Trust credentials › Add, with
+   the issuer URL, the subject `twd:tenant:tn_<tailnet>:mint`, scope
+   `auth_keys`, tag `tag:twd`; and an optional second **lifecycle**
+   credential (subject `…:lifecycle`, scopes `devices:core` and
+   `policy_file:read`) that enables kill tier 2 (device delete), the
+   reaper, spawn checks and deploy preflight. Paste each credential's
+   **client ID** at the prompt (they are public identifiers; twd stores
+   nothing else). Non-interactive: `twd up --wif-client-id <id>
+   [--wif-lifecycle-client-id <id>]`; without the IDs, `twd up --yes`
+   prints the steps, leaves the stack running and exits with
+   `wif_credential_required`.
+4. **Ready.** twd waits until the issuer answers from the public internet
+   (the first HTTPS certificate for a new node name takes 1–2 minutes),
+   creates the tenant in mint mode `wif`, and verifies both credentials
+   with a real token exchange (`✓ trust … exchanges`). From now on every
+   object node's auth key is minted through the trust credential: single
+   use, pre-authorized, tagged, ≤ 5 min. Deleting the credential in the
+   console is your kill switch.
+
+Why a console step at all: creating *new* devices needs a control-plane
+credential; a connection's identity can't do it. The trust credential is
+the keyless form of that credential: no secret exists anywhere, only a
+trust relationship with mgmt's issuer, scoped to `auth_keys` for `tag:twd`.
+Until Tailscale offers a "connect a platform" consent page, this is one
+paste per tailnet.
+
+`twd up --service` on macOS installs the LaunchAgent
+`~/Library/LaunchAgents/dev.twd.up.plist` (per user, no sudo) so the
+supervisor starts at login; `twd down --service` removes it. **Sleep:** a
+sleeping Mac serves nothing. `twd up` prints a hint if sleep is enabled:
+`sudo pmset -a sleep 0 displaysleep 10`, or run `caffeinate -s` in a
+terminal, or use a Mac mini that doesn't sleep.
+
+#### On a developer machine: `twd link`
+
+Your laptop is on the same tailnet with the Tailscale app, as yourself (an
+`autogroup:admin` member, or a user/group/tag granted `twd.dev/cap/admin`
+on `tag:twd-mgmt`). Install twd there too (steps 1–2), then:
+
+```sh
+twd link twd-mgmt.<tailnet>.ts.net       # or just `twd link`: finds twd-mgmt through MagicDNS
+twd init support --template agent        # or hello, mcp, ai-agent; node-workflow needs Node.js on this machine
+cd support && twd dev                    # optional: run it locally against an embedded control plane
+twd deploy                               # bundles here (built-in esbuild), uploads to mgmt over HTTPS, waits until the node is ready
+twd ls · twd audit <object> · twd kill <object> --cascade
+```
+
+`twd link` calls mgmt's `GET /v0/whoami` over your own Tailscale
+connection. mgmt identifies the caller by **WhoIs** (your login, or your
+node's tags) and admits admins by the `twd.dev/cap/admin` capability; it
+stores only the endpoint in `~/.twd/link.json`. No key, no token, nothing
+to rotate. If you are not an admin, `twd link` fails with `not_admin` and
+prints the grant to add. `twd ls` shows `by <login>` on each deployment
+and `twd audit` carries your login on the deploy record. Logs stay on the
+host (`twd logs` there). `twd link --unlink` forgets the endpoint.
+
+### Alternative: API-key mode
+
+For tests and homelabs without HTTPS/Funnel, or when you'd rather hand twd
+a Tailscale API access token: put it in a file as `TS_API_KEY=tskey-api-…`,
+mode `0600`, and name the tailnet explicitly (a key doesn't name its
+tailnet, and twd never bootstraps from your Mac's tailscaled):
+
+```sh
+twd doctor --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env
+twd up --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env --yes
+twd init support --template agent && cd support && twd deploy
+```
+
+The key is read when needed and never copied, logged or printed; `twd
+doctor` labels the mode `apikey`. `twd up` prints the `tag:twd` tagOwners
+snippet if it's missing (`--policy-apply` writes it, validated, with
+If-Match). `twd link` works in this mode too if you give mgmt a tailnet
+node: `twd up … --mgmt-hostname twd-mgmt` (the join is interactive unless
+`--mgmt-authkey-file` is given). A state dir is bound to one mode; switch
+with `twd down --purge` and a fresh `--state-dir`.
+
+### 5. Day 2, stop and uninstall
 
 `twd up` starts `twd-mgmt` (SQLite, local key custody) and `twd-hostd`
 (workerd supervisor) under a detached supervisor; state and logs are in
 `~/.twd` (`--state-dir` to use another directory). `twd deploy` preflights
 the grants your app declares (`tailnet.connects`), bundles it, and waits
 until the workload node is on your tailnet:
-`http://<prefix>wl-support.<tailnet>/`.
-
-Day 2: `twd ls`, `twd logs support`, `twd kill <object> --cascade`,
-`twd audit <object>`.
+`http://<prefix>wl-support.<tailnet>/`. Day 2: `twd ls`, `twd logs
+support`, `twd kill <object> --cascade`, `twd audit <object>`, `twd status`.
 
 #### A second tenant (another tailnet) on the same Mac
 
@@ -147,9 +268,8 @@ netmap only), its own workerd/Node processes, each in its own sandbox, 0700
 state dirs, throttles and audit chain. Objects of one tenant can't resolve
 or reach the other's (`peer_not_visible`). On a host without a process
 sandbox, `twd tenant add` refuses (`sandbox_unavailable`) unless twd was
-started with `twd up --insecure-shared-host`.
-
-### 5. Stop and uninstall
+started with `twd up --insecure-shared-host`. (`twd tenant add` is apikey
+mode only for now; keyless second tenants are a follow-up.)
 
 ```sh
 twd down --purge           # kill every object and delete its devices, then stop
@@ -163,10 +283,27 @@ twd down --purge           # kill every object and delete its devices, then stop
 - `workerd does not run on this machine`: re-sign it (`codesign -f -s -
   ~/.twd/bin/workerd`) and clear quarantine (`xattr -d com.apple.quarantine
   ~/.twd/bin/workerd`), then `twd doctor`.
-- `tailnet_required`: twd won't bootstrap from your Mac's Tailscale login;
-  pass `--tailnet` and `--api-key-file`.
+- `https_required` / `funnel_required` from `twd up`: enable HTTPS
+  certificates (admin console › DNS) or add the `nodeAttrs` funnel entry
+  for `tag:twd-mgmt`; mgmt's node stays joined, re-run `twd up`.
+- `bootstrap_failed … not a tagOwner`: the account you logged in with may
+  not own `tag:twd-mgmt`; add the tagOwners snippet, remove the node in the
+  console, `twd up` again.
+- `issuer_unreachable`: the Funnel issuer never answered publicly. Check
+  the funnel attribute, and `twd logs --component mgmt`.
+- `wif_exchange_failed`: the credential's issuer or subject doesn't match
+  exactly what `twd up` printed (watch for a trailing slash or the wrong
+  tenant ID); fix it in the console and `twd up --wif-client-id <id>`.
+- `not_admin` from `twd link`: you need `twd.dev/cap/admin` from a grant
+  to `tag:twd-mgmt`; the error prints the grant.
+- `mgmt_unreachable` from a linked machine: is your Tailscale connected to
+  the tailnet that runs twd, and does a grant let you reach
+  `tag:twd-mgmt` on tcp:443?
+- `tailnet_required`: apikey mode needs `--tailnet`; twd won't bootstrap
+  from your Mac's Tailscale login.
 - `acl_denied` on deploy: add the printed grant to your tailnet policy, or
-  deploy with `--allow-missing-grants`.
+  deploy with `--allow-missing-grants`. `preflight skipped` means mgmt has
+  no lifecycle credential with `policy_file:read` to read the policy.
 - `twd doctor` says `sandbox` failed: Seatbelt (`/usr/bin/sandbox-exec`)
   or Landlock didn't start workerd or didn't enforce a deny on this OS
   version. Report it; tenants are not confined until it is fixed.
@@ -177,7 +314,7 @@ twd down --purge           # kill every object and delete its devices, then stop
 - A Node app on Linux gets `EACCES` from `net.connect` or its own
   dispatcher: that's the sandbox; send egress through `HTTP(S)_PROXY` /
   `@twd/node`'s `fetch`.
-- Logs: `twd logs --component mgmt|hostd|supervisor`.
+- Logs: `twd logs --component mgmt|hostd|supervisor` (on the host).
 
 ## Linux
 
@@ -207,12 +344,15 @@ VMs by `make e2e-linux` (see the [support matrix](#linux-support-matrix)).
 - Kernel ≥ 5.13 with Landlock (the process sandbox; ABI ≥ 4, i.e. kernel
   6.7+, also restricts TCP; all the distros above have Landlock), cgroups v2 (the default), systemd (for `twd up --service`).
 - No Node.js, Go or npm. `curl`/`scp` and `tar` to get the tarball.
-- The same Tailscale API access token file as on macOS (`TS_API_KEY=…`,
-  mode `0600`).
+- The same as on macOS: a tailnet where you are an admin, with HTTPS
+  enabled, for the [keyless setup](#keyless-setup-recommended) (`twd up`,
+  login URL, trust credential); or an API access token file for the
+  [API-key mode](#alternative-api-key-mode).
 
 twd **never uses the machine's tailscaled**. If a system Tailscale is
 installed and logged in to some other tailnet, it is left alone: every twd
-node is its own tsnet node of the tailnet you pass with `--tailnet`.
+node is its own tsnet node of the tailnet you log in to (or pass with
+`--tailnet` in apikey mode).
 While twd runs, `twd doctor` checks that no twd process holds tailscaled's
 socket or state. It reads `/proc/<pid>/fd` and matches unix-socket peers with
 `ss -x`, and never connects to tailscaled.
@@ -227,7 +367,7 @@ tar -xzf twd-*-linux-*.tar.gz
 cd twd-*-linux-*/ && ./install.sh          # no sudo; refuses to run as root
 export PATH="$HOME/.twd/bin:$PATH"
 echo 'export PATH="$HOME/.twd/bin:$PATH"' >> ~/.profile
-twd doctor --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env
+twd doctor
 ```
 
 On Linux, `install.sh` checks the architecture (`uname -m`: `aarch64` →
@@ -253,7 +393,8 @@ Ubuntu would make bash skip `~/.profile`.
 ### Run twd as a systemd user service
 
 ```sh
-twd up --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env --yes --service
+twd up --service                                                             # keyless (login URL + trust credential, as on macOS)
+twd up --tailnet <your-tailnet>.ts.net --api-key-file ~/path/to/api.env --yes --service   # apikey mode
 systemctl --user status twd.service
 ```
 

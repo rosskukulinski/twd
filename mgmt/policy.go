@@ -385,6 +385,13 @@ func (c *PolicyCache) Get(ctx context.Context, t Tenant) (*Policy, error) {
 	return p, nil
 }
 
+// Invalidate forgets a tenant's cached policy (its credentials changed).
+func (c *PolicyCache) Invalidate(tenantID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, tenantID)
+}
+
 // HasIPGrant reports whether some grant with a network ("ip") part lets a
 // node tagged src reach dst (a tag, or "*").
 func (p *Policy) HasIPGrant(src, dst string) bool {

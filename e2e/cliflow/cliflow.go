@@ -448,11 +448,11 @@ func (e *Env) TrackObjectNodes() {
 func (e *Env) Run() {
 	t, res := e.T, e.Res
 	upArgs := e.upArgs()
-	// Interactive mode must refuse (it would use tailscaled).
-	if _, se, _, err := e.Twd("up", "--yes"); err == nil || !strings.Contains(se, "tailnet_required") {
-		t.Fatalf("twd up without --tailnet should fail with tailnet_required: %v %s", err, se)
+	// apikey mode needs an explicit --tailnet (never this machine's tailscaled).
+	if _, se, _, err := e.Twd("up", "--yes", "--api-key-file", e.APIKeyFile); err == nil || !strings.Contains(se, "tailnet_required") {
+		t.Fatalf("twd up --api-key-file without --tailnet should fail with tailnet_required: %v %s", err, se)
 	}
-	res.pass("up_interactive_refused", "tailnet_required")
+	res.pass("up_apikey_needs_tailnet", "tailnet_required")
 
 	var up struct {
 		TenantID string             `json:"tenantID"`

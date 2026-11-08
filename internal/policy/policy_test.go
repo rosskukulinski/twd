@@ -101,3 +101,70 @@ func TestApply(t *testing.T) {
 		t.Fatalf("invalid policy applied: err=%v sets=%d", err, f2.sets)
 	}
 }
+
+// keyless (M10): nodeAttrs entries and the autogroup:admin → tag:twd-mgmt
+// admin grant merge additively; without AllowSrcs the autogroup source is
+// refused (RT-06), and nodeAttrs may only set funnel on twd tags.
+func keylessSnip() Snippet {
+	return Snippet{
+		TagOwners: map[string][]string{"tag:twd-mgmt": {"autogroup:admin"}},
+		Grants: []map[string]any{{"src": []string{"autogroup:admin"}, "dst": []string{"tag:twd-mgmt"}, "ip": []string{"tcp:443", "tcp:80"},
+			"app": map[string]any{"twd.dev/cap/admin": []any{map[string]any{}}}}},
+		NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"funnel"}}},
+	}
+}
+
+func TestMergeNodeAttrsAndAdminGrant(t *testing.T) {
+	withAttrs := strings.TrimSuffix(strings.TrimSpace(base), "}") + `	"nodeAttrs": [
+		{"target": ["tag:other"], "attr": ["funnel"]}, // keep me too
+	],
+}
+`
+	if _, err := MergeWith([]byte(withAttrs), keylessSnip(), Options{}); err == nil || !strings.Contains(err.Error(), "autogroup:admin") {
+		t.Fatalf("autogroup:admin source must need AllowSrcs: %v", err)
+	}
+	opts := Options{AllowSrcs: []string{"autogroup:admin"}}
+	for _, in := range []string{base, withAttrs, `{}`} {
+		out, err := MergeWith([]byte(in), keylessSnip(), opts)
+		if err != nil {
+			t.Fatalf("merge into %q: %v", in[:min(len(in), 20)], err)
+		}
+		s := string(out)
+		for _, want := range []string{`"attr": ["funnel"]`, `"twd.dev/cap/admin"`, `"tag:twd-mgmt"`} {
+			if !strings.Contains(s, want) && !strings.Contains(s, strings.ReplaceAll(want, " ", "")) {
+				t.Fatalf("merged policy lacks %q:\n%s", want, s)
+			}
+		}
+		if in == withAttrs && (!strings.Contains(s, "// keep me too") || !strings.Contains(s, `"tag:other"`)) {
+			t.Fatalf("existing nodeAttrs entry lost:\n%s", s)
+		}
+		if miss, err := Missing(out, keylessSnip()); err != nil || !miss.Empty() {
+			t.Fatalf("not idempotent: %+v (%v)", miss, err)
+		}
+		if err := VerifyAdditive([]byte(in), out, must(Missing([]byte(in), keylessSnip()))); err != nil {
+			t.Fatalf("not additive: %v", err)
+		}
+	}
+	// A modified existing nodeAttrs entry is refused.
+	tampered := strings.Replace(withAttrs, `"tag:other"`, `"tag:twd-mgmt"`, 1)
+	if err := VerifyAdditive([]byte(withAttrs), []byte(tampered), Snippet{}); err == nil || !strings.Contains(err.Error(), "nodeAttrs[0] modified") {
+		t.Fatalf("modified nodeAttrs not caught: %v", err)
+	}
+	for _, bad := range []Snippet{
+		{NodeAttrs: []map[string]any{{"target": []string{"tag:other"}, "attr": []string{"funnel"}}}},
+		{NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"mullvad"}}}},
+		{NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"funnel"}, "app": 1}}},
+		{NodeAttrs: []map[string]any{{"target": []string{"*"}, "attr": []string{"funnel"}}}},
+	} {
+		if err := Check(bad, opts); err == nil {
+			t.Fatalf("hostile nodeAttrs accepted: %+v", bad)
+		}
+	}
+}
+
+func must(s Snippet, err error) Snippet {
+	if err != nil {
+		panic(err)
+	}
+	return s
+}

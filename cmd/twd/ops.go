@@ -193,7 +193,11 @@ func cmdLs(args []string) error {
 		fmt.Printf("TENANT %s (%s)\n", tn.Tailnet, tn.TenantID)
 		fmt.Println("DEPLOYMENTS")
 		for _, d := range deps {
-			fmt.Printf("  %-12s %-22s %-8s %-10s http://%s/\n", d.Workload, d.DeploymentID, d.Host, d.Status, d.Endpoint.MagicDNS)
+			by := ""
+			if d.DeployedBy != "" {
+				by = "  by " + d.DeployedBy
+			}
+			fmt.Printf("  %-12s %-22s %-8s %-10s http://%s/%s\n", d.Workload, d.DeploymentID, d.Host, d.Status, d.Endpoint.MagicDNS, by)
 		}
 		fmt.Println("OBJECTS")
 		fmt.Printf("  %-36s %-34s %-8s %-30s %s\n", "NODE", "CLASS/NAME", "STATUS", "TAGS", "PARENT")
@@ -578,6 +582,10 @@ func cmdLogs(args []string) error {
 	s, err := openState(*f.stateDir)
 	if err != nil {
 		return err
+	}
+	if s.remote() {
+		return fail("remote_unsupported", "logs are files on the host that runs twd up (this machine is linked to "+s.Link.Endpoint+")").
+			withFix("run `twd logs` on the host", "`twd ls` and `twd audit` work from here")
 	}
 	if !s.configured() {
 		return fail("not_up", "twd is not set up in "+s.Dir)

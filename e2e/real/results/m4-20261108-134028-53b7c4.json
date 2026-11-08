@@ -1,0 +1,69 @@
+{
+  "run": "m4-53b7c4",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T13:40:28-08:00",
+  "checks": {
+    "a_verified_caller": "PASS nodeId nLYZRT3s5B11CNTRL tags [tag:ttest] (workload and the object's own node twd-e2e-53b7c4-supportagent-bbvcszs664.tail7906d5.ts.net)",
+    "b_egress_own_node": "PASS echo WhoIs = twd-e2e-53b7c4-supportagent-bbvcszs664.tail7906d5.ts.net.",
+    "c_mcp_caps": "PASS lookup_order allowed; refund → cap_missing",
+    "d_spawn": "PASS child lookupagent-j6g6qwh5gx node twd-e2e-53b7c4-lookupagent-j6g6qwh5gx.tail7906d5.ts.net tags [tag:twd-agent-support-sub] caps {\n        \"example.com/cap/mcp\": {\n          \"tools\": [\n            \"lookup_order\"\n          ]\n        }\n      }; lim enforced: same-tag child supportagent-i7n2o2ybjk (tag [tag:twd-agent-support], lim {\n        \"example.com/cap/mcp\": {\n          \"tools\": [\n            \"lookup_order\"\n          ]\n        }\n      }) → refund cap_missing, lookup_order ok; parent refund ok=true",
+    "deploy": "PASS agent twd-e2e-53b7c4-agent-njy6ow6i2t.tail7906d5.ts.net, mcp twd-e2e-53b7c4-mcp-sxntyniwin.tail7906d5.ts.net",
+    "down": "PASS 2 objects purged, 5 devices deleted, 4.213s",
+    "e_kill_cascade": "PASS cli 67ms, push 56.5 ms, new requests → 410 object_killed in ≤1ms, via workload 410 killed",
+    "f_audit_chain": "PASS \"twd-e2e-53b7c4-client.tail7906d5.ts.net → twd-e2e-53b7c4-supportagent-bbvcszs664 → twd-e2e-53b7c4-lookupagent-j6g6qwh5gx\", 6 records for the sub-agent, chain verified",
+    "preflight_missing_grant": "PASS acl_denied with HuJSON snippet",
+    "status": "PASS healthy",
+    "up": "PASS tenant tn_tail7906d5 host h-mini in 1.217s",
+    "up_apikey_needs_tailnet": "PASS tailnet_required"
+  },
+  "numbers": {
+    "agent_egress_ms": 13.086,
+    "agent_first_request_ms": 67.701,
+    "delegate_ms": 4768.037,
+    "deploy_agent_active_ms": 433.76,
+    "deploy_agent_cli_ms": 2078.153,
+    "deploy_agent_ready_ms": 2019.243,
+    "deploy_mcp_cli_ms": 1720.17,
+    "deploy_mcp_ready_ms": 1688.875,
+    "down_ms": 4213.144,
+    "first_object_node_ready_ms": 1673.176,
+    "kill_api_ms": 58.103,
+    "kill_cli_ms": 66.579,
+    "kill_push_ms": 56.499,
+    "killed_new_request_ms": 0.963,
+    "killed_via_workload_ms": 3.08,
+    "spawn_ready_ms": 3255.009,
+    "up_host_ready_ms": 1204.199,
+    "up_mgmt_ready_ms": 890.002,
+    "up_ready_ms": 1217.248
+  },
+  "notes": [
+    "policy already had the scenario's tagOwners and grants (not written)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 7,
+    "devices_left": 0,
+    "devices_tracked": 7,
+    "test_keys_minted": 2,
+    "test_keys_revoke_errors": null,
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 5,
+    "twd_keys_tracked": 5,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": [
+    "nvN3jKrmUn11CNTRL",
+    "nCHboCrTme11CNTRL",
+    "n7w6NvYL6a11CNTRL",
+    "nyvKzrAXvC21CNTRL",
+    "nF8E23uMrL11CNTRL"
+  ],
+  "keyIDs": [
+    "ksqxugda3C21CNTRL",
+    "kcsp6NPiU621CNTRL",
+    "kcqwfhg1qC11CNTRL",
+    "kExCuQ5WTE11CNTRL",
+    "kxqMGm76z321CNTRL"
+  ]
+}

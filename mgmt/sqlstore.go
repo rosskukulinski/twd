@@ -187,7 +187,8 @@ func (s *SQLStore) migrate(ctx context.Context) error {
 // migrations; both dialects accept ADD COLUMN with a default).
 func (s *SQLStore) addColumns(ctx context.Context) error {
 	for _, c := range []struct{ table, col, ddl string }{
-		{"objects", "cert", "ALTER TABLE objects ADD COLUMN cert TEXT NOT NULL DEFAULT ''"}, // RT-01 node certificates
+		{"objects", "cert", "ALTER TABLE objects ADD COLUMN cert TEXT NOT NULL DEFAULT ''"},                       // RT-01 node certificates
+		{"deployments", "deployed_by", "ALTER TABLE deployments ADD COLUMN deployed_by TEXT NOT NULL DEFAULT ''"}, // M10: WhoIs login / local actor
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {
@@ -322,6 +323,20 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 	return err
 }
 
+// UpdateTenant rewrites a tenant's mint configuration (mode, key file,
+// WIF client IDs) and limits; ID, tailnet and createdAt are immutable.
+func (s *SQLStore) UpdateTenant(ctx context.Context, t Tenant) error {
+	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=? WHERE id=?"),
+		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.ID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *SQLStore) GetTenant(ctx context.Context, id string) (Tenant, error) {
 	return scanTenant(s.db.QueryRowContext(ctx, s.q("SELECT "+tenantCols+" FROM tenants WHERE id=?"), id))
 }
@@ -402,13 +417,13 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var ns string
 	var ml, md int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt)
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -418,8 +433,8 @@ func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 }
 
 func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?)"),
-		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.Bundle)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?)"),
+		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.Bundle)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -431,7 +446,7 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	var d Deployment
 	var ns string
 	var ml, md int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.Bundle)
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.Bundle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}

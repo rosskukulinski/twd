@@ -83,7 +83,10 @@ type Deployment struct {
 	MaxDepth   int           `json:"maxDepth"`
 	Epoch      int64         `json:"epoch"`
 	Bundle     []byte        `json:"-"`
-	CreatedAt  int64         `json:"createdAt"`
+	// DeployedBy is who ran the deploy: the WhoIs login of a tailnet
+	// caller (`twd link`), or the local actor on the unix socket.
+	DeployedBy string `json:"deployedBy,omitempty"`
+	CreatedAt  int64  `json:"createdAt"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per

@@ -12,12 +12,108 @@ import (
 	"time"
 )
 
-// `twd up --service` / `twd down --service` (LINUX-PLAN DoD 5): run the
-// same supervisor (`twd __supervise`) as a systemd *user* unit, so twd
-// survives logout (with lingering) and reboot. Nothing here uses sudo:
-// enabling lingering is printed for the user to run.
+// `twd up --service` / `twd down --service`: run the same supervisor
+// (`twd __supervise`) as a service that starts at login: a systemd *user*
+// unit on Linux (LINUX-PLAN DoD 5; survives logout with lingering and
+// reboot) or a LaunchAgent on macOS (M10; survives logout only if the
+// Mac doesn't sleep). Nothing here uses sudo: enabling lingering or
+// disabling sleep is printed for the user to run. The systemd half is in
+// this file, the launchd half in service_launchd.go; the functions the
+// commands call dispatch on the OS.
 
-const serviceUnit = "twd.service"
+// serviceUnit names the unit (Linux) or the LaunchAgent label (macOS).
+var serviceUnit = func() string {
+	if runtime.GOOS == "darwin" {
+		return launchdLabel
+	}
+	return "twd.service"
+}()
+
+// serviceKind names the service mechanism for messages.
+func serviceKind() string {
+	if runtime.GOOS == "darwin" {
+		return "LaunchAgent"
+	}
+	return "systemd user unit"
+}
+
+// serviceRestartHint is how to restart the installed service by hand.
+func serviceRestartHint() string {
+	if runtime.GOOS == "darwin" {
+		return "launchctl kickstart -k gui/" + fmt.Sprint(os.Getuid()) + "/" + launchdLabel
+	}
+	return "systemctl --user restart " + serviceUnit
+}
+
+// serviceAvailable reports whether --service can work here.
+func serviceAvailable() error {
+	if runtime.GOOS == "darwin" {
+		return launchdAvailable()
+	}
+	return systemdAvailable()
+}
+
+// serviceActive reports whether the service is installed and running.
+func serviceActive() (installed, active bool) {
+	if runtime.GOOS == "darwin" {
+		return launchdActive()
+	}
+	return systemdActive()
+}
+
+// serviceUnitPath is the unit file / plist path.
+func serviceUnitPath() string {
+	if runtime.GOOS == "darwin" {
+		return launchdPlistPath()
+	}
+	return filepath.Join(userUnitDir(), serviceUnit)
+}
+
+// installService writes and starts the service (restarting it if its
+// definition changed); it returns once the supervisor has written its pid.
+func installService(s *state) (changed bool, err error) {
+	if runtime.GOOS == "darwin" {
+		return launchdInstall(s)
+	}
+	return systemdInstall(s)
+}
+
+// removeService stops (if running), disables and deletes the service.
+func removeService() (removed bool, err error) {
+	if runtime.GOOS == "darwin" {
+		return launchdRemove()
+	}
+	return systemdRemove()
+}
+
+// serviceStop stops the running service without removing it (twd down).
+func serviceStop() error {
+	if runtime.GOOS == "darwin" {
+		return launchdStop()
+	}
+	if out, err := systemctlUser("stop", serviceUnit); err != nil {
+		return fail("service_failed", "systemctl --user stop "+serviceUnit+" failed", out)
+	}
+	return nil
+}
+
+// lingerHint returns the enable-linger guidance (Linux), or "".
+func lingerHint() string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	return systemdLingerHint()
+}
+
+// sleepHint warns that a sleeping Mac stops serving (macOS), or "".
+func sleepHint() string {
+	if runtime.GOOS != "darwin" {
+		return ""
+	}
+	return launchdSleepHint()
+}
+
+// ---- systemd (Linux) ----
 
 // userUnitDir is $XDG_CONFIG_HOME/systemd/user (default ~/.config/systemd/user).
 func userUnitDir() string {
@@ -29,8 +125,6 @@ func userUnitDir() string {
 	return filepath.Join(base, "systemd", "user")
 }
 
-func serviceUnitPath() string { return filepath.Join(userUnitDir(), serviceUnit) }
-
 func systemctlUser(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
@@ -38,11 +132,10 @@ func systemctlUser(args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-// serviceAvailable: Linux, systemd PID 1, and this user's manager answers.
-func serviceAvailable() error {
+// systemdAvailable: Linux, systemd PID 1, and this user's manager answers.
+func systemdAvailable() error {
 	if runtime.GOOS != "linux" {
-		return fail("service_unsupported", "--service installs a systemd user unit and is Linux-only",
-			"on macOS, `twd up` runs a detached supervisor (a launchd agent is not built yet)")
+		return fail("service_unsupported", "--service needs systemd (Linux) or launchd (macOS)")
 	}
 	if fi, err := os.Stat("/run/systemd/system"); err != nil || !fi.IsDir() {
 		return fail("service_unsupported", "systemd is not the init system on this machine", "use `twd up` without --service")
@@ -57,8 +150,8 @@ func serviceAvailable() error {
 	return nil
 }
 
-// serviceActive reports whether twd.service is installed and active.
-func serviceActive() (installed, active bool) {
+// systemdActive reports whether twd.service is installed and active.
+func systemdActive() (installed, active bool) {
 	if !isFile(serviceUnitPath()) {
 		return false, false
 	}
@@ -100,10 +193,10 @@ func unitQuote(p string) string {
 	return p
 }
 
-// installService writes the unit, enables it and starts it (or restarts it
+// systemdInstall writes the unit, enables it and starts it (or restarts it
 // if the unit changed). It returns once the supervisor has written its pid.
-func installService(s *state) (changed bool, err error) {
-	if err := serviceAvailable(); err != nil {
+func systemdInstall(s *state) (changed bool, err error) {
+	if err := systemdAvailable(); err != nil {
 		return false, err
 	}
 	exe, err := os.Executable()
@@ -164,8 +257,8 @@ func installService(s *state) (changed bool, err error) {
 	return changed, nil
 }
 
-// removeService stops (if running), disables and deletes the unit.
-func removeService() (removed bool, err error) {
+// systemdRemove stops (if running), disables and deletes the unit.
+func systemdRemove() (removed bool, err error) {
 	p := serviceUnitPath()
 	if !isFile(p) {
 		return false, nil
@@ -181,8 +274,8 @@ func removeService() (removed bool, err error) {
 	return true, nil
 }
 
-// lingerHint returns the enable-linger guidance, or "" if lingering is on.
-func lingerHint() string {
+// systemdLingerHint returns the enable-linger guidance, or "" if lingering is on.
+func systemdLingerHint() string {
 	u, err := user.Current()
 	if err != nil || u.Username == "" || isFile("/var/lib/systemd/linger/"+u.Username) {
 		return ""

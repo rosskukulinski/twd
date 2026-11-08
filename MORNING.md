@@ -3,15 +3,21 @@
 **Result: every item in BUILD-PLAN.md's definition of done is met, and Linux is a first-class host (LINUX-PLAN.md).** twd installs on a clean MacBook (`mbp`) and on fresh Linux VMs and works end to end against real tailnets. Unit and e2e suites pass on macOS and Linux, re-measured on the final tree (branch `final-verify`, fast-forward of master; STATUS.md "Final verification"). `make release` writes `dist/twd-0.1.0-<commit>-{darwin-arm64,linux-arm64,linux-amd64}.tar.gz`.
 
 ## Install it on another Mac
-Follow `docs/INSTALL.md`. Short version:
+Follow `docs/INSTALL.md`. Short version (M10, keyless by default; STATUS.md "M10"):
 ```sh
 scp dist/twd-0.1.0-<commit>-darwin-arm64.tar.gz other-mac:
 ssh other-mac 'tar xzf twd-*.tar.gz && ./twd-*/install.sh'        # ~6 s, no sudo, installs into ~/.twd
+# host
+twd up [--service]      # prints the policy snippet → a login URL (mgmt's node joins as tag:twd-mgmt) → the admin-console
+                        # steps for the WIF trust credential (issuer over Funnel) → paste the client ID → ready. No API key.
+twd doctor              # workerd, esbuild, sandbox active, mint_mode wif (keyless), system tailscaled NOT used
+# your laptop (on the same tailnet, as an admin)
+twd link twd-mgmt.<tailnet>.ts.net      # WhoIs identity over your own Tailscale connection; no key or token
+twd init hello --template agent && cd hello && twd dev && twd deploy && twd ls && twd audit --all
+# alternative (tests, no HTTPS): apikey mode
 twd up --tailnet <your-test-tailnet> --api-key-file <file with TS_API_KEY=…> --yes
-twd init hello --template agent && cd hello && twd deploy
-twd doctor     # workerd, esbuild, sandbox active, API key OK, system tailscaled NOT used
 ```
-twd never uses the Mac's Tailscale app or login. Every twd node is a tsnet node on the tailnet you name.
+twd never uses the host's Tailscale app or login for its nodes: mgmt's node and every object node are tsnet nodes. The one-time console step that remains is the trust credential: creating new devices needs a control-plane credential, and WIF is its keyless form (ADR-026).
 
 ## What was verified (measured, final runs on master)
 | Acceptance test | Result |
@@ -52,7 +58,7 @@ Linux rows from before this tree (Debian 12, Ubuntu 22.04, Fedora 45, Ubuntu 24.
 - **Linux process tier: Landlock + seccomp sandbox** (unprivileged, no user namespaces; mirrors the Seatbelt guarantees and adds TCP confinement on ABI ≥ 4). Without Landlock, `twd doctor` warns loudly and twd serves one tenant unless `--insecure-shared-host`. Measured on the matrix below.
 - **microVM tier (Linux + KVM):** DO storage persists across VM crash, redeploy and host reboot (per-workload LUKS2 volume); every VM runs under the jailer; the only sudo is the one-time `twd host setup --microvm`. Still missing: snapshot restore; Node apps inside VMs; an ephemeral microVM object across a host reboot was argued from the code path, not run. **Packaging:** the guest image can only be built on Linux; a `make release` without Lima `twd-dev` running ships a linux-arm64 tarball with **no microVM tier** (`release.json` `"microvm": false`, the red team's live pass hit this). `make release` now builds the guest in `twd-dev` and includes it (`scripts/vm-assets-lima.sh`, cached).
 - All tenants' netd registries share one hostd process.
-- Interactive `twd up` (using the local tailscaled login) is deliberately refused; you must pass `--tailnet`. `twd dev` has no embedded policy evaluator yet.
+- (M10 closed this) ~~Interactive `twd up` is deliberately refused; you must pass `--tailnet`.~~ `twd up` is keyless now: tsnet login for mgmt's node, WIF minting, `twd link` for developers; `--api-key-file` is the alternative. Still true: twd never bootstraps from the host's tailscaled. `twd dev` has no embedded policy evaluator yet.
 - Binaries are ad-hoc signed, not notarized. Workflow's Postgres World is untested. With multiple Postgres-backed mgmt replicas, spawn budgets can race.
 - Unsupported in-isolate: `env.AI`, KV, Workflows (Cloudflare's), email, browser, `env.LOADER`, `subAgent()` (see docs/COMPAT.md).
 

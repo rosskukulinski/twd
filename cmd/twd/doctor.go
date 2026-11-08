@@ -179,6 +179,22 @@ func cmdDoctor(args []string) error {
 		return writable(s.Dir)
 	})
 
+	run("mint_mode", func() (string, string, string) {
+		switch {
+		case s != nil && s.remote():
+			return "info", "this machine is linked to " + s.Link.Endpoint + " (twd link: your Tailscale identity, no key or token here)", ""
+		case s == nil || !s.configured():
+			return "skip", "twd up not run here (default: keyless wif; --api-key-file: apikey)", ""
+		case s.Cfg.keyless():
+			d := "wif (keyless): mgmt node " + s.Cfg.MgmtDNSName + " serves the OIDC issuer " + s.Cfg.IssuerURL + " over Funnel; trust credential client ID " + s.Cfg.WIFClientID + " (public)"
+			if s.Cfg.WIFLifecycleClientID == "" {
+				return "warn", d + "; no lifecycle credential (kill deletes no devices; no preflight or spawn checks)", "twd up --wif-lifecycle-client-id <id> (scopes devices:core, policy_file:read)"
+			}
+			return "ok", d + ", lifecycle credential " + s.Cfg.WIFLifecycleClientID, ""
+		}
+		return "ok", "apikey: the API key file " + s.Cfg.APIKeyFile + " mints every node key (alternative mode; keyless is the default)", ""
+	})
+
 	run("api_key", func() (string, string, string) {
 		tn, kf := *tailnetF, *keyF
 		if s != nil {
@@ -189,8 +205,11 @@ func cmdDoctor(args []string) error {
 				kf = s.Cfg.APIKeyFile
 			}
 		}
+		if s != nil && s.Cfg.keyless() && *keyF == "" {
+			return "skip", "keyless mode: no API key on this machine (nodes are minted through the WIF trust credential)", ""
+		}
 		if tn == "" || kf == "" {
-			return "skip", "no tailnet / API key file configured (twd up not run here)", "twd doctor --tailnet <tailnet> --api-key-file <file>"
+			return "skip", "no API key file configured (keyless mode needs none; apikey mode: twd up --api-key-file)", ""
 		}
 		kf, _ = filepath.Abs(kf)
 		key, err := tsapi.LoadEnvFile(kf, "TS_API_KEY")
@@ -259,6 +278,9 @@ func cmdDoctor(args []string) error {
 				return "fail", "twd.json has no explicit control URL", "twd down, then twd up --tailnet <tailnet> …"
 			}
 			notes = append(notes, "twd nodes are tsnet nodes of "+s.Cfg.Tailnet+" (control "+s.Cfg.ControlURL+", state under "+filepath.Join(s.Dir, "hostd")+")")
+			if s.Cfg.MgmtDNSName != "" {
+				notes = append(notes, "mgmt's node "+s.Cfg.MgmtDNSName+" is a tsnet node too (state under "+s.mgmtTsnetDir()+"), joined by its own login")
+			}
 		} else {
 			notes = append(notes, "twd only ever runs tsnet nodes for the tailnet you name (no bootstrap from tailscaled)")
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,6 +94,18 @@ func (b *Broker) API(ctx context.Context, t Tenant, purpose string) (TailnetAPI,
 		return c, nil
 	}
 	return nil, fmt.Errorf("unknown mint mode %q", t.MintMode)
+}
+
+// Forget drops a tenant's cached access tokens (after its client IDs
+// changed, or to force a fresh exchange).
+func (b *Broker) Forget(tenantID string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for k := range b.tokens {
+		if strings.HasPrefix(k, tenantID+"|") {
+			delete(b.tokens, k)
+		}
+	}
 }
 
 func (b *Broker) token(ctx context.Context, tenantID, clientID, subject string) (string, error) {

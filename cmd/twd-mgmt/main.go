@@ -27,6 +27,8 @@ import (
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/mgmt"
 	"github.com/rosskukulinski/twd/netd"
+	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tsnet"
 )
 
@@ -52,8 +54,10 @@ func run() error {
 		funnel       = flag.Bool("funnel", false, "WIF: serve the issuer publicly via tsnet ListenFunnel :443 (needs -tsnet-hostname)")
 		tsHostname   = flag.String("tsnet-hostname", "", "serve the API on the operator tailnet as this tsnet node (e.g. twd-mgmt)")
 		tsControl    = flag.String("tsnet-control-url", "", "operator tailnet control URL (required with -tsnet-hostname)")
-		tsAuthFile   = flag.String("tsnet-authkey-file", "", "file with the operator-tailnet auth key for the first join (TS_AUTHKEY=…)")
-		admins       = flag.String("admins", "", "comma-separated operator-tailnet logins allowed to call CLI endpoints (default: any untagged user)")
+		tsAuthFile   = flag.String("tsnet-authkey-file", "", "file with the operator-tailnet auth key for the first join (TS_AUTHKEY=…); without it the node state must already be logged in (twd up does the interactive login)")
+		tsTags       = flag.String("tsnet-tags", mgmt.MgmtTag, "comma-separated tags the mgmt node advertises")
+		tsTLS        = flag.Bool("tsnet-tls", true, "also serve the API on :443 with the node's HTTPS certificate when the tailnet has HTTPS enabled (plain :80 is always served)")
+		admins       = flag.String("admins", "", "comma-separated tailnet logins admitted as admins even without the "+mgmt.AdminCap+" capability (override; the normal path is the cap, granted to "+mgmt.MgmtTag+")")
 		custodyKind  = flag.String("custody", "file", "custody backend: file (AES-GCM in <state-dir>/custody) or setec")
 		setecURL     = flag.String("setec-url", "", "setec server URL (with -custody setec)")
 		reapEvery    = flag.Duration("reap-interval", 10*time.Second, "reaper interval")
@@ -112,12 +116,16 @@ func run() error {
 
 	// Operator-tailnet node (optional).
 	var ts *tsnet.Server
+	self := mgmt.SelfInfo{}
 	if *tsHostname != "" {
 		if *tsControl == "" {
 			return errors.New("-tsnet-hostname needs an explicit -tsnet-control-url")
 		}
 		ts = &tsnet.Server{Hostname: *tsHostname, Dir: filepath.Join(*stateDir, "tsnet"), ControlURL: *tsControl,
 			Logf: func(string, ...any) {}}
+		if *tsTags != "" {
+			ts.AdvertiseTags = strings.Split(*tsTags, ",")
+		}
 		if *tsAuthFile != "" {
 			k, err := tsapi.LoadEnvFile(*tsAuthFile, "TS_AUTHKEY")
 			if err != nil {
@@ -126,17 +134,27 @@ func run() error {
 			ts.AuthKey = k
 		}
 		upCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-		_, err := ts.Up(upCtx)
+		st, err := tsnetUp(upCtx, ts, ts.AuthKey == "")
 		cancel()
 		if err != nil {
 			return fmt.Errorf("tsnet up: %w", err)
 		}
 		defer ts.Close()
+		self.DNSName = strings.TrimSuffix(st.Self.DNSName, ".")
+		if st.CurrentTailnet != nil {
+			self.Tailnet = st.CurrentTailnet.MagicDNSSuffix
+		}
+		self.HTTPS = *tsTLS && len(ts.CertDomains()) > 0
 		if *funnel && *issuerURL == "" {
 			if doms := ts.CertDomains(); len(doms) > 0 {
 				*issuerURL = "https://" + doms[0]
 			}
 		}
+		tags := []string{}
+		if st.Self.Tags != nil {
+			tags = st.Self.Tags.AsSlice()
+		}
+		log.Info("tailnet node", "name", self.DNSName, "tailnet", self.Tailnet, "tags", tags, "https", self.HTTPS, "ips", st.TailscaleIPs)
 	}
 
 	var issuer *mgmt.Issuer
@@ -156,7 +174,10 @@ func run() error {
 		return err
 	}
 	defer m.Close()
-	api := &mgmt.Server{M: m}
+	if issuer != nil {
+		self.Issuer = issuer.BaseURL
+	}
+	api := &mgmt.Server{M: m, Self: self}
 	if *admins != "" {
 		api.Admins = strings.Split(*admins, ",")
 	}
@@ -193,22 +214,38 @@ func run() error {
 		if err != nil {
 			return err
 		}
-		whois := func(ctx context.Context, addr string) (string, []string, string, error) {
+		whois := func(ctx context.Context, addr string) (mgmt.WhoIsInfo, error) {
 			wi, err := lc.WhoIs(ctx, addr)
 			if err != nil {
-				return "", nil, "", err
+				return mgmt.WhoIsInfo{}, err
 			}
-			login := ""
+			info := mgmt.WhoIsInfo{NodeID: string(wi.Node.StableID), Name: wi.Node.Name, Tags: wi.Node.Tags}
 			if wi.UserProfile != nil {
-				login = wi.UserProfile.LoginName
+				info.Login = wi.UserProfile.LoginName
 			}
-			return string(wi.Node.StableID), wi.Node.Tags, login, nil
+			for c := range wi.CapMap {
+				info.Caps = append(info.Caps, string(c))
+			}
+			return info, nil
 		}
 		ln, err := ts.Listen("tcp", ":80")
 		if err != nil {
 			return err
 		}
-		servers = append(servers, serve("tsnet", ln, api.TailnetHandler(whois, api.Handler())))
+		th := api.TailnetHandler(whois, api.Handler())
+		servers = append(servers, serve("tsnet", ln, th))
+		if self.HTTPS {
+			// The API over the node's own HTTPS certificate: what `twd
+			// link` uses from a developer machine. tailnet-only (ListenTLS
+			// never serves Funnel traffic).
+			tln, err := ts.ListenTLS("tcp", ":443")
+			if err != nil {
+				return fmt.Errorf("tsnet tls: %w", err)
+			}
+			servers = append(servers, serve("tsnet-tls", tln, th))
+		} else if *tsTLS {
+			log.Warn("HTTPS is not enabled on this tailnet: the API is served on :80 only (twd link needs https)")
+		}
 		if *funnel {
 			if issuer == nil {
 				return errors.New("-funnel needs an issuer URL")
@@ -244,4 +281,37 @@ func run() error {
 		s.Shutdown(sctx)
 	}
 	return nil
+}
+
+// tsnetUp brings the node up. If it needs an interactive login and no auth
+// key was given, it fails fast with the login URL instead of waiting for
+// someone to click it: `twd up` owns the interactive flow.
+func tsnetUp(ctx context.Context, ts *tsnet.Server, failOnLogin bool) (*ipnstate.Status, error) {
+	if !failOnLogin {
+		return ts.Up(ctx)
+	}
+	lc, err := ts.LocalClient()
+	if err != nil {
+		return nil, err
+	}
+	w, err := lc.WatchIPNBus(ctx, ipn.NotifyInitialState)
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+	for {
+		n, err := w.Next()
+		if err != nil {
+			return nil, err
+		}
+		if n.ErrMessage != nil {
+			return nil, errors.New(*n.ErrMessage)
+		}
+		if n.BrowseToURL != nil {
+			return nil, fmt.Errorf("the mgmt node needs an interactive login (run `twd up` on this host to log in): %s", *n.BrowseToURL)
+		}
+		if n.State != nil && *n.State == ipn.Running {
+			return ts.Up(ctx)
+		}
+	}
 }

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd/bundle"
+	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/internal/esbundle"
 	"github.com/rosskukulinski/twd/mgmt"
 )
@@ -315,14 +316,27 @@ func cmdDeploy(args []string) error {
 
 	// Preflight tailnet.connects and tagOwners against the tenant policy.
 	var pf mgmt.PreflightResult
+	policyUnavailable := ""
 	if err := mc.Do(ctx, "POST", "/v0/tenants/"+tn.TenantID+"/preflight",
 		mgmt.PreflightRequest{SrcTags: a.srcTags(), Connects: a.Cfg.Tailnet.Connects}, &pf); err != nil {
-		return err
+		me, ok := mgmtapi.AsError(err)
+		if !ok || me.Code != "policy_unavailable" {
+			return err
+		}
+		// Keyless mode without a lifecycle credential (policy_file:read):
+		// mgmt can't read the policy, so grants are not preflighted here;
+		// a missing tagOwners entry still fails at mint (Tailscale checks).
+		policyUnavailable = me.Message
+		pf = mgmt.PreflightResult{OK: true, Unchecked: append([]string{}, a.Cfg.Tailnet.Connects...)}
 	}
 	res.Preflight = pf
 	res.Timings["preflight"] = ms(time.Since(t0))
 	if !*f.json {
-		printPreflight(a, pf)
+		if policyUnavailable != "" {
+			fmt.Printf("› preflight  skipped: mgmt can't read the tailnet policy (%s)\n             add a lifecycle trust credential with scope policy_file:read (twd up --wif-lifecycle-client-id) to preflight grants; tags are still checked by Tailscale at mint\n", firstLine(policyUnavailable))
+		} else {
+			printPreflight(a, pf)
+		}
 	}
 	if !pf.OK && !*allowMissing {
 		e := fail("acl_denied", "preflight failed: the tenant policy is missing grants or tagOwners this app needs")
