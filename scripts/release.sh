@@ -34,7 +34,10 @@ sha256() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum 
 # vendored node_modules (same for every target: pure JS)
 VNM=$CACHE/vendor
 rm -rf "$VNM"
-node scripts/vendor-node-modules.mjs "$ROOT" "$VNM/node_modules" @twd/tailnet @twd/mcp agents @modelcontextprotocol/server @modelcontextprotocol/sdk zod >"$CACHE/vendor.json"
+# Roots: every dependency any template declares (so every template deploys offline).
+ROOTS=$(node -e 'const fs=require("fs"),d="js/packages/create-twd/templates";const s=new Set();for(const t of fs.readdirSync(d)){try{for(const k of Object.keys(require("./"+d+"/"+t+"/package.json").dependencies||{}))s.add(k)}catch{}}console.log([...s].sort().join(" "))')
+echo "release: vendoring the templates' deps: $ROOTS"
+node scripts/vendor-node-modules.mjs "$ROOT" "$VNM/node_modules" $ROOTS >"$CACHE/vendor.json"
 echo "release: vendored node_modules $(cat "$CACHE/vendor.json")"
 
 for t in $TARGETS; do

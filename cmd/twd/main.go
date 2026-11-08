@@ -39,7 +39,7 @@ func init() {
 		{name: "up", usage: "up --tailnet <tailnet> --api-key-file <file> [--yes] [--policy-apply]", help: "start twd-mgmt + twd-hostd on this machine (homelab all-in-one)", run: cmdUp},
 		{name: "down", usage: "down [--purge]", help: "stop everything twd up started (--purge: kill every object and delete its device first)", run: cmdDown},
 		{name: "status", usage: "status", help: "health of mgmt, the host, the tenant and deployments", run: cmdStatus},
-		{name: "init", usage: "init <dir> [--template hello|agent|mcp]", help: "create an app from a template", run: cmdInit},
+		{name: "init", usage: "init <dir> [--template hello|agent|mcp|ai-agent]", help: "create an app from a template", run: cmdInit},
 		{name: "dev", usage: "dev [dir] [--port 8787]", help: "run an app locally: process tier + embedded control plane (no tailnet)", run: cmdDev},
 		{name: "deploy", usage: "deploy [dir] [--name <workload>] [--allow-missing-grants] [--no-wait]", help: "bundle, preflight grants, deploy, wait until ready", run: cmdDeploy},
 		{name: "ls", usage: "ls [--all]", help: "list deployments and objects", run: cmdLs},

@@ -67,3 +67,24 @@ test("budget reserves against the perDay limit from authorizeTool", async () => 
   assert.equal(body.code, "cap_limit_exceeded");
   assert.equal(body.used, 80);
 });
+
+test("mcpFetch routes via ctx.tailnet.fetch with traceparent; typed errors pass through", async () => {
+  const { mcpFetch } = await import("../dist/index.js");
+  const { TailnetError } = await import("@twd/tailnet");
+  const seen = [];
+  const ctx = { tailnet: { async fetch(url, init) { seen.push({ url, init }); if (url.includes("denied")) throw new TailnetError("peer_not_visible", "nope"); return new Response("{}"); } } };
+  const f = mcpFetch(ctx, { traceId: "0123456789abcdef0123456789abcdef", headers: { "x-a": "1" } });
+  const r = await f("http://mcp/mcp", { method: "POST", body: '{"jsonrpc":"2.0"}', headers: { "content-type": "application/json" } });
+  assert.equal(r.status, 200);
+  assert.equal(seen[0].url, "http://mcp/mcp");
+  assert.equal(seen[0].init.method, "POST");
+  assert.equal(new TextDecoder().decode(seen[0].init.body), '{"jsonrpc":"2.0"}');
+  assert.match(seen[0].init.headers.get("traceparent"), /^00-0123456789abcdef0123456789abcdef-[0-9a-f]{16}-01$/);
+  assert.equal(seen[0].init.headers.get("x-a"), "1");
+  await assert.rejects(f("http://denied/mcp"), (e) => e.code === "peer_not_visible");
+  // redirect: "error" (the @ai-sdk/mcp default) is emulated: workerd rejects it.
+  const g = mcpFetch({ tailnet: { async fetch(url, init) { seen.push({ url, init }); return new Response(null, { status: 302, headers: { location: "http://x/" } }); } } });
+  await assert.rejects(g("http://mcp/mcp", { redirect: "error" }), /redirect/);
+  assert.equal(seen.at(-1).init.redirect, "manual");
+  assert.throws(() => mcpFetch({}), (e) => e.code === "no_identity");
+});

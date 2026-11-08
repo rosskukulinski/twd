@@ -6,8 +6,9 @@
       // each instance gets its own node; egress leaves from it (facet mode)
       "SupportAgent": { "tags": ["tag:twd-agent-support"], "agent": true },
       "LookupAgent":  { "tags": ["tag:twd-agent-support-sub"], "agent": true, "ttl": "10m" }
-      // a class that needs alarms (Agents SDK schedule()) uses plain-DO mode:
-      //   "Reminder": { "tags": [...], "egress": "workload" }
+      // schedule()/scheduleEvery() work in this (facet) mode: alarms are
+      // delegated to the host DO. "egress": "workload" (plain-DO mode) is
+      // only needed if egress may leave as the workload node.
     },
     "spawn": { "maxLive": 64, "maxDepth": 3 }
   }

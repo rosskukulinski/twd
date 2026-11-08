@@ -377,6 +377,18 @@ func TestE2EMbp(t *testing.T) {
 			t.Fatalf("twd doctor on mbp: %s is %s: %s", c.Name, c.Status, c.Detail)
 		}
 	}
+	for _, c := range doc.Checks {
+		if c.Name == "bundler" && !strings.Contains(c.Detail, "ai-agent") {
+			t.Fatalf("doctor's bundler check didn't build the ai-agent template: %s", c.Detail)
+		}
+	}
+	// ai-agent (Vercel AI SDK + @ai-sdk/mcp) scaffolds on mbp with no npm;
+	// doctor above bundled it offline. Not deployed: its tags aren't in
+	// tailnet 1's policy, and M6 doesn't write policy.
+	if _, se, _, err := e.Twd("init", rWork+"/ai", "--template", "ai-agent", "--json"); err != nil {
+		t.Fatalf("twd init --template ai-agent on mbp: %v %s", err, se)
+	}
+	res.Pass("init_ai_agent_offline", "twd init --template ai-agent on mbp (no npm); bundled offline by doctor")
 	res.Numbers["doctor_ms"] = msOf(d)
 	res.Pass("doctor", fmt.Sprintf("%d checks ok in %.0f ms (workerd runs, bundler offline, ~/.twd writable, API key works, system tailscaled not used)", len(doc.Checks), msOf(d)))
 

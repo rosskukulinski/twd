@@ -23,7 +23,12 @@ func repoRoot(t *testing.T) string {
 func TestMatchesBuildMJS(t *testing.T) {
 	root := repoRoot(t)
 	node, nodeErr := exec.LookPath("node")
-	for _, tmpl := range []string{"hello", "agent", "mcp"} {
+	ents, _ := os.ReadDir(filepath.Join(root, "js", "packages", "create-twd", "templates"))
+	if len(ents) < 3 {
+		t.Fatalf("templates: %d", len(ents))
+	}
+	for _, en := range ents {
+		tmpl := en.Name()
 		t.Run(tmpl, func(t *testing.T) {
 			dir := filepath.Join(root, "js", "packages", "create-twd", "templates", tmpl)
 			wb, err := os.ReadFile(filepath.Join(dir, "wrangler.jsonc"))

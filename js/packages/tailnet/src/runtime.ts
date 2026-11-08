@@ -133,6 +133,43 @@ function define(ctx: any, tn: TailnetContext) {
   }
 }
 
+/**
+ * installAlarmShim: workerd facets cannot set alarms ("Facets currently
+ * cannot set alarms"), so a facet's ctx.storage alarm methods are delegated
+ * to its parent Host DO (a real DO, same object identity), which owns the
+ * physical alarm and calls the facet's alarm() when it fires. This is what
+ * makes the Agents SDK's schedule()/scheduleEvery() work in facet mode.
+ */
+function installAlarmShim(ctx: any, tw: TailnetApiStub) {
+  const st = ctx?.storage;
+  if (!st || !tw) return;
+  const call = async (action: string, time?: number) => {
+    const r = await tw.call("alarm", { action, time });
+    if (!r || !r.ok) throw TailnetError.from((r as any)?.error);
+    return r.value;
+  };
+  const shim: Record<string, (...a: any[]) => Promise<any>> = {
+    async setAlarm(t: number | Date) {
+      const ms = typeof t === "number" ? t : t instanceof Date ? t.getTime() : Number(t);
+      if (!Number.isFinite(ms)) throw new TypeError("setAlarm: invalid time");
+      await call("set", ms);
+    },
+    async getAlarm() {
+      return (await call("get")) ?? null;
+    },
+    async deleteAlarm() {
+      await call("delete");
+    },
+  };
+  for (const [k, fn] of Object.entries(shim)) {
+    try {
+      Object.defineProperty(st, k, { value: fn, configurable: true, writable: true });
+    } catch {
+      /* non-extensible storage: alarms stay unsupported in this facet */
+    }
+  }
+}
+
 /** wrapFacetClass wraps a tenant DO class run as a facet (per-object egress). */
 export function wrapFacetClass(C: any, name: string, bindings: BindingMap) {
   if (typeof C !== "function") throw new Error(`twd: durable_objects class ${name} is not exported by the main module`);
@@ -143,7 +180,13 @@ export function wrapFacetClass(C: any, name: string, bindings: BindingMap) {
         const e = { ...env };
         delete e.__TWD;
         define(ctx, createTailnetContext(tw, e, bindings));
+        installAlarmShim(ctx, tw);
         super(ctx, e);
+      }
+      // Called by the Host DO when the delegated alarm fires.
+      async __twd_alarm(info: unknown) {
+        const self = this as any;
+        if (typeof self.alarm === "function") return self.alarm(info);
       }
     },
   }[name];

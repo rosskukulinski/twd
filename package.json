@@ -9,14 +9,20 @@
     "test": "npm run build && npm test --workspaces --if-present"
   },
   "devDependencies": {
-    "workerd": "1.20261108.1",
-    "typescript": "7.0.2",
-    "esbuild": "0.28.2",
-    "agents": "0.33.0",
-    "@modelcontextprotocol/server": "2.4.0",
+    "@ai-sdk/mcp": "2.0.93",
+    "@ai-sdk/provider": "4.0.37",
+    "@ai-sdk/provider-utils": "5.0.76",
+    "@modelcontextprotocol/client": "2.4.0",
     "@modelcontextprotocol/sdk": "1.32.2",
-    "zod": "4.6.7",
-    "@types/node": "^24"
+    "@modelcontextprotocol/server": "2.4.0",
+    "@types/node": "^24",
+    "agents": "0.33.0",
+    "ai": "7.0.165",
+    "esbuild": "0.28.2",
+    "mcp-handler": "2.3.1",
+    "typescript": "7.0.2",
+    "workerd": "1.20261108.1",
+    "zod": "4.6.7"
   },
   "engines": {
     "node": ">=20"

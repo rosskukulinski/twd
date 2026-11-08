@@ -1,0 +1,7 @@
+{
+  "name": "vercel-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": { "MCP_CAP": "example.com/cap/mcp" }
+}

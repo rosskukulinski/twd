@@ -118,7 +118,17 @@ func cmdDoctor(args []string) error {
 		}
 		defer os.RemoveAll(tmp)
 		var sizes []string
-		for _, tm := range []string{"hello", "agent", "mcp"} {
+		ents, _ := os.ReadDir(filepath.Join(ct, "templates"))
+		var tms []string
+		for _, e := range ents {
+			if e.IsDir() {
+				tms = append(tms, e.Name())
+			}
+		}
+		if len(tms) == 0 {
+			return "fail", "no templates in " + ct, "reinstall twd"
+		}
+		for _, tm := range tms {
 			dir := filepath.Join(ct, "templates", tm)
 			wb, err := os.ReadFile(filepath.Join(dir, "wrangler.jsonc"))
 			if err != nil {

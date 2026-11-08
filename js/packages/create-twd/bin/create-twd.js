@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // create-twd: scaffold a twd app from a template, or bundle one.
-//   npm create twd@latest <dir> -- --template hello|agent|mcp
+//   npm create twd@latest <dir> -- --template hello|agent|mcp|ai-agent
 //   create-twd build [dir]        (bundles wrangler.jsonc main → dist/index.js)
 import { cpSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";

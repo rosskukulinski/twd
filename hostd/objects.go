@@ -227,6 +227,16 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 	}
 	h.mu.Lock()
 	if old := h.objects[o.ID]; old != nil { // mgmt returned an existing object
+		if old.Workload != w.name || old.Class != class || old.Name != name {
+			// mgmt keys objects by (tenant, namespace = class, name), so two
+			// workloads of one tenant with the same DO class and object name
+			// get the same object. Sharing it would hand one app the other's
+			// node identity: fail closed.
+			h.mu.Unlock()
+			return nil, &apiError{Code: "namespace_conflict", Detail: fmt.Sprintf(
+				"object %s/%s of workload %s is the same mgmt object (%s) as %s/%s of workload %s: DO class names must be unique per tenant",
+				class, name, w.name, o.ID, old.Class, old.Name, old.Workload)}
+		}
 		h.byKey[o.key()] = old
 		if !old.live && !old.terminal() {
 			h.startNodeLocked(old)
