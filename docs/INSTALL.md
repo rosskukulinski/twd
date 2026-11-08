@@ -29,11 +29,15 @@ macOS 26.6) by `make e2e-mbp`; measured numbers are in STATUS.md (M6).
 > `process_vm_readv/writev` (so no reading a sibling's memory), kexec,
 > mount, bpf, perf_event_open, keyctl, new namespaces, io_uring, and
 > UDP/ICMP/raw/MPTCP sockets; and other processes' `/proc` entries (their
-> environment, cmdline) are unreadable. On kernels with Landlock ABI < 9,
-> Landlock can't refuse a *connect* to a unix socket by path, so twd's
-> sockets (mgmt's admin socket, hostd's push socket, each instance's egress
-> sockets) refuse sandboxed peers themselves, and instance dirs have
-> unguessable names that a sandboxed process can't list.
+> environment, cmdline) are unreadable. Workloads get **no unix sockets**
+> (seccomp; workerd's listener is inherited and its services are
+> token-checked loopback TCP), so the host's tailscaled or docker socket is
+> out of reach, and they may signal only themselves. twd's own sockets
+> refuse sandboxed peers too. As defence in depth, if *your user* can reach
+> the system tailscaled's socket or a container engine (or is in the
+> docker/podman/lxd groups), `twd doctor` warns (`host_sockets`) and twd
+> serves one tenant only unless `twd up --insecure-shared-host`: run twd as
+> a dedicated user to share a host.
 >
 > `twd doctor` checks that the sandbox enforces on your machine (Linux: the
 > Landlock ABI too), and while twd runs, that every workload is under it.

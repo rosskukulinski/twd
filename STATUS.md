@@ -957,9 +957,46 @@ Attacks, all from inside a sandboxed workload or under its **live** profile (`pr
 | serving requests (a–c, e, f of E2E-MULTI) and **egress via netd** (`EgressAttributed`: sdk, global fetch, `node:http`, undici; the echo's WhoIs is the deployment's node) | work under the sandbox |
 
 ### Gaps vs Seatbelt
-- **Unix sockets that aren't twd's, on ABI < 9:** Landlock can't refuse the connect, so a sandboxed workload can reach other software's sockets **at a known path** (the D-Bus session bus, `docker.sock` if the user may use it, tailscaled's LocalAPI socket). Seatbelt also allows unix sockets outside its denied paths, but on macOS those mostly live under the denied home dir. Kernels with Landlock ABI 9 close this automatically (the profile already requests it); measured only on ABI 4 here.
-- **Signals and abstract unix sockets on ABI < 6:** a workload can signal a same-uid process by pid (not `kill(-1)`) and connect to an abstract socket whose name it knows (names aren't discoverable: `/proc/net/unix` and sock_diag are blocked). Seatbelt allows signals too. ABI 6 scopes apply automatically.
+- ~~**Unix sockets that aren't twd's, on ABI < 9**~~: closed in the follow-up below (workloads get no AF_UNIX sockets).
+- ~~**Signals and abstract unix sockets on ABI < 6**~~: closed in the follow-up below (signals only to self/own group; no AF_UNIX sockets).
 - **The "sandboxed peer" test is a heuristic:** more seccomp filters than the server. A legitimate client that itself runs under extra seccomp filters (e.g. the `twd` CLI inside a container while mgmt runs outside) is refused by mgmt's and hostd's sockets.
 - **Child processes** of a Node app can't read their own `/proc/self/*` (the rules name the launcher's pid). Not hit by any test (Workflow included); an app that forks helpers that need `/proc/self/maps` would see `EACCES`.
 - System dirs (`/usr`, `/etc`, `/opt`) are readable, as with Seatbelt; `/tmp` is **not** (stricter than Seatbelt). Apps can't do their own DNS (UDP is refused), by design.
 - **Not run:** amd64 (builds and vets; the amd64 seccomp file is untested), kernels with Landlock ABI ≥ 5, other distros, and the sandbox **from an installed linux release tarball** (L1's matrix covers that; nothing new is shipped: the launcher is twd-hostd itself). ABI 1–3 kernels (FS-only, TCP unrestricted) are handled by best-effort downgrade and a doctor warning, but not tested.
+
+### Follow-up: host unix sockets contained (lead review)
+The gap in the first pass: on Landlock ABI < 9 a sandboxed workload could `connect()` to host unix sockets at known paths, such as `/var/run/tailscale/tailscaled.sock` (the host's own tailnet identity, BUILD-PLAN rule 1) or `/var/run/docker.sock` (root-equivalent). **Closed by taking unix sockets away from workloads entirely**, plus a shared-host refusal as defence in depth:
+- **workerd needs no unix socket.** Its ingress listener is created by hostd and inherited as fd 3 (`workerd serve --socket-fd ingress=3`). Its three outbound services (`netd-egress`, `egress-wl`, `hostd`) are **hostd loopback TCP listeners** (`127.0.0.1:<ephemeral>`). Landlock pins workerd's connects to exactly those 3 ports. Each request carries a per-instance 256-bit token, injected by workerd's config (`injectRequestHeaders`, in the instance dir, unreadable to others); hostd checks the token in constant time and strips it. So other local processes, which can't connect under Landlock anyway, also can't use the ports on an ABI < 4 kernel. Status shows `LoopbackPorts`.
+- **seccomp `NoUnixSockets`** (workerd, and Node apps in the default TCP listen mode): `socket(AF_UNIX, …)` → EPERM. `socketpair(AF_UNIX)` is allowed for STREAM and SEQPACKET only: those pairs are connected and can't be re-pointed. A DGRAM pair could be re-pointed at a host socket, so it is EPERM. workerd, Node 24, Vercel Workflow and the SDK apps all run unchanged. The Node app in `listen: "unix"` mode still creates its own unix socket, so that mode keeps AF_UNIX (gap below).
+- **Signals (any ABI):** `kill` only to pid 0, self or −self (hostd now starts workerd in its own process group too, like Node). `tgkill`/`rt_sigqueueinfo`/`rt_tgsigqueueinfo` only to self. `tkill` and `pidfd_send_signal` are EPERM. A workload can no longer signal hostd, mgmt or another tenant's processes on ABI < 6.
+- **Defence in depth (Linux):** `procsb.RiskyHostSockets` lists risky sockets this user can connect to and risky group memberships. It checks write permission via `access(W_OK)` and never connects. The sockets covered are tailscaled's, docker, containerd, podman, lxd/incus and rootless docker/podman under `$XDG_RUNTIME_DIR`. The groups are docker, podman, lxd and incus(-admin). If any is found:
+  - hostd refuses a second tenant's process-tier deployment (`sandbox_unavailable`, naming them);
+  - `twd tenant add` refuses up front;
+  - `twd doctor` warns under the new `host_sockets` check, with the fix "run twd as a dedicated user that can't reach those sockets and isn't in those groups";
+  - all three accept `twd up --insecure-shared-host` as the override.
+- **Doctor's `sandbox` probe** now also checks that its profile can't open a unix socket.
+
+**Tests, with fake listeners at the real paths.** In `twdl-sbx-u24`, sudo started a root-owned listener on each of `/var/run/tailscale/tailscaled.sock` and `/var/run/docker.sock` (mode 0666; it answers `HTTP 200 fake`). The VM has no real tailscaled or docker, and neither was touched. The listeners were removed afterwards.
+
+| Check (listeners present) | Result |
+|---|---|
+| control: curl from the user, unsandboxed | reaches both (`fake`) |
+| `procsb` `TestSandboxProbes`, under a workload profile | both sockets: **EPERM**; temp and guarded sockets EPERM; socketpair stream/seqpacket ok, dgram EPERM; `kill(self/0)` ok; kill of a sibling, of the parent test, of pid 1, and `kill(-1)`: EPERM; tgkill of a sibling: EPERM |
+| hostd `TestLandlockHostSockets`: a **serving workerd**'s live profile | tailscaled.sock, docker.sock, hostd's push socket, a temp socket: **EPERM**; profile has `noUnixSockets` |
+| `make test-node`: a **Node app**'s own `net.connect({path})` | tailscaled.sock, docker.sock, both hostds' push sockets: **EPERM**; TCP as before; Workflow passes |
+| `make test-sdk` | PASS (8/8 SDK workloads under Landlock) |
+| `twd doctor` | `sandbox ok`; `host_sockets warn` naming both sockets |
+| `TestCLIMultiTenant` / `make e2e-multi` | `twd tenant add` refused: `sandbox_unavailable … can reach /var/run/tailscale/tailscaled.sock, /var/run/docker.sock` (expected: defence in depth); the e2e run still cleaned up to 0 devices |
+
+**After the listeners were removed:**
+- **`make test` PASS.** It includes `TestMultiTenant`, whose (d) now also shows A → B's 3 loopback service ports refused (`EACCES`) and B's ports refusing a token-less unsandboxed request. It also includes `TestSharedHostRiskySockets`.
+- **`make e2e-multi` ×2 PASS** (`63a580`, `41967a`): 0 devices left, no policy written, 0 `tskey-`.
+- **macOS:** `make test`, `make lint`, `make test-sdk` and `make test-node` PASS.
+
+**Remaining gaps after the follow-up:**
+- A Node app in `listen: "unix"` mode keeps AF_UNIX, so on ABI < 9 it can reach host sockets by path. The `host_sockets` refusal still protects shared hosts.
+- **A Node app's child processes:**
+  - they can't signal their own pid, because the filter names the app's pid, so `raise()`/`abort()` in a child fails;
+  - the app can't signal its children by pid; `kill(0)` or the process group works.
+  - No test hit this.
+- `host_sockets` makes `--insecure-shared-host` necessary on any Linux host where tailscaled is installed, because its socket is 0666 by design. That is defence in depth beyond what the sandbox needs. A dedicated user doesn't help, since the socket is world-writable.
