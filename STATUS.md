@@ -4,6 +4,7 @@ Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on
 Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
 Last update: 2026-11-08 00:40 PT. M8 (microVM tier, Firecracker in Lima) on branch `m8-vm`: `make e2e-vm` PASS.
 Last update: 2026-11-08 00:45 PT. M4 (`twd` CLI + integrated single-machine flow, E2E-MAC on this Mac) on branch `m4-cli`.
+Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -553,3 +554,57 @@ Final run: `e2e/vm/results/m8-20261108T083524Z.json`.
 - **Push URLs** live in mgmt memory: after a mgmt restart, kills fall back to the heartbeat until the host re-registers (hostd re-registers only on a 404).
 - **Spawned sub-agents report `principal`** = the root's caller, not an `actingFor` assertion (RFC §4.6, still not implemented).
 - **Linux/Lima not run** for M4.
+
+## M5: SDK conformance, in-isolate, process tier (DONE, branch `m5-sdk`)
+
+Full matrix: `docs/COMPAT.md`.
+
+### What's built
+- **`make test-sdk`** (`e2e/sdk`, build tag `sdk`, hermetic). Two twd-hostd hosts (each with fakemgmt, static mint) share one testcontrol + local DERP/STUN: host A runs the agent apps, host B the MCP servers, so agent → MCP calls cross the tailnet. A tsnet client drives everything over HTTP and WebSocket (`github.com/coder/websocket`, now a direct dependency). There is no real tailnet, no LLM and no key.
+  - `apps/cfagents`: one `agents` `Agent` body exported twice, `StateAgent` (facet mode) and `PlainAgent` (plain-DO mode). It also serves an in-app `createMcpHandler` + `withTailnet` at `/mcp`.
+  - `apps/vercel-mcp`: Vercel `mcp-handler` + `withTailnet` (`whoami`, `lookup_order`, `refund`).
+  - Templates under test: `mcp` (host B), `agent`, and the new `ai-agent` (host A, deployed twice: once against each MCP server).
+- **SDK versions:** `agents` **0.33.0** is still npm `latest` (2026-11-08) and runs on the pinned workerd 1.20261108.1 unmodified. Added (exact devDependencies): `ai` 7.0.165, `@ai-sdk/provider` 4.0.37, `@ai-sdk/provider-utils` 5.0.76, `@ai-sdk/mcp` 2.0.93, `mcp-handler` 2.3.1, `@modelcontextprotocol/client` 2.4.0.
+- **Facet alarm delegation (twd fix).** workerd facets cannot set alarms ("Facets currently cannot set alarms"). Because the Agents SDK re-arms on every wake, one `schedule()` call in facet mode wedged the agent: every later request returned 500. The facet wrapper now redirects the facet's `ctx.storage.{set,get,delete}Alarm` through `TailnetApi` op `alarm` (facet objects only, props-attested) to its `Host_<Class>` DO. That DO owns the real alarm and its `alarm()` runs the facet's `alarm()` (`AlarmInvocationInfo` isn't serializable, so its fields are passed instead). A kill deletes the alarm. With this, **`schedule()`/`scheduleEvery()` work in both egress modes**, so the agent template no longer needs plain-DO mode for alarms.
+- **Cross-workload identity collision (twd fix: fail closed).** mgmt keys objects by `(tenant, namespace = class, name)`. So two workloads of one tenant that use the same DO class and object name got the *same* mgmt object, and hostd handed the second app the first app's node: its egress (MCP calls) was attributed to the other app. hostd now refuses with a typed **`409 namespace_conflict`**, which is also in the TS catalog. The real fix is a mgmt namespace that includes the workload (contract change, M2).
+- **`@twd/mcp` `mcpFetch(ctx, {headers, traceId})`.** A `fetch` for MCP clients (for example the `@ai-sdk/mcp` transport `fetch`):
+  - it goes through `ctx.tailnet.fetch`, so it carries the object's or workload's identity and throws typed errors (`peer_not_visible`, `namespace_conflict`, …) instead of an opaque "HTTP 403";
+  - it sends a W3C `traceparent` built from the caller's trace ID;
+  - it emulates `redirect: "error"`, which is the `@ai-sdk/mcp` default and which workerd rejects.
+  - Unit tested (mcp 5/5).
+  - The Agents SDK's `addMcpServer` has no fetch hook. It already egresses from the agent's own node, but its errors are untyped.
+- **Templates.**
+  - New **`ai-agent`**: a `ToolLoopAgent` in a DO, one agent and one node per caller, with `/agents/<name>` and `/worker` routes. Its tools come from a twd MCP server via `createMCPClient` + `mcpFetch`, and it streams `toUIMessageStreamResponse()`. It ships a scripted `MockLanguageModelV4` in `src/model.ts`, with a comment on swapping in a provider through `ctx.tailnet.fetch`. Typed twd errors (including ones wrapped as an error's `cause`) render as catalog responses.
+  - **`agent`** gains `routeAgentRequest`, `onConnect` with `getCaller(ctx.request)`, and a facet-mode `schedule()` route (`/remind`). The existing routes and responses are unchanged.
+  - **`mcp`** gains a `whoami` tool.
+  - `twd init` and `create-twd` now list `ai-agent`.
+
+### Test results (measured 2026-11-08)
+- **`make test-sdk`: PASS on macOS** (this Mac, 28.7 s) **and in Lima `twd-dev`** (Ubuntu arm64, cloned from `/Users/ross/dev/twd` at `m5-sdk`; 82.7 s, because node joins are slower there).
+
+  | Check | Result |
+  |---|---|
+  | `routeAgentRequest`, `getAgentByName`, `getCaller` in `onRequest` (both modes) | ✅; an unknown namespace gets 400 |
+  | `setState` / `onStateChanged` / `this.sql` (both modes, via the workload and via the object's own node) | ✅ |
+  | `schedule(1)` + `scheduleEvery(1)` | ✅ both modes; once + 2× every fired in 1.9–2.0 s |
+  | WebSockets: `onConnect` `getCaller`, `cf_agent_state` broadcast to a second connection | ✅ both modes |
+  | WebSocket hibernation (14 s idle) | ✅ both modes: the DO was evicted (new boot ID), the sockets stayed open, connection state was intact |
+  | `fetch()` egress | facet: the object's node; plain: the workload node |
+  | `addMcpServer` → `mcp` template on host B | ✅ `lookup_order` allowed, `refund` `cap_missing`. The server's `whoami` = `a-cfagents-stateagent-mc1` (facet) / `a-cfagents` (plain) |
+  | same-host `addMcpServer` | ❌ by design: netd `forbidden_destination` (the SDK reports "HTTP 403") |
+  | `createMcpHandler` + `withTailnet`, `mcp-handler` + `withTailnet` | ✅ allow, deny (`cap_missing` JSON), `whoami` = the client |
+  | `ToolLoopAgent` (mock model) → `mcp-handler` and → `createMcpHandler` | ✅ streamed UI message SSE (36–38 events); the MCP server saw the agent's own node (DO) or the workload node (Worker) |
+  | typed errors through the MCP client | ✅ `403 peer_not_visible`, `409 namespace_conflict` |
+  | Unsupported, documented by tests | `env.AI`, KV, Workflows, `env.BROWSER`, `env.LOADER` absent; `cloudflare:email` throws "not supported on twd"; `subAgent()` in a facet fails ("not found in worker exports") |
+- **`make test`: PASS on macOS** (netd, internal, cmd, mgmt, hostd, gen, JS tailnet 7/7 and mcp 5/5). **Also PASS in Lima** (same packages, plus `hostd/vm`).
+- `make lint`: PASS (now also vets `-tags sdk`).
+- `package-lock.json` was regenerated with npm 11.19, because npm 11.6 (Node 25 on this Mac) had dropped the optional `@emnapi/*` entries and `npm ci` failed on Linux.
+
+### Known gaps (M5)
+- **Same-host object → object over the tailnet** is refused (RFC §4.5 platform path not built). An agent and its MCP server must be on different hosts.
+- **The mgmt namespace is the class.** DO class names must be unique per tenant; hostd fails closed (`namespace_conflict`) until mgmt namespaces include the workload.
+- **No on-behalf-of assertions** on MCP calls (RFC §4.6). Servers see the agent's node, not the human it acts for.
+- `subAgent()` (facet sub-agents) does not work inside a facet. Use `ctx.tailnet.spawn`.
+- Not tested: `@callable` RPC, `useAgent`, `AIChatAgent`, `McpAgent` (deprecated), and real LLM providers (no keys by rule).
+- `addMcpServer` errors are untyped (there's no fetch hook to install `mcpFetch`).
+
