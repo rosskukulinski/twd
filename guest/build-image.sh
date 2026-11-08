@@ -83,7 +83,8 @@ E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mkfs.ext4 -q -F -t ext4 -O ^has_journal,^
 TS=$(date -u -d "@$SOURCE_DATE_EPOCH" +%Y%m%d%H%M%S)
 N=$(( $(find "$STAGE" | wc -l) + 16 ))
 # By inode number: path lookups in debugfs follow symlinks (/lib, /bin).
-{ for i in $(seq 2 "$N"); do echo "sif <$i> ctime $TS"; done
+# atime too: mke2fs reading the staged files bumps it (relatime).
+{ for i in $(seq 2 "$N"); do echo "sif <$i> ctime $TS"; echo "sif <$i> atime $TS"; echo "sif <$i> ctime_extra 0"; echo "sif <$i> atime_extra 0"; done
   echo "sif /lost+found mtime $TS"; echo "sif /lost+found atime $TS"; echo "sif /lost+found crtime $TS"
 } >"$STAGE.debugfs"
 E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH debugfs -w -f "$STAGE.debugfs" "$IMG" >/dev/null 2>&1
