@@ -107,7 +107,7 @@ func start(t *testing.T) *env {
 		b, _ := json.MarshalIndent(map[string]any{"when": time.Now().UTC().Format(time.RFC3339), "goos": runtime.GOOS, "goarch": runtime.GOARCH,
 			"node": nodeVersion(), "results": e.results}, "", "  ")
 		os.MkdirAll("results", 0o755)
-		os.WriteFile(filepath.Join("results", fmt.Sprintf("m9-%s-%s.json", runtime.GOOS, time.Now().UTC().Format("20060102T150405Z"))), b, 0o644)
+		os.WriteFile(filepath.Join("results", fmt.Sprintf("m9-%s-%s-%s.json", t.Name(), runtime.GOOS, time.Now().UTC().Format("20060102T150405Z"))), b, 0o644)
 	})
 	return e
 }
