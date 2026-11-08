@@ -63,18 +63,24 @@ func openTapInNetns(ns, name string, mtu int) (int, error) {
 	}
 	ch := make(chan res, 1)
 	go func() {
-		// This thread switches namespaces; it is never handed back to the
-		// scheduler (no UnlockOSThread), so the Go runtime retires it.
+		// Switch this OS thread into ns just long enough to create the TAP,
+		// then switch back and return the thread to the pool. (Letting a
+		// locked thread exit instead would be wrong here: a thread that once
+		// forked another VM's firecracker may be the one that exits.)
 		runtime.LockOSThread()
+		orig, err := os.Open("/proc/thread-self/ns/net")
+		if err != nil {
+			ch <- res{-1, err}
+			runtime.UnlockOSThread()
+			return
+		}
+		defer orig.Close()
 		fd, err := func() (int, error) {
 			nsf, err := os.Open("/run/netns/" + ns)
 			if err != nil {
 				return -1, err
 			}
 			defer nsf.Close()
-			if err := unix.Unshare(unix.CLONE_FS); err != nil {
-				return -1, err
-			}
 			if err := unix.Setns(int(nsf.Fd()), unix.CLONE_NEWNET); err != nil {
 				return -1, fmt.Errorf("setns: %w", err)
 			}
@@ -91,6 +97,13 @@ func openTapInNetns(ns, name string, mtu int) (int, error) {
 			}
 			return fd, nil
 		}()
+		if serr := unix.Setns(int(orig.Fd()), unix.CLONE_NEWNET); serr != nil {
+			// Can't restore: keep the thread locked so it dies with this
+			// goroutine instead of running other code in the wrong netns.
+			ch <- res{fd, err}
+			return
+		}
+		runtime.UnlockOSThread()
 		ch <- res{fd, err}
 	}()
 	r := <-ch

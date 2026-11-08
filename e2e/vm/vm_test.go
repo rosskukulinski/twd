@@ -64,6 +64,7 @@ func TestE2EVM(t *testing.T) {
 	if err != nil {
 		t.Fatalf("microVM backend unavailable: %v", err)
 	}
+	t.Cleanup(func() { be.Close() })
 	res := &results{m: map[string]any{"started": time.Now().UTC().Format(time.RFC3339), "kernel": kernel, "rootfs": rootfs, "vcpus": vcpus, "mem_mib": 512,
 		"hugepages": os.Getenv("TWD_VM_HUGEPAGES"), "free_hugepages_2m_at_start": vm.FreeHugePages2M()}}
 	if mb, err := os.ReadFile(filepath.Join(filepath.Dir(rootfs), "manifest.json")); err == nil {

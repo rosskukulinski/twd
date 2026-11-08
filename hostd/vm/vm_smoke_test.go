@@ -51,6 +51,7 @@ func TestSmoke(t *testing.T) {
 	if err != nil {
 		t.Skip(err)
 	}
+	defer b.Close()
 	app := t.TempDir()
 	os.WriteFile(filepath.Join(app, "w.js"), []byte(smokeJS), 0o600)
 	os.WriteFile(filepath.Join(app, "config.capnp"), []byte(smokeCapnp), 0o600)

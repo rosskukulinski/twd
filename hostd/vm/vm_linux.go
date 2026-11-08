@@ -60,8 +60,9 @@ const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 quiet ro rootfstype=ext4
 
 // Backend is the Firecracker microVM backend.
 type Backend struct {
-	cfg Config
-	seq atomic.Int64
+	cfg    Config
+	seq    atomic.Int64
+	ownDir bool
 }
 
 // Available reports whether this host can run microVMs (KVM, Firecracker,
@@ -115,17 +116,18 @@ func New(cfg Config) (*Backend, error) {
 	if err := Available(cfg); err != nil {
 		return nil, err
 	}
+	own := false
 	if cfg.RunDir == "" {
 		d, err := os.MkdirTemp("/tmp", "twd-vm-")
 		if err != nil {
 			return nil, err
 		}
-		cfg.RunDir = d
+		cfg.RunDir, own = d, true
 	}
 	if err := os.MkdirAll(cfg.RunDir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Backend{cfg: cfg}, nil
+	return &Backend{cfg: cfg, ownDir: own}, nil
 }
 
 func (b *Backend) machineConfig() map[string]any {
@@ -139,6 +141,15 @@ func (b *Backend) machineConfig() map[string]any {
 		}
 	}
 	return mc
+}
+
+// Close removes the backend's run directory if it created it. Running VMs
+// must be stopped first.
+func (b *Backend) Close() error {
+	if b.ownDir {
+		return os.RemoveAll(b.cfg.RunDir)
+	}
+	return nil
 }
 
 // Name implements sandbox.Backend.
@@ -189,10 +200,8 @@ type Machine struct {
 func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err error) {
 	t0 := time.Now()
 	n := b.seq.Add(1)
-	id := fmt.Sprintf("%s-%d", s.ID, n)
-	if len(id) > 20 {
-		id = id[len(id)-20:]
-	}
+	// Unique across hostd processes on this host (it names the netns).
+	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), s.ID, n)
 	m := &Machine{b: b, id: id, ns: "twd-" + id, dir: filepath.Join(b.cfg.RunDir, id), tapFD: -1,
 		done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}}
 	m.log = b.cfg.Log.With("vm", id)
@@ -247,7 +256,9 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	}
 	m.cmd = exec.Command("ip", "netns", "exec", m.ns, b.cfg.Firecracker, "--api-sock", apiSock, "--id", id, "--level", "Warning")
 	m.cmd.Stdout, m.cmd.Stderr = console, console
-	m.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pdeathsig: syscall.SIGKILL}
+	// No Pdeathsig: it fires when the forking *thread* exits, not hostd.
+	// Stop/Close (and teardown on every error path) kill the VMM instead.
+	m.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := m.cmd.Start(); err != nil {
 		console.Close()
 		return nil, err
