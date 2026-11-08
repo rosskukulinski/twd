@@ -67,6 +67,11 @@ printf 'root:x:0:\n' >"$STAGE/etc/group"
 printf 'twd-guest\n' >"$STAGE/etc/hostname"
 printf 'hosts: files\n' >"$STAGE/etc/nsswitch.conf"
 printf '127.0.0.1 localhost\n' >"$STAGE/etc/hosts"
+# workerd refuses to start without a system CA store (it is unused: https
+# egress is originated by host netd), so ship the base image's bundle.
+mkdir -p "$STAGE/etc/ssl/certs"
+cp -L "$BASE_ROOTFS/etc/ssl/certs/ca-certificates.crt" "$STAGE/etc/ssl/certs/ca-certificates.crt"
+chmod 0644 "$STAGE/etc/ssl/certs/ca-certificates.crt"
 : >"$STAGE/etc/resolv.conf" # no DNS: names are resolved by host netd, from the netmap
 
 find "$STAGE" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
