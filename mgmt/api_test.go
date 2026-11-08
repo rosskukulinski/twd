@@ -720,3 +720,38 @@ func TestKillWhileJoining(t *testing.T) {
 		t.Fatalf("late device not deleted: %v", d)
 	}
 }
+
+// TestAPIVolumeKey: the DO volume data key (L3) is created in custody once,
+// returned stably, and only to the lease holder at the lease's epoch.
+func TestAPIVolumeKey(t *testing.T) {
+	e := newTestEnv(t, nil)
+	c, h1, h2 := e.c, e.asHost("h1"), e.asHost("h2")
+	var tn struct{ TenantID string }
+	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 100, "tiers": []string{"process", "microvm"}}, nil)
+	bundle := makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})
+	var dep DeployResponse
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "support", "bundle": bundle}, &dep)
+	q := func(epoch int64) string {
+		return fmt.Sprintf("/v0/volumes/key?tenant=%s&workload=support&epoch=%d", tn.TenantID, epoch)
+	}
+	var k1, k2 VolumeKeyResponse
+	h1.ok("GET", q(dep.Epoch), nil, &k1)
+	h1.ok("GET", q(dep.Epoch), nil, &k2)
+	if len(k1.Key) != 32 || !bytes.Equal(k1.Key, k2.Key) {
+		t.Fatalf("volume key: %d bytes, stable %v", len(k1.Key), bytes.Equal(k1.Key, k2.Key))
+	}
+	h1.fail("GET", q(dep.Epoch+1), nil, 409, "lease_lost")
+	h1.fail("GET", q(0), nil, 400, "bad_request")
+	h2.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h2", "capacityNodes": 100, "tiers": []string{"process"}}, nil)
+	h2.fail("GET", q(dep.Epoch), nil, 409, "lease_lost")
+	var other VolumeKeyResponse
+	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "other", "bundle": bundle}, &dep)
+	h1.ok("GET", fmt.Sprintf("/v0/volumes/key?tenant=%s&workload=other&epoch=%d", tn.TenantID, dep.Epoch), nil, &other)
+	if bytes.Equal(other.Key, k1.Key) {
+		t.Fatal("two workloads share a volume key")
+	}
+	if s := fmt.Sprint(k1); strings.Contains(s, string(k1.Key)) {
+		t.Fatal("VolumeKeyResponse prints its key")
+	}
+}

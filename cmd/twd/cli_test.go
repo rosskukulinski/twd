@@ -311,6 +311,10 @@ func TestDoctor(t *testing.T) {
 	} else if runtime.GOOS == "linux" {
 		want["sandbox"] = "warn" // Linux without Landlock: loud warning
 	}
+	if runtime.GOOS == "linux" {
+		// No microVM guest next to this test build: the tier is off (warn).
+		want["microvm"] = "warn"
+	}
 	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)
 	}

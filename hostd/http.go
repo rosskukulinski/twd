@@ -375,6 +375,18 @@ func (h *Host) pushAPI() http.Handler {
 	m.HandleFunc("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, h.Status())
 	})
+	// Operator checks of a workload's microVM (twd host vmcheck): guest
+	// stats, DO volume fsync latency, and the no-keys-in-guest scan. The
+	// socket is the user's (0700 dir); answers carry no key material.
+	m.HandleFunc("POST /v0/vm/check", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		rep, err := h.VMCheck(r.Context(), q.Get("tenant"), q.Get("workload"), q.Get("keyscan") == "1")
+		if err != nil {
+			writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})
+			return
+		}
+		writeJSON(w, 200, rep)
+	})
 	return m
 }
 
@@ -392,6 +404,8 @@ type WorkloadStatus struct {
 	InstanceDir                                     string
 	Tier                                            string
 	VM                                              *sandbox.Info `json:",omitempty"`
+	// VMRSSKB is the microVM's VMM resident set (incl. hugetlb guest RAM).
+	VMRSSKB int64 `json:",omitempty"`
 	// Process tier: the workerd (or node) pid, its sandbox ("none" |
 	// "seatbelt" | "landlock"), the profile (.sb / .json), and its DO
 	// storage dir.
@@ -415,6 +429,10 @@ type StatusView struct {
 	// Sandbox is the host's process sandbox: "seatbelt", "landlock (ABI n)"
 	// or "none".
 	Sandbox   string `json:",omitempty"`
+	// Tiers this host offers ("process", and "microvm" with a backend);
+	// VMVia says how microVMs are launched (twd-vmhelper or in-process).
+	Tiers     []string
+	VMVia     string `json:",omitempty"`
 	Objects   []ObjectStatus
 	Workloads []WorkloadStatus
 }
@@ -422,7 +440,13 @@ type StatusView struct {
 // Status returns a snapshot.
 func (h *Host) Status() StatusView {
 	h.mu.Lock()
-	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo()}
+	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo(), Tiers: []string{"process"}}
+	if h.cfg.VM != nil {
+		v.Tiers = append(v.Tiers, "microvm")
+		if vv, ok := h.cfg.VM.(interface{ Via() string }); ok {
+			v.VMVia = vv.Via()
+		}
+	}
 	for _, o := range h.objects {
 		v.Objects = append(v.Objects, ObjectStatus{o.ID, o.NetdID, o.TenantID, o.Workload, o.Class, o.Name, o.Hostname, o.Status, o.NodeID, o.MagicDNS, o.IP, o.Err, o.Parent, o.Wakes})
 	}
@@ -455,6 +479,10 @@ func (h *Host) Status() StatusView {
 			if vm := w.active.currentVM(); vm != nil {
 				info := vm.Info()
 				ws.VM = &info
+				ws.VMRSSKB = vm.RSSKB()
+				if info.Console != "" {
+					ws.LogFile = info.Console // guest workerd logs to the serial console
+				}
 			}
 		}
 		w.mu.Unlock()

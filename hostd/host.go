@@ -84,6 +84,8 @@ type Config struct {
 	DefaultTier string
 	// VMDebug enables guest diagnostics (connectivity probes; tests).
 	VMDebug bool
+	// VMVolumeMiB sizes new DO volumes (microVM tier; sparse; default 1024).
+	VMVolumeMiB int
 	// Sandbox confines process-tier workerds and Node apps: "none"
 	// (default), "seatbelt" (macOS), "landlock" (Linux) or "auto".
 	Sandbox string
@@ -147,6 +149,9 @@ func New(cfg Config) (*Host, error) {
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 30 * time.Second
+	}
+	if cfg.VMVolumeMiB == 0 {
+		cfg.VMVolumeMiB = 1024
 	}
 	if cfg.DrainTimeout == 0 {
 		cfg.DrainTimeout = 10 * time.Second

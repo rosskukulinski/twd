@@ -164,6 +164,14 @@ func (c *Client) Credential(ctx context.Context, id string, epoch int64) (Creden
 	return out, err
 }
 
+// VolumeKey fetches the (tenant, workload) DO volume's data key; mgmt
+// releases it only to the namespace lease holder at epoch.
+func (c *Client) VolumeKey(ctx context.Context, tenantID, workload string, epoch int64) ([]byte, error) {
+	var out VolumeKey
+	err := c.Do(ctx, "GET", fmt.Sprintf("/v0/volumes/key?tenant=%s&workload=%s&epoch=%d", url.QueryEscape(tenantID), url.QueryEscape(workload), epoch), nil, &out)
+	return out.Key, err
+}
+
 func (c *Client) Ready(ctx context.Context, id string, r ReadyRequest) error {
 	return c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/ready", r, nil)
 }

@@ -15,8 +15,11 @@ const (
 	GuestConfigFile = "guest.json"
 	// AppDir is where the generated workerd instance dir is extracted.
 	AppDir = "/run/twd/app"
-	// DODir is the guest-local DO storage directory (tmpfs).
+	// DODir is the guest's DO storage directory: the persistent volume
+	// (GuestConfig.Volume) mounted there, else guest tmpfs.
 	DODir = "/run/twd/do"
+	// VolumeDev is the persistent volume's device (the third drive).
+	VolumeDev = "/dev/vdc"
 )
 
 // Defaults for the guest network (every VM lives in its own network
@@ -51,13 +54,18 @@ type GuestConfig struct {
 	HealthCF string `json:"healthCF"`
 	// Debug enables the probe op (connectivity tests).
 	Debug bool `json:"debug,omitempty"`
+	// Volume is the block device holding DO storage (ext4, created and
+	// decrypted on the host), mounted at DODir. "" = tmpfs (not persistent).
+	Volume string `json:"volume,omitempty"`
 }
 
 // Msg is one control-channel message (either direction).
 //
 // guest → host: Type "boot" (once, on connect), "ready" (workerd healthy),
 // "workerd-exit", "log", or "resp" (answer to an op, same ID).
-// host → guest: Op "probe", "stats", "fsscan", "ping".
+// host → guest: Op "probe", "stats", "fsscan", "ping", "shutdown" (stop
+// workerd, sync and unmount the volume: the host may then release it),
+// "fsbench" (write+fsync latency on the DO volume).
 type Msg struct {
 	Type string `json:"type,omitempty"`
 	ID   int64  `json:"id,omitempty"`
@@ -78,6 +86,10 @@ type Msg struct {
 	// stats
 	Stats *Stats `json:"stats,omitempty"`
 
+	// fsbench: N writes of 4 KiB + fdatasync on DODir
+	N     int    `json:"n,omitempty"`
+	Bench *Bench `json:"bench,omitempty"`
+
 	// fsscan: files whose name looks like tailscale state
 	Found   []string `json:"found,omitempty"`
 	Scanned int      `json:"scanned,omitempty"`
@@ -91,10 +103,23 @@ type ProbeResult struct {
 	MS     int64  `json:"ms"`
 }
 
+// Bench is fsbench's result (microseconds).
+type Bench struct {
+	N          int    `json:"n"`
+	FS         string `json:"fs"` // the mount's source and type
+	WriteP50US int64  `json:"writeP50us"`
+	WriteP95US int64  `json:"writeP95us"`
+	SyncP50US  int64  `json:"fsyncP50us"`
+	SyncP95US  int64  `json:"fsyncP95us"`
+}
+
 // Stats is guest memory accounting.
 type Stats struct {
 	MemTotalKB     int64 `json:"memTotalKB"`
 	MemAvailableKB int64 `json:"memAvailableKB"`
 	WorkerdRSSKB   int64 `json:"workerdRssKB"`
 	UptimeMS       int64 `json:"uptimeMs"`
+	// DO storage: the mount's source ("/dev/vdc ext4" or "tmpfs") and usage.
+	DOFS     string `json:"doFS,omitempty"`
+	DOUsedKB int64  `json:"doUsedKB,omitempty"`
 }

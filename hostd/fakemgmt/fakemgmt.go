@@ -72,6 +72,9 @@ type Server struct {
 	audit       map[string][]mgmtapi.AuditRecord
 	nodeIDs     map[string]string // stable node ID -> objectID (every node that reported ready)
 	pushes      []string
+	volKeys     map[string][]byte // tenant/workload -> DO volume data key
+	// VolumeKeyCalls counts GET /v0/volumes/key (tests).
+	VolumeKeyCalls int
 }
 
 type tenant struct {
@@ -129,7 +132,7 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(),
 		tenants: map[string]*tenant{}, hosts: map[string]*host{}, deployments: map[string]*deployment{},
 		leases: map[string]*lease{}, objects: map[string]*object{}, byName: map[string]string{},
-		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}}
+		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}}
 	m := s.mux
 	m.HandleFunc("POST /v0/tenants", s.createTenant)
 	m.HandleFunc("GET /v0/tenants", s.listTenants)
@@ -145,6 +148,7 @@ func New(cfg Config) *Server {
 	m.HandleFunc("GET /v0/objects/{id}", s.getObject)
 	m.HandleFunc("GET /v0/objects/{id}/credential", s.credential)
 	m.HandleFunc("POST /v0/objects/{id}/ready", s.ready)
+	m.HandleFunc("GET /v0/volumes/key", s.volumeKey)
 	m.HandleFunc("POST /v0/objects/{id}/kill", s.kill)
 	m.HandleFunc("POST /v0/audit", s.postAudit)
 	m.HandleFunc("GET /v0/audit", s.getAudit)
@@ -695,6 +699,42 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.lineage(o))
+}
+
+// volumeKey releases a workload's DO volume key to the lease holder at
+// the lease's epoch (mgmt.VolumeKey's contract).
+func (s *Server) volumeKey(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	epoch, _ := strconv.ParseInt(q.Get("epoch"), 10, 64)
+	name := mgmtapi.LeaseName(q.Get("tenant"), q.Get("workload"))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.VolumeKeyCalls++
+	l := s.leases[name]
+	if l == nil || l.epoch != epoch {
+		writeErr(w, 409, mgmtapi.CodeLeaseLost, fmt.Sprintf("lease %s is not held at epoch %d", name, epoch))
+		return
+	}
+	if hid := r.Header.Get("Twd-Host-ID"); hid != "" && hid != l.host {
+		writeErr(w, 409, mgmtapi.CodeLeaseLost, "host "+hid+" does not hold the lease")
+		return
+	}
+	k := s.volKeys[name]
+	if k == nil {
+		k = make([]byte, 32)
+		rand.Read(k)
+		s.volKeys[name] = k
+	}
+	w.Header().Set("content-type", "application/json")
+	json.NewEncoder(w).Encode(mgmtapi.VolumeKey{Key: k})
+}
+
+// VolumeKeyOf returns the volume key fakemgmt holds for (tenant, workload)
+// (tests: the no-keys-in-guest scan's needle).
+func (s *Server) VolumeKeyOf(tenantID, workload string) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.volKeys[mgmtapi.LeaseName(tenantID, workload)]
 }
 
 func (s *Server) credential(w http.ResponseWriter, r *http.Request) {

@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node
+.PHONY: all build deps js-build test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-mbp e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -74,6 +74,37 @@ e2e-vm: deps guest-image
 	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
 	sudo env $(VM_ENV) bin/vmsmoke.test -test.v -test.count=1
 	cd e2e/vm && sudo env $(VM_ENV) ../../bin/e2evm.test -test.v -test.count=1 -test.timeout 15m
+## vm-assets: the microVM guest for the linux release (Linux only, in Lima twd-dev): the guest
+## image, the kernel (TWD_VM_KERNEL) and Firecracker + jailer (FC_BIN_DIR) in VM_ASSETS.
+FC_BIN_DIR ?= /usr/local/bin
+VM_ASSETS  ?= dist/vm-assets-$(shell go env GOARCH)
+vm-assets: guest-image
+	@[ "$$(uname -s)" = Linux ] || { echo "vm-assets: Linux only; run it inside Lima twd-dev"; exit 1; }
+	mkdir -p $(VM_ASSETS)
+	cp -f $(GUEST_OUT)/rootfs.ext4 $(GUEST_OUT)/manifest.json $(VM_ASSETS)/
+	cp -f $(TWD_VM_KERNEL) $(VM_ASSETS)/vmlinux
+	cp -f $(FC_BIN_DIR)/firecracker $(FC_BIN_DIR)/jailer $(VM_ASSETS)/
+	$(VM_ASSETS)/firecracker --version | head -1
+
+## e2e-linux-vm: L3 E2E from the installed release on a FRESH nested-virt Lima VM
+## (twdl-kvm-u24; created if missing, stopped at the end): the linux-arm64 release with the
+## microVM assets is built in Lima twd-dev, copied in with limactl copy, then install.sh ->
+## sudo twd host setup --microvm -> twd up -> agent + mcp with tier microvm -> checks (a)-(f) from
+## this Mac over tailnet 1, storage persistence across a VM kill and a redeploy, no keys in
+## the guest, twd host setup --undo.
+LINUX_VM ?= twdl-kvm-u24
+e2e-linux-vm:
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-linux-vm: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TS_CREDS="$(TS_CREDS)" TAILNET1="$(TAILNET1)" sh scripts/e2e-linux-vm.sh $(LINUX_VM)
+
+## e2e-linux-reboot: L3 DO storage across host reboots of the same fresh VM (clean, then a
+## power cut): helper back via systemd, twd up, same object node, data present, volume re-opens.
+e2e-linux-reboot:
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-linux-reboot: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_RUN=TestE2ELinuxReboot TS_CREDS="$(TS_CREDS)" TAILNET1="$(TAILNET1)" sh scripts/e2e-linux-vm.sh $(LINUX_VM)
+
 ## e2e-mac: E2E-MAC via the twd CLI on tailnet 1 (twd up → deploy agent+mcp → checks a–f → twd down → zero leftovers).
 e2e-mac: deps
 	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
@@ -118,8 +149,9 @@ lint:
 	$(GO) vet -tags e2e ./e2e/local/...
 	$(GO) vet -tags e2ereal ./e2e/real/...
 	$(GO) vet -tags m2mgmt ./e2e/m2mgmt/...
-	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/...
+	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/... ./cmd/twd-vmhelper/... ./cmd/twd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
+	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags e2embp ./e2e/mbp/...

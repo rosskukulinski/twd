@@ -10,6 +10,11 @@
 # package-lock.json), share/twd/create-twd (templates + build.mjs),
 # share/twd/node_modules (the templates' runtime deps, vendored: deploy works
 # offline, no npm/node), install.sh, VERSION, SHA256SUMS, INSTALL.md.
+# linux tarballs also hold bin/twd-vmhelper (the microVM tier's privileged
+# helper; `sudo twd host setup --microvm` installs a root-owned copy) and,
+# if TWD_VM_ASSETS_<arch> names a directory (make vm-assets, in Lima), the
+# microVM guest in share/twd/vm: vmlinux, rootfs.ext4 + manifest.json, and
+# Firecracker + jailer.
 # darwin binaries are ad-hoc code-signed (codesign -s -; they are unsigned
 # otherwise and arm64 macOS refuses to run unsigned code).
 set -eu
@@ -50,8 +55,10 @@ for t in $TARGETS; do
 	echo "release: $name"
 
 	# Go binaries
+	cmds="./cmd/twd ./cmd/twd-mgmt ./cmd/twd-hostd ./cmd/twd-netd"
+	[ "$os" = linux ] && cmds="$cmds ./cmd/twd-vmhelper"
 	CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
-		-o "$st/bin/" ./cmd/twd ./cmd/twd-mgmt ./cmd/twd-hostd ./cmd/twd-netd
+		-o "$st/bin/" $cmds
 
 	# workerd from the npm platform package, checked against the lockfile.
 	pkg=@cloudflare/workerd-$os-$arch
@@ -74,12 +81,26 @@ for t in $TARGETS; do
 	find "$st/share/twd/create-twd/templates" -name dist -type d -prune -exec rm -rf {} + 2>/dev/null || true
 	cp -R "$VNM/node_modules" "$st/share/twd/node_modules"
 
+	# microVM guest + Firecracker (linux, when built: make vm-assets)
+	microvm=false
+	eval "va=\${TWD_VM_ASSETS_$arch:-}"
+	if [ "$os" = linux ] && [ -n "$va" ]; then
+		for f in vmlinux rootfs.ext4 manifest.json firecracker jailer; do
+			[ -f "$va/$f" ] || { echo "release: $va/$f missing (make vm-assets)"; exit 1; }
+		done
+		mkdir -p "$st/share/twd/vm"
+		cp "$va/vmlinux" "$va/rootfs.ext4" "$va/manifest.json" "$va/firecracker" "$va/jailer" "$st/share/twd/vm/"
+		chmod 644 "$st/share/twd/vm/vmlinux" "$st/share/twd/vm/rootfs.ext4" "$st/share/twd/vm/manifest.json"
+		chmod 755 "$st/share/twd/vm/firecracker" "$st/share/twd/vm/jailer"
+		microvm=true
+	fi
+
 	cp scripts/install.sh "$st/install.sh"
 	chmod 755 "$st/install.sh"
 	cp docs/INSTALL.md "$st/INSTALL.md"
 	printf '%s\n' "$VERSION" >"$st/VERSION"
 	cat >"$st/share/twd/release.json" <<EOF
-{"version":"$VERSION","os":"$os","arch":"$arch","workerd":"$WORKERD_VERSION","esbuild":"built into twd","sandbox":"$( [ "$os" = darwin ] && echo seatbelt || echo landlock )","commit":"$(git rev-parse HEAD)","built":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"version":"$VERSION","os":"$os","arch":"$arch","workerd":"$WORKERD_VERSION","esbuild":"built into twd","sandbox":"$( [ "$os" = darwin ] && echo seatbelt || echo landlock )","microvm":$microvm,"commit":"$(git rev-parse HEAD)","built":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 
 	if [ "$os" = darwin ]; then
