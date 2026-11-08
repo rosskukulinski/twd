@@ -1,0 +1,11 @@
+# Lint config for api/openapi.yaml (`make api-lint`). Warnings fail the build.
+extends:
+  - recommended
+rules:
+  operation-4xx-response: error
+  no-unused-components: error
+  operation-operationId-unique: error
+  operation-summary: error
+  no-ambiguous-paths: error
+  security-defined: error
+  spec-strict-refs: off
