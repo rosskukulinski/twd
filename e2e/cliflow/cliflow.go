@@ -650,6 +650,15 @@ func (e *Env) Run() {
 	if no.Parent != ao.ID || !slices.Contains(no.Tags, "tag:twd-agent-support") || fmt.Sprint(get(ncaps, MCPCap, "tools")) != "[lookup_order]" {
 		t.Fatalf("(d) narrowed child object: %+v", no)
 	}
+	// The narrowed child answers on its own node too. This also gives the
+	// client a WireGuard session to that node before (e) kills it: a first
+	// contact after the kill would measure path setup (one lost handshake
+	// = a 5 s retransmit, seen once on Linux), not how fast a killed
+	// object refuses.
+	noIP := peerIP(t, client, no.MagicDNS, e.tmo(60*time.Second))
+	if r := do(hc, "GET", "http://"+noIP+"/", nil); r.Code != 200 || get(r.Body, "caller", "nodeId") != clientID {
+		t.Fatalf("(d) narrowed child via its own node: %s", r)
+	}
 	res.pass("d_spawn", fmt.Sprintf("child %s node %s tags %v caps %s; lim enforced: same-tag child %s (tag %v, lim %s) → refund cap_missing, lookup_order ok; parent refund ok=%v",
 		co.ID, co.MagicDNS, co.Tags, co.Caps, no.ID, no.Tags, no.Caps, get(r.Body, "parent", "refund", "ok")))
 
@@ -681,7 +690,6 @@ func (e *Env) Run() {
 	res.Numbers["kill_push_ms"] = kr.Result.PushMS
 	// The cascade covers the agent, its LookupAgent child and the narrowed
 	// SupportAgent child from check (d).
-	noIP := peerIP(t, client, no.MagicDNS, e.tmo(60*time.Second))
 	if d > e.tmo(time.Second) || len(kr.Result.Killed) != 3 || len(kr.Result.Pushed) != 3 {
 		t.Fatalf("(e) kill: %v %+v", d, kr)
 	}
