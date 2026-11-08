@@ -59,8 +59,8 @@ for lib in $(readelf -d "$WORKERD" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p
   cp -L "$src" "$STAGE/usr/lib/$LIBDIR/$lib"
   chmod 0755 "$STAGE/usr/lib/$LIBDIR/$lib"
 done
-# The ELF interpreter path workerd asks for (/lib/ld-linux-*.so.1) resolves
-# through the /lib symlink above.
+# The ELF interpreter path workerd asks for (/lib/ld-linux-*.so.1).
+ln -s "$LIBDIR/$LDSO" "$STAGE/usr/lib/$LDSO"
 
 printf 'root:x:0:0:root:/tmp:/sbin/twd-guestd\n' >"$STAGE/etc/passwd"
 printf 'root:x:0:\n' >"$STAGE/etc/group"

@@ -50,7 +50,7 @@ type Config struct {
 
 // DefaultBootArgs: serial console, no PCI probing, panic → reboot (which
 // Firecracker turns into a VM exit), twd-guestd as init, read-only root.
-const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 pci=off quiet ro rootfstype=ext4 init=/sbin/twd-guestd"
+const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 quiet ro rootfstype=ext4 init=/sbin/twd-guestd"
 
 // Backend is the Firecracker microVM backend.
 type Backend struct {
@@ -162,6 +162,7 @@ type Machine struct {
 	pending map[int64]chan proto.Msg
 	nextID  int64
 	events  []proto.Msg
+	lastErr string
 	cleanup sync.Once
 }
 
@@ -277,7 +278,10 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	case <-m.done:
 		return nil, fmt.Errorf("microVM exited during boot: %v", m.exitErr)
 	case <-rctx.Done():
-		return nil, fmt.Errorf("microVM not ready after %v; events %v; console: %s", b.cfg.ReadyTimeout, m.eventTypes(), m.consoleTail(3000))
+		m.mu.Lock()
+		le := m.lastErr
+		m.mu.Unlock()
+		return nil, fmt.Errorf("microVM not ready after %v; events %v; last %s; console: %s", b.cfg.ReadyTimeout, m.eventTypes(), le, m.consoleTail(3000))
 	}
 	m.info.Total = time.Since(t0)
 	m.log.Info("microVM ready", "boot_ms", m.info.Boot.Milliseconds(), "ready_ms", m.info.Ready.Milliseconds(), "total_ms", m.info.Total.Milliseconds())
@@ -388,6 +392,9 @@ func (m *Machine) readCtl(c net.Conn) {
 			}
 		case "workerd-exit":
 			m.log.Warn("guest workerd exited", "code", msg.ExitCode, "restarts", msg.Restarts, "err", msg.Error)
+			m.mu.Lock()
+			m.lastErr = fmt.Sprintf("workerd exit %d %s", msg.ExitCode, msg.Error)
+			m.mu.Unlock()
 		}
 	}
 }

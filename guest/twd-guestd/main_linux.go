@@ -459,7 +459,11 @@ func (g *guest) superviseWorkerd() {
 		}
 		g.mu.Unlock()
 		if err != nil {
+			logf("start workerd: %v", err)
 			g.send(proto.Msg{Type: "workerd-exit", ExitCode: -1, Error: err.Error(), Restarts: attempt})
+			if attempt >= 5 {
+				select {}
+			}
 			time.Sleep(time.Second)
 			continue
 		}
