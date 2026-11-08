@@ -5,6 +5,7 @@ Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
 Last update: 2026-11-08 00:40 PT. M8 (microVM tier, Firecracker in Lima) on branch `m8-vm`: `make e2e-vm` PASS.
 Last update: 2026-11-08 00:45 PT. M4 (`twd` CLI + integrated single-machine flow, E2E-MAC on this Mac) on branch `m4-cli`.
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
+Last update: 2026-11-08 01:40 PT. M7 (E2E-MULTI: one host, tenant A on tailnet 1 + tenant B on tailnet-2) on branch `m7-multi`: `make e2e-multi` PASS (3 runs).
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -608,3 +609,97 @@ Full matrix: `docs/COMPAT.md`.
 - Not tested: `@callable` RPC, `useAgent`, `AIChatAgent`, `McpAgent` (deprecated), and real LLM providers (no keys by rule).
 - `addMcpServer` errors are untyped (there's no fetch hook to install `mcpFetch`).
 
+
+## M7: multi-tenant hosts and E2E-MULTI (DONE on this Mac, branch `m7-multi`)
+
+### What's built
+- **Identity fix in mgmt (closes the M5 `namespace_conflict` finding).** Object identity is now **(tenant, workload, class, objectName)**.
+  - `Object.Workload` is stored with a unique key on `(tenant_id, workload, namespace, name)`, and the object ID HMAC covers all four parts.
+  - Two apps of one tenant with the same class and object name get distinct objects, nodes, hostnames and state dirs. The same names in another tenant never collide either, because the tenant is in the HMAC and in the state path.
+  - `POST /v0/objects` takes `workload`, which hostd always sends. Without it:
+    - a spawn inherits its parent's workload;
+    - otherwise exactly one workload may declare the class, else 409 `namespace_ambiguous`.
+  - An ID already held by another identity gets 409 `identity_conflict`.
+  - **Store migration:** pre-M7 SQLite and Postgres stores are migrated in place when opened. Rows keep their IDs and take the workload from their deployment.
+  - hostd keeps `namespace_conflict` only as a **defensive assertion**: it fails closed if mgmt ever returns another identity's object. Contract: `docs/contracts/mgmt-api.md` § M7. COMPAT.md is updated.
+- **`twd tenant add <tailnet> --api-key-file <f> [--control-url] [--policy-apply] [--registrations-per-minute]`** is the CLI equivalent of `twd connect` in apikey mode.
+  - It checks the key can read that tailnet's policy, creates the tenant in mgmt (`tn_<label>`) and records it in `twd.json` (key file path only).
+  - It checks the base `tag:twd` snippet the same way `twd up` does.
+  - It refuses a key file that already serves another tailnet (`state_conflict`).
+  - `twd tenant ls` lists the tenants with role, throttle and objects.
+  - `--tenant <tailnet|id|label>` is accepted by `deploy`, `ls`, `kill`, `audit` and `logs`; the default is the `twd up` tenant.
+  - `twd audit --tenant X --all` returns every record of tenant X. Every audit query is scoped to the tenant on the server, and the CLI drops any record of another tenant.
+  - `twd status` shows each tenant (mint queue, rate, objects) and each workload's tenant and sandbox. `twd down --purge` purges every tenant.
+- **Per-tenant isolation on one host:**
+  - **netd:** one registry per tenant, as before, with its own control URL. New: each registry's key source fetches credentials **only for that tenant's objects** and refuses others (unit test).
+  - **workerd:** one process per (tenant, workload), never shared. The same workload name in two tenants gives two processes (pids are in status).
+  - **State dirs:** `hostd/tenants/<tenantID>/{nodes,workloads}`, 0700 at every level. Tenant IDs are validated as one safe path element. DO storage lives under the tenant's own dir.
+  - **Throttles:** mgmt's token bucket and AIMD backoff are per tenant. A test drains and backs off tenant A and checks that tenant B is unaffected.
+  - **Process sandbox (new, macOS): Seatbelt.** On the process tier every daemon runs as one uid, so 0700 alone doesn't stop tenant A's workerd from reading tenant B's files. `twd-hostd -sandbox auto` (the default; `twd up` also passes `-sandbox-deny`) runs each workerd under `sandbox-exec` with a generated profile (`hostd/seatbelt.go`).
+    - Denied: reads, writes and unix-socket connects to the home dir, hostd's data and run dirs, twd's state and run dirs (mgmt custody, **mgmt's admin socket**), and every tenant's API key file (from `GET /v0/tenants`).
+    - Allowed: its own instance dir, its own workload's DO storage, and reading the workerd binary.
+    - So a tenant's workerd can't read even its **own** tenant's node keys. The keys stay in hostd, as in the microVM tier.
+
+### Test results (measured 2026-11-08, this Mac)
+- **`make test`: PASS** (netd, internal, cmd, mgmt, hostd with `-race`, gen; JS tailnet 7/7 and mcp 5/5). New tests:
+  - mgmt `TestStoreIdentityScope`, `TestStoreMigratesLegacyObjects` (SQLite; Postgres under `make test-pg`), and `TestAPIIdentityScope`:
+    - 2 workloads × 1 class plus a second tenant give 3 distinct IDs and hostnames;
+    - `namespace_ambiguous`; a spawn inherits its parent's workload; a cross-tenant parent is refused;
+    - list filters; per-tenant throttles; tenant-scoped audit.
+  - hostd `TestMultiTenant`: one hostd, **two testcontrol planes**, the same agent app in both tenants. It checks distinct IDs, workerd pids, instance dirs and DO dirs, and 0700 dirs. Seatbelt denies tenant B's state, node state, DO storage, hostd's audit key and the home dir. The by-name and by-IP refusal is typed `peer_not_visible`, and killing tenant A's agent leaves tenant B's serving.
+  - hostd unit tests: `TestKeySourceRefusesOtherTenantsObjects`, `TestTenantIDsAreSafePathElements`, `TestSeatbeltProfile`.
+  - cmd/twd **`TestCLIMultiTenant`**: the full E2E-MULTI scenario through the real binaries, against two testcontrols and a fake API, in about 9 s.
+- **`make test-pg`: PASS**, including the Postgres legacy migration.
+- **`make test-sdk`: PASS.** `SameClassAcrossWorkloadsFailsClosed` became `SameClassAcrossWorkloadsDistinctIdentities`: the two `ai-agent` workloads' `AiAgent/dup` get two nodes, and each one's MCP calls leave from its own node.
+- **`make e2e-mac`: PASS** (tailnet 1; run `35f16c`, with Seatbelt on), so the single-tenant flow is unchanged.
+- `make lint`: PASS (now also vets `-tags e2emulti`).
+- **`make e2e-multi`: PASS in 3 of 3 runs** (`1678f2`, `d4aad9`, and a third on the final commit; `e2e/real/results/m7-*.json`).
+  - Setup: `twd up` with tailnet 1 = tenant A, then `twd tenant add tail2c3a48.ts.net` = tenant B. The same `agent` template directory (workload `agent`, `SupportAgent/a1`) was deployed to both. Test clients and echoes are tsnet `tag:ttest` nodes, each in its own tenant's tailnet, with prefix `ttest-m7-<run>-`.
+  - **Tailnet-2's name** is discovered at run time. Its API key's device list was empty, so the name came from the MagicDNS name of a test client joined with an API-minted key. It is checked against an allow list, with the personal tailnet refused, before anything is written.
+
+  | Check | Result (run `d4aad9`) |
+  |---|---|
+  | tenants | A `tn_tail7906d5` (operator) · B `tn_tail2c3a48` via `twd tenant add` (0.45 s); reusing A's key file for another tailnet → `state_conflict` |
+  | (a) own agent, verified caller | each client's nodeId + `tag:ttest` seen via its workload and via its agent's own node; each agent's egress to its own echo = its own node (echo WhoIs) |
+  | (b) same names, distinct identities | `agent:SupportAgent/a1` → A `supportagent-…` node `nPWS…` (`…tail7906d5.ts.net`) vs B `supportagent-…` node `nQy6…` (`…tail2c3a48.ts.net`); workload nodes, workerd pids, instance dirs and DO dirs all differ; each node's state is under its own tenant dir only |
+  | (c) isolation A→B and B→A | tenant A's agent → B's echo (name, FQDN, IP), B's agent (name, FQDN, IP), B's workload (FQDN, IP): **8/8 typed `peer_not_visible` in 1–4 ms**; the same 8/8 for B→A |
+  | (d) state dirs | all tenant dirs 0700. Under A's workerd profile: B's state dir, B's node state file, B's DO storage, **B's API key file**, A's own node keys and **mgmt's admin socket** are all denied, and A's own DO storage is readable (vice versa for B). The control check shows mgmt's socket is reachable outside the sandbox |
+  | (e) kill A spares B | `twd kill --tenant A … --cascade`: 62 ms; A's agent → 410 `object_killed` in < 1 ms; B's agent and workload still 200 (3×), B object `ready`. Cross-tenant `kill`/`audit` of A's object as tenant B → `unknown_object` |
+  | (f) audit per tenant | `twd audit --tenant A --all`: 11 records, all `tn_tail7906d5`, chain verified (includes the kill). Tenant B: 10 records, all `tn_tail2c3a48`, **no kill records**, chain verified |
+  | cleanup | per tailnet: 0 twd devices and 0 valid twd keys after `twd down`; the test's own devices deleted by ID and keys revoked; 0 left, 0 untracked. An independent API listing afterwards shows 0 `ttest-m7` devices in either tailnet |
+
+  | Timing (production control) | Value |
+  |---|---|
+  | `twd up` → ready | 1.56 s (2 runs) |
+  | `twd tenant add` | 0.45 s |
+  | `twd deploy` → ready (A / B) | 2.1 / 6.7 s and 4.8 / 1.8 s (bimodal join, as before) |
+  | cross-tenant refusal (typed) | 1–4 ms |
+  | `twd kill --tenant A` | 61–62 ms |
+  | `twd down` (both tenants) | 4.0 s |
+
+### Policy change on tailnet-2 (recorded per BUILD-PLAN safety rule 2)
+- **When and how:** applied once, by `make e2e-multi` run `1678f2` (2026-11-08 01:27 PT), through `internal/policy.Apply`. It read the policy with its ETag, merged **additions only** (comments and every existing rule kept), validated via `POST /acl/validate` (also dry-run validated beforehand without writing), and wrote with `If-Match: "66bc1a17…"`. Later runs find nothing missing and don't write.
+- **Backups:** the copy from before the change is in `~/.config/tailnet-agents-design/tailnet2_acl.pre-m7-1678f2.hujson`; the original backup is untouched.
+- **Added:** exactly M4's tailnet-1 snippet (`cliflow.Policy()`, which `cliflow.MultiPolicy()` returns), so the two tenants have the same rules.
+  - tagOwners: `tag:twd-wl-agent`, `tag:twd-wl-mcp` and `tag:twd-agent-support`, owned by `[autogroup:admin, tag:twd]`; `tag:twd-agent-support-sub`, owned by `[autogroup:admin, tag:twd, tag:twd-agent-support]`.
+  - grants (tcp:80):
+    1. `tag:ttest` → the four tags;
+    2. `tag:ttest` → `tag:twd-wl-mcp` with app `{tools:[lookup_order]}`;
+    3. the agent tags → `tag:ttest`;
+    4. `tag:twd-agent-support` → `tag:twd-wl-mcp` `{tools:[lookup_order, refund]}`;
+    5. `tag:twd-agent-support-sub` → `tag:twd-wl-mcp` `{tools:[lookup_order]}`.
+- **Tailnet 1:** not written (it already had all of this from M4). **Ross's personal tailnet was not touched**, and the system tailscaled was never used.
+
+### Findings
+1. **Two tailnets on one host are isolated by netd's netmap-only egress guard, with no extra code.** A tenant's registry has only its own tailnet's netmap, so another tenant's names don't resolve and its IPs aren't peers: the answer is a typed `peer_not_visible` in about 1 ms, never a timeout. Cross-tenant IP collisions are possible in principle (both tailnets draw from CGNAT space). On production they didn't happen; on testcontrol they always happen (sequential numbering). The scenario skips, and notes, an IP that is also a node of the source tenant.
+2. **0700 is not isolation on the process tier.** Every daemon runs as one uid, so before Seatbelt any tenant's workerd (after an RCE) could have read every tenant's node keys, mgmt's custody key, and the API key files, and could have used **mgmt's unix-socket admin API** (kill any tenant's objects). The Seatbelt profile closes all of these on macOS.
+3. Tailnet-2's API key sees no devices on an empty tailnet, and the API has no "tailnet DNS name" field. The name is discovered from the first API-minted node's MagicDNS name, then checked against the allow list.
+
+### Known gaps (M7)
+- **Seatbelt is macOS-only**, and `sandbox-exec` is deprecated by Apple (it still works on macOS 27.2). On Linux, the process tier has 0700 dirs but no per-tenant confinement (no per-tenant uids, since that needs root); the microVM tier (M8) is the isolation answer there.
+- A sandbox profile is built when a workerd starts. An API key file **outside `$HOME`** of a tenant added later is not denied to already-running workerds until they restart. Files under `$HOME` are always denied.
+- netd isolation is **per registry, in one hostd process**. Per-tenant netd *processes* are not built, so a hostd compromise exposes every tenant's node keys.
+- `twd tenant rm`, `twd connect` (WIF onboarding) and interactive mode are not built. Tenants are only added.
+- With fakemgmt (tests), hostd names nodes `<workload>-<class>-<name>`, which is the same in two tailnets. That is harmless because tailnets are separate namespaces; real mgmt names nodes by the tenant-scoped ID.
+- `GET /v0/tenants`, which the sandbox uses to deny every key file, is admin-only. It works on the local unix socket; a remote tsnet-mode mgmt would refuse it, and hostd falls back to the tenants it knows.
+- Not run in Lima/Linux for M7 (the hermetic tests are portable; Seatbelt checks skip off macOS).

@@ -1,0 +1,89 @@
+{
+  "checks": {
+    "a_A_own_agent": "PASS caller ttest-m7-d4aad9-a-client.tail7906d5.ts.net (nw2DBN1DLq11CNTRL) [tag:ttest]; agent ttest-m7-d4aad9-supportagent-abmjxknzhn.tail7906d5.ts.net egress → own echo as ttest-m7-d4aad9-supportagent-abmjxknzhn.tail7906d5.ts.net.",
+    "a_B_own_agent": "PASS caller ttest-m7-d4aad9-b-client.tail2c3a48.ts.net (nfBSuMb6nS11CNTRL) [tag:ttest]; agent ttest-m7-d4aad9-supportagent-astupebine.tail2c3a48.ts.net egress → own echo as ttest-m7-d4aad9-supportagent-astupebine.tail2c3a48.ts.net.",
+    "b_distinct_identities": "PASS agent:SupportAgent/a1 → A supportagent-abmjxknzhn node nZqx5TLTp311CNTRL (ttest-m7-d4aad9-supportagent-abmjxknzhn.tail7906d5.ts.net) · B supportagent-astupebine node nSUgsrcoLw11CNTRL (ttest-m7-d4aad9-supportagent-astupebine.tail2c3a48.ts.net); workload nodes ttest-m7-d4aad9-agent-lt6jz3fmu6.tail7906d5.ts.net / ttest-m7-d4aad9-agent-qxk6rhuk5s.tail2c3a48.ts.net; workerd pids 84152 / 84160",
+    "c_isolation_A_to_B": "PASS echo name peer_not_visible in 4 ms; echo FQDN peer_not_visible in 1 ms; echo IP peer_not_visible in 1 ms; agent name peer_not_visible in 1 ms; agent FQDN peer_not_visible in 1 ms; agent IP peer_not_visible in 1 ms; workload FQDN peer_not_visible in 1 ms; workload IP peer_not_visible in 1 ms",
+    "c_isolation_B_to_A": "PASS echo name peer_not_visible in 2 ms; echo FQDN peer_not_visible in 1 ms; echo IP peer_not_visible in 1 ms; agent name peer_not_visible in 1 ms; agent FQDN peer_not_visible in 1 ms; agent IP peer_not_visible in 1 ms; workload FQDN peer_not_visible in 1 ms; workload IP peer_not_visible in 1 ms",
+    "d_state_isolation_A": "PASS tenant dirs 0700; workerd pid 84152 under Seatbelt: tenant B state dir denied, tenant B node state denied, tenant B DO storage denied, tenant B API key file denied, its own tenant's node keys denied, mgmt admin socket denied; own DO storage readable",
+    "d_state_isolation_B": "PASS tenant dirs 0700; workerd pid 84160 under Seatbelt: tenant A state dir denied, tenant A node state denied, tenant A DO storage denied, tenant A API key file denied, its own tenant's node keys denied, mgmt admin socket denied; own DO storage readable",
+    "deploy_same_app": "PASS agent → A ttest-m7-d4aad9-agent-lt6jz3fmu6.tail7906d5.ts.net · B ttest-m7-d4aad9-agent-qxk6rhuk5s.tail2c3a48.ts.net",
+    "down": "PASS 3 objects purged, 4 devices deleted, 3.945s",
+    "e_kill_A_spares_B": "PASS killed [supportagent-abmjxknzhn] in 62ms; A's agent → 410 object_killed in 1.029ms; B's agent and workload still 200 (3×), B object ready",
+    "f_audit_A": "PASS 11 records, all tenant tn_tail7906d5, chain verified, kinds map[create:2 credential:2 deploy:1 kill:1 mint:2 ready:2 tenant:1]",
+    "f_audit_B": "PASS 18 records, all tenant tn_tail2c3a48, chain verified, kinds map[create:2 credential:2 deny:8 deploy:1 mint:2 ready:2 tenant:1]",
+    "tenants": "PASS A tail7906d5.ts.net (tn_tail7906d5, operator) · B tail2c3a48.ts.net (tn_tail2c3a48) via `twd tenant add` in 454ms"
+  },
+  "notes": [
+    "tailnet-2 discovered: tail2c3a48.ts.net (from the API-minted test client's MagicDNS name)",
+    "tail7906d5.ts.net: policy already had the scenario's tagOwners and grants (not written)",
+    "tail2c3a48.ts.net: policy already had the scenario's tagOwners and grants (not written)"
+  ],
+  "numbers": {
+    "deploy_A_ms": 4752.425,
+    "deploy_A_ready_ms": 4210.324,
+    "deploy_B_ms": 1833.947,
+    "deploy_B_ready_ms": 1584.711,
+    "down_ms": 3945.001,
+    "kill_A_cli_ms": 62.478,
+    "tenant_add_ms": 454.021,
+    "up_ready_ms": 1555.227
+  },
+  "run": "m7-d4aad9",
+  "tenants": {
+    "tail2c3a48.ts.net": {
+      "run": "m7-d4aad9-B",
+      "tailnet": "tail2c3a48.ts.net",
+      "date": "2026-11-08T01:31:36-08:00",
+      "checks": {},
+      "numbers": {},
+      "cleanup": {
+        "devices_deleted_by_cleanup": 4,
+        "devices_left": 0,
+        "devices_tracked": 4,
+        "test_keys_minted": 2,
+        "test_keys_revoke_errors": null,
+        "twd_devices_left_after_down": 0,
+        "twd_devices_tracked": 2,
+        "twd_keys_tracked": 2,
+        "twd_keys_valid_after_down": 0,
+        "untracked_run_devices": null
+      },
+      "nodeIDs": [
+        "nK6xwWRx4921CNTRL",
+        "nSUgsrcoLw11CNTRL"
+      ],
+      "keyIDs": [
+        "kpprnT1EZE11CNTRL",
+        "kf6C34mdsC11CNTRL"
+      ]
+    },
+    "tail7906d5.ts.net": {
+      "run": "m7-d4aad9-A",
+      "tailnet": "tail7906d5.ts.net",
+      "date": "2026-11-08T01:31:36-08:00",
+      "checks": {},
+      "numbers": {},
+      "cleanup": {
+        "devices_deleted_by_cleanup": 4,
+        "devices_left": 0,
+        "devices_tracked": 4,
+        "test_keys_minted": 2,
+        "test_keys_revoke_errors": null,
+        "twd_devices_left_after_down": 0,
+        "twd_devices_tracked": 2,
+        "twd_keys_tracked": 2,
+        "twd_keys_valid_after_down": 0,
+        "untracked_run_devices": null
+      },
+      "nodeIDs": [
+        "ngFo8YeePJ11CNTRL",
+        "nZqx5TLTp311CNTRL"
+      ],
+      "keyIDs": [
+        "km49NYMLT821CNTRL",
+        "kMWKoW96Q111CNTRL"
+      ]
+    }
+  }
+}
