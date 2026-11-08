@@ -3,8 +3,9 @@ package mgmtapi
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -21,6 +22,9 @@ import (
 type Client struct {
 	Base string // "http://mgmt" for unix sockets
 	HTTP *http.Client
+	// HostID, if set, is sent as the Twd-Host-ID header (homelab/test
+	// transports; production mgmt authenticates hosts by WhoIs instead).
+	HostID string
 }
 
 // NewClient returns a Client for addr: "unix:///abs/path.sock", a bare
@@ -59,6 +63,9 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 	}
 	if in != nil {
 		req.Header.Set("content-type", "application/json")
+	}
+	if c.HostID != "" {
+		req.Header.Set("Twd-Host-ID", c.HostID)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -137,7 +144,7 @@ func (c *Client) CreateObject(ctx context.Context, r CreateObjectRequest) (*Crea
 
 func (c *Client) Credential(ctx context.Context, id string, epoch int64) (Credential, error) {
 	var out Credential
-	err := c.Do(ctx, "GET", fmt.Sprintf("/v0/objects/%s/credential?epoch=%d", url.PathEscape(id), epoch), nil, &out)
+	err := c.Do(ctx, "GET", fmt.Sprintf("/v0/objects/%s/credential?epoch=%d&wait=10", url.PathEscape(id), epoch), nil, &out)
 	return out, err
 }
 
@@ -155,22 +162,44 @@ func (c *Client) Audit(ctx context.Context, recs []AuditRecord) error {
 	return c.Do(ctx, "POST", "/v0/audit", AuditBatch{Records: recs}, nil)
 }
 
-// ChainHash is the audit hash of rec chained to prev:
-// hex(sha256(prev || "\n" || canonical JSON of rec without hash/hostSig)).
+// ChainHash is the audit hash of rec chained to prev (contract v0
+// clarifications): body = the record JSON without "hash" and "hostSig"
+// (including "prevHash"), keys sorted, no whitespace, no HTML escaping;
+// hash = lowercase hex(SHA-256(body)).
 func ChainHash(prev string, rec AuditRecord) string {
-	rec.PrevHash, rec.Hash, rec.HostSig = prev, "", ""
+	rec.PrevHash = prev
 	b, _ := json.Marshal(rec)
-	h := sha256.Sum256(append([]byte(prev+"\n"), b...))
+	c, err := Canonicalize(b, "hash", "hostSig")
+	if err != nil {
+		return ""
+	}
+	h := sha256.Sum256(c)
 	return hex.EncodeToString(h[:])
 }
 
-// HostSig is the MVP host signature over a record hash: HMAC-SHA256 with the
-// host's audit key (an Ed25519 host key replaces it with the setec custody
-// work).
-func HostSig(key []byte, hash string) string {
-	m := hmac.New(sha256.New, key)
-	m.Write([]byte(hash))
-	return hex.EncodeToString(m.Sum(nil))
+// Canonicalize re-encodes a JSON object with sorted keys, dropping keys.
+func Canonicalize(raw []byte, drop ...string) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return nil, err
+	}
+	for _, k := range drop {
+		delete(m, k)
+	}
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(m); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// HostSig is base64(ed25519.Sign(key, utf8(hash))).
+func HostSig(key ed25519.PrivateKey, hash string) string {
+	return base64.StdEncoding.EncodeToString(ed25519.Sign(key, []byte(hash)))
 }
 
 // VerifyChain checks prevHash links and hashes in order.

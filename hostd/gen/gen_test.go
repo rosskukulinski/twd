@@ -172,7 +172,9 @@ func (in *inst) get(path string, twd map[string]any, hdr ...string) (int, http.H
 	return resp.StatusCode, resp.Header, out
 }
 
-func obj(cls, name string) map[string]any { return map[string]any{"kind": "object", "class": cls, "name": name} }
+func obj(cls, name string) map[string]any {
+	return map[string]any{"kind": "object", "class": cls, "name": name}
+}
 
 var wl = map[string]any{"kind": "workload"}
 

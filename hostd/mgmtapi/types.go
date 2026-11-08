@@ -44,6 +44,8 @@ type RegisterRequest struct {
 	// PushURL (v0.1, optional) is where mgmt may push kills and assignment
 	// changes ("unix:///path/hostd.sock" or "http://..."); see hostd push API.
 	PushURL string `json:"pushURL,omitempty"`
+	// AuditPubKey (v0 clarification): base64 ed25519 key for hostSig.
+	AuditPubKey string `json:"auditPubKey,omitempty"`
 }
 
 type OK struct {
@@ -80,6 +82,10 @@ type HeartbeatResponse struct {
 	// Kill (v0.1, optional) lists objects mgmt killed since the last
 	// heartbeat (the fallback when a push could not be delivered).
 	Kill []KillOrder `json:"kill,omitempty"`
+	// RevokeObjects (v0 clarification) lists objects killed in the last
+	// 10 min in namespaces this host holds; they repeat, so kills must be
+	// idempotent. This is mgmt's kill delivery path.
+	RevokeObjects []string `json:"revokeObjects,omitempty"`
 }
 
 type DeployRequest struct {
@@ -117,6 +123,10 @@ type Assignment struct {
 	Epoch        int64           `json:"epoch"`
 	// WorkloadTags (v0.1, optional) are the workload entry node's tags.
 	WorkloadTags []string `json:"workloadTags,omitempty"`
+	// v0 clarifications (M2): the lease name, tailnet and control URL.
+	Lease      string `json:"lease,omitempty"`
+	Tailnet    string `json:"tailnet,omitempty"`
+	ControlURL string `json:"controlURL,omitempty"`
 }
 
 type ObjectRef struct {
@@ -132,12 +142,16 @@ type CreateObjectRequest struct {
 	TTL        string          `json:"ttl,omitempty"`
 	// Hostname (v0.1, optional) is the hostname hostd will join with.
 	Hostname string `json:"hostname,omitempty"`
+	// v0 clarifications: feed audit.
+	ActingFor string `json:"actingFor,omitempty"`
+	TraceID   string `json:"traceID,omitempty"`
 }
 
 type CreateObjectResponse struct {
 	ObjectID string   `json:"objectID"`
 	Status   string   `json:"status"`
 	Tags     []string `json:"tags"`
+	Hostname string   `json:"hostname,omitempty"` // v0 clarification
 }
 
 type Credential struct {
@@ -151,6 +165,7 @@ type ReadyRequest struct {
 	NodeID       string `json:"nodeID"`
 	StableNodeID string `json:"stableNodeID"`
 	MagicDNS     string `json:"magicDNS"`
+	Epoch        int64  `json:"epoch,omitempty"`
 }
 
 type KillRequest struct {
@@ -186,6 +201,7 @@ type AuditRecord struct {
 	Code      string `json:"code,omitempty"`
 	TraceID   string `json:"traceID"`
 	ActingFor string `json:"actingFor,omitempty"`
+	TenantID  string `json:"tenantID,omitempty"`
 	Detail    string `json:"detail,omitempty"` // v0.1, optional
 	PrevHash  string `json:"prevHash"`
 	Hash      string `json:"hash"`
@@ -202,11 +218,19 @@ type AuditResponse struct {
 	Problems []string      `json:"problems,omitempty"`
 }
 
-// Namespace returns the lease namespace of a DO class in a workload
-// ("<workload>/<Class>"), or of the workload entry node itself (class "").
+// WorkloadNamespace is the object namespace of a workload's entry node
+// (contract gap, see STATUS.md M3: mgmt must declare it like a class, with
+// the twd.jsonc tailnet.tags).
+const WorkloadNamespace = "_workload"
+
+// Namespace returns the object namespace for POST /v0/objects: the DO
+// class name, or WorkloadNamespace for the workload entry node (class "").
 func Namespace(workload, class string) string {
 	if class == "" {
-		return workload
+		return WorkloadNamespace
 	}
-	return workload + "/" + class
+	return class
 }
+
+// LeaseName is the namespace lease of a workload: "<tenantID>/<workload>".
+func LeaseName(tenantID, workload string) string { return tenantID + "/" + workload }
