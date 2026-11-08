@@ -13,16 +13,31 @@ import (
 // cmdHost: `twd host setup --microvm` (one time, with sudo, Linux) installs
 // the microVM tier's privileged helper; `twd host setup --undo` removes it.
 func cmdHost(args []string) error {
-	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+	// The subcommand is the first positional (global flags such as
+	// --state-dir X may come first).
+	sub := -1
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--state-dir" || a == "-state-dir" {
+			i++
+			continue
+		}
+		if !strings.HasPrefix(a, "-") {
+			sub = i
+			break
+		}
+	}
+	if sub < 0 {
 		return fail("bad_request", "usage: twd "+usageOf("host"))
 	}
-	switch args[0] {
+	rest := append(append([]string{}, args[:sub]...), args[sub+1:]...)
+	switch args[sub] {
 	case "setup":
-		return cmdHostSetup(args[1:])
+		return cmdHostSetup(rest)
 	case "vmcheck":
-		return cmdHostVMCheck(args[1:])
+		return cmdHostVMCheck(rest)
 	}
-	return fail("bad_request", fmt.Sprintf("unknown host subcommand %q", args[0]), "usage: twd "+usageOf("host"))
+	return fail("bad_request", fmt.Sprintf("unknown host subcommand %q", args[sub]), "usage: twd "+usageOf("host"))
 }
 
 // setupResult is `twd host setup --json`.
