@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -13,6 +12,7 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd/bundle"
+	"github.com/rosskukulinski/twd/internal/esbundle"
 	"github.com/rosskukulinski/twd/mgmt"
 )
 
@@ -159,17 +159,13 @@ func (a *app) srcTags() []string {
 	return out
 }
 
-// build bundles the app with create-twd's esbuild bundler (as hostd/gen
-// expects: dist/index.js + twd.jsonc + wrangler.jsonc + twd-bundle.json)
-// and packs it.
+// build bundles the app with esbuild, in-process (internal/esbundle, the Go
+// twin of create-twd's build.mjs), into what hostd/gen expects
+// (dist/index.js + twd.jsonc + wrangler.jsonc + twd-bundle.json), and packs it.
 func (a *app) build(vars map[string]string) ([]byte, int, error) {
 	ct, err := createTwdDir()
 	if err != nil {
 		return nil, 0, err
-	}
-	node, err := exec.LookPath("node")
-	if err != nil {
-		return nil, 0, fail("not_installed", "node is needed to bundle apps (esbuild)").withFix("install Node.js ≥ 22")
 	}
 	out, err := os.MkdirTemp("", "twd-build-")
 	if err != nil {
@@ -177,11 +173,10 @@ func (a *app) build(vars map[string]string) ([]byte, int, error) {
 	}
 	defer os.RemoveAll(out)
 	outfile := filepath.Join(out, "index.js")
-	cmd := exec.Command(node, filepath.Join(ct, "lib", "build.mjs"), a.Dir, outfile)
-	cmd.Dir = a.Dir
-	cmd.Env = append(os.Environ(), "TWD_NODE_PATH="+strings.Join(nodePaths(ct), ":"))
-	if b, err := cmd.CombinedOutput(); err != nil {
-		return nil, 0, fail("build_failed", "esbuild failed for "+a.Dir, strings.Split(strings.TrimSpace(string(b)), "\n")...)
+	main, _ := a.Wrangler["main"].(string)
+	// In-process esbuild (Go API): no Node.js needed on this machine.
+	if _, err := esbundle.Build(esbundle.Options{Dir: a.Dir, Main: main, Outfile: outfile, NodePaths: nodePaths(ct)}); err != nil {
+		return nil, 0, fail("build_failed", "esbuild failed for "+a.Dir, strings.Split(strings.TrimSpace(err.Error()), "\n")...)
 	}
 	js, err := os.ReadFile(outfile)
 	if err != nil {
