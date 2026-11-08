@@ -330,9 +330,16 @@ tag:ttest client and echo ran on the Mac (M5 Pro) over tailnet 1. Every row
 passed checks (a)–(f), `twd doctor` before and while running,
 `systemctl --user restart twd` (healthy again, the same workload IP answering
 the Mac), `twd down --purge --service`, and cleanup: zero leftover devices or
-keys. **Sandbox: none on every row in L1's run (made before the Landlock sandbox landed; the integration rows below re-ran with Landlock on).** **microVM
+keys. **Sandbox: none on every row in L1's run (made before the Landlock sandbox landed).** **microVM
 tier: unavailable on every row** (no `/dev/kvm` in these VMs, no
 firecracker, not root). Raw results: `e2e/real/results/l1-linux/`.
+With the sandbox on, the Ubuntu 24.04 arm64 row (reboot + ephemeral phases),
+Debian 12 and Ubuntu 24.04 amd64 were re-run during integration, and Ubuntu
+24.04 arm64 again on the final tree (`sandbox ok`, both workloads
+`process/landlock`, 410 after kill in ≤ 1 ms, reboot → answering 7.7 s;
+STATUS.md "Integration (Linux)" and "Final verification"). The microVM
+tier's own rows (`make e2e-linux-vm`, `make e2e-linux-reboot` on a
+nested-virt VM, from the shipped tarball) are there too.
 
 | | Ubuntu 24.04 arm64 | Debian 12 arm64 | Ubuntu 22.04 arm64 | Fedora 45 arm64 | Ubuntu 24.04 **amd64** (qemu, emulated) |
 |---|---|---|---|---|---|

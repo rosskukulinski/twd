@@ -24,6 +24,19 @@ twd never uses the Mac's Tailscale app or login. Every twd node is a tsnet node 
 | Opt-in Node tier + Vercel Workflow | Signed caller header · egress attributed and SSRF-guarded · workflow survives a kill mid-sleep and mid-hook (resume ~0.6 s) · ~90 MB per app, ~300 MB with Workflow |
 | Real-tailnet netd suite | Ingress +0.33 ms p50 · egress p50 0.69 ms · kill → caller fails in 0.12–0.68 ms |
 
+## Linux (measured on the final tree, 2026-11-08; details in STATUS.md "Final verification")
+Linux is a first-class host: the same tarball flow (`install.sh` into `~/.twd`, no root), a **Landlock + seccomp** process sandbox, `twd up --service` (systemd user unit), and on KVM hosts the **Firecracker microVM tier** with persistent encrypted DO storage. Fresh Lima VMs, nothing mounted, tarball via `limactl copy`; test client + echo on this Mac over tailnet 1.
+
+| Row | Result |
+|---|---|
+| **Ubuntu 24.04 arm64** (kernel 6.8, Landlock ABI 4), `make e2e-linux` with reboot + ephemeral phases | **PASS** (run 2; run 1 failed on a harness timing flaw, fixed, see STATUS). doctor 19 rows none failed, `sandbox ok`; install 0.56 s · `twd up --service` 0.66 s · deploy → ready 3.8 s · first object node 1.6 s · kill 70 ms · **410 in ≤ 1 ms** · `systemctl --user restart` → answering 6.7 s · **reboot** → service active 6.7 s, answering this Mac **7.7 s**, 2 objects rejoined with their old node IDs · **ephemeral** sub-agent re-minted after a restart in 4.1 s, answering at 9.5 s · `twd down --purge --service` → redeploy on the same state dir works · 0 leftovers |
+| **microVM tier** (`twdl-kvm-u24`, nested virt), `make e2e-linux-vm` **from the shipped Mac-built tarball** | **PASS** 23/23 in 42 s: `sudo twd host setup --microvm` 1.0 s (the only sudo) · agent + mcp in jailed Firecracker VMs (boot 0.97 s) · checks (a)–(f) · DO storage survives a VMM SIGKILL (1.15 s) and a redeploy · no key material in either guest (28 needles) · `setup --undo` |
+| **Host reboot with microVMs**, `make e2e-linux-reboot` (clean stop + power cut) | **PASS**: helper back 3.7–4.2 s after kernel boot, `twd up` 0.6 s, LUKS2 volume re-attached in ~25 ms, same node ID, every write present; a pre-existing client re-finds the node in **20 s (clean) vs 6 s (power cut)**, a client-side WireGuard stale-session effect, explained in STATUS/INSTALL |
+| Lima `twd-dev` | `make test` (`-race`) 164 s · `test-node` 35 s · `test-sdk` 91 s · `e2e-vm` 19 s (13/13): all **PASS** |
+| Packaging | The Mac-built linux-arm64 tarball **lacked the microVM guest** (red team, pass 2). `make release` now builds it in `twd-dev` and includes it (`share/twd/vm`, `release.json` `"microvm": true`; 162 MB); linux-amd64 has no guest. |
+
+Linux rows from before this tree (Debian 12, Ubuntu 22.04, Fedora 45, Ubuntu 24.04 amd64) are in `docs/INSTALL.md`'s support matrix and STATUS.md (L1 / Integration); they were not re-run on the final tree.
+
 ## Bugs found and fixed overnight (the interesting ones)
 - **Cross-tenant key exposure:** without a sandbox, any tenant's workerd could read every tenant's node keys and drive mgmt's admin socket. Fixed with a per-tenant **Seatbelt** profile on macOS, now applied to Node apps too and checked by `twd doctor`.
 - **Identity collision:** two apps with the same DO class and object name shared a node, so one app's traffic left as the other's. Identity is now keyed by (tenant, workload, class, object), with an in-place store migration.
