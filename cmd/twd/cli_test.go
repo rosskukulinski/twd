@@ -195,3 +195,42 @@ func TestDevOnce(t *testing.T) {
 		t.Fatalf("twd dev --once: %+v", r)
 	}
 }
+
+func TestDoctor(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	wd, err := nettest.WorkerdBinary()
+	if err != nil {
+		t.Skip("needs workerd (make deps)")
+	}
+	t.Setenv("TWD_WORKERD", wd)
+	bin := cliflow.BuildBinaries(t)
+	work := t.TempDir()
+	e := &cliflow.Env{T: t, BinDir: bin, StateDir: filepath.Join(work, "state"), WorkDir: work}
+	var r struct {
+		OK     bool `json:"ok"`
+		Checks []struct {
+			Name, Status, Detail string
+		} `json:"checks"`
+	}
+	e.MustJSON(&r, "doctor")
+	got := map[string]string{}
+	for _, c := range r.Checks {
+		got[c.Name] = c.Status
+	}
+	want := map[string]string{"binaries": "ok", "workerd": "ok", "bundler": "ok", "twd_home_writable": "ok",
+		"state_dir_writable": "ok", "api_key": "skip", "system_tailscaled_not_used": "ok"}
+	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)
+	}
+	if _, err := os.Stat(filepath.Join(work, "state")); !os.IsNotExist(err) {
+		t.Fatalf("doctor created the state dir")
+	}
+	// A key file without TS_API_KEY fails the api_key check (and the command).
+	bad := filepath.Join(work, "bad.env")
+	os.WriteFile(bad, []byte("NOPE=1\n"), 0o600)
+	if _, se, _, err := e.Twd("doctor", "--tailnet", "example.ts.net", "--api-key-file", bad); err == nil || !strings.Contains(se, "doctor_failed") {
+		t.Fatalf("doctor with a bad key file: %v %s", err, se)
+	}
+}

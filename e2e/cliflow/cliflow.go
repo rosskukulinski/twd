@@ -98,6 +98,15 @@ type Env struct {
 	// testcontrol they are untagged users, so the principal is a login.
 	ClientTagged bool
 	Res          *Results
+	// Exec, if set, runs the CLI elsewhere (e2e-mbp: over ssh on another
+	// Mac) with args after the binary (--state-dir first). dur is the CLI's
+	// own wall time on that machine.
+	Exec func(args []string) (stdout, stderr string, dur time.Duration, err error)
+	// PatchFile, if set, edits a file in WorkDir (which is then remote).
+	PatchFile func(path string, edit func([]byte) []byte) error
+	// OnPeers, if set, runs once the client sees the agent and mcp
+	// workload nodes (e2e-mbp measures the cross-machine path there).
+	OnPeers func(client *nettest.Node, hc *http.Client, agentIP, mcpIP string)
 }
 
 // Results are the measured outcome (written as JSON by e2e-mac).
@@ -122,9 +131,15 @@ func NewResults(run, tailnet string) *Results {
 
 func (r *Results) pass(name, detail string) { r.Checks[name] = "PASS " + detail }
 
+// Pass records a passed check (for callers outside cliflow).
+func (r *Results) Pass(name, detail string) { r.pass(name, detail) }
+
 // Twd runs the CLI.
 func (e *Env) Twd(args ...string) (stdout, stderr string, dur time.Duration, err error) {
 	full := append([]string{"--state-dir", e.StateDir}, args...)
+	if e.Exec != nil {
+		return e.Exec(full)
+	}
 	cmd := exec.Command(filepath.Join(e.BinDir, "twd"), full...)
 	cmd.Dir = e.WorkDir
 	var so, se bytes.Buffer
@@ -337,10 +352,18 @@ func (e *Env) Run() {
 	}
 	// Declare the agent's dependency on the echo service (preflighted).
 	tj := filepath.Join(agentDir, "twd.jsonc")
-	b, _ := os.ReadFile(tj)
-	b = bytes.Replace(b, []byte(`"tags": ["tag:twd-wl-agent"],`), []byte(`"tags": ["tag:twd-wl-agent"],
+	addConnects := func(b []byte) []byte {
+		return bytes.Replace(b, []byte(`"tags": ["tag:twd-wl-agent"],`), []byte(`"tags": ["tag:twd-wl-agent"],
     "connects": ["`+TestTag+`"],`), 1)
-	os.WriteFile(tj, b, 0o644)
+	}
+	if e.PatchFile != nil {
+		if err := e.PatchFile(tj, addConnects); err != nil {
+			t.Fatalf("patch %s: %v", tj, err)
+		}
+	} else {
+		b, _ := os.ReadFile(tj)
+		os.WriteFile(tj, addConnects(b), 0o644)
+	}
 
 	// Preflight refuses hello (tailnet.connects tag:db has no grant).
 	_, se, _, err := e.Twd("deploy", helloDir)
@@ -386,6 +409,9 @@ func (e *Env) Run() {
 
 	agentIP := peerIP(t, client, agent.Endpoint.MagicDNS, 60*time.Second)
 	mcpIP := peerIP(t, client, mcp.Endpoint.MagicDNS, 60*time.Second)
+	if e.OnPeers != nil {
+		e.OnPeers(client, hc, agentIP, mcpIP)
+	}
 
 	// (a) verified caller, via the workload node to a fresh agent object.
 	first := time.Now()
