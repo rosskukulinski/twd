@@ -4,7 +4,7 @@ Last update: 2026-11-07 23:55 PT. M0 and M1 by the first run; M2 (`twd-mgmt`) on
 Last update: 2026-11-08 00:10 PT. M0, M1 (main) and M3 (branch `m3-hostd`).
 Last update: 2026-11-08 00:40 PT. M8 (microVM tier, Firecracker in Lima) on branch `m8-vm`: `make e2e-vm` PASS.
 Last update: 2026-11-08 00:45 PT. M4 (`twd` CLI + integrated single-machine flow, E2E-MAC on this Mac) on branch `m4-cli`.
-Last update: 2026-11-08 01:10 PT. M6 (release tarballs, `install.sh`, `twd doctor`, **E2E-MAC on `mbp`: PASS**) on branch `m6-release`.
+Last update: 2026-11-08 01:15 PT. M6 (merged with M5; release tarballs, `install.sh`, `twd doctor`, **E2E-MAC on `mbp`: PASS**) on branch `m6-release`.
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 
 ## M0: repo skeleton (DONE)
@@ -605,6 +605,13 @@ Final run: `e2e/vm/results/m8-20261108T083524Z.json`.
 - **Ross's personal tailnet was not touched.** mbp's Tailscale.app was never used, queried or read: the test never runs `tailscale`, and twd on mbp runs only tsnet nodes of tailnet 1 (`twd doctor`'s lsof check passed in every run).
 - **No policy change in M6** (read-only check that M4's grants exist). No sudo on mbp; nothing installed outside `~/.twd` and `~/.twd-e2e`, and both are removed at the end. No Homebrew installs.
 - Keys: the key file goes over ssh stdin (never on a command line), mode 0600, deleted at the end even on failure. No `tskey-*` in logs or results (check-secrets).
+
+### After merging master (M5) into `m6-release` (commit `9e3c50b`)
+- The release now vendors **every dependency any template declares** (computed from the templates' `package.json`): `@ai-sdk/mcp @ai-sdk/provider @modelcontextprotocol/server @twd/mcp @twd/tailnet agents ai zod` → 177 packages, 71 MB. `twd doctor` and the esbundle byte-identity test cover all four templates, `ai-agent` included.
+- e2e-mbp gained `init_ai_agent_offline`: `twd init --template ai-agent` on mbp (no npm) and doctor bundles it offline. It isn't **deployed** on mbp: its tags (`tag:twd-wl-ai`, `tag:twd-ai-agent`) aren't in tailnet 1's policy, and M6 writes no policy.
+- **`make e2e-mbp`: PASS 2 of 2 on `9e3c50b`** (clean tree; runs `bf4d28`, `e61800`), 18/18 checks each, 0 leftovers, mbp clean. Numbers are in line with the table above: install 5.5–5.6 s, up 1.57–1.63 s, deploy→ready agent 3.74 / 1.58 s and mcp 1.61 / 1.60 s, first object node 1.79 / 1.71 s, spawn 6.8 / 3.6 s, kill CLI 69 / 69 ms, killed → 410 in 6.8 / 7.8 ms, direct HTTP 11.1 / 12.3 ms vs DERP 18.8 / 18.8 ms, direct ping 3.7 / 4.1 ms vs DERP 11.1 / 11.4 ms.
+- Total: **5 green e2e-mbp runs** (3 before the merge, 2 after) plus 1 deliberate failure-path run.
+- `make test` and `make lint`: PASS after the merge.
 
 ### Known gaps (M6)
 - **No separate esbuild binary in the tarball:** esbuild is linked into `twd` (Go API, same version). That is simpler and needs no Node; `create-twd build` (the JS CLI) still needs Node + npm esbuild.
