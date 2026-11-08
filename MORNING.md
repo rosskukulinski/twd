@@ -1,11 +1,11 @@
 # Good morning: overnight build summary (2026-11-08)
 
-**Result: every item in BUILD-PLAN.md's definition of done is met.** twd installs on a clean MacBook (`mbp`) and works end to end against a real tailnet. Unit and e2e suites pass on macOS and Linux. Master is `724b742`; the release is in `dist/twd-0.1.0-724b7423-{darwin,linux}-arm64.tar.gz`.
+**Result: every item in BUILD-PLAN.md's definition of done is met, and Linux is a first-class host (LINUX-PLAN.md).** twd installs on a clean MacBook (`mbp`) and on fresh Linux VMs and works end to end against real tailnets. Unit and e2e suites pass on macOS and Linux, re-measured on the final tree (branch `final-verify`, fast-forward of master; STATUS.md "Final verification"). `make release` writes `dist/twd-0.1.0-<commit>-{darwin-arm64,linux-arm64,linux-amd64}.tar.gz`.
 
 ## Install it on another Mac
 Follow `docs/INSTALL.md`. Short version:
 ```sh
-scp dist/twd-0.1.0-724b7423-darwin-arm64.tar.gz other-mac:
+scp dist/twd-0.1.0-<commit>-darwin-arm64.tar.gz other-mac:
 ssh other-mac 'tar xzf twd-*.tar.gz && ./twd-*/install.sh'        # ~6 s, no sudo, installs into ~/.twd
 twd up --tailnet <your-test-tailnet> --api-key-file <file with TS_API_KEY=…> --yes
 twd init hello --template agent && cd hello && twd deploy
