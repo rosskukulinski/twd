@@ -314,15 +314,13 @@ func TestDoctor(t *testing.T) {
 		want["sandbox"] = "warn" // Linux without Landlock: loud warning
 	}
 	if runtime.GOOS == "linux" {
-		// No microVM guest next to this test build: the tier is off (warn).
-		want["microvm"] = "warn"
-	}
-	if runtime.GOOS == "linux" {
 		// Linux host checks: present, never failing on a supported host
-		// (kvm/firecracker/microvm_tier may skip, systemd/landlock may warn).
+		// (kvm/firecracker may skip, systemd/landlock may warn). No microVM
+		// guest sits next to this test build, so microvm_tier is warn (the
+		// tier is off; L3's helper status is what it reports).
 		for _, n := range []string{"glibc", "kernel", "landlock", "user_namespaces", "kvm", "firecracker", "cgroups_v2", "systemd", "microvm_tier"} {
 			st, ok := got[n]
-			if !ok || st == "fail" {
+			if !ok || st == "fail" || (n == "microvm_tier" && st != "warn") {
 				t.Fatalf("doctor on linux: %s = %q: %v", n, st, r.Checks)
 			}
 			delete(got, n)

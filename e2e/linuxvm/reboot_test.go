@@ -247,6 +247,43 @@ func TestE2ELinuxReboot(t *testing.T) {
 		d := up()
 		res.Numbers[tag+"_twd_up_ms"] = msOf(d)
 		sv := time.Now()
+		// Where do the 12-17 s until this Mac reaches the rejoined node go?
+		// Sample the client's view of the peer (netmap presence, Online,
+		// relay / direct path, last handshake) while we poll the object.
+		stopSample := make(chan struct{})
+		var timeline []string
+		go func() {
+			last := ""
+			for {
+				select {
+				case <-stopSample:
+					return
+				case <-time.After(250 * time.Millisecond):
+				}
+				sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				st, err := client.LC.Status(sctx)
+				cancel()
+				if err != nil {
+					continue
+				}
+				cur := "peer absent from netmap"
+				for _, p := range st.Peer {
+					if len(p.TailscaleIPs) > 0 && p.TailscaleIPs[0].String() == objIP {
+						hs := "no handshake"
+						if !p.LastHandshake.IsZero() {
+							hs = "handshake " + time.Since(p.LastHandshake).Round(100*time.Millisecond).String() + " ago"
+						}
+						cur = fmt.Sprintf("in netmap: online=%v active=%v relay=%q curAddr=%q %s", p.Online, p.Active, p.Relay, p.CurAddr, hs)
+						break
+					}
+				}
+				key, _, _ := strings.Cut(cur, " handshake")
+				if key != last {
+					last = key
+					timeline = append(timeline, fmt.Sprintf("+%.1fs %s", time.Since(sv).Seconds(), cur))
+				}
+			}
+		}()
 		var m map[string]any
 		for {
 			var code int
@@ -254,11 +291,18 @@ func TestE2ELinuxReboot(t *testing.T) {
 				break
 			}
 			if time.Since(sv) > 3*time.Minute {
-				t.Fatalf("%s: object not serving on %s 3 min after twd up", tag, objIP)
+				close(stopSample)
+				t.Fatalf("%s: object not serving on %s 3 min after twd up: %s", tag, objIP, strings.Join(timeline, "; "))
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+		close(stopSample)
 		res.Numbers[tag+"_up_to_object_serving_ms"] = msOf(time.Since(sv))
+		timeline = append(timeline, fmt.Sprintf("+%.1fs first HTTP 200 from the object", time.Since(sv).Seconds()))
+		// The VM side: when hostd said the object's node was ready (VM clock,
+		// Lima keeps it in sync), vs. when the Mac client got through.
+		ready := strings.TrimSpace(r.must(`grep 'object node ready' ~/.twd-e2e/state/logs/hostd.log | tail -1 | sed 's/.*time=\([^ ]*\).*join_ms=\([^ ]*\).*/\1 join_ms=\2/'; date -u +%Y-%m-%dT%H:%M:%S.%3NZ`))
+		res.Notes = append(res.Notes, fmt.Sprintf("%s re-find timeline (client view; twd up returned at %s, Mac clock): %s | VM: last 'object node ready' at %s", tag, sv.Format("15:04:05.000"), strings.Join(timeline, "; "), strings.Join(strings.Fields(ready), " now=")))
 		want++
 		if callsOf(m) != want {
 			t.Fatalf("%s: SQLite calls %d, want %d: data lost? %v", tag, callsOf(m), want, m)

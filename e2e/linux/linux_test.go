@@ -206,7 +206,7 @@ func TestE2ELinux(t *testing.T) {
 	osInfo := strings.TrimSpace(v.must(`. /etc/os-release; printf '%s | ' "$PRETTY_NAME"; uname -rm | tr '\n' ' '; printf '| glibc '; getconf GNU_LIBC_VERSION 2>/dev/null | cut -d' ' -f2; nproc | tr '\n' ' '; echo cpus`))
 	res.Notes = append(res.Notes, "VM: "+osInfo)
 	res.Checks["os"] = "INFO " + osInfo
-	res.Checks["sandbox"] = "INFO sandbox: none (L2 pending)"
+	res.Checks["sandbox"] = "INFO sandbox: checked while twd runs (below)"
 
 	quiet := slog.New(netd.NewRedactingHandler(slog.NewTextHandler(io.Discard, nil)))
 	minter := tsapi.MintSource(api, quiet)
@@ -621,11 +621,25 @@ func TestE2ELinux(t *testing.T) {
 		Workloads []struct{ Workload, Tier, Sandbox string }
 	}
 	e.MustJSON(&sbst, "status")
+	// Every process-tier workload runs under Landlock (+ seccomp), and
+	// doctor's sandbox check sees all of them under it (it may be warn on
+	// Landlock ABI < 4, where TCP is restricted by seccomp alone).
 	var sbs []string
+	nProc := 0
 	for _, w := range sbst.Workloads {
 		sbs = append(sbs, w.Workload+":"+w.Tier+"/"+orNone(w.Sandbox))
+		if w.Tier == "process" {
+			nProc++
+			if w.Sandbox != "landlock" {
+				t.Fatalf("workload %s (tier %s) runs with sandbox %q, want landlock: %v", w.Workload, w.Tier, w.Sandbox, sbs)
+			}
+		}
 	}
-	res.Checks["sandbox"] = "INFO sandbox: none (L2 pending); workloads " + strings.Join(sbs, " ")
+	sbSt, sbD := doc.get("sandbox")
+	if sbSt == "fail" || sbSt == "skip" || !strings.Contains(sbD, fmt.Sprintf("active: %d/%d", nProc, nProc)) {
+		t.Fatalf("doctor (running): sandbox %s %s (workloads %v)", sbSt, sbD, sbs)
+	}
+	res.Pass("sandbox", fmt.Sprintf("workloads %s; doctor sandbox %s: %s", strings.Join(sbs, " "), sbSt, sbD))
 
 	// Persistent nodes: purge (kill every object, delete its device), and
 	// remove the unit, in one `twd down`.
@@ -686,9 +700,26 @@ func TestE2ELinux(t *testing.T) {
 		}
 		parent := e.WaitObjectReady("SupportAgent", "e1", scale(90*time.Second))
 		parentIP := cliflow.PeerIP(t, client, parent.MagicDNS, scale(60*time.Second))
-		if c, b := getJSON("http://" + parentIP + "/spawn?child=e2"); c != 200 || fmt.Sprint(b["child"].(map[string]any)["reply"].(map[string]any)["lookup"]) != "e2" {
+		// The spawn mints + joins the child on the real tailnet (4-10 s here,
+		// longer when the Mac is loaded): a longer client timeout than the
+		// 10 s used for plain calls.
+		slowHC := client.HTTPClient(scale(40 * time.Second))
+		spawnJSON := func(u string) (int, map[string]any) {
+			resp, err := slowHC.Get(u)
+			if err != nil {
+				return 0, nil
+			}
+			defer resp.Body.Close()
+			var m map[string]any
+			b, _ := io.ReadAll(resp.Body)
+			json.Unmarshal(b, &m)
+			return resp.StatusCode, m
+		}
+		st := time.Now()
+		if c, b := spawnJSON("http://" + parentIP + "/spawn?child=e2"); c != 200 || fmt.Sprint(b["child"].(map[string]any)["reply"].(map[string]any)["lookup"]) != "e2" {
 			t.Fatalf("ephemeral: spawn: %d %v", c, b)
 		}
+		res.Numbers["eph_spawn_ready_ms"] = msOf(time.Since(st))
 		child := e.WaitObjectReady("LookupAgent", "e2", scale(90*time.Second))
 		childIP := cliflow.PeerIP(t, client, child.MagicDNS, scale(60*time.Second))
 		if c, b := getJSON("http://" + childIP + "/"); c != 200 || b["lookup"] != "e2" {

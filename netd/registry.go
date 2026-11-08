@@ -635,6 +635,27 @@ func (r *Registry) forgetIPs(o *Object) {
 }
 
 // Get returns the object with the given ID, or nil.
+// RemoveState deletes a killed object's saved node state (twd down
+// --purge). A kill with a tombstone removes the dir only when the tombstone
+// expires; if the host stops before that, the next object of the same ID
+// would find the dead node's state and spend a re-mint round trip on it.
+// Refused while the object is live (pending or ready).
+func (r *Registry) RemoveState(id string) error {
+	if !ValidObjectID(id) {
+		return fmt.Errorf("netd: invalid object id %q", id)
+	}
+	r.mu.Lock()
+	o := r.objects[id]
+	r.mu.Unlock()
+	if o != nil {
+		switch o.State() {
+		case StatePending, StateReady:
+			return fmt.Errorf("netd: object %s is live", id)
+		}
+	}
+	return os.RemoveAll(filepath.Join(r.cfg.StateRoot, id))
+}
+
 func (r *Registry) Get(id string) *Object {
 	r.mu.Lock()
 	defer r.mu.Unlock()

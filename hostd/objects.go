@@ -425,18 +425,34 @@ func (h *Host) forgetLocked(o *object) {
 	}
 }
 
-// Purge forgets every killed object (twd down --purge) and saves
-// objects.json without them. Returns the forgotten IDs.
+// Purge forgets every killed object (twd down --purge), removes its saved
+// node state (its device is gone; a kill's tombstone would otherwise keep
+// the state dir until it expires, and a redeploy of the same identity would
+// re-mint instead of joining fresh), and saves objects.json without them.
+// Returns the forgotten IDs.
 func (h *Host) Purge() []string {
 	h.mu.Lock()
 	ids := []string{}
+	var gone []*object
 	for _, o := range h.objects {
 		if o.terminal() {
 			h.forgetLocked(o)
 			ids = append(ids, o.ID)
+			gone = append(gone, o)
 		}
 	}
+	tenants := map[string]*tenant{}
+	for _, o := range gone {
+		tenants[o.TenantID] = h.tenants[o.TenantID]
+	}
 	h.mu.Unlock()
+	for _, o := range gone {
+		if t := tenants[o.TenantID]; t != nil && t.reg != nil {
+			if err := t.reg.RemoveState(o.NetdID); err != nil {
+				h.log.Warn("purge: node state kept", "object", o.ID, "err", err)
+			}
+		}
+	}
 	h.saveObjects()
 	return ids
 }
