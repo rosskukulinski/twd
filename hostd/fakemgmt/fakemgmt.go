@@ -75,12 +75,24 @@ type Server struct {
 	pushes      []string
 	volKeys     map[string][]byte // tenant/workload -> DO volume data key
 	// VolumeKeyCalls counts GET /v0/volumes/key (tests).
-	VolumeKeyCalls int
-	// LeaseLostCredentials makes the next N credential calls fail with
-	// lease_lost (tests: a host whose lease epoch went stale mid-join).
-	LeaseLostCredentials int
-	// CredentialCalls counts GET /v0/objects/{id}/credential (tests).
-	CredentialCalls int
+	VolumeKeyCalls       int
+	leaseLostCredentials int // next N credential calls fail with lease_lost
+	credentialCalls      int
+}
+
+// SetLeaseLostCredentials makes the next n credential calls fail with
+// lease_lost (tests: a host whose lease epoch went stale mid-join).
+func (s *Server) SetLeaseLostCredentials(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leaseLostCredentials = n
+}
+
+// CredentialCalls counts GET /v0/objects/{id}/credential.
+func (s *Server) CredentialCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.credentialCalls
 }
 
 type tenant struct {
@@ -759,9 +771,9 @@ func (s *Server) credential(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
 		return
 	}
-	s.CredentialCalls++
-	if s.LeaseLostCredentials > 0 {
-		s.LeaseLostCredentials--
+	s.credentialCalls++
+	if s.leaseLostCredentials > 0 {
+		s.leaseLostCredentials--
 		s.mu.Unlock()
 		writeErr(w, 409, mgmtapi.CodeLeaseLost, "the caller does not hold the namespace lease at this epoch (test knob)")
 		return

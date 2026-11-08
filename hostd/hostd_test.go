@@ -521,16 +521,16 @@ func TestKillViaHeartbeat(t *testing.T) {
 func TestNodeRetriesAfterLeaseLost(t *testing.T) {
 	s := startSuite(t, fakemgmt.Config{NoPush: true})
 	e := s.e
-	e.FM.LeaseLostCredentials = 1
+	e.FM.SetLeaseLostCredentials(1)
 	st := time.Now()
 	d := e.Deploy(hostdtest.Fixture("probe"), "probe", nil)
 	probe := e.WaitActive("probe", d, 60*time.Second)
-	if e.FM.CredentialCalls < 2 {
-		t.Fatalf("credential calls %d, want a retry after lease_lost", e.FM.CredentialCalls)
+	if n := e.FM.CredentialCalls(); n < 2 {
+		t.Fatalf("credential calls %d, want a retry after lease_lost", n)
 	}
 	s.waitPeer(probe.IP)
 	if code, _ := s.getJSON("http://" + probe.IP + "/probe/k/"); code != 200 {
 		t.Fatalf("probe via retried node: %d", code)
 	}
-	t.Logf("node ready after a lease_lost retry in %v (%d credential calls)", time.Since(st), e.FM.CredentialCalls)
+	t.Logf("node ready after a lease_lost retry in %v (%d credential calls)", time.Since(st), e.FM.CredentialCalls())
 }
