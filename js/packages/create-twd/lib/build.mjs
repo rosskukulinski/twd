@@ -41,6 +41,9 @@ export async function buildApp(dir, { outfile = "dist/index.js", minify = false 
     mainFields: ["module", "main"],
     external: ["cloudflare:*", "node:*"],
     minify,
+    // Module fallbacks for apps outside the twd repo (twd deploy sets this
+    // to twd's own node_modules: @twd/tailnet, @twd/mcp, agents, …).
+    nodePaths: (process.env.TWD_NODE_PATH || "").split(":").filter(Boolean),
     legalComments: "none",
     logLevel: "warning",
     metafile: true,

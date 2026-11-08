@@ -215,7 +215,16 @@ export function wrapHandler(H: any, bindings: BindingMap) {
     if (typeof H[k] !== "function") continue;
     out[k] = function (this: unknown, a: unknown, env: any, ctx: any) {
       if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
-      return H[k].call(H, a, env, ctx);
+      const r = H[k].call(H, a, env, ctx);
+      if (k !== "fetch") return r;
+      // A call into a killed object throws "[killed] …" from the platform;
+      // answer the caller with a typed 410 instead of an opaque 500.
+      return Promise.resolve(r).catch((e: unknown) => {
+        const m = String((e as Error)?.message ?? e);
+        const i = m.indexOf("[killed]");
+        if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+        throw e;
+      });
     };
   }
   return out;

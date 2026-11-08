@@ -11,6 +11,7 @@ const (
 	CodePeerNotVisible       = "peer_not_visible"
 	CodeForbiddenDestination = "forbidden_destination"
 	CodeKilled               = "killed"
+	CodeObjectKilled         = "object_killed" // a new request to a killed object (its tombstone answers)
 	CodeIdentityPending      = "identity_pending"
 	CodeBootstrapFailed      = "bootstrap_failed"
 	CodeNoIdentity           = "no_identity"
@@ -52,7 +53,7 @@ func (e *Error) Status() int {
 		return http.StatusForbidden
 	case CodeBadRequest:
 		return http.StatusBadRequest
-	case CodeKilled:
+	case CodeKilled, CodeObjectKilled:
 		return http.StatusGone
 	case CodeIdentityPending, CodeUpstreamUnavailable:
 		return http.StatusServiceUnavailable

@@ -29,6 +29,8 @@ type Store interface {
 	// FindClass returns the latest deployment of tenantID that declares the
 	// DO class (namespace).
 	FindClass(ctx context.Context, tenantID, class string) (Deployment, ClassConfig, error)
+	// LatestDeployments returns the latest deployment of every workload of a tenant.
+	LatestDeployments(ctx context.Context, tenantID string) ([]Deployment, error)
 
 	CreateObject(ctx context.Context, o Object) error // ErrExists on (tenant, namespace, name)
 	GetObject(ctx context.Context, id string) (Object, error)

@@ -397,6 +397,10 @@ func (s *SQLStore) Assignments(ctx context.Context, hostID string) ([]Deployment
 	return out, nil
 }
 
+func (s *SQLStore) LatestDeployments(ctx context.Context, tenantID string) ([]Deployment, error) {
+	return s.latestDeployments(ctx, "AND d.tenant_id=?", tenantID)
+}
+
 func (s *SQLStore) FindClass(ctx context.Context, tenantID, class string) (Deployment, ClassConfig, error) {
 	ds, err := s.latestDeployments(ctx, "AND d.tenant_id=?", tenantID)
 	if err != nil {

@@ -49,6 +49,11 @@ func NewClient(addr string) (*Client, error) {
 // Do sends a JSON request and decodes a JSON response into out (if non-nil).
 // Non-2xx responses become *Error.
 func (c *Client) Do(ctx context.Context, method, path string, in, out any) error {
+	return c.DoHeaders(ctx, method, path, in, out, nil)
+}
+
+// DoHeaders is Do with extra request headers.
+func (c *Client) DoHeaders(ctx context.Context, method, path string, in, out any, hdr map[string]string) error {
 	var body io.Reader
 	if in != nil {
 		b, err := json.Marshal(in)
@@ -66,6 +71,9 @@ func (c *Client) Do(ctx context.Context, method, path string, in, out any) error
 	}
 	if c.HostID != "" {
 		req.Header.Set("Twd-Host-ID", c.HostID)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {

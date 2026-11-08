@@ -1,0 +1,66 @@
+{
+  "run": "m4-ad7b88",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T00:36:30-08:00",
+  "checks": {
+    "a_verified_caller": "PASS nodeId nkSFFLiVq521CNTRL tags [tag:ttest] (workload and the object's own node twd-e2e-ad7b88-supportagent-gjbe5oncax.tail7906d5.ts.net)",
+    "b_egress_own_node": "PASS echo WhoIs = twd-e2e-ad7b88-supportagent-gjbe5oncax.tail7906d5.ts.net.",
+    "c_mcp_caps": "PASS lookup_order allowed; refund → cap_missing",
+    "d_spawn": "PASS child lookupagent-ewbflrxfof node twd-e2e-ad7b88-lookupagent-ewbflrxfof.tail7906d5.ts.net tags [tag:twd-agent-support-sub] caps {\n        \"example.com/cap/mcp\": {\n          \"tools\": [\n            \"lookup_order\"\n          ]\n        }\n      }",
+    "deploy": "PASS agent twd-e2e-ad7b88-agent-i5gkaipqmp.tail7906d5.ts.net, mcp twd-e2e-ad7b88-mcp-we2iojscua.tail7906d5.ts.net",
+    "down": "PASS 2 objects purged, 4 devices deleted, 468ms",
+    "e_kill_cascade": "PASS cli 71ms, push 61.9 ms, new requests → 410 object_killed in ≤1ms, via workload 410 killed",
+    "f_audit_chain": "PASS \"twd-e2e-ad7b88-client.tail7906d5.ts.net → twd-e2e-ad7b88-supportagent-gjbe5oncax → twd-e2e-ad7b88-lookupagent-ewbflrxfof\", 6 records for the sub-agent, chain verified",
+    "preflight_missing_grant": "PASS acl_denied with HuJSON snippet",
+    "status": "PASS healthy",
+    "up": "PASS tenant tn_tail7906d5 host h-mini in 994ms",
+    "up_interactive_refused": "PASS tailnet_required"
+  },
+  "numbers": {
+    "agent_egress_ms": 7.932,
+    "agent_first_request_ms": 62.066,
+    "deploy_agent_active_ms": 426.441,
+    "deploy_agent_cli_ms": 1781.449,
+    "deploy_agent_ready_ms": 1680.053,
+    "deploy_mcp_cli_ms": 1617.566,
+    "deploy_mcp_ready_ms": 1540.77,
+    "down_ms": 467.984,
+    "first_object_node_ready_ms": 1625.05,
+    "kill_api_ms": 63.115,
+    "kill_cli_ms": 71.086,
+    "kill_push_ms": 61.898,
+    "killed_new_request_ms": 0.978,
+    "killed_via_workload_ms": 3.102,
+    "spawn_ready_ms": 1772.834,
+    "up_host_ready_ms": 982.513,
+    "up_mgmt_ready_ms": 774.296,
+    "up_ready_ms": 993.857
+  },
+  "notes": [
+    "policy already had the scenario's tagOwners and grants (not written)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 6,
+    "devices_left": 0,
+    "devices_tracked": 6,
+    "test_keys_minted": 2,
+    "test_keys_revoke_errors": null,
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 4,
+    "twd_keys_tracked": 4,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": [
+    "nZwTsVSfEY11CNTRL",
+    "nsa7jnZum921CNTRL",
+    "nraqAzmr9w11CNTRL",
+    "n66cPHVNjW11CNTRL"
+  ],
+  "keyIDs": [
+    "k8LivBSW2G11CNTRL",
+    "kXd9ZZ34i111CNTRL",
+    "kaUbqtfUfr11CNTRL",
+    "kUyft5kzE711CNTRL"
+  ]
+}

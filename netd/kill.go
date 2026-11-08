@@ -2,7 +2,9 @@ package netd
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"reflect"
 	"sync"
@@ -32,11 +34,12 @@ type KillOptions struct {
 	// peers' netmaps median 206 ms vs 2.4 s, because closing an ephemeral
 	// node first waits on its control-side logout (up to 5 s).
 	CloseFirst bool
-	// Tombstone keeps the killed node up (listener closed, flows reset) for
-	// this long after the device delete before closing it, so NEW
-	// connections from peers get an immediate RST from netstack instead of
-	// black-holing until their timeout (M1 finding 3). Ignored with
-	// CloseFirst. Registry.Close still closes tombstoned nodes at once.
+	// Tombstone keeps the killed node up (flows reset) for this long after
+	// the device delete before closing it, so NEW connections from peers
+	// fail fast instead of black-holing until their timeout (M1 finding 3):
+	// the ingress port answers every request with a typed 410
+	// object_killed (Connection: close). Ignored with CloseFirst.
+	// Registry.Close still closes tombstoned nodes at once.
 	Tombstone time.Duration
 }
 
@@ -89,6 +92,9 @@ func (r *Registry) Kill(ctx context.Context, id string, opts KillOptions) (*Kill
 	// 1. Stop accepting, then RST everything in flight, both directions.
 	if ln != nil {
 		ln.Close() // new SYNs to the port now get a RST from netstack
+	}
+	if opts.Tombstone > 0 && !opts.CloseFirst {
+		o.serveTombstone(opts.Reason)
 	}
 	rep.FlowsAborted = o.abortFlows()
 	rep.AbortMS = ms(time.Since(t0))
@@ -253,4 +259,39 @@ func gonetEndpoint(c *gonet.TCPConn) tcpip.Endpoint {
 func hasEPField() bool {
 	f, ok := reflect.TypeFor[gonet.TCPConn]().FieldByName("ep")
 	return ok && f.Type == reflect.TypeFor[tcpip.Endpoint]()
+}
+
+// serveTombstone re-listens on the ingress port of a killed node and answers
+// every request with a typed 410 object_killed, so a caller learns at once
+// (and why) instead of seeing a bare RST or, once peers drop the node, a
+// black-holed dial. Connections are not tracked and never reach upstream.
+func (o *Object) serveTombstone(reason string) {
+	o.mu.Lock()
+	srv := o.srv
+	o.mu.Unlock()
+	if srv == nil {
+		return
+	}
+	ln, err := srv.Listen("tcp", fmt.Sprintf(":%d", o.reg.cfg.IngressPort))
+	if err != nil {
+		return
+	}
+	id := o.id
+	hs := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Connection", "close")
+			e := newErr(CodeObjectKilled, "object "+id+" was killed")
+			if reason != "" {
+				e.Detail += ": " + reason
+			}
+			e.Object = id
+			WriteError(w, e)
+		}),
+	}
+	hs.SetKeepAlivesEnabled(false)
+	o.mu.Lock()
+	o.tombSrv = hs
+	o.mu.Unlock()
+	go hs.Serve(ln)
 }

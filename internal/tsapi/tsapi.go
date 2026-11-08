@@ -124,7 +124,10 @@ func (c *Client) doHdr(ctx context.Context, method, path string, hdr http.Header
 		base = DefaultBaseURL
 	}
 	var rd io.Reader
-	if body != nil {
+	ctype := "application/json"
+	if rb, ok := body.(RawBody); ok {
+		rd, ctype = bytes.NewReader(rb.Body), rb.ContentType
+	} else if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
@@ -140,7 +143,7 @@ func (c *Client) doHdr(ctx context.Context, method, path string, hdr http.Header
 	}
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", ctype)
 	}
 	hc := c.HTTP
 	if hc == nil {
@@ -358,4 +361,75 @@ func (c *Client) CreateFederated(ctx context.Context, o FederatedOptions) (Feder
 		return fc, errors.New("tsapi: federated credential response missing id")
 	}
 	return fc, nil
+}
+
+// RawBody is a request body sent as-is (e.g. a HuJSON policy file).
+type RawBody struct {
+	Body        []byte
+	ContentType string
+}
+
+// GetPolicyHuJSON reads the policy file as HuJSON (comments kept) with its ETag.
+func (c *Client) GetPolicyHuJSON(ctx context.Context) (body []byte, etag string, err error) {
+	var raw []byte
+	rh, err := c.doHdr(ctx, "GET", c.tailnetPath("/acl"), http.Header{"Accept": {"application/hujson"}}, nil, &raw)
+	if err != nil {
+		return nil, "", err
+	}
+	return raw, rh.Get("ETag"), nil
+}
+
+// ValidatePolicy asks the control plane to validate a policy file (HuJSON)
+// without applying it. A non-nil error carries the server's message.
+func (c *Client) ValidatePolicy(ctx context.Context, hujsonBody []byte) error {
+	var raw []byte
+	if _, err := c.doHdr(ctx, "POST", c.tailnetPath("/acl/validate"), nil, RawBody{hujsonBody, "application/hujson"}, &raw); err != nil {
+		return err
+	}
+	var m struct {
+		Message string `json:"message"`
+		Data    []struct {
+			User   string   `json:"user"`
+			Errors []string `json:"errors"`
+		} `json:"data"`
+	}
+	if len(bytes.TrimSpace(raw)) > 0 && json.Unmarshal(raw, &m) == nil && m.Message != "" {
+		msg := m.Message
+		for _, d := range m.Data {
+			msg += "; " + strings.Join(d.Errors, "; ")
+		}
+		return &APIError{Status: 400, Message: "policy invalid: " + msg}
+	}
+	return nil
+}
+
+// SetPolicy replaces the policy file, only if it still has ETag ifMatch
+// (412 otherwise). It returns the new ETag. Callers must validate first.
+func (c *Client) SetPolicy(ctx context.Context, hujsonBody []byte, ifMatch string) (string, error) {
+	if ifMatch == "" {
+		return "", errors.New("tsapi: SetPolicy requires an If-Match ETag")
+	}
+	var raw []byte
+	rh, err := c.doHdr(ctx, "POST", c.tailnetPath("/acl"), http.Header{"If-Match": {ifMatch}, "Accept": {"application/hujson"}},
+		RawBody{hujsonBody, "application/hujson"}, &raw)
+	if err != nil {
+		return "", err
+	}
+	return rh.Get("ETag"), nil
+}
+
+// KeyInfo is the metadata of an auth key (never the secret).
+type KeyInfo struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Invalid     bool   `json:"invalid"`
+	Revoked     string `json:"revoked,omitempty"`
+	Expires     string `json:"expires,omitempty"`
+}
+
+// GetKey reads a key's metadata. A 404 means it no longer exists.
+func (c *Client) GetKey(ctx context.Context, id string) (KeyInfo, error) {
+	var k KeyInfo
+	err := c.do(ctx, "GET", c.tailnetPath("/keys/"+url.PathEscape(id)), nil, &k)
+	return k, err
 }

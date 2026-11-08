@@ -208,6 +208,12 @@ type Object struct {
 	rejoined bool
 	ln       net.Listener
 	httpSrv  *http.Server
+	tombSrv  *http.Server // after a kill with Tombstone: answers object_killed
+	// upCancel/upDone guard the in-flight start(): tsnet.Server.Close must not
+	// run concurrently with Up (data race in tsnet init), so teardown cancels
+	// the join and waits for start to return first.
+	upCancel context.CancelFunc
+	upDone   chan struct{}
 	tr       *http.Transport
 	flows    map[*flow]struct{}
 }
@@ -341,7 +347,13 @@ func (r *Registry) join(o *Object) {
 	}
 	ctx, cancel := context.WithTimeout(r.ctx, r.cfg.JoinTimeout)
 	defer cancel()
-	if err := o.start(ctx); err != nil {
+	done := make(chan struct{})
+	o.mu.Lock()
+	o.upCancel, o.upDone = cancel, done
+	o.mu.Unlock()
+	err := o.start(ctx)
+	close(done) // before any teardown below, which waits on it
+	if err != nil {
 		err = RedactError(err)
 		r.log.Warn("object join failed", "object", o.id, "err", err)
 		o.fail(err)
@@ -469,10 +481,24 @@ func (o *Object) fail(err error) {
 // logging out. It is idempotent.
 func (o *Object) teardown() {
 	o.mu.Lock()
-	srv, hs, tr := o.srv, o.httpSrv, o.tr
+	upCancel, upDone := o.upCancel, o.upDone
+	o.mu.Unlock()
+	if upDone != nil {
+		select {
+		case <-upDone:
+		default:
+			upCancel()
+			<-upDone
+		}
+	}
+	o.mu.Lock()
+	srv, hs, tr, ts := o.srv, o.httpSrv, o.tr, o.tombSrv
 	o.mu.Unlock()
 	if hs != nil {
 		hs.Close()
+	}
+	if ts != nil {
+		ts.Close()
 	}
 	if tr != nil {
 		tr.CloseIdleConnections()

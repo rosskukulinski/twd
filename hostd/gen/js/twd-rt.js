@@ -14,6 +14,7 @@ var CATALOG = Object.freeze({
   derp_unreachable: { status: 502, title: "no direct path and no reachable DERP relay" },
   plan_feature_missing: { status: 501, title: "the tailnet's plan or control server lacks a feature twd can use" },
   killed: { status: 410, title: "the object was killed" },
+  object_killed: { status: 410, title: "a new request reached a killed object (its node's tombstone answered)" },
   no_identity: { status: 401, title: "the request carries no verified tailnet caller" },
   lease_lost: { status: 409, title: "this host no longer holds the namespace lease" },
   bad_request: { status: 400, title: "the request is malformed" },
@@ -230,7 +231,14 @@ function wrapHandler(H, bindings) {
     if (typeof H[k] !== "function") continue;
     out[k] = function(a, env, ctx) {
       if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
-      return H[k].call(H, a, env, ctx);
+      const r = H[k].call(H, a, env, ctx);
+      if (k !== "fetch") return r;
+      return Promise.resolve(r).catch((e) => {
+        const m = String(e?.message ?? e);
+        const i = m.indexOf("[killed]");
+        if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+        throw e;
+      });
     };
   }
   return out;

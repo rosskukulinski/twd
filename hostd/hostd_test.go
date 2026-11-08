@@ -374,14 +374,21 @@ func TestHostd(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("stream survived the kill")
 		}
-		// A new call fails fast (RST from the tombstoned node), not a timeout.
+		// A new call fails fast with a typed object_killed from the
+		// tombstoned node, not a timeout.
 		qc := s.client.HTTPClient(5 * time.Second)
 		rs := time.Now()
-		_, err = qc.Get("http://" + objIP["c"] + "/")
+		nr, err := qc.Get("http://" + objIP["c"] + "/")
 		d := time.Since(rs)
-		t.Logf("new request after kill: %v in %v", err, d)
-		if err == nil || d > time.Second {
+		if err != nil || d > time.Second {
 			t.Fatalf("new request after kill: err=%v after %v", err, d)
+		}
+		var kb map[string]any
+		json.NewDecoder(nr.Body).Decode(&kb)
+		nr.Body.Close()
+		t.Logf("new request after kill: %d %v in %v", nr.StatusCode, kb["code"], d)
+		if nr.StatusCode != 410 || kb["code"] != "object_killed" || nr.Header.Get("twd-error") != "object_killed" {
+			t.Fatalf("new request after kill: %d %v", nr.StatusCode, kb)
 		}
 		// Via the workload: typed killed.
 		code, r := s.getJSON("http://" + probe.IP + "/probe/c/")
