@@ -8,6 +8,7 @@ Last update: 2026-11-08 01:15 PT. M6 (merged with M5; release tarballs, `install
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 Last update: 2026-11-08 01:20 PT. M9 (opt-in Node process tier + Vercel Workflow) on branch `m9-node`: `make test-node` PASS on macOS and Lima.
 Last update: 2026-11-08 01:40 PT. M7 (E2E-MULTI: one host, tenant A on tailnet 1 + tenant B on tailnet-2) on branch `m7-multi`: `make e2e-multi` PASS (3 runs).
+Last update: 2026-11-08 08:15 PT. L3 (production-shaped microVM tier on Linux) on branch `l3-microvm`: `make e2e-vm` PASS (13 subtests), `make e2e-linux-vm` PASS from the installed release on fresh `twdl-kvm-u24`.
 Last update: 2026-11-08 02:05 PT. Integration: master (M6 + M5 + M9, `57dd519`) merged into `m7-multi`; the full matrix passes on `4cce30d` (macOS, real tailnets, mbp from the release, Lima).
 
 ## M0: repo skeleton (DONE)
@@ -914,3 +915,59 @@ Earlier runs, kept for the record: on merge commit `a219532`, `make e2e-mac` (`8
 - The Node tier on Linux has no per-tenant confinement, same as workerd. `runtime: node` + `tier: microvm` is still rejected (M9 gap).
 - Node-tier templates (`node-workflow`) are shipped in the release but not deployable offline: they need Node and `npm install`, as before (only `@twd/node` is vendored).
 
+
+## L3: production-shaped microVM tier on Linux (DONE, branch `l3-microvm`)
+Persistent encrypted DO storage, the Firecracker jailer, an unprivileged twd with a small privileged helper, and the e2e from the installed release on a fresh nested-virt VM.
+
+### What's built
+- **Privilege model: `twd-vmhelper`** (`cmd/twd-vmhelper`, `hostd/vm/helper`). twd-hostd runs as the user; the helper is the only root part.
+  - systemd system service `twd-vmhelper.service`, root with `CapabilityBoundingSet=` NET_ADMIN SYS_ADMIN SYS_CHROOT SETUID SETGID CHOWN FOWNER DAC_OVERRIDE DAC_READ_SEARCH MKNOD KILL SYS_RESOURCE IPC_LOCK, `NoNewPrivileges`, `Delegate=yes` (per-VM cgroups live in its subtree).
+  - Socket `/run/twd/vmhelper.sock` (root-owned, SOCK_SEQPACKET); every connection is authorized by **SO_PEERCRED uid** against `/etc/twd/vmhelper.json`.
+  - **It never opens a path a client names.** hostd passes open fds (SCM_RIGHTS): kernel, rootfs, config drive, console log, volume image; it gets back fds for its TAP and the vsock listener. The jailer and Firecracker come from root-owned copies in `/usr/local/libexec/twd` (never from the user-writable `~/.twd`). One connection = one VM: the helper tears everything down when the VM exits or hostd hangs up.
+  - No `ProtectSystem=`/`PrivateTmp=`: a private mount namespace can't bind-mount fds from the host namespace (measured: EINVAL).
+  - As root without the service (tests, `make e2e-vm`), hostd runs the same helper code in-process.
+- **Jailer** (Firecracker v1.17): per VM a chroot (`/var/lib/twd-vm/jail/firecracker/<id>/root`: kernel and rootfs bind-mounted read-only, config drive copied, the volume's device node, the vsock socket, `api.sock`), a dedicated uid/gid (3900000000+slot), its own netns (`fc0` TAP owned by the jail uid), cgroup v2 `cpu.max` = vCPUs and `memory.max` = guest RAM (when not on huge pages) + 256 MiB, and Firecracker's default seccomp filter (checked: `/proc/<pid>/status` `Seccomp: 2`, uid, cgroup).
+- **Persistent DO storage**, per (tenant, workload): `~/.twd/hostd/tenants/<t>/workloads/<w>/do.img` (sparse, 1 GiB default), **LUKS2 opened with dm-crypt on the host** by the helper (loop over the passed fd, key on cryptsetup's stdin). The guest gets plaintext ext4 on `/dev/vdc` (Firecracker `cache_type: Writeback`, so guest fsyncs reach the host), mounted at workerd's DO dir. **The key never enters the guest.**
+  - Key: a 256-bit DEK created once in **mgmt custody** (`twd/<tenant>/volumes/<workload>/dek`, sealed by the custody key), released by `GET /v0/volumes/key` only to the namespace lease holder at the current epoch (ADR-011), audited (`volume_key`). fakemgmt implements it too.
+  - **Fencing:** a volume is attached to one VM at a time (in-memory by dev/inode + an exclusive flock held while attached → `volume_busy`), and never at an epoch older than the newest it was attached at (`/var/lib/twd-vm/volumes.json`, keyed by uid + LUKS UUID → `volume_fenced`). A wrong key → `volume_key`.
+  - **Blue/green → serial for microVM workloads** (like the Node tier): requests wait at the gate; the old VM drains, its guest stops workerd, syncs and unmounts the volume (`shutdown` op), the helper releases it; then the new VM attaches it.
+- **`sudo twd host setup --microvm`** (one time): root-owned binaries, helper config (the user's uid), the unit (enabled), adds the user to `kvm`, reserves huge pages (`/etc/sysctl.d/60-twd-microvm.conf`; default 4 VMs' worth, ≤ ¼ RAM). **`--undo`** removes all of it and restores `nr_hugepages` and `kvm` membership (recorded in `/etc/twd/setup.json`). Without setup, `tier: microvm` falls back to the process tier; `twd doctor` has a `microvm` check (Linux) that says why and how to fix it; `twd up` prints `tiers: process, microvm (…)`.
+- **`twd host vmcheck <workload> [--keyscan]`** (hostd `POST /v0/vm/check` on its user-only socket): guest memory, DO volume fsync latency, and the no-keys scan (rootfs, config drive, guest files, full RAM snapshot taken by the helper) for `tskey-`, every node/machine private key in hostd's state, and the volume key; positive control = the instance MAC key in RAM. Output has needle names and counts only.
+- **Release:** linux tarballs carry `bin/twd-vmhelper`, and with `make vm-assets` (in Lima) `share/twd/vm/{vmlinux, rootfs.ext4, manifest.json, firecracker, jailer}`. twd-hostd finds them next to itself. Microvm workloads' `twd logs` is the guest console.
+
+### Test results
+**`make e2e-vm`** (Lima `twd-dev`, root → in-process helper; fresh clone): **PASS**, TestSmoke + TestVolume + TestE2EVM 13/13 (`e2e/vm/results/l3-20261108T155228Z.json`). New: StorageWrite, Jailed, VolumeNeverDoubleMounted (second VM on probe's volume → `volume_busy`), NoKeysInGuest now with the volume key (29 needles, none in 3 disks / 74 files / 512 MiB RAM; the volume image doesn't contain the DO's plaintext), KillVMFailsFast now checks KV + SQLite **and a write acknowledged right before SIGKILL** survive, RedeployKeepsStorage. TestVolume: data across restart, `volume_busy`, `volume_fenced` (epoch 1 after 2), `volume_key`, key absent from RAM + image. The same two backend tests also pass **as the normal user through the systemd helper** in twd-dev.
+
+**`make e2e-linux-vm`: PASS** (run `47c606`, `e2e/real/results/l3-linuxvm-20261108-080743-47c606.json`, release `0.1.0-…`): fresh `twdl-kvm-u24` (Ubuntu 24.04 arm64, vz, nested virt, 6 CPU / 10 GiB / 40 GiB, nothing mounted, no provisioning; tarball and key file via `limactl copy`). install.sh (0.7 s, no sudo) → doctor (`microvm: warn … not installed`, fix shown) → `sudo twd host setup --microvm` (1.0 s) → doctor `microvm: ok` → `twd up` (0.62 s) → agent + mcp with `"tier": "microvm"` → **checks (a)–(f) PASS** from this Mac (tsnet client + echo, `ttest-l3-<run>`) → both workloads jailed (uid, seccomp mode 2 checked via procfs) → storage across a **VMM SIGKILL** (30 SQLite writes, incl. the last acked one) and a **redeploy** → **no keys in either guest** (22/24 needles incl. volume key; none in rootfs, config drive, 70/49 guest files, 512 MiB RAM; MAC-key control found) → `twd down` → `sudo twd host setup --undo` (nothing left; kvm membership and huge pages restored; doctor back to warn). Cleanup: 6 test devices deleted, 0 left; 4 twd devices/keys, 0 left after down; VM clean; key file removed; **VM stopped, not deleted**. An earlier run (`bbc005`) failed only at `twd logs agent` (no host-side workerd.log for microVMs: fixed, logs = guest console) and one at `twd host vmcheck` arg parsing (fixed).
+
+**Measurements** (nested virt on an M5 Pro; fresh VM unless noted):
+
+| Metric | Value |
+|---|---|
+| InstanceStart → workerd ready (agent / mcp) | 744 / 703 ms (twd-dev hermetic: 557–666 ms) |
+| Whole boot (helper: netns, jail, volume attach, jailer, API; guest) | 861 / 811 ms |
+| Volume attach (loop + LUKS2 open; first boot also formats) | 93–95 ms first boot, 15–20 ms after |
+| **RSS per VM** (Firecracker VmRSS + hugetlb guest RAM) | agent 175 → 193 MiB, mcp 159 → 171 MiB (hermetic hello/probe 118/150 MiB); guest workerd RSS 116 / 98 MiB |
+| **Request latency** p50 / p95, this Mac → VM over tailnet 1 | MCP tools/list 1.49 / 3.34 ms; agent request with SQLite insert + setState 4.40 / 5.16 ms |
+| Hermetic (twd-dev, tsnet) | object in VM 0.53 / 0.80 ms vs process 0.38 / 0.44; egress 1.43 / 1.80 vs 0.90 / 1.41 |
+| **DO write latency** (hermetic, per request over tsnet) | KV put 0.59 / 2.80 ms, SQL insert 3.22 / 4.40 ms, KV get 0.55 / 0.87 ms |
+| **Volume 4 KiB write + fdatasync in the guest** (virtio-blk → dm-crypt → image) | write p50 10 µs; fsync p50 2.9–3.2 ms, p95 3.8–4.4 ms (twd-dev 2.3–2.5 / 2.5–2.7 ms) |
+| **Restart → serving** after VMM SIGKILL | 1.28 s (fresh VM, via tailnet); 0.94 s hermetic |
+| Redeploy → serving (serial: drain, guest unmount, release, new VM, attach) | 1.74 s from `twd deploy` (CLI 1.57 s); hermetic 0.82 s, guest unmount + release ~110 ms |
+| `twd host setup --microvm` / install.sh | 1.0 s / 0.7 s |
+
+### Findings
+1. **Fd hygiene matters across jails.** `dup()` without CLOEXEC let a later VM's jailer inherit another VM's volume fd, holding its flock: the restarted VM got `volume_busy`. All dups are `F_DUPFD_CLOEXEC` and received SCM_RIGHTS fds are marked CLOEXEC.
+2. **Acknowledged DO writes survive a VMM SIGKILL** (workerd commits before answering; `Writeback` cache turns guest flushes into host fsyncs). A plain file written through a workerd disk service without fsync did **not** survive (ext4 delayed allocation): durability is the app runtime's fsync, which workerd's DO storage does.
+3. The jailer's pivot_root keeps bind mounts made beforehand in the host namespace; `/proc/<pid>/root` of the jailed VMM isn't readable by the user (only by root).
+4. Huge pages are still decisive (STATUS M8); setup reserves them persistently.
+
+### Known gaps (L3)
+- **Host reboot** persistence is by design (image + custody key + helper enabled at boot) but **not tested end to end**.
+- **Snapshot restore** (warm start) not built; boot is ~0.6–0.75 s to workerd ready.
+- Serial blue/green means ~0.8–1.7 s of held requests on redeploy; no hot handover of the volume.
+- The volume never shrinks/grows (fixed sparse size, `-vm-volume-mib`); no online backup (ADR-012's async backup is not built).
+- The helper runs as root with a bounded capability set, not as a capability-only non-root binary; jailer + cryptsetup + mounts need CAP_SYS_ADMIN anyway. No `ProtectSystem` (see above).
+- `kvm` group membership is added (as specified) but unused by twd: the helper opens `/dev/kvm` for the jail.
+- amd64 microVM assets aren't built (L1 adds amd64 releases; the tier needs an x86 kernel + image).
+- The cryptsetup/losetup/mkfs dependency: present on Ubuntu/Debian cloud images; setup fails with an install hint otherwise.
