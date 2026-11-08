@@ -324,8 +324,14 @@ func TestE2EVM(t *testing.T) {
 	t.Run("LatencyVsProcessTier", func(t *testing.T) {
 		pa := map[string]string{}
 		for _, n := range []string{"a"} {
-			getJSON("http://" + probep.IP + "/probe/" + n + "/")
-			o := e.WaitObject("probep", "Probe", n, 60*time.Second)
+			code, r := getJSON("http://" + probep.IP + "/probe/" + n + "/")
+			if code != 200 {
+				t.Fatalf("process tier probe: %d %v", code, r)
+			}
+			o, err := e.WaitObjectErr("probep", "Probe", n, 60*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
 			waitPeer(o.IP)
 			pa[n] = o.IP
 		}
@@ -528,8 +534,11 @@ func keyNeedles(t *testing.T, dataDir string) map[string][]byte {
 	var add func(b []byte, depth int)
 	add = func(b []byte, depth int) {
 		for _, k := range re.FindAll(b, -1) {
-			n["privkey text "+string(k[8:16])] = append([]byte(nil), k...)
 			raw, _ := hex.DecodeString(string(k[8:]))
+			if bytes.Equal(raw, make([]byte, len(raw))) {
+				continue // an unset (zero) key slot is not a secret
+			}
+			n["privkey text "+string(k[8:16])] = append([]byte(nil), k...)
 			n["privkey raw "+string(k[8:16])] = raw
 		}
 		if depth > 2 {
