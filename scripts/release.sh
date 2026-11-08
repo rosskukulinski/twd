@@ -105,6 +105,10 @@ for t in $TARGETS; do
 		chmod 755 "$st/share/twd/vm/firecracker" "$st/share/twd/vm/jailer"
 		microvm=true
 	fi
+	if [ "$os" = linux ]; then
+		if [ $microvm = true ]; then echo "release: $os-$arch microVM guest assets (share/twd/vm): included"
+		else echo "release: $os-$arch microVM guest assets (share/twd/vm): NOT included (the microVM tier needs a release built with them: make release with Lima twd-dev running, or on Linux)"; fi
+	fi
 
 	cp scripts/install.sh "$st/install.sh"
 	chmod 755 "$st/install.sh"

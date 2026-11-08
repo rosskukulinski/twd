@@ -131,9 +131,21 @@ ifndef RELEASE_VERSION
 RELEASE_VERSION := $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
 endif
 RELEASE_TARGETS ?= darwin-arm64 linux-arm64 linux-amd64
+## The linux-arm64 microVM guest (share/twd/vm: kernel, rootfs, firecracker, jailer) is
+## built by scripts/vm-assets-lima.sh: on Linux directly, on macOS inside Lima twd-dev
+## (cached in dist/vm-assets-arm64 by input hash). RELEASE_VM_ASSETS=auto (default): include
+## it when a builder is available, else warn and ship without the microVM tier
+## (release.json "microvm": false); 1: required; 0: never. TWD_VM_ASSETS_arm64 overrides.
+RELEASE_VM_ASSETS ?= auto
 release: deps
 	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS
-	sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
+	@va="$${TWD_VM_ASSETS_arm64:-}"; \
+	if [ -z "$$va" ] && [ "$(RELEASE_VM_ASSETS)" != 0 ] && echo "$(RELEASE_TARGETS)" | grep -q linux-arm64; then \
+		if sh scripts/vm-assets-lima.sh dist/vm-assets-arm64; then va="$(CURDIR)/dist/vm-assets-arm64"; \
+		elif [ "$(RELEASE_VM_ASSETS)" = 1 ]; then echo "release: microVM assets required (RELEASE_VM_ASSETS=1)"; exit 1; \
+		else echo "release: WARNING: the linux-arm64 tarball will have NO microVM guest (see scripts/vm-assets-lima.sh)"; fi; \
+	fi; \
+	TWD_VM_ASSETS_arm64="$$va" sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
 
 ## e2e-mbp: E2E-MAC on the clean MacBook `mbp` from the release tarball (skips without
 ## the tailnet-1 key file or `ssh mbp`). twd runs on mbp; the test client + echo run here.

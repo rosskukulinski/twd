@@ -118,6 +118,22 @@ func median(xs []float64) float64 {
 	return s[len(s)/2]
 }
 
+type doctorOut struct {
+	OK     bool `json:"ok"`
+	Checks []struct {
+		Name, Status, Detail string
+	} `json:"checks"`
+}
+
+func (d doctorOut) get(name string) (status, detail string) {
+	for _, c := range d.Checks {
+		if c.Name == name {
+			return c.Status, c.Detail
+		}
+	}
+	return "", ""
+}
+
 func TestE2EMbp(t *testing.T) {
 	keyFile, tailnet, host, tarball := os.Getenv("TWD_E2E_API_KEY_FILE"), os.Getenv("TWD_E2E_TAILNET"), os.Getenv("TWD_E2E_SSH_HOST"), os.Getenv("TWD_E2E_TARBALL")
 	if keyFile == "" || tailnet == "" || host == "" || tarball == "" {
@@ -361,19 +377,25 @@ func TestE2EMbp(t *testing.T) {
 	res.Pass("install", fmt.Sprintf("install.sh %.1f s (again %.1f s), no sudo, ~/.twd: %s", msOf(d)/1000, msOf(d2)/1000, strings.Join(strings.Fields(ver), " ")))
 
 	// twd doctor before up (no state yet: the key check uses the flags).
-	var doc struct {
-		OK     bool `json:"ok"`
-		Checks []struct {
-			Name, Status, Detail string
-		} `json:"checks"`
-	}
+	var doc doctorOut
 	so, se, d, err = e.Twd("doctor", "--tailnet", tailnet, "--api-key-file", rKey, "--json")
 	if err != nil || json.Unmarshal([]byte(so), &doc) != nil || !doc.OK {
 		t.Fatalf("twd doctor on mbp: %v\n%s\n%s", err, so, netd.Redact(se))
 	}
+	// No check may fail, and these must be ok. host_sockets is a Linux-only
+	// check (skip on macOS) and node_egress is skip until twd runs.
+	mustOK := []string{"binaries", "workerd", "bundler", "twd_home_writable", "state_dir_writable", "api_key", "sandbox", "system_tailscaled_not_used"}
+	var summary []string
 	for _, c := range doc.Checks {
-		if c.Status != "ok" {
+		summary = append(summary, c.Name+"="+c.Status)
+		res.Checks["doctor_"+c.Name] = strings.ToUpper(c.Status) + " " + c.Detail
+		if c.Status == "fail" || (slices.Contains(mustOK, c.Name) && c.Status != "ok") {
 			t.Fatalf("twd doctor on mbp: %s is %s: %s", c.Name, c.Status, c.Detail)
+		}
+	}
+	for _, name := range mustOK {
+		if st, _ := doc.get(name); st == "" {
+			t.Fatalf("twd doctor on mbp has no %s check", name)
 		}
 	}
 	for _, c := range doc.Checks {
@@ -389,7 +411,7 @@ func TestE2EMbp(t *testing.T) {
 	}
 	res.Pass("init_ai_agent_offline", "twd init --template ai-agent on mbp (no npm); bundled offline by doctor")
 	res.Numbers["doctor_ms"] = msOf(d)
-	res.Pass("doctor", fmt.Sprintf("%d checks ok in %.0f ms (workerd runs, bundler offline, ~/.twd writable, API key works, Seatbelt enforces, system tailscaled not used)", len(doc.Checks), msOf(d)))
+	res.Pass("doctor", fmt.Sprintf("%d checks, none failed, in %.0f ms (workerd runs, bundler offline, ~/.twd writable, API key works, Seatbelt enforces, system tailscaled not used): %s", len(doc.Checks), msOf(d), strings.Join(summary, " ")))
 
 	// (c)–(e) on mbp, checks (a)–(f) from this Mac.
 	e.Run()

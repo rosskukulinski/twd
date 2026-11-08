@@ -1,0 +1,38 @@
+{
+  "run": "m6-mbp-109fd1",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T10:12:12-08:00",
+  "checks": {
+    "copy": "PASS tarball + key file (0600) in ~/.twd-e2e",
+    "install": "PASS install.sh 5.5 s (again 6.2 s), no sudo, ~/.twd: 0.1.0-5ee6780e workerd 2026-11-08 Signature=adhoc"
+  },
+  "numbers": {
+    "extract_ms": 1560.977,
+    "install_again_ms": 6165.48,
+    "install_ms": 5534.958,
+    "scp_tarball_ms": 4687.128,
+    "uninstall_ms": 2448.936
+  },
+  "notes": [
+    "twd on mbp from twd-0.1.0-5ee6780e-darwin-arm64.tar.gz; test client + echo on this Mac",
+    "policy has the scenario's tagOwners and grants (read only; not written)",
+    "mbp has no node, go, npm or esbuild on PATH",
+    "mbp: 26.6.2 arm64 Apple M2 Pro",
+    "scp'd tarball has no xattrs on mbp (no com.apple.quarantine)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 0,
+    "devices_left": 0,
+    "devices_tracked": 0,
+    "mbp_clean": true,
+    "test_keys_minted": 0,
+    "test_keys_revoke_errors": null,
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 0,
+    "twd_keys_tracked": 0,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": null,
+  "keyIDs": null
+}

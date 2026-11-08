@@ -373,10 +373,22 @@ Unsupported hosts (bonus rows; `TestUnsupportedHost`):
 On Linux with KVM, twd can run each workload in its own **Firecracker
 microVM** instead of a host process. Every tailnet identity (node keys,
 auth keys) stays in twd-hostd on the host; the guest gets only plaintext
-DO storage and workerd. The linux release ships everything the tier needs
-in `~/.twd/share/twd/vm/`: the guest kernel (`vmlinux`), the read-only guest
-image (`rootfs.ext4`, reproducible; `manifest.json` has its hashes),
-Firecracker and its jailer (v1.17), plus `bin/twd-vmhelper`.
+DO storage and workerd. A linux-arm64 release **built with the microVM
+assets** ships everything the tier needs in `~/.twd/share/twd/vm/`: the
+guest kernel (`vmlinux`), the read-only guest image (`rootfs.ext4`,
+reproducible; `manifest.json` has its hashes), Firecracker and its jailer
+(v1.17), plus `bin/twd-vmhelper`.
+
+> **Check your tarball.** The guest image can only be built on Linux.
+> `make release` includes it when it runs on Linux or when Lima `twd-dev`
+> is running on the Mac (`scripts/vm-assets-lima.sh` builds it there and
+> caches it); otherwise it prints a warning and the tarball has **no
+> microVM tier**: `share/twd/release.json` says `"microvm": false`,
+> `share/twd/vm/` is absent, and `twd doctor` reports `firecracker: skip …
+> install a linux release built with the microVM assets`. The process tier
+> (Landlock + seccomp) is unaffected. The red team's second pass found a
+> Mac-built tarball without the guest; the `make release` change above is
+> the fix, and the e2e-linux-vm row in STATUS.md says which tarball it ran.
 
 ### What you need
 
