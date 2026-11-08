@@ -3,7 +3,9 @@ module github.com/rosskukulinski/twd
 go 1.27.3
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/jackc/pgx/v5 v5.12.0
+	github.com/tailscale/hujson v0.0.0-20260727124030-b80ff77dac4f
 	gvisor.dev/gvisor v0.0.0-20260915211658-a6f909f08a72
 	modernc.org/sqlite v1.62.0
 	tailscale.com v1.105.0-pre.0.20261107202901-503010831ecd
@@ -48,7 +50,6 @@ require (
 	github.com/safchain/ethtool v0.7.0 // indirect
 	github.com/tailscale/certstore v0.1.1-0.20260409135935-3638fb84b77d // indirect
 	github.com/tailscale/go-winio v0.0.0-20231025203758-c4f33415bf55 // indirect
-	github.com/tailscale/hujson v0.0.0-20260727124030-b80ff77dac4f // indirect
 	github.com/tailscale/peercred v0.0.0-20250107143737-35a0c7bd7edc // indirect
 	github.com/tailscale/web-client-prebuilt v0.0.0-20260917222731-e0ed2d0d0fea // indirect
 	github.com/tailscale/wireguard-go v0.0.0-20261105205217-79ead109a81a // indirect

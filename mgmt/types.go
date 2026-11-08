@@ -53,8 +53,8 @@ type Host struct {
 	ID            string   `json:"hostID"`
 	CapacityNodes int      `json:"capacityNodes"`
 	Tiers         []string `json:"tiers"`
-	NodeID        string   `json:"nodeID,omitempty"`       // operator-tailnet stable node ID (tsnet mode)
-	AuditPubKey   string   `json:"auditPubKey,omitempty"`  // base64 ed25519, verifies hostSig
+	NodeID        string   `json:"nodeID,omitempty"`      // operator-tailnet stable node ID (tsnet mode)
+	AuditPubKey   string   `json:"auditPubKey,omitempty"` // base64 ed25519, verifies hostSig
 	LiveNodes     int      `json:"liveNodes"`
 	LastSeen      int64    `json:"lastSeen"` // unix ms
 }
