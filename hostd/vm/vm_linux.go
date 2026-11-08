@@ -43,6 +43,10 @@ type Config struct {
 	VCPUs       int    // default 1
 	MTU         int    // default 1500
 	BootArgs    string // kernel cmdline (default below)
+	// HugePages backs guest memory with 2 MiB pages (needs free hugetlbfs
+	// pages on the host: vm.nr_hugepages). Far fewer stage-2 faults, which
+	// dominate workerd start-up under nested virtualization.
+	HugePages bool
 	// ReadyTimeout bounds boot → workerd healthy in the guest (default 30 s).
 	ReadyTimeout time.Duration
 	Log          *slog.Logger
@@ -120,6 +124,14 @@ func New(cfg Config) (*Backend, error) {
 		return nil, err
 	}
 	return &Backend{cfg: cfg}, nil
+}
+
+func (b *Backend) machineConfig() map[string]any {
+	mc := map[string]any{"vcpu_count": b.cfg.VCPUs, "mem_size_mib": b.cfg.MemMiB}
+	if b.cfg.HugePages {
+		mc["huge_pages"] = "2M"
+	}
+	return mc
 }
 
 // Name implements sandbox.Backend.
@@ -253,7 +265,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		path string
 		body any
 	}{
-		{"/machine-config", map[string]any{"vcpu_count": b.cfg.VCPUs, "mem_size_mib": b.cfg.MemMiB}},
+		{"/machine-config", b.machineConfig()},
 		{"/boot-source", map[string]any{"kernel_image_path": b.cfg.Kernel, "boot_args": b.cfg.BootArgs}},
 		{"/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": b.cfg.Rootfs, "is_root_device": true, "is_read_only": true}},
 		{"/drives/config", map[string]any{"drive_id": "config", "path_on_host": drive, "is_root_device": false, "is_read_only": true}},

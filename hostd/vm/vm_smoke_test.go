@@ -4,6 +4,7 @@ package vm
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -46,7 +47,7 @@ func TestSmoke(t *testing.T) {
 	if kernel == "" || rootfs == "" {
 		t.Skip("TWD_VM_KERNEL / TWD_VM_ROOTFS not set")
 	}
-	b, err := New(Config{Kernel: kernel, Rootfs: rootfs, BootArgs: os.Getenv("TWD_VM_BOOTARGS")})
+	b, err := New(Config{Kernel: kernel, Rootfs: rootfs, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES") != "", VCPUs: envInt("TWD_VM_VCPUS")})
 	if err != nil {
 		t.Skip(err)
 	}
@@ -85,4 +86,10 @@ func TestSmoke(t *testing.T) {
 	k := time.Now()
 	<-m.Done()
 	t.Logf("kill → done %v", time.Since(k))
+}
+
+func envInt(k string) int {
+	var n int
+	fmt.Sscan(os.Getenv(k), &n)
+	return n
 }
