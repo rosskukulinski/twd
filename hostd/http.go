@@ -368,6 +368,11 @@ func (h *Host) pushAPI() http.Handler {
 		h.killLocal(k.ObjectID, k.Reason)
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
+	// twd down --purge: forget killed objects (their tombstones) so a
+	// redeploy on this state dir starts from a clean registry.
+	m.HandleFunc("POST /v0/purge", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"ok": true, "purged": h.Purge()})
+	})
 	m.HandleFunc("POST /v0/push/assignments", func(w http.ResponseWriter, r *http.Request) {
 		h.TriggerSync()
 		writeJSON(w, 200, map[string]any{"ok": true})
@@ -428,7 +433,7 @@ type StatusView struct {
 	HostID string
 	// Sandbox is the host's process sandbox: "seatbelt", "landlock (ABI n)"
 	// or "none".
-	Sandbox   string `json:",omitempty"`
+	Sandbox string `json:",omitempty"`
 	// Tiers this host offers ("process", and "microvm" with a backend);
 	// VMVia says how microVMs are launched (twd-vmhelper or in-process).
 	Tiers     []string

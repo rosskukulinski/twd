@@ -395,10 +395,10 @@ func TestE2ELinuxVM(t *testing.T) {
 		return "", "", ""
 	}
 	doc := doctor("--tailnet", tailnet, "--api-key-file", rKey)
-	if s, dd, fx := checkOf(doc, "microvm"); s != "warn" || !strings.Contains(dd, "not installed") || !strings.Contains(fx, "host setup --microvm") {
+	if s, dd, fx := checkOf(doc, "microvm_tier"); s != "warn" || !strings.Contains(dd, "not installed") || !strings.Contains(fx, "host setup --microvm") {
 		t.Fatalf("doctor microvm before setup: %s %s (fix %s)", s, dd, fx)
 	} else {
-		res.Pass("doctor_before_setup", "microvm: warn: "+dd+" · fix: "+fx)
+		res.Pass("doctor_before_setup", "microvm_tier: warn: "+dd+" · fix: "+fx)
 	}
 	for _, c := range doc.Checks {
 		if c.Status == "fail" {
@@ -425,10 +425,10 @@ func TestE2ELinuxVM(t *testing.T) {
 		res.Pass("host_setup", fmt.Sprintf("%.1f s: %d steps; helper active; %s", msOf(d)/1000, len(sr.Steps), strings.Join(strings.Fields(so), " ")))
 	}
 	doc = doctor()
-	if s, dd, _ := checkOf(doc, "microvm"); s != "ok" {
+	if s, dd, _ := checkOf(doc, "microvm_tier"); s != "ok" {
 		t.Fatalf("doctor microvm after setup: %s %s", s, dd)
 	} else {
-		res.Pass("doctor_after_setup", "microvm: ok: "+dd)
+		res.Pass("doctor_after_setup", "microvm_tier: ok: "+dd)
 	}
 
 	// 5. twd up (as the user, no sudo) + agent/mcp in microVMs + (a)–(f).
@@ -573,7 +573,7 @@ func TestE2ELinuxVM(t *testing.T) {
 	if strings.Contains(left, "LEFT") || strings.Contains(left, "\nactive") || strings.HasPrefix(left, "active") || strings.Contains(left, "twds") {
 		t.Fatalf("after --undo: %s", left)
 	}
-	if s, _, _ := checkOf(doctor(), "microvm"); s != "warn" {
+	if s, _, _ := checkOf(doctor(), "microvm_tier"); s != "warn" {
 		t.Fatalf("doctor microvm after undo: %s", s)
 	}
 	res.Pass("host_setup_undo", strings.Join(ur.Steps, " | ")+" · nothing left ("+strings.Join(strings.Fields(left), " ")+")")

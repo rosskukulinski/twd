@@ -159,10 +159,12 @@ func TestCLIEndToEnd(t *testing.T) {
 	})
 	e.Run()
 	e.Down()
+	// `twd down --purge && twd up && twd deploy` on the same state dir.
+	e.RedeployAfterPurge()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	devs, keys := cliflow.Leftovers(ctx, &tsapi.Client{Tailnet: "ttest.ts.net", APIKey: "fake", BaseURL: api.URL}, res)
-	if len(res.NodeIDs) < 4 || len(devs) > 0 || len(keys) > 0 {
+	if len(res.NodeIDs) < 5 || len(devs) > 0 || len(keys) > 0 {
 		t.Fatalf("after twd down: %d node IDs tracked, leftover devices %v, keys %v", len(res.NodeIDs), devs, keys)
 	}
 	if fts.setPolicy != 0 {
@@ -314,6 +316,20 @@ func TestDoctor(t *testing.T) {
 	if runtime.GOOS == "linux" {
 		// No microVM guest next to this test build: the tier is off (warn).
 		want["microvm"] = "warn"
+	}
+	if runtime.GOOS == "linux" {
+		// Linux host checks: present, never failing on a supported host
+		// (kvm/firecracker/microvm_tier may skip, systemd/landlock may warn).
+		for _, n := range []string{"glibc", "kernel", "landlock", "user_namespaces", "kvm", "firecracker", "cgroups_v2", "systemd", "microvm_tier"} {
+			st, ok := got[n]
+			if !ok || st == "fail" {
+				t.Fatalf("doctor on linux: %s = %q: %v", n, st, r.Checks)
+			}
+			delete(got, n)
+		}
+		if st := r.Checks[1]; st.Name != "glibc" || st.Status != "ok" {
+			t.Fatalf("doctor on linux: glibc must run before workerd and be ok: %+v", st)
+		}
 	}
 	if !r.OK || fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("doctor: ok=%v %v", r.OK, r.Checks)

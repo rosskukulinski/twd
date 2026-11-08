@@ -226,6 +226,11 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 		o.Parent = parent.ID
 	}
 	h.mu.Lock()
+	if old := h.objects[o.ID]; old != nil && old.terminal() && resp.Status == statusPending {
+		// A killed tombstone of the same identity, and mgmt made a new
+		// object (the old one was purged): forget the tombstone.
+		h.forgetLocked(old)
+	}
 	if old := h.objects[o.ID]; old != nil { // mgmt returned an existing object
 		if old.TenantID != w.tenantID || old.Workload != w.name || old.Class != class || old.Name != name {
 			// mgmt scopes identity by (tenant, workload, class, name) (M7),
@@ -325,7 +330,7 @@ func (h *Host) awaitNode(t *tenant, o *object, no *netd.Object) {
 	rcancel()
 	closeOnce(ch)
 	h.saveObjects()
-	h.log.Info("object node ready", "object", o.ID, "hostname", o.Hostname, "ip", o.IP, "join_ms", info.JoinMS, "rejoined", info.Rejoined)
+	h.log.Info("object node ready", "object", o.ID, "hostname", o.Hostname, "ip", o.IP, "join_ms", info.JoinMS, "rejoined", info.Rejoined, "reminted", info.Reminted)
 }
 
 func closeOnce(ch chan struct{}) {
@@ -408,6 +413,33 @@ func (h *Host) killLocal(objectID, reason string) {
 }
 
 // ---- persistence ----
+
+// forgetLocked drops a terminal object from the registry (h.mu held).
+func (h *Host) forgetLocked(o *object) {
+	delete(h.objects, o.ID)
+	if h.byNetd[o.NetdID] == o {
+		delete(h.byNetd, o.NetdID)
+	}
+	if h.byKey[o.key()] == o {
+		delete(h.byKey, o.key())
+	}
+}
+
+// Purge forgets every killed object (twd down --purge) and saves
+// objects.json without them. Returns the forgotten IDs.
+func (h *Host) Purge() []string {
+	h.mu.Lock()
+	ids := []string{}
+	for _, o := range h.objects {
+		if o.terminal() {
+			h.forgetLocked(o)
+			ids = append(ids, o.ID)
+		}
+	}
+	h.mu.Unlock()
+	h.saveObjects()
+	return ids
+}
 
 func (h *Host) objectsPath() string { return filepath.Join(h.cfg.DataDir, "objects.json") }
 

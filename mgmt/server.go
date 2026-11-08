@@ -257,6 +257,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v0/status", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		return map[string]any{"ok": true, "pendingDeviceDeletes": m.PendingDeletes()}, nil
 	}))
+	mux.HandleFunc("POST /v0/tenants/{id}/purge", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		return m.Purge(r.Context(), r.PathValue("id"))
+	}))
 	mux.HandleFunc("POST /v0/flush", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		n := m.PendingDeletes()
 		m.FlushDeletes()
@@ -325,6 +328,13 @@ func (s *Server) Handler() http.Handler {
 			return nil, err
 		}
 		return m.Ready(r.Context(), r.PathValue("id"), hostOf(r), req)
+	}))
+	mux.HandleFunc("POST /v0/objects/{id}/remint", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
+		var req RemintRequest
+		if err := readJSON(r, &req); err != nil {
+			return nil, err
+		}
+		return m.Remint(r.Context(), r.PathValue("id"), hostOf(r), req)
 	}))
 	mux.HandleFunc("POST /v0/objects/{id}/kill", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
 		var req KillRequest

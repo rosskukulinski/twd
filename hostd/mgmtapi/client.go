@@ -176,6 +176,10 @@ func (c *Client) Ready(ctx context.Context, id string, r ReadyRequest) error {
 	return c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/ready", r, nil)
 }
 
+func (c *Client) Remint(ctx context.Context, id string, r RemintRequest) error {
+	return c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/remint", r, nil)
+}
+
 func (c *Client) Kill(ctx context.Context, id string, r KillRequest) (*KillResponse, error) {
 	var out KillResponse
 	err := c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/kill", r, &out)

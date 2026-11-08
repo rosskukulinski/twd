@@ -44,6 +44,10 @@ type Store interface {
 	// CountLive counts live objects of a tenant, or (rootID != "") the live
 	// descendants of rootID.
 	CountLive(ctx context.Context, tenantID, rootID string) (int, error)
+	// DeleteDeadObjects removes a tenant's killed and failed objects (twd
+	// down --purge), so their names and IDs can be used again. It returns
+	// the removed objects; audit records are untouched.
+	DeleteDeadObjects(ctx context.Context, tenantID string) ([]Object, error)
 
 	AcquireLease(ctx context.Context, name, holder string, ttl time.Duration, now time.Time) (Lease, error)
 	RenewLease(ctx context.Context, name, holder string, epoch int64, ttl time.Duration, now time.Time) (Lease, error)
