@@ -8,6 +8,7 @@ Last update: 2026-11-08 01:15 PT. M6 (merged with M5; release tarballs, `install
 Last update: 2026-11-08 01:10 PT. M5 (SDK conformance, `make test-sdk`) on branch `m5-sdk`: PASS on macOS and Lima.
 Last update: 2026-11-08 01:20 PT. M9 (opt-in Node process tier + Vercel Workflow) on branch `m9-node`: `make test-node` PASS on macOS and Lima.
 Last update: 2026-11-08 01:40 PT. M7 (E2E-MULTI: one host, tenant A on tailnet 1 + tenant B on tailnet-2) on branch `m7-multi`: `make e2e-multi` PASS (3 runs).
+Last update: 2026-11-08 02:05 PT. Integration: master (M6 + M5 + M9, `57dd519`) merged into `m7-multi`; the full matrix passes on `4cce30d` (macOS, real tailnets, mbp from the release, Lima).
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
@@ -768,7 +769,7 @@ Full matrix: `docs/COMPAT.md`.
 - `twd tenant rm`, `twd connect` (WIF onboarding) and interactive mode are not built. Tenants are only added.
 - With fakemgmt (tests), hostd names nodes `<workload>-<class>-<name>`, which is the same in two tailnets. That is harmless because tailnets are separate namespaces; real mgmt names nodes by the tenant-scoped ID.
 - `GET /v0/tenants`, which the sandbox uses to deny every key file, is admin-only. It works on the local unix socket; a remote tsnet-mode mgmt would refuse it, and hostd falls back to the tenants it knows.
-- Not run in Lima/Linux for M7 (the hermetic tests are portable; Seatbelt checks skip off macOS).
+- ~~Not run in Lima/Linux for M7~~: run after the integration merge (see "Integration (M7 + master)"); Seatbelt checks skip off macOS.
 
 ## M9: opt-in Node process tier + Vercel Workflow (DONE, branch `m9-node`)
 `make test-node` **passes on macOS** (Node 25.1) **and in Lima `twd-dev`** (Linux arm64, Node 24.22; fresh clone of `m9-node`). It is hermetic: testcontrol + local DERP, fakemgmt, real hostd, real node. `make test` stays green on macOS and in Lima; `make lint` is green. Design and caveats are in `docs/node-tier.md`.
@@ -855,3 +856,61 @@ Result files: `e2e/node/results/m9-*.json`.
 - No CPU or memory limits (cgroups) on the node process; no per-deployment Node version pinning (it uses hostd's `node`).
 - `docs/COMPAT.md` lives on `m5-sdk` (not this branch). To avoid an add/add conflict, the M9 compatibility table is in `docs/node-tier.md` § Compatibility; append it to COMPAT.md when the branches merge.
 - `twd dev` / `twd deploy` of `node-workflow` outside the repo need the app's own `npm install` (the Workflow builder resolves from the app dir). `@twd/node` is not published, so it resolves via twd's `node_modules` (`TWD_NODE_PATH`).
+
+## Integration (M7 + master) (DONE, branch `m7-multi`, commit `4cce30d`)
+`git merge origin/master` (`57dd519`: M6 release/esbundle/doctor/e2e-mbp, M5 SDK, M9 Node tier) into `m7-multi`: merge commit `a219532`, then fixes in `4cce30d`. Master fast-forwards to `origin/m7-multi`.
+
+### Conflicts and semantic decisions
+- **Textual (9 files), all kept from both sides.**
+  - `hostd.Config`: `Sandbox`/`SandboxDeny` (M7) and `NodeBin` (M9). `instance`: `doStorage`/`profile` and `node`.
+  - `WorkloadStatus`: `PID`/`Sandbox`/`SandboxProfile`/`DOStorage` and `Runtime`/`Node`/`LogFile`.
+  - `cmd/twd`: the `--tenant` usages plus `doctor`/`version`. `twd logs <workload>` filters by tenant **and** uses `LogFile` (`app.log` for runtime node).
+  - Tests: `TestCLIMultiTenant` and `TestDoctor` both kept. Makefile: `e2e-multi`, `e2e-mbp` and `test-node`; lint vets `e2emulti` and `e2embp`.
+- **(a) The Node tier runs sandboxed per tenant on macOS.** Node apps are tenant code, so `hostd/seatbelt.go` now wraps node exactly like workerd (`instance.sandboxed`). The profile:
+  - read-write: only the instance dir and the app's own data dir. That data dir is now `tenantDir(<t>)/workloads/<w>/node`, so it is per tenant and 0700;
+  - read-only: the node binary and its install prefix (`…/bin/node` → `…`). This is needed because nvm puts node under the denied home dir;
+  - denied: the home dir, hostd/twd state and run dirs, mgmt's socket, and every tenant's key file.
+  - `make test-node` runs its hosts with `sandbox auto`, as twd-hostd does by default. **Measured on macOS:** the nodeprobe app gets **EPERM** on hostd's data dir (a canary file, list, write), on the tenants dir and on `$HOME`, and its own data dir is read-write. **Vercel Workflow (world-local, steps, sleep, hook, kill/resume) passes under Seatbelt.** Unit test: `TestSeatbeltProfileNodePrefix`.
+- **(b) Seatbelt from an installed release on a clean Mac.** The installed `~/.twd/bin/workerd` is under the denied home dir. It is allowed as a read-only literal; the instance dir and DO dir are allowed below the denied state dir; no repo paths are involved.
+  - `make e2e-mbp` gained `seatbelt_release`. On mbp (macOS 26.6.2), every workload reports `sandbox seatbelt`. Under each workload's **live profile**, `cat` of the API key file, `ls` of `~/.twd-e2e/state/hostd` and `ls ~/.twd/bin` all fail, while the same commands succeed unsandboxed. Only exit codes are used.
+- **(c) `twd doctor` has a `sandbox` check.**
+  - It runs `workerd --version` under a generated twd profile that denies `$HOME`, and checks that a denied canary is unreadable.
+  - While twd runs, it reports `active: N/N` process-tier workloads (workerd and Node) under Seatbelt, and warns if any isn't.
+  - `skip` off macOS: Linux has 0700 dirs only, so use `tier: microvm` there.
+- **(d) Release.** M7 needs nothing new in the tarball: `sandbox-exec` is part of macOS, and profiles are generated at runtime. `release.json` now records `"sandbox"`. `INSTALL.md` documents Seatbelt, the doctor check and `twd tenant add`.
+- **Linux:** Seatbelt code is runtime-gated (`ResolveSandbox` → none). Its tests skip off macOS, and the Linux builds and tests don't depend on it (Lima: green).
+
+### Fixes needed in shared code (both pre-existing on master `57dd519`)
+1. **`make release` (and so `make e2e-mbp`) failed.** After M9, release vendoring took every template's deps, including `node-workflow`'s Workflow packages, which live only in `e2e/node/node_modules`. The error was `can't resolve @ai-sdk/workflow`.
+   - The new `scripts/template-roots.mjs` takes all deps of the workerd templates, and only `@twd/*` for Node-tier templates. This matches the lead's reconciliation: Node-tier apps need Node and their own `npm install` to build.
+   - Result: 178 packages, 70.8 MB. Test: `internal/release` `TestTemplateRoots`.
+2. **`make e2e-vm` `KillObjectFailsFast` failed** on master too (checked with a fresh master clone in Lima). The test enables `KillTombstone`, so a new request gets the M4 typed **410 `object_killed`**, but the M8 assertion expected a dial error. It now accepts either, under 1 s. Measured: 410 in 0.41 ms.
+
+### Verification matrix (all on `4cce30d`; the later commit changes only STATUS and results)
+| Where | Target | Result |
+|---|---|---|
+| macOS (this Mac, 27.2) | `make test` | **PASS** (incl. `internal/release`, `TestCLIMultiTenant`, `TestDoctor` with `sandbox: ok`, `TestMultiTenant`, Seatbelt unit tests) |
+| | `make lint` | **PASS** |
+| | `make test-sdk` | **PASS** |
+| | `make test-node` | **PASS** (TestNodeTier incl. new `Sandbox` subtest: seatbelt, 5/5 denied, own dir rw; TestNodeWorkflow under seatbelt) |
+| | `make test-pg` | **PASS** (incl. Postgres legacy migration) |
+| macOS, real tailnet | `make e2e-mac` | **PASS** run `99da11` (12/12; up 1.10 s, kill CLI 69 ms, 0 devices left) |
+| | `make e2e-multi` ×2 | **PASS** `dc7767`, `ae780f` (13/13 each; tenant B on `tail2c3a48`; up 1.27–1.28 s, deploy→ready A/B ~1.58 s, kill A 63 ms; 0 devices left in either tailnet; **no policy written**) |
+| | `make e2e-mbp` ×2 | **PASS** `a3ce5f`, `4e0d74` (20/20 each, release `0.1.0-4cce30d4`, clean tree; mbp macOS 26.6.2; doctor 8/8 ok incl. `sandbox` before up; `seatbelt_release` and `doctor_sandbox_active` 2/2; install 5.4–5.7 s, up 1.41–1.57 s, kill CLI 68 ms; 0 devices left; mbp clean) |
+| Lima `twd-dev` (Linux arm64, fresh clone of `m7-multi` @ `4cce30d`) | `make test` | **PASS** (98 s; Seatbelt checks skip) |
+| | `make test-node` | **PASS** (`Sandbox` subtest skips: no Seatbelt on Linux) |
+| | `make test-sdk` | **PASS** |
+| | `make e2e-vm` | **PASS** (all 9 subtests; `KillObjectFailsFast` new request → 410 `object_killed` in 0.41 ms) |
+
+Earlier runs, kept for the record: on merge commit `a219532`, `make e2e-mac` (`8c1592`) and `make e2e-multi` ×2 (`1dc500`, `4ba728`) passed, and `make e2e-mbp` failed in `make release` (fix 1). On a dirty tree with fix 1, e2e-mbp passed once (`acd614`).
+
+### Safety
+- Policy: **no writes** (both tailnets already had the scenario's rules, as e2e-multi reports). Ross's personal tailnet and mbp's Tailscale.app were not touched (doctor's lsof check passed).
+- Every run deleted its own devices by ID and revoked its keys (0 left). No `tskey-` in results (check-secrets).
+
+### Gaps (integration)
+- `sandbox-exec` is deprecated by Apple; it works on macOS 26.6.2 (mbp) and 27.2. The doctor check is the canary for a future macOS.
+- The Node tier's read-only node prefix means an app can read its own Node install. If `node` isn't under a `bin/` dir, only the binary itself is allowed; a node that loads libraries from under `$HOME` from elsewhere would fail to start (not seen).
+- The Node tier on Linux has no per-tenant confinement, same as workerd. `runtime: node` + `tier: microvm` is still rejected (M9 gap).
+- Node-tier templates (`node-workflow`) are shipped in the release but not deployable offline: they need Node and `npm install`, as before (only `@twd/node` is vendored).
+
