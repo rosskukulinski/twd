@@ -103,11 +103,12 @@ func TestRealTailnet(t *testing.T) {
 	b := make([]byte, 3)
 	rand.Read(b)
 	run := hex.EncodeToString(b)
-	prefix := "ttest-" + run
+	prefix := "ttest-m1-" + run
 	res := &results{Run: run, Tailnet: tailnet, Date: time.Now().Format(time.RFC3339), Checks: map[string]string{},
 		Numbers: map[string]float64{}, Cleanup: map[string]any{}}
 	res.resultsTo = filepath.Join(root, "e2e", "real", "results", time.Now().Format("20060102-150405")+"-"+run+".json")
 	minter := tsapi.MintSource(api, slog.New(netd.NewRedactingHandler(slog.NewTextHandler(io.Discard, nil))))
+	tracker := tsapi.NewTracker(api)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -119,36 +120,24 @@ func TestRealTailnet(t *testing.T) {
 	var closers []func()
 	// Cleanup runs even on failure: close nodes, delete every device of this
 	// run, revoke every minted key, write the results file.
+	var reg *netd.Registry
 	t.Cleanup(func() {
+		if reg != nil {
+			for _, o := range reg.Objects() {
+				tracker.Track(o.NodeID, "obj-"+o.ID)
+			}
+		}
 		for i := len(closers) - 1; i >= 0; i-- {
 			closers[i]()
 		}
 		cctx, ccancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer ccancel()
-		devs, err := api.ListDevices(cctx)
-		deleted := 0
-		var delErrs []string
-		if err != nil {
-			delErrs = append(delErrs, "list: "+err.Error())
-		}
-		for _, d := range devs {
-			if strings.HasPrefix(d.Hostname, prefix) || strings.HasPrefix(d.Name, prefix) {
-				if err := api.DeleteDevice(cctx, d.NodeID); err != nil {
-					delErrs = append(delErrs, d.Hostname+": "+err.Error())
-				} else {
-					deleted++
-				}
-			}
-		}
-		// Verify nothing of this run is left.
-		left := 0
-		if devs, err := api.ListDevices(cctx); err == nil {
-			for _, d := range devs {
-				if strings.HasPrefix(d.Hostname, prefix) {
-					left++
-				}
-			}
-		}
+		// ID-based cleanup only: delete exactly the devices this run created
+		// (other suites share the tailnet; never sweep by prefix or tag).
+		crep := tracker.Cleanup(cctx, prefix)
+		deleted, left, delErrs := crep.Deleted, crep.Left, crep.Errors
+		res.Cleanup["devices_tracked"] = crep.Tracked
+		res.Cleanup["untracked_run_devices"] = crep.Untracked
 		revErr := minter.RevokeAll(cctx)
 		res.Cleanup["devices_deleted_at_cleanup"] = deleted
 		res.Cleanup["devices_left"] = left
@@ -184,7 +173,7 @@ func TestRealTailnet(t *testing.T) {
 		at time.Time
 	}
 	deletes := make(chan delEv, 8)
-	reg, err := netd.New(netd.Config{
+	reg, err = netd.New(netd.Config{
 		ControlURL: prodControl,
 		StateRoot:  filepath.Join(dir, "state"),
 		Keys:       minter,
@@ -193,6 +182,7 @@ func TestRealTailnet(t *testing.T) {
 		Hostname:   func(id string) string { return prefix + "-obj-" + id },
 		Upstream:   netd.UnixUpstream(wd.IngressSock),
 		OnDelete: func(ctx context.Context, in netd.ObjectInfo) error {
+			tracker.Track(in.NodeID, "obj-"+in.ID)
 			err := api.DeleteDevice(ctx, in.NodeID)
 			deletes <- delEv{in.ID, time.Now()}
 			return err
@@ -228,6 +218,9 @@ func TestRealTailnet(t *testing.T) {
 			t.Fatalf("%s: %v", role, netd.RedactError(err))
 		}
 		res.num("join_"+role+"_ms", msOf(time.Since(st)))
+		if st, err := n.LC.StatusWithoutPeers(ctx); err == nil && st.Self != nil {
+			tracker.Track(string(st.Self.ID), role)
+		}
 		closers = append(closers, func() { n.Close() })
 		return n
 	}
@@ -244,6 +237,7 @@ func TestRealTailnet(t *testing.T) {
 			t.Fatalf("object %s: %v", id, err)
 		}
 		ips[id] = o.IPv4().String()
+		tracker.Track(o.Info().NodeID, "obj-"+id)
 		joinMS = append(joinMS, time.Duration(o.Info().JoinMS*float64(time.Millisecond)))
 	}
 	res.num("objects_all_ready_ms", msOf(time.Since(joinStart)))
