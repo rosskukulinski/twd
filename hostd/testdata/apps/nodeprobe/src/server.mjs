@@ -3,8 +3,11 @@ import fs from "node:fs";
 import net from "node:net";
 import { getCaller, requireCaller, CallerError, fetch as twdFetch, dispatcher, installGlobalDispatcher, enforceEgress } from "@twd/node";
 // The /net sandbox probe must use the UNPATCHED connect (enforceEgress
-// tunnels raw connects through the proxy; the probe measures the OS sandbox).
-const rawConnect = net.connect;
+// tunnels raw connects through the proxy; the probe measures the OS
+// sandbox). net.connect() itself goes through Socket.prototype.connect, so
+// keep the raw prototype method.
+const rawProtoConnect = net.Socket.prototype.connect;
+const rawConnect = (opts) => rawProtoConnect.call(new net.Socket(), opts);
 enforceEgress();
 
 const port = Number(process.env.PORT);
