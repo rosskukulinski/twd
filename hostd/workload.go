@@ -199,7 +199,7 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 
 	tier := h.tierFor(app, t)
 	if tier == bundle.TierProcess {
-		if err := h.sharedHostCheck(w.tenantID); err != nil {
+		if err := h.sharedHostCheck(w.tenantID, app); err != nil {
 			w.fail(a.DeploymentID, err)
 			return
 		}
@@ -548,26 +548,37 @@ func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier st
 	return inst, nil
 }
 
-// sharedHostCheck refuses a process-tier deployment of tenant when this
-// host has no process sandbox (Linux without Landlock, or -sandbox none)
-// and another tenant already runs process-tier workloads here: without a
-// sandbox, tenants' code shares one uid and could read each other's keys.
-// Config.InsecureSharedHost (twd-hostd -insecure-shared-host) allows it.
+// sharedHostCheck refuses a process-tier deployment of tenant (app) when
+// this host must not be shared and another tenant already runs process-tier
+// workloads here:
+//   - no process sandbox (Linux without Landlock, or -sandbox none):
+//     tenants' code shares one uid and could read each other's keys;
+//   - this user can reach a container engine's socket or is in its group
+//     (procsb.ScanHostSockets Hard): root-equivalent for hostd itself, so
+//     only a dedicated user fixes it;
+//   - this user can reach the system tailscaled's socket (the host's own
+//     tailnet identity) AND some workload could use it: the sandbox is not
+//     Landlock+seccomp, or a Node app listens on a unix socket (that mode
+//     keeps AF_UNIX). With every workload denied AF_UNIX, tailscaled's
+//     socket is out of reach and the host may be shared.
 //
-// On Linux it also refuses when this user can reach risky host sockets (the
-// system tailscaled's LocalAPI, a container engine) or is in a container
-// engine's group: defence in depth for a workload that escapes its sandbox,
-// which could then act as the host's tailnet identity or as root.
-func (h *Host) sharedHostCheck(tenant string) error {
+// Config.InsecureSharedHost (twd-hostd -insecure-shared-host) allows all.
+func (h *Host) sharedHostCheck(tenant string, app *bundle.App) error {
 	if h.cfg.InsecureSharedHost {
 		return nil
 	}
+	hs := h.hostSockets()
 	var why string
-	if h.sandbox == SandboxNone {
+	switch {
+	case h.sandbox == SandboxNone:
 		why = "this host has no process sandbox (" + h.noSandboxReason() + ")"
-	} else if r := h.riskySockets(); len(r) > 0 {
-		why = "this user can reach " + strings.Join(r, ", ") + " (a workload escaping its sandbox could act as the host's tailnet identity or as root)"
-	} else {
+	case len(hs.Hard) > 0:
+		why = "this user can reach " + strings.Join(hs.Hard, ", ") + " (root-equivalent for twd-hostd itself)"
+	case hs.Tailscaled != "" && h.sandbox != SandboxLandlock:
+		why = "this user can reach " + hs.Tailscaled + " (the host's tailnet identity) and the " + h.sandbox + " sandbox doesn't deny unix sockets"
+	case hs.Tailscaled != "" && (nodeListensUnix(app) || h.anyNodeListensUnix()):
+		why = "this user can reach " + hs.Tailscaled + " (the host's tailnet identity) and a Node app listens on a unix socket (that mode keeps AF_UNIX sockets)"
+	default:
 		return nil
 	}
 	h.mu.Lock()
@@ -580,18 +591,38 @@ func (h *Host) sharedHostCheck(tenant string) error {
 		busy := o.active != nil && o.active.tier != bundle.TierMicroVM
 		o.mu.Unlock()
 		if busy {
-			return fmt.Errorf("sandbox_unavailable: %s, so it runs process-tier workloads of one tenant only, and tenant %s already runs here; fix: run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, enable Landlock, or deploy with tier \"microvm\"; or start twd-hostd with -insecure-shared-host (tenants are then NOT isolated from each other)", why, o.tenantID)
+			return fmt.Errorf("sandbox_unavailable: %s, so it runs process-tier workloads of one tenant only, and tenant %s already runs here; fix: run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, enable Landlock, use TCP listen mode for Node apps, or deploy with tier \"microvm\"; or start twd-hostd with -insecure-shared-host (tenants are then NOT isolated from each other)", why, o.tenantID)
 		}
 	}
 	return nil
 }
 
-// riskySockets is procsb.RiskyHostSockets, overridable in tests.
-func (h *Host) riskySockets() []string {
-	if h.cfg.RiskySockets != nil {
-		return h.cfg.RiskySockets()
+func nodeListensUnix(app *bundle.App) bool {
+	return app != nil && app.Runtime == bundle.RuntimeNode && app.Node.Listen == "unix"
+}
+
+// anyNodeListensUnix: some active or pending workload is a unix-listening
+// Node app.
+func (h *Host) anyNodeListensUnix() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, w := range h.workloads {
+		w.mu.Lock()
+		u := nodeListensUnix(w.app)
+		w.mu.Unlock()
+		if u {
+			return true
+		}
 	}
-	return procsb.RiskyHostSockets()
+	return false
+}
+
+// hostSockets is procsb.ScanHostSockets, overridable in tests.
+func (h *Host) hostSockets() procsb.HostSockets {
+	if h.cfg.HostSockets != nil {
+		return h.cfg.HostSockets()
+	}
+	return procsb.ScanHostSockets()
 }
 
 func (h *Host) noSandboxReason() string {

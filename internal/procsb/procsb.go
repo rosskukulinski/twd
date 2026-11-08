@@ -137,3 +137,19 @@ func ProbeCommand(profile, op string, args ...string) (*exec.Cmd, error) {
 	}
 	return exec.Command(p.Launcher, append([]string{ExecArg, "-f", profile, "--probe", op}, args...)...), nil
 }
+
+// HostSockets is ScanHostSockets' result.
+type HostSockets struct {
+	// Tailscaled is the system tailscaled's LocalAPI socket if this user
+	// can connect to it ("" otherwise). Sandboxed workloads can't reach it
+	// (no AF_UNIX sockets), so a host with every workload sandboxed may
+	// still be shared; the hostd process itself gains nothing from it.
+	Tailscaled string
+	// Hard are container-engine sockets this user can connect to and
+	// container-engine groups it is in: root-equivalent for the hostd
+	// process itself, so a shared host needs a dedicated user.
+	Hard []string
+}
+
+// Empty reports whether nothing risky was found.
+func (h HostSockets) Empty() bool { return h.Tailscaled == "" && len(h.Hard) == 0 }

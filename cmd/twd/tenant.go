@@ -148,13 +148,24 @@ func cmdTenantAdd(args []string) error {
 			"twd doctor explains the sandbox check; tenants of a shared host need Seatbelt (macOS) or Landlock (Linux)").
 			withFix("use a kernel with Landlock, deploy with tier \"microvm\", or (tenants NOT isolated) twd down && twd up --insecure-shared-host")
 	}
-	if r := procsb.RiskyHostSockets(); len(r) > 0 && !s.Cfg.InsecureSharedHost {
-		return fail("sandbox_unavailable", "this user can reach "+strings.Join(r, ", ")+": a workload that escaped its sandbox could act as this host's tailnet identity (tailscaled) or as root (a container engine), so this host must not serve more than one tenant",
-			"twd doctor lists them under host_sockets").
-			withFix("run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, or (tenants NOT isolated) twd down && twd up --insecure-shared-host")
-	}
 	if err := s.requireUp(); err != nil {
 		return err
+	}
+	// Defence in depth (Linux): sockets this user can reach that would let
+	// a process act as someone else. Container engines are root-equivalent
+	// for twd itself: refuse. tailscaled's socket matters only if some
+	// workload could reach it: every workload under Landlock+seccomp is
+	// denied AF_UNIX, except Node apps listening on a unix socket.
+	if hs := procsb.ScanHostSockets(); !hs.Empty() && !s.Cfg.InsecureSharedHost {
+		fix := "run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups, or (tenants NOT isolated) twd down && twd up --insecure-shared-host"
+		if len(hs.Hard) > 0 {
+			return fail("sandbox_unavailable", "this user can reach "+strings.Join(hs.Hard, ", ")+": root-equivalent for twd-hostd itself, so this host must not serve more than one tenant",
+				"twd doctor lists them under host_sockets").withFix(fix)
+		}
+		if why := tailscaledExposed(s, hs.Tailscaled); why != "" {
+			return fail("sandbox_unavailable", "this user can reach "+hs.Tailscaled+" (this host's tailnet identity) and "+why+", so this host must not serve more than one tenant",
+				"twd doctor lists it under host_sockets").withFix(fix + "; or enable Landlock and use TCP listen mode for Node apps")
+		}
 	}
 	t0 := time.Now()
 	res := tenantAddResult{Tailnet: tailnet, ControlURL: *control, Timings: map[string]float64{}}
@@ -309,4 +320,34 @@ func cmdTenantLs(args []string) error {
 		}
 	})
 	return nil
+}
+
+// tailscaledExposed says why a workload on this host could reach the system
+// tailscaled's socket ("" if none can): the sandbox isn't Landlock+seccomp,
+// or a running Node app listens on a unix socket. It asks twd-hostd.
+func tailscaledExposed(s *state, sock string) string {
+	if sock == "" {
+		return ""
+	}
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxLandlock {
+		return "the process sandbox (" + sb + ") doesn't deny unix sockets"
+	}
+	if s == nil || !s.supervisorAlive() {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var hv hostd.StatusView
+	if err := s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv); err != nil {
+		return "twd-hostd is not answering, so running workloads can't be checked"
+	}
+	if !strings.HasPrefix(hv.Sandbox, hostd.SandboxLandlock) {
+		return "twd-hostd runs with sandbox " + hv.Sandbox
+	}
+	for _, w := range hv.Workloads {
+		if w.Node != nil && w.Node.Listen == "unix" {
+			return "Node app " + w.TenantID + "/" + w.Workload + " listens on a unix socket (that mode keeps AF_UNIX sockets)"
+		}
+	}
+	return ""
 }

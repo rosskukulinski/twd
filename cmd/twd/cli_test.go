@@ -297,8 +297,13 @@ func TestDoctor(t *testing.T) {
 		"state_dir_writable": "ok", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "system_tailscaled_not_used": "ok"}
 	if runtime.GOOS == "linux" {
 		want["host_sockets"] = "ok"
-		if len(procsb.RiskyHostSockets()) > 0 {
+		if hs := procsb.ScanHostSockets(); len(hs.Hard) > 0 {
 			want["host_sockets"] = "warn"
+		} else if hs.Tailscaled != "" {
+			want["host_sockets"] = "info" // blocked for workloads by seccomp (twd is not up here)
+			if !sandboxAvailable() {
+				want["host_sockets"] = "warn"
+			}
 		}
 	}
 	if sandboxAvailable() {

@@ -200,18 +200,30 @@ func doctorLandlock(s *state) (string, string, string) {
 }
 
 // doctorHostSockets (Linux) lists risky host sockets this user can reach
-// (the system tailscaled's LocalAPI, container engines) and container-engine
-// group memberships. Sandboxed workloads can't reach them (no AF_UNIX
-// sockets), but as defence in depth twd then refuses a second tenant unless
-// twd up --insecure-shared-host.
-func doctorHostSockets() (string, string, string) {
+// and container-engine group memberships. Container engines are
+// root-equivalent for twd itself: warn, and twd refuses a second tenant.
+// tailscaled's socket is info only while every workload is denied AF_UNIX
+// (Landlock+seccomp, no unix-listening Node app); otherwise it warns too.
+// twd up --insecure-shared-host overrides the refusal.
+func doctorHostSockets(s *state) (string, string, string) {
 	if runtime.GOOS != "linux" {
 		return "skip", "Linux-only check (on macOS Seatbelt denies sockets under the home dir)", ""
 	}
-	r := procsb.RiskyHostSockets()
-	if len(r) == 0 {
-		return "ok", "this user can't reach the system tailscaled's socket or a container engine (docker/containerd/podman/lxd) and is in none of their groups", ""
+	hs := procsb.ScanHostSockets()
+	fix := "run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups"
+	if len(hs.Hard) > 0 {
+		d := "this user can reach " + strings.Join(hs.Hard, ", ") + ": root-equivalent for twd-hostd itself, so twd serves one tenant only here (twd tenant add refuses unless twd up --insecure-shared-host)"
+		if hs.Tailscaled != "" {
+			d += "; also " + hs.Tailscaled
+		}
+		return "warn", d, fix
 	}
-	return "warn", "this user can reach " + strings.Join(r, ", ") + ": a workload escaping its sandbox could act as this host's tailnet identity or as root, so twd serves one tenant only here (twd tenant add refuses unless twd up --insecure-shared-host)",
-		"run twd as a dedicated user that can't reach those sockets and isn't in the docker/podman/lxd groups"
+	if hs.Tailscaled != "" {
+		if why := tailscaledExposed(s, hs.Tailscaled); why != "" {
+			return "warn", hs.Tailscaled + " (this host's tailnet identity) is reachable by this user and " + why + ", so twd serves one tenant only here (twd tenant add refuses unless twd up --insecure-shared-host)",
+				fix + ", or enable Landlock and use TCP listen mode for Node apps"
+		}
+		return "info", hs.Tailscaled + " is reachable by this user, blocked for workloads by seccomp (AF_UNIX denied); the host may be shared", ""
+	}
+	return "ok", "this user can't reach the system tailscaled's socket or a container engine (docker/containerd/podman/lxd) and is in none of their groups", ""
 }

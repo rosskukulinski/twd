@@ -209,7 +209,7 @@ func cmdDoctor(args []string) error {
 	})
 
 	run("sandbox", func() (string, string, string) { return doctorSandbox(s) })
-	run("host_sockets", doctorHostSockets)
+	run("host_sockets", func() (string, string, string) { return doctorHostSockets(s) })
 
 	run("system_tailscaled_not_used", func() (string, string, string) {
 		var notes []string
@@ -255,7 +255,7 @@ func cmdDoctor(args []string) error {
 	}
 	res := map[string]any{"ok": !failed, "version": version, "checks": checks}
 	emit(f, res, func() {
-		mark := map[string]string{"ok": "✓", "warn": "!", "fail": "✗", "skip": "-"}
+		mark := map[string]string{"ok": "✓", "warn": "!", "fail": "✗", "skip": "-", "info": "i"}
 		fmt.Printf("twd doctor · twd %s · %s/%s\n", version, runtime.GOOS, runtime.GOARCH)
 		for _, c := range checks {
 			fmt.Printf("%s %-28s %s\n", mark[c.Status], c.Name, c.Detail)

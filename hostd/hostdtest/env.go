@@ -15,6 +15,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/internal/procsb"
 	"github.com/rosskukulinski/twd/netd"
 	"github.com/rosskukulinski/twd/netd/nettest"
 )
@@ -38,8 +39,8 @@ type Options struct {
 	Sandbox string
 	// InsecureSharedHost: see hostd.Config.
 	InsecureSharedHost bool
-	// RiskySockets: see hostd.Config.
-	RiskySockets func() []string
+	// HostSockets: see hostd.Config.
+	HostSockets func() procsb.HostSockets
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -101,7 +102,7 @@ func Start(t testing.TB, o Options) *Env {
 		HostID: "h1", Mgmt: hc, DataDir: filepath.Join(dir, "data"), RunDir: filepath.Join(dir, "run"),
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
-		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, RiskySockets: o.RiskySockets,
+		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, HostSockets: o.HostSockets,
 	})
 	if err != nil {
 		t.Fatal(err)

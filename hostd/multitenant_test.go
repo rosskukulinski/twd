@@ -322,17 +322,54 @@ func landlockCrossTenant(t *testing.T, ea *hostdtest.Env, a, b hostd.WorkloadSta
 // tenant's deploy fails typed sandbox_unavailable. -insecure-shared-host
 // would allow it.
 func TestSharedHostWithoutSandbox(t *testing.T) {
-	sharedHostRefused(t, hostdtest.Options{Sandbox: hostd.SandboxNone}, "-insecure-shared-host")
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxNone}, "", "-insecure-shared-host")
 }
 
-// With a sandbox, but with a risky host socket reachable (here: reported by
-// a stub), the second tenant is refused too, naming the socket.
+// With a sandbox, but a container engine reachable (stubbed), the second
+// tenant is refused too (root-equivalent for hostd itself).
 func TestSharedHostRiskySockets(t *testing.T) {
-	sharedHostRefused(t, hostdtest.Options{Sandbox: hostd.SandboxAuto,
-		RiskySockets: func() []string { return []string{"/var/run/docker.sock"} }}, "/var/run/docker.sock")
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxAuto,
+		HostSockets: func() procsb.HostSockets { return procsb.HostSockets{Hard: []string{"/var/run/docker.sock"}} }},
+		"", "/var/run/docker.sock")
 }
 
-func sharedHostRefused(t *testing.T, o hostdtest.Options, mention string) {
+var tailscaledOnly = func() procsb.HostSockets {
+	return procsb.HostSockets{Tailscaled: "/var/run/tailscale/tailscaled.sock"}
+}
+
+// tailscaled's socket reachable, but every workload under Landlock+seccomp
+// (no AF_UNIX): the host may be shared, and the second tenant's workerd
+// still can't connect to that socket.
+func TestSharedHostTailscaledSandboxed(t *testing.T) {
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxLandlock {
+		t.Skip("needs Landlock")
+	}
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxAuto, HostSockets: tailscaledOnly}, "", "")
+}
+
+// tailscaled's socket reachable and no sandbox: refused.
+func TestSharedHostTailscaledNoSandbox(t *testing.T) {
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxNone, HostSockets: tailscaledOnly}, "", "no process sandbox")
+}
+
+// tailscaled's socket reachable, sandbox on, but tenant A's Node app
+// listens on a unix socket (keeps AF_UNIX): refused, naming the reason.
+func TestSharedHostTailscaledUnixListen(t *testing.T) {
+	if sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto); sb != hostd.SandboxLandlock {
+		t.Skip("needs Landlock")
+	}
+	if _, err := os.Stat(hostdtest.NodeDeps()); err != nil {
+		t.Skip("node tier deps not installed (make test-node)")
+	}
+	sharedHost(t, hostdtest.Options{Sandbox: hostd.SandboxAuto, HostSockets: tailscaledOnly}, "unix", "listens on a unix socket")
+}
+
+// sharedHost deploys tenant A (the agent template, or nodeprobe listening
+// on aListen when set), then tenant B's agent. With mention == "" B must
+// run and, under Landlock, its workerd must get EPERM on the (stubbed)
+// tailscaled path; otherwise B must fail typed sandbox_unavailable naming
+// mention.
+func sharedHost(t *testing.T, o hostdtest.Options, aListen, mention string) {
 	if testing.Short() {
 		t.Skip("short")
 	}
@@ -345,12 +382,24 @@ func sharedHostRefused(t *testing.T, o hostdtest.Options, mention string) {
 	o.Tenant = mgmtapi.Tenant{Tailnet: "a.ts.net", ControlURL: ctl.URL, MintMode: "static"}
 	ea := hostdtest.Start(t, o)
 	eb := ea.AddTenant(mgmtapi.Tenant{Tailnet: "b.ts.net", ControlURL: ctl.URL, MintMode: "static"})
-	ea.WaitActive("agent", ea.Deploy(hostdtest.Template("agent"), "agent", nil), 60*time.Second)
+	if aListen != "" {
+		files, err := hostdtest.BuildNode(hostdtest.Fixture("nodeprobe"), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files["twd.jsonc"] = []byte(strings.Replace(string(files["twd.jsonc"]), `"node": {`, `"node": { "listen": "`+aListen+`",`, 1))
+		ea.WaitActive("nodeprobe", ea.DeployFiles(files, "nodeprobe"), 60*time.Second)
+	} else {
+		ea.WaitActive("agent", ea.Deploy(hostdtest.Template("agent"), "agent", nil), 60*time.Second)
+	}
 	depB := eb.Deploy(hostdtest.Template("agent"), "agent", nil)
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		for _, w := range ea.Host.Status().Workloads {
 			if w.TenantID == eb.TenantID && w.Status == "failed" {
+				if mention == "" {
+					t.Fatalf("tenant B refused on a shareable host: %s", w.Error)
+				}
 				if !strings.Contains(w.Error, "sandbox_unavailable") || !strings.Contains(w.Error, mention) {
 					t.Fatalf("tenant B failed for another reason: %s", w.Error)
 				}
@@ -358,7 +407,18 @@ func sharedHostRefused(t *testing.T, o hostdtest.Options, mention string) {
 				return
 			}
 			if w.TenantID == eb.TenantID && w.Status == "active" && w.DeploymentID == depB {
-				t.Fatal("tenant B's process-tier workload runs on an unsandboxed shared host")
+				if mention != "" {
+					t.Fatal("tenant B's process-tier workload runs on a host that must not be shared")
+				}
+				if w.Sandbox == hostd.SandboxLandlock {
+					cmd, _ := procsb.ProbeCommand(w.SandboxProfile, procsb.ProbeConnectUnix, tailscaledOnly().Tailscaled)
+					out, _ := cmd.Output()
+					if r := strings.TrimSpace(string(out)); r != "EPERM" {
+						t.Fatalf("tenant B's workerd profile → tailscaled.sock: %s (want EPERM)", r)
+					}
+					t.Logf("tenant B runs; its workerd profile → tailscaled.sock: EPERM")
+				}
+				return
 			}
 		}
 		if time.Now().After(deadline) {

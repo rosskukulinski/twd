@@ -25,12 +25,13 @@ var riskySocketPaths = []string{
 // equivalent).
 var riskyGroups = []string{"docker", "podman", "lxd", "incus", "incus-admin"}
 
-// RiskyHostSockets lists what this user could reach that would let a
-// workload escaping its sandbox act as someone else: connectable risky
-// sockets (the user has write permission; nothing is connected to) and
-// membership of container-engine groups. Empty means none found.
-func RiskyHostSockets() []string {
-	var out []string
+// ScanHostSockets reports what this user could reach that would let a
+// process act as someone else: the system tailscaled's LocalAPI socket (the
+// host's own tailnet identity), and container-engine sockets or group
+// memberships (root-equivalent). It checks write permission only; nothing
+// is connected to.
+func ScanHostSockets() HostSockets {
+	var hs HostSockets
 	paths := append([]string{}, riskySocketPaths...)
 	if rd := os.Getenv("XDG_RUNTIME_DIR"); rd != "" {
 		paths = append(paths, filepath.Join(rd, "docker.sock"), filepath.Join(rd, "podman", "podman.sock"))
@@ -43,20 +44,24 @@ func RiskyHostSockets() []string {
 		}
 		seen[r] = true
 		st, err := os.Stat(r)
-		if err != nil || st.Mode()&os.ModeSocket == 0 {
+		if err != nil || st.Mode()&os.ModeSocket == 0 || unix.Access(r, unix.W_OK) != nil {
 			continue
 		}
-		if unix.Access(r, unix.W_OK) == nil {
-			out = append(out, p)
+		if filepath.Base(p) == "tailscaled.sock" {
+			if hs.Tailscaled == "" {
+				hs.Tailscaled = p
+			}
+		} else {
+			hs.Hard = append(hs.Hard, p)
 		}
 	}
 	if u, err := user.Current(); err == nil {
 		gids, _ := u.GroupIds()
 		for _, g := range gids {
 			if gr, err := user.LookupGroupId(g); err == nil && slices.Contains(riskyGroups, gr.Name) {
-				out = append(out, "group "+gr.Name)
+				hs.Hard = append(hs.Hard, "group "+gr.Name)
 			}
 		}
 	}
-	return out
+	return hs
 }

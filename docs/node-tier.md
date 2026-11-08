@@ -124,6 +124,20 @@ network is hostd's gVisor gateway, which exposes only the egress, workload
 and host-API ports, and every other SYN is RST'd (M8). Running Node apps
 inside the Firecracker guest is not built yet; see STATUS.md M9.
 
+### Linux sandbox limits for the app's own processes
+
+Under the Linux sandbox (Landlock + seccomp) the app runs in its own process
+group and may send signals only to **itself (`process.pid`) or its own
+process group** (`process.kill(0, …)` / `-pgid`), never to hostd, mgmt or
+other tenants' processes. The filter names the app's pid, so this reaches
+**child processes** too: a child can't `raise()`/`abort()` or signal its own
+pid, and the parent can't signal a child *by pid* (`child.kill()` fails
+with `EPERM`); signalling the group works. Child processes also get no
+`/proc/self` of their own. Apps in TCP listen mode (the default) can't open
+any AF_UNIX socket; `listen: "unix"` apps keep AF_UNIX, and a host with
+such an app and a reachable system tailscaled socket is not shareable (see
+INSTALL.md `host_sockets`).
+
 ## Supervision and logs
 
 - **Restarts.** On exit, the app restarts with exponential backoff (250 ms,

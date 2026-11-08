@@ -82,4 +82,4 @@ http.createServer(async (req, res) => {
     if (e instanceof CallerError) return json(res, 401, { code: e.code, message: e.message });
     json(res, 500, { error: String(e?.cause?.message ?? e?.message ?? e) });
   }
-}).listen(port, "127.0.0.1");
+}).listen(...(process.env.TWD_SOCKET ? [process.env.TWD_SOCKET] : [port, "127.0.0.1"]));

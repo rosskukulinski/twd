@@ -527,6 +527,7 @@ type NodeInfo struct {
 	PID       int
 	Starts    int
 	Addr      string // the app's listen address (127.0.0.1:port or socket)
+	Listen    string // "tcp" | "unix"
 	ProxyAddr string // the egress proxy (credentials are not exposed)
 	StartedAt time.Time
 	// ReadyMs is the first start's process spawn → health answered.
@@ -543,6 +544,10 @@ func (inst *instance) nodeInfo() *NodeInfo {
 	}
 	np.mu.Lock()
 	defer np.mu.Unlock()
-	return &NodeInfo{PID: np.pid, Starts: np.starts, Addr: np.addr, ProxyAddr: np.proxy.Addr().String(), StartedAt: np.started,
+	listen := np.listen
+	if listen == "" {
+		listen = "tcp"
+	}
+	return &NodeInfo{PID: np.pid, Starts: np.starts, Addr: np.addr, Listen: listen, ProxyAddr: np.proxy.Addr().String(), StartedAt: np.started,
 		ReadyMs: float64(np.readyDur.Microseconds()) / 1000, LogFile: np.logPath, DataDir: np.dataDir, LastExit: np.lastExit}
 }
