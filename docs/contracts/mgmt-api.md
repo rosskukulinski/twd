@@ -47,8 +47,8 @@ hostd's API, not this document's.
 - JSON everywhere. Timestamps are unix **milliseconds** unless the field
   says otherwise (`AuditRecord.ts` is RFC 3339).
 - **Pagination.** Every list returns `{"items": [...], "nextCursor":
-  "..." | null}`. `?limit=` defaults to 50 and is capped at 500 (a larger
-  value is clamped, not refused). `?cursor=` is opaque; it encodes the
+  "..." | null}`. `?limit=` defaults to 50; 1–500 is accepted and anything
+  else is `400 bad_request`. `?cursor=` is opaque; it encodes the
   stable sort key `(createdAt, id)` (audit: `(ts, chain, seq)`), so a page
   is stable under concurrent inserts. A cursor that does not decode is
   `400 bad_cursor`. Filters are query parameters and must be repeated
@@ -149,7 +149,7 @@ Customer tailnets. Admin only.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `limit` | query | integer | no | Page size. Values above 500 are clamped to 500. |
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
 | `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
 
 | Status | Body | Description |
@@ -299,7 +299,7 @@ twd-hostd instances. A host writes its own record; admins read.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `limit` | query | integer | no | Page size. Values above 500 are clamped to 500. |
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
 | `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
 | `live` | query | boolean | no | Only hosts that heartbeated within the host lease TTL (10 s). |
 
@@ -415,7 +415,7 @@ operator credential when mgmt has one; otherwise it is reported in
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
 | `id` | path | string | yes | Host ID (one safe path element). |
-| `limit` | query | integer | no | Page size. Values above 500 are clamped to 500. |
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
 | `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
 
 | Status | Body | Description |
@@ -462,7 +462,7 @@ Deploys of a workload bundle to a host.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `limit` | query | integer | no | Page size. Values above 500 are clamped to 500. |
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
 | `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
 | `tenant` | query | string | no |  |
 | `workload` | query | string | no |  |
@@ -588,7 +588,7 @@ DO instances, agents and sub-agents, each with its own tailnet node.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `limit` | query | integer | no | Page size. Values above 500 are clamped to 500. |
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
 | `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
 | `tenant` | query | string | no |  |
 | `workload` | query | string | no |  |
@@ -832,7 +832,7 @@ Hash-chained, append-only audit log.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `limit` | query | integer | no | Page size. Values above 500 are clamped to 500. |
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
 | `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
 | `object` | query | string | no | Records about this object ID. |
 | `human` | query | string | no | Records whose `actingFor` is this principal (the human at the head of a chain). |
@@ -1090,9 +1090,9 @@ Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
 `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-`preflight` (optional; dryRun deploys), `host_add`.
+`preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
 
-Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`
+Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`, `credential`, `obo_root`, `object_update`
 
 #### `AuditPage`
 
@@ -1115,12 +1115,12 @@ written, no HTML escaping. `seq` and `chain` are assigned by mgmt.
 | `actingFor` | string | no |  |
 | `chain` | string | no | (read-only) `mgmt` or `host:<hostID>`. |
 | `code` | string | no |  |
-| `detail` | object | no |  |
+| `detail` | object \| string | no | Structured detail (mgmt records) or free text (host `tenant_note`s). |
 | `dst` | string | no |  |
 | `grant` | string | no |  |
 | `hash` | string | yes |  |
 | `hostSig` | string | no | base64 ed25519 over utf8(hash); host chains only. |
-| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`. |
+| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`. |
 | `objectID` | string | no |  |
 | `prevHash` | string | yes | `""` for the first record of a chain. |
 | `seq` | integer (int64) | no | (read-only) |
@@ -1260,7 +1260,7 @@ is policy HuJSON to paste when a grant is missing; `doc_url` is
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `code` | `ErrorCode` | yes | The catalog. Status in parentheses. \| code \| status \| when \| \|---\|---\|---\| \| `bad_request` \| 400 \| malformed body, parameter or filter \| \| `bad_cursor` \| 400 \| `cursor` does not decode \| \| `bad_bundle` \| 400 \| bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` \| \| `immutable_field` \| 400 \| PATCH touches a field the caller may not change \| \| `no_identity` \| 401 \| WhoIs failed for the connection \| \| `host_token_required` \| 401 \| local-dev socket without `Twd-Host-Token` \| \| `host_token_invalid` \| 403 \| local-dev socket, wrong token \| \| `not_admin` \| 403 \| tailnet caller without `twd.dev/cap/admin` (`snippet` given) \| \| `forbidden` \| 403 \| role ok, but outside the caller's records / namespaces \| \| `host_not_registered` \| 403 \| `tag:twd-host` node that never did `PUT /v1/hosts/{id}` \| \| `host_identity_mismatch` \| 403 \| host ID bound to another node \| \| `delegation_invalid` \| 403 \| spawn caps ⊄ parent, or child tag not owned by the parent's \| \| `not_found` \| 404 \| — \| \| `unknown_tenant` \| 404 \| — \| \| `unknown_namespace` \| 404 \| `(workload, class)` not declared \| \| `exists` \| 409 \| create of an existing ID \| \| `lease_lost` \| 409 \| epoch/holder fence failed \| \| `lease_held` \| 409 \| another host holds the lease \| \| `already_joined` \| 409 \| credential for an object that has a node \| \| `identity_conflict` \| 409 \| object ID collision across identities \| \| `namespace_ambiguous` \| 409 \| class declared by several workloads, `workload` missing \| \| `not_ready` \| 409 \| certificate requested before `ready` \| \| `superseded` \| 409 \| undeploy of a non-latest deployment \| \| `tenant_has_live_objects` \| 409 \| tenant delete without `force` \| \| `host_holds_leases` \| 409 \| host delete without `drain` \| \| `killed` \| 410 \| tombstone (`TombstoneError`) \| \| `precondition_failed` \| 412 \| `If-Match` mismatch \| \| `object_quota_exceeded` \| 429 \| tenant `maxObjects` \| \| `spawn_budget_exceeded` \| 429 \| `maxLive` / `maxDepth` \| \| `bootstrap_failed` \| 502 \| control plane refused the mint \| \| `host_token_unconfigured` \| 503 \| local-dev mgmt without a token (fail closed) \| \| `identity_pending` \| 503 \| mint still queued (`Retry-After: 1`) \| \| `no_host` \| 503 \| no live host for the deployment \| \| `policy_unavailable` \| 503 \| mgmt cannot read the tenant policy \| \| `internal` \| 500 \| — \| |
+| `code` | `ErrorCode` | yes | The catalog. Status in parentheses. \| code \| status \| when \| \|---\|---\|---\| \| `bad_request` \| 400 \| malformed body, parameter or filter \| \| `bad_cursor` \| 400 \| `cursor` does not decode \| \| `bad_bundle` \| 400 \| bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` \| \| `immutable_field` \| 400 \| PATCH touches a field the caller may not change \| \| `no_identity` \| 401 \| WhoIs failed for the connection \| \| `host_token_required` \| 401 \| local-dev socket without `Twd-Host-Token` \| \| `host_token_invalid` \| 403 \| local-dev socket, wrong token \| \| `not_admin` \| 403 \| tailnet caller without `twd.dev/cap/admin` (`snippet` given) \| \| `forbidden` \| 403 \| role ok, but outside the caller's records / namespaces \| \| `host_not_registered` \| 403 \| `tag:twd-host` node that never did `PUT /v1/hosts/{id}` \| \| `host_identity_mismatch` \| 403 \| host ID bound to another node \| \| `delegation_invalid` \| 403 \| child tag not owned by the parent's, parent unknown (404) or dead (410) \| \| `delegation_exceeds_parent` \| 403 \| spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) \| \| `not_found` \| 404 \| — \| \| `unknown_tenant` \| 404 \| — \| \| `unknown_namespace` \| 404 \| `(workload, class)` not declared \| \| `exists` \| 409 \| create of an existing ID \| \| `lease_lost` \| 409 \| epoch/holder fence failed \| \| `lease_held` \| 409 \| another host holds the lease \| \| `already_joined` \| 409 \| credential for an object that has a node \| \| `identity_conflict` \| 409 \| object ID collision across identities \| \| `namespace_ambiguous` \| 409 \| class declared by several workloads, `workload` missing \| \| `not_ready` \| 409 \| certificate requested before `ready` \| \| `superseded` \| 409 \| undeploy of a non-latest deployment \| \| `tenant_has_live_objects` \| 409 \| tenant delete without `force` \| \| `host_holds_leases` \| 409 \| host delete without `drain` \| \| `killed` \| 410 \| tombstone (`TombstoneError`) \| \| `precondition_failed` \| 412 \| `If-Match` mismatch \| \| `object_quota_exceeded` \| 429 \| tenant `maxObjects` \| \| `spawn_budget_exceeded` \| 429 \| `maxLive` / `maxDepth` \| \| `bootstrap_failed` \| 502 \| control plane refused the mint \| \| `host_token_unconfigured` \| 503 \| local-dev mgmt without a token (fail closed) \| \| `identity_pending` \| 503 \| mint still queued (`Retry-After: 1`) \| \| `no_host` \| 503 \| no live host for the deployment \| \| `policy_unavailable` \| 503 \| mgmt cannot read the tenant policy \| \| `internal` \| 500 \| — \| |
 | `doc_url` | string (uri) | yes |  |
 | `message` | string | yes |  |
 | `missing` | object | no | What is missing. Shape depends on `code` (e.g. `{src, dst, cap, field}` for `delegation_invalid`). |
@@ -1284,7 +1284,8 @@ The catalog. Status in parentheses.
 | `forbidden` | 403 | role ok, but outside the caller's records / namespaces |
 | `host_not_registered` | 403 | `tag:twd-host` node that never did `PUT /v1/hosts/{id}` |
 | `host_identity_mismatch` | 403 | host ID bound to another node |
-| `delegation_invalid` | 403 | spawn caps ⊄ parent, or child tag not owned by the parent's |
+| `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
+| `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
 | `not_found` | 404 | — |
 | `unknown_tenant` | 404 | — |
 | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1309,7 +1310,7 @@ The catalog. Status in parentheses.
 | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
 | `internal` | 500 | — |
 
-Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity`, `host_token_required`, `host_token_invalid`, `not_admin`, `forbidden`, `host_not_registered`, `host_identity_mismatch`, `delegation_invalid`, `not_found`, `unknown_tenant`, `unknown_namespace`, `exists`, `lease_lost`, `lease_held`, `already_joined`, `identity_conflict`, `namespace_ambiguous`, `not_ready`, `superseded`, `tenant_has_live_objects`, `host_holds_leases`, `killed`, `precondition_failed`, `object_quota_exceeded`, `spawn_budget_exceeded`, `bootstrap_failed`, `host_token_unconfigured`, `identity_pending`, `no_host`, `policy_unavailable`, `internal`
+Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity`, `host_token_required`, `host_token_invalid`, `not_admin`, `forbidden`, `host_not_registered`, `host_identity_mismatch`, `delegation_invalid`, `delegation_exceeds_parent`, `not_found`, `unknown_tenant`, `unknown_namespace`, `exists`, `lease_lost`, `lease_held`, `already_joined`, `identity_conflict`, `namespace_ambiguous`, `not_ready`, `superseded`, `tenant_has_live_objects`, `host_holds_leases`, `killed`, `precondition_failed`, `object_quota_exceeded`, `spawn_budget_exceeded`, `bootstrap_failed`, `host_token_unconfigured`, `identity_pending`, `no_host`, `policy_unavailable`, `internal`
 
 #### `Health`
 
@@ -1727,13 +1728,13 @@ The kill record of an object. Kept until the tenant's terminal objects are purge
 
 #### `TombstoneError`
 
-`410 Gone`: the error plus the kill record.
+`410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`).
 
 Extends `Error`.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `tombstone` | `Tombstone` | yes | The kill record of an object. Kept until the tenant's terminal objects are purged. |
+| `tombstone` | `Tombstone` | no | The kill record of an object. Kept until the tenant's terminal objects are purged. |
 
 #### `Transport`
 

@@ -18,10 +18,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	v1 "github.com/rosskukulinski/twd/hostd/mgmtapi/v1"
 )
 
-// Client talks to twd-mgmt over a unix socket ("unix:///path/mgmt.sock") or
-// HTTP(S) base URL.
+// Client talks to twd-mgmt's /v1 API over HTTP(S) (normal operation: the
+// tsnet transport, authenticated by WhoIs on the connection) or over the
+// local-dev unix socket ("unix:///path/mgmt.sock" + host token). Do and
+// DoHeaders are the generic path-level calls (the CLI); the typed methods
+// go through the generated client (V1).
 type Client struct {
 	Base string // "http://mgmt" for unix sockets
 	HTTP *http.Client
@@ -39,6 +44,9 @@ type Client struct {
 	tokVal  string
 	tokMod  time.Time
 	tokRead time.Time
+
+	v1Once sync.Once
+	v1c    *v1.ClientWithResponses
 }
 
 // HostTokenHeader is mgmt's per-host bearer token header (mgmt.HostTokenHeader).
@@ -112,13 +120,11 @@ func (c *Client) DoHeaders(ctx context.Context, method, path string, in, out any
 	}
 	if in != nil {
 		req.Header.Set("content-type", "application/json")
+		if method == http.MethodPatch {
+			req.Header.Set("content-type", "application/merge-patch+json")
+		}
 	}
-	if c.HostID != "" {
-		req.Header.Set("Twd-Host-ID", c.HostID)
-	}
-	if tok := c.hostToken(); tok != "" {
-		req.Header.Set(HostTokenHeader, tok)
-	}
+	c.setHeaders(req)
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
@@ -154,38 +160,164 @@ func AsError(err error) (*Error, bool) {
 	return e, ok
 }
 
+// V1 returns the generated /v1 client sharing this client's transport and
+// headers (Twd-Host-ID, Twd-Host-Token); every typed method below goes
+// through it, so URLs and parameters come from api/openapi.yaml.
+func (c *Client) V1() *v1.ClientWithResponses {
+	c.v1Once.Do(func() {
+		hc := c.HTTP
+		if hc == nil {
+			hc = &http.Client{Timeout: 30 * time.Second}
+		}
+		c.v1c, _ = v1.NewClientWithResponses(c.Base, v1.WithHTTPClient(hc), v1.WithRequestEditorFn(func(ctx context.Context, req *http.Request) error {
+			c.setHeaders(req)
+			return nil
+		}))
+	})
+	return c.v1c
+}
+
+// setHeaders adds the host identity and the local-dev token.
+func (c *Client) setHeaders(req *http.Request) {
+	if c.HostID != "" {
+		req.Header.Set("Twd-Host-ID", c.HostID)
+	}
+	if tok := c.hostToken(); tok != "" {
+		req.Header.Set(HostTokenHeader, tok)
+	}
+}
+
+// result turns a generated response into out (any 2xx) or a typed *Error.
+func result(resp *http.Response, body []byte, out any) error {
+	if resp == nil {
+		return errors.New("mgmtapi: no response")
+	}
+	if resp.StatusCode/100 != 2 {
+		e := &Error{Status: resp.StatusCode}
+		if json.Unmarshal(body, e) != nil || e.Code == "" {
+			e.Code, e.Message = "http_"+fmt.Sprint(resp.StatusCode), strings.TrimSpace(string(body))
+		}
+		return e
+	}
+	if out == nil || len(body) == 0 {
+		return nil
+	}
+	return json.Unmarshal(body, out)
+}
+
+func jsonBody(v any) (io.Reader, error) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	return bytes.NewReader(b), nil
+}
+
+// Register is PUT /v1/hosts/{id} (idempotent: 201 the first time, 200 after).
 func (c *Client) Register(ctx context.Context, r RegisterRequest) error {
-	return c.Do(ctx, "POST", "/v0/hosts/register", r, nil)
+	// The spec's HostRegistration: push is {url} (local-dev unix socket)
+	// or {port} (the host's own tsnet node); nothing else is accepted.
+	reg := map[string]any{"capacityNodes": r.CapacityNodes, "tiers": r.Tiers}
+	if r.AuditPubKey != "" {
+		reg["auditPubKey"] = r.AuditPubKey
+	}
+	if r.Pool != "" {
+		reg["pool"] = r.Pool
+	}
+	switch {
+	case r.PushPort > 0:
+		reg["push"] = map[string]any{"port": r.PushPort}
+	case r.PushURL != "":
+		reg["push"] = map[string]any{"url": r.PushURL}
+	}
+	body, err := jsonBody(reg)
+	if err != nil {
+		return err
+	}
+	resp, err := c.V1().RegisterHostWithBodyWithResponse(ctx, r.HostID, "application/json", body)
+	if err != nil {
+		return err
+	}
+	return result(resp.HTTPResponse, resp.Body, nil)
 }
 
+// Heartbeat is PUT /v1/hosts/{id}/status.
 func (c *Client) Heartbeat(ctx context.Context, host string, r HeartbeatRequest) (*HeartbeatResponse, error) {
+	body, err := jsonBody(r)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.V1().ReportHostStatusWithBodyWithResponse(ctx, host, "application/json", body)
+	if err != nil {
+		return nil, err
+	}
 	var out HeartbeatResponse
-	err := c.Do(ctx, "POST", "/v0/hosts/"+url.PathEscape(host)+"/heartbeat", r, &out)
-	return &out, err
+	if err := result(resp.HTTPResponse, resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
+// Assignments is GET /v1/hosts/{id}/assignments, following every page.
 func (c *Client) Assignments(ctx context.Context, host string) ([]Assignment, error) {
+	limit := 500
 	var out []Assignment
-	err := c.Do(ctx, "GET", "/v0/hosts/"+url.PathEscape(host)+"/assignments", nil, &out)
-	return out, err
+	var cursor *string
+	for {
+		resp, err := c.V1().ListHostAssignmentsWithResponse(ctx, host, &v1.ListHostAssignmentsParams{Limit: &limit, Cursor: cursor})
+		if err != nil {
+			return nil, err
+		}
+		var pg Page[Assignment]
+		if err := result(resp.HTTPResponse, resp.Body, &pg); err != nil {
+			return nil, err
+		}
+		out = append(out, pg.Items...)
+		if pg.NextCursor == nil || *pg.NextCursor == "" {
+			return out, nil
+		}
+		cursor = pg.NextCursor
+	}
 }
 
+// Tenant is GET /v1/tenants/{id}.
 func (c *Client) Tenant(ctx context.Context, id string) (*Tenant, error) {
+	resp, err := c.V1().GetTenantWithResponse(ctx, id, &v1.GetTenantParams{})
+	if err != nil {
+		return nil, err
+	}
 	var out Tenant
-	err := c.Do(ctx, "GET", "/v0/tenants/"+url.PathEscape(id), nil, &out)
-	return &out, err
+	if err := result(resp.HTTPResponse, resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
-// Tenants lists every tenant (local admin socket only; used to keep every
-// tenant's API key file out of every workerd sandbox).
+// Tenants lists every tenant (follows every page; local admin socket only;
+// used to keep every tenant's API key file out of every workerd sandbox).
 func (c *Client) Tenants(ctx context.Context) ([]Tenant, error) {
+	limit := 500
 	var out []Tenant
-	err := c.Do(ctx, "GET", "/v0/tenants", nil, &out)
-	return out, err
+	var cursor *string
+	for {
+		resp, err := c.V1().ListTenantsWithResponse(ctx, &v1.ListTenantsParams{Limit: &limit, Cursor: cursor})
+		if err != nil {
+			return nil, err
+		}
+		var pg Page[Tenant]
+		if err := result(resp.HTTPResponse, resp.Body, &pg); err != nil {
+			return nil, err
+		}
+		out = append(out, pg.Items...)
+		if pg.NextCursor == nil || *pg.NextCursor == "" {
+			return out, nil
+		}
+		cursor = pg.NextCursor
+	}
 }
 
-// Bundle fetches a deployment bundle (raw tar). bundleURL may be relative to
-// the mgmt base.
+// Bundle fetches a deployment bundle (raw tar). bundleURL is the
+// assignment's bundleURL (/v1/deployments/{id}/bundle), possibly absolute.
 func (c *Client) Bundle(ctx context.Context, bundleURL string) ([]byte, error) {
 	path := bundleURL
 	if u, err := url.Parse(bundleURL); err == nil && u.IsAbs() {
@@ -194,55 +326,136 @@ func (c *Client) Bundle(ctx context.Context, bundleURL string) ([]byte, error) {
 		}
 		path = strings.TrimPrefix(bundleURL, c.Base)
 	}
-	var b []byte
-	err := c.Do(ctx, "GET", path, nil, &b)
-	return b, err
+	const prefix, suffix = "/v1/deployments/", "/bundle"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return nil, fmt.Errorf("mgmtapi: bundle URL %q is not a /v1 bundle path", bundleURL)
+	}
+	id, err := url.PathUnescape(strings.TrimSuffix(strings.TrimPrefix(path, prefix), suffix))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.V1().GetDeploymentBundleWithResponse(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := result(resp.HTTPResponse, resp.Body, nil); err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
 }
 
+// CreateObject is POST /v1/objects: 202 for a new object, 200 for an
+// existing one (both success); a killed identity is a typed 410 "killed".
 func (c *Client) CreateObject(ctx context.Context, r CreateObjectRequest) (*CreateObjectResponse, error) {
+	body, err := jsonBody(r)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.V1().CreateObjectWithBodyWithResponse(ctx, "application/json", body)
+	if err != nil {
+		return nil, err
+	}
 	var out CreateObjectResponse
-	err := c.Do(ctx, "POST", "/v0/objects", r, &out)
-	return &out, err
+	if err := result(resp.HTTPResponse, resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
+// Credential is POST /v1/objects/{id}/credentials?epoch=N (201): a
+// single-use key, released only to the lease holder at epoch.
 func (c *Client) Credential(ctx context.Context, id string, epoch int64) (Credential, error) {
+	return c.credential(ctx, id, epoch, nil)
+}
+
+func (c *Client) credential(ctx context.Context, id string, epoch int64, reason *v1.CreateObjectCredentialParamsReason) (Credential, error) {
+	wait := 10
+	resp, err := c.V1().CreateObjectCredentialWithResponse(ctx, id, &v1.CreateObjectCredentialParams{Epoch: epoch, Wait: &wait, Reason: reason})
+	if err != nil {
+		return Credential{}, err
+	}
 	var out Credential
-	err := c.Do(ctx, "GET", fmt.Sprintf("/v0/objects/%s/credential?epoch=%d&wait=10", url.PathEscape(id), epoch), nil, &out)
+	err = result(resp.HTTPResponse, resp.Body, &out)
 	return out, err
 }
 
-// VolumeKey fetches the (tenant, workload) DO volume's data key; mgmt
-// releases it only to the namespace lease holder at epoch.
+// Remint is POST /v1/objects/{id}/credentials?epoch=N&reason=rejoin_rejected:
+// the saved node state was rejected by control; mgmt deletes the old
+// device, clears the certificate and mints again under the same hostname.
+// The new single-use key is returned.
+func (c *Client) Remint(ctx context.Context, id string, r RemintRequest) (Credential, error) {
+	reason := v1.CreateObjectCredentialParamsReason("rejoin_rejected")
+	return c.credential(ctx, id, r.Epoch, &reason)
+}
+
+// VolumeKey is POST /v1/volumes/{tenant}:{workload}/keys?epoch=N (201): the
+// (tenant, workload) DO volume's data key, released only to the lease
+// holder at epoch.
 func (c *Client) VolumeKey(ctx context.Context, tenantID, workload string, epoch int64) ([]byte, error) {
+	resp, err := c.V1().CreateVolumeKeyGrantWithResponse(ctx, tenantID+":"+workload, &v1.CreateVolumeKeyGrantParams{Epoch: epoch})
+	if err != nil {
+		return nil, err
+	}
 	var out VolumeKey
-	err := c.Do(ctx, "GET", fmt.Sprintf("/v0/volumes/key?tenant=%s&workload=%s&epoch=%d", url.QueryEscape(tenantID), url.QueryEscape(workload), epoch), nil, &out)
-	return out.Key, err
+	if err := result(resp.HTTPResponse, resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return out.Key, nil
 }
 
+// Ready is PATCH /v1/objects/{id} {"status":"ready", …} (merge patch).
 func (c *Client) Ready(ctx context.Context, id string, r ReadyRequest) error {
-	return c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/ready", r, nil)
+	body, err := jsonBody(map[string]any{"status": "ready", "nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "epoch": r.Epoch})
+	if err != nil {
+		return err
+	}
+	resp, err := c.V1().UpdateObjectWithBodyWithResponse(ctx, id, &v1.UpdateObjectParams{}, "application/merge-patch+json", body)
+	if err != nil {
+		return err
+	}
+	return result(resp.HTTPResponse, resp.Body, nil)
 }
 
-func (c *Client) Remint(ctx context.Context, id string, r RemintRequest) error {
-	return c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/remint", r, nil)
-}
-
+// Kill is DELETE /v1/objects/{id}?cascade=&reason= (202 KillResult).
 func (c *Client) Kill(ctx context.Context, id string, r KillRequest) (*KillResponse, error) {
+	params := &v1.DeleteObjectParams{Cascade: &r.Cascade}
+	if r.Reason != "" {
+		params.Reason = &r.Reason
+	}
+	resp, err := c.V1().DeleteObjectWithResponse(ctx, id, params)
+	if err != nil {
+		return nil, err
+	}
 	var out KillResponse
-	err := c.Do(ctx, "POST", "/v0/objects/"+url.PathEscape(id)+"/kill", r, &out)
-	return &out, err
+	if err := result(resp.HTTPResponse, resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
+// Audit is POST /v1/audit (201).
 func (c *Client) Audit(ctx context.Context, recs []AuditRecord) error {
-	return c.Do(ctx, "POST", "/v0/audit", AuditBatch{Records: recs}, nil)
+	body, err := jsonBody(AuditBatch{Records: recs})
+	if err != nil {
+		return err
+	}
+	resp, err := c.V1().AppendAuditWithBodyWithResponse(ctx, "application/json", body)
+	if err != nil {
+		return err
+	}
+	return result(resp.HTTPResponse, resp.Body, nil)
 }
 
-// NodeCert fetches the certificate of the tenant's object whose node is
-// stableNodeID (RT-01). A 404 means the node is not a twd object of that
-// tenant (ErrNoCert).
+// NodeCert is GET /v1/certificates/{stableNodeID}?tenant= (RT-01): the
+// certificate of the tenant's object whose node is stableNodeID. A 404
+// means the node is not a twd object of that tenant (ErrNoCert).
 func (c *Client) NodeCert(ctx context.Context, tenantID, stableNodeID string) (*NodeCert, error) {
+	resp, err := c.V1().GetCertificateWithResponse(ctx, stableNodeID, &v1.GetCertificateParams{Tenant: tenantID})
+	if err != nil {
+		return nil, err
+	}
 	var out NodeCert
-	err := c.Do(ctx, "GET", "/v0/certs/"+url.PathEscape(stableNodeID)+"?tenant="+url.QueryEscape(tenantID), nil, &out)
+	err = result(resp.HTTPResponse, resp.Body, &out)
 	if e, ok := AsError(err); ok && (e.Status == 404 || e.Code == CodeNotFound) {
 		return nil, ErrNoCert
 	}
@@ -256,8 +469,8 @@ func (c *Client) NodeCert(ctx context.Context, tenantID, stableNodeID string) (*
 // certificate exists and no lim applies.
 var ErrNoCert = errors.New("mgmtapi: no node certificate for that node")
 
-// ChainHash is the audit hash of rec chained to prev (contract v0
-// clarifications): body = the record JSON without "hash" and "hostSig"
+// ChainHash is the audit hash of rec chained to prev (the contract's
+// AuditRecord): body = the record JSON without "hash" and "hostSig"
 // (including "prevHash"), keys sorted, no whitespace, no HTML escaping;
 // hash = lowercase hex(SHA-256(body)).
 func ChainHash(prev string, rec AuditRecord) string {

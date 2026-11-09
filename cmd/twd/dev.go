@@ -99,7 +99,7 @@ func cmdDev(args []string) error {
 	var tr struct {
 		TenantID string `json:"tenantID"`
 	}
-	if err := mc.Do(ctx, "POST", "/v0/tenants", mgmtapi.Tenant{Tailnet: nettest.MagicDNSDomain, ControlURL: ctl.URL, MintMode: "static"}, &tr); err != nil {
+	if err := mc.Do(ctx, "POST", "/v1/tenants", mgmtapi.Tenant{Tailnet: nettest.MagicDNSDomain, ControlURL: ctl.URL, MintMode: "static"}, &tr); err != nil {
 		return err
 	}
 	hc, _ := mgmtapi.NewClient("unix://" + sock)
@@ -129,7 +129,7 @@ func cmdDev(args []string) error {
 			return hostd.ObjectStatus{}, err
 		}
 		var dr mgmtapi.DeployResponse
-		if err := mc.Do(ctx, "POST", "/v0/deployments", mgmtapi.DeployRequest{TenantID: tr.TenantID, Workload: a.Name, Bundle: tb}, &dr); err != nil {
+		if err := mc.Do(ctx, "POST", "/v1/deployments", mgmtapi.DeployRequest{TenantID: tr.TenantID, Workload: a.Name, Bundle: tb}, &dr); err != nil {
 			return hostd.ObjectStatus{}, err
 		}
 		dl := time.Now().Add(60 * time.Second)

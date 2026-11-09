@@ -148,6 +148,9 @@ func TestE2EMulti(t *testing.T) {
 			for _, id := range s.res.NodeIDs {
 				s.tracker.Track(id, "twd")
 			}
+			for _, id := range s.res.InfraNodeIDs {
+				s.tracker.Track(id, "twd-infra")
+			}
 			crep := s.tracker.Cleanup(cctx, prefix)
 			for _, k := range keys {
 				s.api.DeleteKey(cctx, k)

@@ -6,7 +6,7 @@
 //
 // The push API (mgmt → hostd) and status live on <run-dir>/hostd.sock:
 //
-//	POST /v0/push/kill {objectID, reason}   POST /v0/push/assignments   GET /v0/status
+//	POST /v1/push/kill {objectID, reason}   POST /v1/push/assignments   GET /v1/status
 package main
 
 import (
@@ -15,6 +15,8 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -26,8 +28,13 @@ import (
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
+	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd"
+	"tailscale.com/tsnet"
 )
+
+// hostNodeName is the tsnet hostname of a host's own node (mgmt.HostNodeName).
+func hostNodeName(hostID string) string { return "twd-host-" + hostID }
 
 func main() {
 	if err := run(); err != nil {
@@ -37,9 +44,17 @@ func main() {
 }
 
 func run() error {
+	if len(os.Args) > 1 && os.Args[1] == "join" {
+		return runJoin(os.Args[2:])
+	}
 	home, _ := os.UserHomeDir()
 	var (
-		mgmtAddr   = flag.String("mgmt", "unix://"+filepath.Join(home, ".twd", "run", "mgmt.sock"), "twd-mgmt address (unix:///path or http(s)://)")
+		mgmtAddr   = flag.String("mgmt", "", "twd-mgmt address: http(s)://twd-mgmt.<tailnet> over this host's node (default), or unix:///path with -local-dev")
+		localDev   = flag.Bool("local-dev", false, "talk to mgmt over its unix socket with the per-host token instead of this host's own tailnet node (twd dev, hermetic tests)")
+		tsDir      = flag.String("tsnet-dir", "", "state of this host's own tailnet node (default <data-dir>/tsnet)")
+		tsControl  = flag.String("tsnet-control-url", "", "operator tailnet control URL for this host's node (required unless -local-dev)")
+		joinFile   = flag.String("join-token-file", "", "TS_AUTHKEY=… file with the single-use join key mgmt minted (twd host add / twd up); waited for when the node has no state yet. Deleted after use")
+		pushPort   = flag.Int("push-port", 7474, "port on this host's node where mgmt pushes kills and assignment changes")
 		hostID     = flag.String("host-id", "", "this host's ID (default: hostname)")
 		dataDir    = flag.String("data-dir", filepath.Join(home, ".twd", "hostd"), "node state, DO storage, objects.json")
 		runDir     = flag.String("run-dir", "", "sockets and generated configs (short path; default a new /tmp dir)")
@@ -86,20 +101,65 @@ func run() error {
 	if *nodeBin == "" {
 		*nodeBin = os.Getenv("TWD_NODE")
 	}
-	mc, err := mgmtapi.NewClient(*mgmtAddr)
-	if err != nil {
-		return err
+	var mc *mgmtapi.Client
+	var ts *tsnet.Server
+	var pushLn net.Listener
+	if *localDev {
+		if *mgmtAddr == "" {
+			*mgmtAddr = "unix://" + filepath.Join(home, ".twd", "run", "mgmt.sock")
+		}
+		if mc, err = mgmtapi.NewClient(*mgmtAddr); err != nil {
+			return err
+		}
+		if strings.HasPrefix(*mgmtAddr, "unix://") || strings.HasPrefix(*mgmtAddr, "/") {
+			mc.TokenFile = *tokenFile
+		}
+	} else {
+		if *tsControl == "" {
+			return errors.New("-tsnet-control-url is required (normal operation is tsnet only; -local-dev for the unix socket)")
+		}
+		if *mgmtAddr == "" {
+			return errors.New("-mgmt is required: http(s)://twd-mgmt.<tailnet>")
+		}
+		if *tsDir == "" {
+			*tsDir = filepath.Join(*dataDir, "tsnet")
+		}
+		ts, err = joinHostNode(context.Background(), *tsDir, hostNodeName(*hostID), *tsControl, *joinFile, log)
+		if err != nil {
+			return err
+		}
+		defer ts.Close()
+		if mc, err = mgmtapi.NewClient(*mgmtAddr); err != nil {
+			return err
+		}
+		mc.HTTP = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: ts.Dial, MaxIdleConnsPerHost: 16}}
+		if pushLn, err = ts.Listen("tcp", fmt.Sprintf(":%d", *pushPort)); err != nil {
+			return fmt.Errorf("push listener on the node: %w", err)
+		}
+		// mgmt's node must be in our netmap before the first request.
+		wctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		for {
+			if err := mc.Do(wctx, "GET", "/v1/healthz", nil, nil); err == nil {
+				break
+			} else if wctx.Err() != nil {
+				cancel()
+				return fmt.Errorf("mgmt %s unreachable over the tailnet: %w (does the policy grant tag:twd-host → tag:twd-mgmt?)", *mgmtAddr, err)
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		cancel()
 	}
-	if strings.HasPrefix(*mgmtAddr, "unix://") || strings.HasPrefix(*mgmtAddr, "/") {
-		mc.TokenFile = *tokenFile
-	}
-	h, err := hostd.New(hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
+	hcfg := hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
 		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
 		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH, AllowSiblingEgress: *siblings,
 		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB,
 		VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, jailer: *vmJailer, helper: *vmHelper,
-			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)})
+			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)}
+	if pushLn != nil {
+		hcfg.PushListener, hcfg.PushPort = pushLn, *pushPort
+	}
+	h, err := hostd.New(hcfg)
 	if err != nil {
 		return err
 	}
@@ -109,12 +169,118 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	log.Info("twd-hostd running", "host", *hostID, "mgmt", *mgmtAddr, "push", h.PushSocket(), "workerd", wd, "sandbox", h.SandboxInfo())
+	transport := "tsnet"
+	if *localDev {
+		transport = "local-dev"
+	}
+	log.Info("twd-hostd running", "host", *hostID, "mgmt", *mgmtAddr, "transport", transport, "push", h.PushSocket(), "workerd", wd, "sandbox", h.SandboxInfo())
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Info("shutting down (node state kept for rejoin)")
 	return h.Close()
+}
+
+// joinHostNode opens (or joins) this host's own tailnet node. A node with
+// saved state re-opens without a key. Otherwise it needs the single-use
+// join key: from joinFile, which is waited for (twd up writes it after
+// mgmt minted it) and deleted once the node is up. The key never reaches
+// the log.
+func joinHostNode(ctx context.Context, dir, hostname, control, joinFile string, log *slog.Logger) (*tsnet.Server, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, err
+	}
+	ts := &tsnet.Server{Hostname: hostname, Dir: dir, ControlURL: control, AdvertiseTags: []string{"tag:twd-host"},
+		Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
+	hasState := false
+	if _, err := os.Stat(filepath.Join(dir, "tailscaled.state")); err == nil {
+		hasState = true
+	}
+	if !hasState {
+		if joinFile == "" {
+			return nil, errors.New("this host's node has no state yet: run `twd-hostd join --token-file <file>` (twd host add mints the key) or pass -join-token-file")
+		}
+		log.Info("waiting for the join key", "file", joinFile, "node", hostname)
+		for {
+			if k, err := tsapi.LoadEnvFile(joinFile, "TS_AUTHKEY"); err == nil && k != "" {
+				ts.AuthKey = k
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	}
+	uctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	st, err := ts.Up(uctx)
+	if err != nil {
+		ts.Close()
+		return nil, fmt.Errorf("join the operator tailnet as %s: %w", hostname, err)
+	}
+	if !hasState && joinFile != "" {
+		os.Remove(joinFile) // single use
+	}
+	tags := []string{}
+	if st.Self != nil && st.Self.Tags != nil {
+		tags = st.Self.Tags.AsSlice()
+	}
+	log.Info("tailnet node", "name", strings.TrimSuffix(st.Self.DNSName, "."), "tags", tags, "ips", st.TailscaleIPs)
+	return ts, nil
+}
+
+// runJoin is `twd-hostd join --token-file <file> [--token <key>] --control-url … --tsnet-dir …`:
+// join the operator tailnet once with the single-use key `twd host add`
+// minted, save the node state and exit. The service then starts without a key.
+func runJoin(args []string) error {
+	home, _ := os.UserHomeDir()
+	fs := flag.NewFlagSet("twd-hostd join", flag.ContinueOnError)
+	hostID := fs.String("host-id", "", "this host's ID (default: hostname)")
+	dataDir := fs.String("data-dir", filepath.Join(home, ".twd", "hostd"), "hostd state (the node state goes to <data-dir>/tsnet)")
+	tsDir := fs.String("tsnet-dir", "", "node state dir (default <data-dir>/tsnet)")
+	control := fs.String("control-url", "https://controlplane.tailscale.com", "operator tailnet control URL")
+	tokenFile := fs.String("token-file", "", "TS_AUTHKEY=… file with the join key (twd host add --json > …)")
+	token := fs.String("token", "", "the join key itself (prefer --token-file; argv is visible to other users)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *hostID == "" {
+		h, _ := os.Hostname()
+		*hostID = h
+	}
+	if *tsDir == "" {
+		*tsDir = filepath.Join(*dataDir, "tsnet")
+	}
+	key := *token
+	if *tokenFile != "" {
+		k, err := tsapi.LoadEnvFile(*tokenFile, "TS_AUTHKEY")
+		if err != nil {
+			return err
+		}
+		key = k
+	}
+	if key == "" {
+		return errors.New("twd-hostd join needs --token-file or --token")
+	}
+	if err := os.MkdirAll(*tsDir, 0o700); err != nil {
+		return err
+	}
+	ts := &tsnet.Server{Hostname: hostNodeName(*hostID), Dir: *tsDir, ControlURL: *control, AdvertiseTags: []string{"tag:twd-host"}, AuthKey: key,
+		Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	st, err := ts.Up(ctx)
+	if err != nil {
+		return fmt.Errorf("join: %w", err)
+	}
+	ts.Close()
+	if *tokenFile != "" {
+		os.Remove(*tokenFile)
+	}
+	fmt.Printf("joined as %s (%s); node state in %s. Start twd-hostd without a key now.\n", strings.TrimSuffix(st.Self.DNSName, "."), st.TailscaleIPs, *tsDir)
+	return nil
 }
 
 // vmAsset finds a microVM asset: next to the installed release

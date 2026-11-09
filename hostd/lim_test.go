@@ -1,7 +1,6 @@
 package hostd_test
 
 import (
-	"context"
 	"encoding/json"
 	"net/url"
 	"strings"
@@ -106,15 +105,15 @@ func TestTenantAuditIsOnlyANote(t *testing.T) {
 	var resp mgmtapi.AuditResponse
 	deadline := time.Now().Add(10 * time.Second)
 	for {
-		e.Mgmt.Do(context.Background(), "GET", "/v0/audit?object="+a.ID, nil, &resp)
+		resp = e.Audit(a.ID)
 		notes := 0
-		for _, rec := range resp.Records {
+		for _, rec := range resp.Items {
 			if rec.ObjectID != a.ID {
 				continue
 			}
 			switch rec.Kind {
 			case "allow", "deny", "kill", "spawn", "egress":
-				if rec.Source == "tenant" || strings.Contains(rec.Detail, "wired") {
+				if rec.Source == "tenant" || strings.Contains(string(rec.Detail), "wired") {
 					t.Fatalf("tenant content reached a privileged kind: %+v", rec)
 				}
 			case "tenant_note":
@@ -125,7 +124,7 @@ func TestTenantAuditIsOnlyANote(t *testing.T) {
 				if rec.TraceID == "trace-of-victim" || rec.ActingFor == "ceo@victim.example" || rec.Grant != "" || rec.Code != "" {
 					t.Fatalf("tenant controlled a platform field: %+v", rec)
 				}
-				if !strings.Contains(rec.Detail, `"claimedKind"`) || !strings.Contains(rec.Detail, `"parentHint":"trace-of-victim"`) || !strings.Contains(rec.Detail, "wired") {
+				if d := string(rec.Detail); !strings.Contains(d, `"claimedKind"`) || !strings.Contains(d, `"parentHint":"trace-of-victim"`) || !strings.Contains(d, "wired") {
 					t.Fatalf("note detail lost the tenant's claims: %s", rec.Detail)
 				}
 			}
@@ -134,11 +133,11 @@ func TestTenantAuditIsOnlyANote(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("want 4 tenant_note records, saw %d (%d records)", notes, len(resp.Records))
+			t.Fatalf("want 4 tenant_note records, saw %d (%d records)", notes, len(resp.Items))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	if !resp.Verified {
-		t.Fatalf("chain not verified: %v", resp.Problems)
+		t.Fatalf("chain not verified: %v", resp.Chains)
 	}
 }

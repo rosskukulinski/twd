@@ -259,7 +259,7 @@ func (h *Host) create(ctx context.Context, w *workload, class, name string, pare
 	h.mu.Unlock()
 	h.saveObjects()
 	if parent != nil {
-		h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "spawn", Detail: "by " + parent.ID + " caps " + string(caps), TraceID: newTraceID()})
+		h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "spawn", Detail: mgmtapi.Note("by " + parent.ID + " caps " + string(caps)), TraceID: newTraceID()})
 	}
 	h.log.Info("object created", "object", o.ID, "class", class, "name", name, "hostname", hn, "acting_for", actingFor)
 	return o, nil
@@ -454,7 +454,7 @@ func (h *Host) killLocal(objectID, reason string) {
 			inst.admin(map[string]any{"kind": "admin", "op": "kill", "class": o.Class, "name": o.Name, "reason": reason})
 		}
 	}
-	h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "kill", Detail: reason, TraceID: newTraceID()})
+	h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "kill", Detail: mgmtapi.Note(reason), TraceID: newTraceID()})
 	h.saveObjects()
 	h.log.Info("object killed", "object", o.ID, "reason", reason, "ms", time.Since(st).Milliseconds())
 }

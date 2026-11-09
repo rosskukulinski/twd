@@ -75,7 +75,10 @@ func checkIfMatch(r *http.Request, current any) error {
 func pageParams(limit *int, cursor *string) (Page, int, error) {
 	n := PageDefaultLimit
 	if limit != nil {
-		n = ClampLimit(*limit)
+		if *limit <= 0 || *limit > PageMaxLimit {
+			return Page{}, 0, errf(400, "bad_request", "limit must be between 1 and %d", PageMaxLimit)
+		}
+		n = *limit
 	}
 	pg := Page{Limit: n + 1}
 	if cursor != nil {
@@ -269,7 +272,11 @@ func (a *v1api) GetStatus(w http.ResponseWriter, r *http.Request) {
 	if principalOf(r.Context()).Kind == "local" {
 		transport = "local-dev"
 	}
-	writeJSON(w, 200, map[string]any{"ok": true, "transport": transport, "listeners": a.s.Listeners,
+	listeners := a.s.Listeners
+	if listeners == nil {
+		listeners = []string{}
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "transport": transport, "listeners": listeners,
 		"pendingDeviceDeletes": st.PendingDeletes, "hosts": map[string]int{"total": st.Hosts, "live": st.LiveHosts},
 		"tenants": st.Tenants, "objects": st.Objects, "version": a.s.Version})
 }
@@ -582,20 +589,21 @@ func (a *v1api) GetHost(w http.ResponseWriter, r *http.Request, id v1.HostID, _ 
 }
 
 func (a *v1api) RegisterHost(w http.ResponseWriter, r *http.Request, id v1.HostID) {
-	var req RegisterRequest
-	if err := readJSON(r, &req); err != nil {
-		writeErr(w, r, err)
-		return
-	}
-	// The hostd-additions shape (push.port / push.url) and the flat one.
-	var push struct {
+	var body struct {
+		RegisterRequest
 		Push *struct {
 			Port int    `json:"port"`
 			URL  string `json:"url"`
 		} `json:"push"`
 	}
-	r.Body.Close()
-	_ = push
+	if err := readJSON(r, &body); err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	req := body.RegisterRequest
+	if body.Push != nil { // the spec's HostRegistration.push {url | port}
+		req.PushURL, req.PushPort = body.Push.URL, body.Push.Port
+	}
 	req.HostID = id
 	p := principalOf(r.Context())
 	if p.Kind == "host" && p.HostID != "" && p.HostID != id {
@@ -846,6 +854,17 @@ func (a *v1api) CreateObject(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := a.s.M.CreateObject(r.Context(), req)
 	if err != nil {
+		var e *Error
+		if errors.As(err, &e) && e.Code == "killed" {
+			if objs, lerr := a.s.M.store.ListObjects(r.Context(), ObjectFilter{TenantID: req.TenantID, Namespace: req.Namespace, Status: []string{StatusKilled}}); lerr == nil {
+				for _, o := range objs {
+					if o.Name == req.ObjectName && (req.Workload == "" || o.Workload == req.Workload) {
+						a.writeGone(w, r, o)
+						return
+					}
+				}
+			}
+		}
 		writeErr(w, r, err)
 		return
 	}
@@ -917,10 +936,6 @@ func (a *v1api) UpdateObject(w http.ResponseWriter, r *http.Request, id v1.Objec
 		writeErr(w, r, err)
 		return
 	}
-	if cur.Status == StatusKilled {
-		a.writeGone(w, r, cur)
-		return
-	}
 	if err := checkIfMatch(r, a.objectView(r, cur, nil)); err != nil {
 		writeErr(w, r, err)
 		return
@@ -933,6 +948,12 @@ func (a *v1api) UpdateObject(w http.ResponseWriter, r *http.Request, id v1.Objec
 	p := principalOf(r.Context())
 	_, ready := body["status"]
 	_, ttl := body["ttl"]
+	if cur.Status == StatusKilled && !ready {
+		// A ready report still goes through Ready: it deletes the device
+		// that joined after the kill, then answers 410.
+		a.writeGone(w, r, cur)
+		return
+	}
 	for k := range body {
 		switch k {
 		case "status", "nodeID", "stableNodeID", "magicDNS", "epoch", "ttl":
@@ -1029,6 +1050,10 @@ func (a *v1api) DeleteObject(w http.ResponseWriter, r *http.Request, id v1.Objec
 }
 
 func (a *v1api) CreateObjectCredential(w http.ResponseWriter, r *http.Request, id v1.ObjectID, params v1.CreateObjectCredentialParams) {
+	if params.Epoch <= 0 {
+		writeErr(w, r, errf(400, "bad_request", "epoch query parameter must be positive"))
+		return
+	}
 	wait := 10 * time.Second
 	if params.Wait != nil && *params.Wait >= 0 && *params.Wait <= 30 {
 		wait = time.Duration(*params.Wait) * time.Second
@@ -1192,6 +1217,10 @@ func (a *v1api) CreateVolumeKeyGrant(w http.ResponseWriter, r *http.Request, id 
 		writeErr(w, r, errf(400, "bad_request", "volume ID must be <tenantID>:<workload>"))
 		return
 	}
+	if params.Epoch <= 0 {
+		writeErr(w, r, errf(400, "bad_request", "epoch query parameter must be positive"))
+		return
+	}
 	w.Header().Set("Cache-Control", "no-store")
 	host := hostOf(r)
 	key, err := a.s.M.VolumeKey(r.Context(), tenantID, workload, host, params.Epoch)
@@ -1235,30 +1264,36 @@ func (s *Server) roleAllowed(p Principal, role string) bool {
 	return s.allowed(p, roles)
 }
 
-// roleMiddleware gates every generated route by the spec's x-twd-role and
-// binds tsnet hosts to their own /v1/hosts/{id} records.
-func (s *Server) roleMiddleware(roles map[string]string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			p := principalOf(r.Context())
-			role, known := roles[r.Pattern]
-			if !known {
-				writeErr(w, r, errf(404, "not_found", "%s %s is not a /v1 route", r.Method, r.URL.Path))
+// roleGate gates every generated route by the spec's x-twd-role and binds
+// tsnet hosts to their own /v1/hosts/{id} records. It runs before the
+// generated parameter binding (mux.Handler resolves the pattern without
+// serving), so a malformed request from the wrong role is a 403, not a 400.
+func (s *Server) roleGate(roles map[string]string, mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := principalOf(r.Context())
+		_, pattern := mux.Handler(r)
+		role, known := roles[pattern]
+		if !known {
+			if p.Kind == "" {
+				writeErr(w, r, errf(401, "no_identity", "unauthenticated"))
 				return
 			}
-			if !s.roleAllowed(p, role) {
-				writeErr(w, r, errf(403, "forbidden", "caller (%s) may not call %s %s", p.Kind, r.Method, r.URL.Path))
+			writeErr(w, r, errf(404, "not_found", "%s %s is not a /v1 route (see api/openapi.yaml)", r.Method, r.URL.Path))
+			return
+		}
+		if !s.roleAllowed(p, role) {
+			writeErr(w, r, errf(403, "forbidden", "caller (%s) may not call %s %s", p.Kind, r.Method, r.URL.Path))
+			return
+		}
+		if p.Kind == "host" && p.HostID != "" && strings.HasPrefix(pattern[strings.Index(pattern, " ")+1:], "/v1/hosts/{id}") {
+			// /v1/hosts/{id}[/...]: the id is the third path element.
+			if parts := strings.SplitN(strings.TrimPrefix(r.URL.Path, "/"), "/", 4); len(parts) >= 3 && parts[2] != p.HostID {
+				writeErr(w, r, errf(403, "forbidden", "host %s may not act as host %s", p.HostID, parts[2]))
 				return
 			}
-			if p.Kind == "host" && strings.HasPrefix(r.Pattern, "PUT /v1/hosts/{id}") || p.Kind == "host" && strings.HasPrefix(r.Pattern, "GET /v1/hosts/{id}") {
-				if id := r.PathValue("id"); id != "" && p.HostID != "" && id != p.HostID {
-					writeErr(w, r, errf(403, "forbidden", "host %s may not act as host %s", p.HostID, id))
-					return
-				}
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // Handler returns the /v1 API mux: generated routing + parameter parsing
@@ -1270,21 +1305,13 @@ func (s *Server) Handler() http.Handler {
 	}
 	mux := http.NewServeMux()
 	v1.HandlerWithOptions(&v1api{s: s}, v1.StdHTTPServerOptions{
-		BaseRouter:  mux,
-		Middlewares: []v1.MiddlewareFunc{s.roleMiddleware(roles)},
+		BaseRouter: mux,
 		ErrorHandlerFunc: func(w http.ResponseWriter, r *http.Request, err error) {
 			writeErr(w, r, errf(400, "bad_request", "%v", err))
 		},
 	})
-	// Anything else is a typed 404 (there is no /v0).
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if principalOf(r.Context()).Kind == "" {
-			writeErr(w, r, errf(401, "no_identity", "unauthenticated"))
-			return
-		}
-		writeErr(w, r, errf(404, "not_found", "%s %s is not a /v1 route (see api/openapi.yaml)", r.Method, r.URL.Path))
-	})
-	return mux
+	// Anything else (there is no /v0) is a typed 404 from the gate.
+	return s.roleGate(roles, mux)
 }
 
 // pendingIDs lists objects whose device delete is scheduled.

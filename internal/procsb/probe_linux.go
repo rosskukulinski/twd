@@ -52,7 +52,7 @@ func probe(op string, args []string) error {
 		// A server that refuses sandboxed peers accepts, then closes:
 		// a request must get an answer to count as connected.
 		c.SetDeadline(time.Now().Add(3 * time.Second))
-		if _, err := c.Write([]byte("GET /v0/status HTTP/1.0\r\n\r\n")); err != nil {
+		if _, err := c.Write([]byte("GET /v1/status HTTP/1.0\r\n\r\n")); err != nil {
 			return err
 		}
 		b := make([]byte, 1)

@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-m2mgmt test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -211,7 +211,6 @@ lint: api-check
 	$(GO) vet ./...
 	$(GO) vet -tags e2e ./e2e/local/...
 	$(GO) vet -tags e2ereal ./e2e/real/...
-	$(GO) vet -tags m2mgmt ./e2e/m2mgmt/...
 	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/... ./cmd/twd-vmhelper/... ./cmd/twd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
@@ -234,12 +233,6 @@ clean:
 gen-js: $(WORKERD)
 	node_modules/.bin/esbuild js/packages/tailnet/src/runtime.ts --bundle --format=esm --platform=neutral \
 		--target=es2022 --legal-comments=none --log-level=warning --outfile=hostd/gen/js/twd-rt.js
-
-## test-m2mgmt: hostd against the real twd-mgmt built from origin/m2-mgmt (hermetic).
-test-m2mgmt: deps
-	rm -rf /tmp/twd-m2src && mkdir -p /tmp/twd-m2src && git fetch -q origin m2-mgmt && git archive origin/m2-mgmt | tar -x -C /tmp/twd-m2src
-	cd /tmp/twd-m2src && $(GO) build -o /tmp/twd-m2src/twd-mgmt ./cmd/twd-mgmt
-	TWD_MGMT_BIN=/tmp/twd-m2src/twd-mgmt $(GO) test -tags m2mgmt -count=1 -v -timeout 5m ./e2e/m2mgmt/...
 
 ## test-node: the opt-in Node process tier + Vercel Workflow (hermetic; npm ci of the pinned deps in e2e/node).
 test-node: deps

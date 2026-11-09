@@ -19,7 +19,7 @@ import (
 	"github.com/rosskukulinski/twd/guest/proto"
 )
 
-// VMCheckReport is POST /v0/vm/check: a workload microVM's guest stats,
+// VMCheckReport is POST /v1/vm/check: a workload microVM's guest stats,
 // DO volume latency and (optionally) the no-keys-in-guest scan. It never
 // contains key material: only counts and needle *names*.
 type VMCheckReport struct {

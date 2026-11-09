@@ -1,6 +1,7 @@
-// Package mgmtapi holds the wire types of the mgmt ⇄ hostd contract
-// (docs/contracts/mgmt-api.md, v0 plus the backward-compatible v0.1
-// additions marked "v0.1"), and a small client used by twd-hostd.
+// Package mgmtapi is twd-hostd's (and the twd CLI's) client for the mgmt
+// /v1 API. The wire is the generated client in hostd/mgmtapi/v1 (from
+// api/openapi.yaml, the contract's source of truth); the hostd-facing
+// types here are the subset hostd works with, converted at the edge.
 package mgmtapi
 
 import "encoding/json"
@@ -41,9 +42,11 @@ type Tenant struct {
 	// OBOPublicKey (RT-01) is the base64 Ed25519 key that verifies this
 	// tenant's node certificates. hostd pins it when it opens the tenant.
 	OBOPublicKey string `json:"oboPublicKey,omitempty"`
+	CreatedAt    int64  `json:"createdAt"`
+	UpdatedAt    int64  `json:"updatedAt"`
 }
 
-// NodeCert is GET /v0/certs/{stableNodeID}?tenant= (RT-01): the sender's
+// NodeCert is GET /v1/certificates/{stableNodeID}?tenant= (RT-01): the sender's
 // node certificate, signed by the tenant's OBO root key, and its payload.
 type NodeCert struct {
 	TenantID     string           `json:"tenantID"`
@@ -73,11 +76,15 @@ type RegisterRequest struct {
 	HostID        string   `json:"hostID"`
 	CapacityNodes int      `json:"capacityNodes"`
 	Tiers         []string `json:"tiers"`
-	// PushURL (v0.1, optional) is where mgmt may push kills and assignment
-	// changes ("unix:///path/hostd.sock" or "http://..."); see hostd push API.
+	// PushURL is where mgmt pushes kills and assignment changes on the
+	// local-dev socket ("unix:///path/hostd.sock"); see hostd's push API.
 	PushURL string `json:"pushURL,omitempty"`
-	// AuditPubKey (v0 clarification): base64 ed25519 key for hostSig.
+	// PushPort is hostd's push listener on its own tsnet node; mgmt pushes
+	// to the WhoIs node's address at this port (tsnet transport).
+	PushPort int `json:"pushPort,omitempty"`
+	// AuditPubKey: base64 ed25519 key for hostSig.
 	AuditPubKey string `json:"auditPubKey,omitempty"`
+	Pool        string `json:"pool,omitempty"`
 }
 
 type OK struct {
@@ -108,16 +115,15 @@ type KillOrder struct {
 	Reason   string `json:"reason,omitempty"`
 }
 
+// HeartbeatResponse is PUT /v1/hosts/{id}/status's reply.
 type HeartbeatResponse struct {
-	OK     bool     `json:"ok"`
 	Revoke []string `json:"revoke"`
-	// Kill (v0.1, optional) lists objects mgmt killed since the last
-	// heartbeat (the fallback when a push could not be delivered).
-	Kill []KillOrder `json:"kill,omitempty"`
-	// RevokeObjects (v0 clarification) lists objects killed in the last
-	// 10 min in namespaces this host holds; they repeat, so kills must be
-	// idempotent. This is mgmt's kill delivery path.
-	RevokeObjects []string `json:"revokeObjects,omitempty"`
+	// RevokeObjects lists objects killed in the last 10 min in namespaces
+	// this host holds; they repeat, so kills must be idempotent. This is
+	// mgmt's kill delivery fallback (the push is the fast path).
+	RevokeObjects []string `json:"revokeObjects"`
+	// AssignmentsChanged hints that a push could not be delivered.
+	AssignmentsChanged bool `json:"assignmentsChanged,omitempty"`
 }
 
 type DeployRequest struct {
@@ -127,17 +133,26 @@ type DeployRequest struct {
 }
 
 type Endpoint struct {
+	ObjectID string `json:"objectID,omitempty"`
 	Node     string `json:"node"`
 	MagicDNS string `json:"magicDNS"`
+	Status   string `json:"status"`
 }
 
+// DeployResponse is the Deployment resource (POST /v1/deployments 202,
+// GET /v1/deployments/{id}).
 type DeployResponse struct {
-	DeploymentID string   `json:"deploymentID"`
-	Host         string   `json:"host"`
-	Endpoint     Endpoint `json:"endpoint"`
-	// v0.1 (GET /v0/deployments/{id})
-	Status string `json:"status,omitempty"`
-	Error  string `json:"error,omitempty"`
+	DeploymentID string          `json:"deploymentID"`
+	TenantID     string          `json:"tenantID,omitempty"`
+	Workload     string          `json:"workload,omitempty"`
+	Host         string          `json:"host"`
+	Epoch        int64           `json:"epoch"`
+	Endpoint     Endpoint        `json:"endpoint"`
+	Status       string          `json:"status,omitempty"`
+	Error        string          `json:"error,omitempty"`
+	Namespaces   []NamespaceSpec `json:"namespaces"`
+	DeployedBy   string          `json:"deployedBy,omitempty"`
+	CreatedAt    int64           `json:"createdAt"`
 }
 
 type NamespaceSpec struct {
@@ -155,10 +170,10 @@ type Assignment struct {
 	Epoch        int64           `json:"epoch"`
 	// WorkloadTags (v0.1, optional) are the workload entry node's tags.
 	WorkloadTags []string `json:"workloadTags,omitempty"`
-	// v0 clarifications (M2): the lease name, tailnet and control URL.
-	Lease      string `json:"lease,omitempty"`
-	Tailnet    string `json:"tailnet,omitempty"`
-	ControlURL string `json:"controlURL,omitempty"`
+	Lease        string   `json:"lease"`
+	Tailnet      string   `json:"tailnet"`
+	ControlURL   string   `json:"controlURL,omitempty"`
+	CreatedAt    int64    `json:"createdAt"`
 }
 
 type ObjectRef struct {
@@ -182,30 +197,44 @@ type CreateObjectRequest struct {
 	TraceID   string `json:"traceID,omitempty"`
 }
 
+// CreateObjectResponse is the part of the Object resource hostd uses
+// after POST /v1/objects (202 new, 200 existing).
 type CreateObjectResponse struct {
 	ObjectID string   `json:"objectID"`
 	Status   string   `json:"status"`
 	Tags     []string `json:"tags"`
-	Hostname string   `json:"hostname,omitempty"` // v0 clarification
+	Hostname string   `json:"hostname,omitempty"`
 }
 
+// Credential is POST /v1/objects/{id}/credentials (201): a single-use key.
 type Credential struct {
-	AuthKey string `json:"authKey"`
+	AuthKey    string   `json:"authKey"`
+	ExpiresAt  int64    `json:"expiresAt"`
+	Tags       []string `json:"tags"`
+	Hostname   string   `json:"hostname"`
+	Ephemeral  bool     `json:"ephemeral"`
+	ControlURL string   `json:"controlURL,omitempty"`
+	Reminted   bool     `json:"reminted,omitempty"`
 }
 
 // String never prints the key.
 func (c Credential) String() string { return "mgmtapi.Credential{redacted}" }
 
-// VolumeKey is GET /v0/volumes/key (L3): a workload's DO volume data key.
+// VolumeKey is POST /v1/volumes/{tenant}:{workload}/keys (201): a
+// workload's DO volume data key grant.
 type VolumeKey struct {
-	Key []byte `json:"key"`
+	VolumeID string `json:"volumeID,omitempty"`
+	Epoch    int64  `json:"epoch,omitempty"`
+	Key      []byte `json:"key"`
 }
 
 // String never prints the key.
 func (VolumeKey) String() string { return "mgmtapi.VolumeKey{redacted}" }
 
-// RemintRequest is POST /v0/objects/{id}/remint: the saved node state was
-// rejected by control; mint again under the same hostname.
+// RemintRequest asks for a re-mint (POST /v1/objects/{id}/credentials
+// ?reason=rejoin_rejected): the saved node state was rejected by control;
+// mgmt deletes the old device, clears the certificate and mints again
+// under the same hostname.
 type RemintRequest struct {
 	Epoch  int64  `json:"epoch,omitempty"`
 	Reason string `json:"reason"`
@@ -223,24 +252,41 @@ type KillRequest struct {
 	Reason  string `json:"reason"`
 }
 
+// KillResponse is DELETE /v1/objects/{id} (202 KillResult).
 type KillResponse struct {
-	Killed []string `json:"killed"`
+	Killed          []string          `json:"killed"`
+	Pushed          []string          `json:"pushed,omitempty"`
+	DevicesDeleted  []string          `json:"devicesDeleted"`
+	DevicesDeleting []string          `json:"devicesDeleting,omitempty"`
+	Errors          map[string]string `json:"errors,omitempty"`
 }
 
+// Object is the /v1 Object resource (the fields hostd and the fakes use).
 type Object struct {
-	ObjectID   string          `json:"objectID"`
-	TenantID   string          `json:"tenantID"`
-	Workload   string          `json:"workload,omitempty"`
-	Namespace  string          `json:"namespace"`
-	ObjectName string          `json:"objectName"`
-	Parent     string          `json:"parent,omitempty"`
-	Status     string          `json:"status"` // pending | ready | killed
-	Tags       []string        `json:"tags"`
-	Caps       json.RawMessage `json:"caps,omitempty"`
-	NodeID     string          `json:"nodeID,omitempty"`
-	MagicDNS   string          `json:"magicDNS,omitempty"`
-	Host       string          `json:"host,omitempty"`
-	Lineage    []string        `json:"lineage,omitempty"` // root first
+	ObjectID     string          `json:"objectID"`
+	TenantID     string          `json:"tenantID"`
+	Workload     string          `json:"workload"`
+	Namespace    string          `json:"namespace"`
+	ObjectName   string          `json:"objectName"`
+	Hostname     string          `json:"hostname"`
+	DeploymentID string          `json:"deploymentID"`
+	Lease        string          `json:"lease"`
+	Parent       string          `json:"parent,omitempty"`
+	Root         string          `json:"root"`
+	Depth        int             `json:"depth"`
+	Ephemeral    bool            `json:"ephemeral"`
+	Status       string          `json:"status"` // pending | minted | ready | killed | failed
+	Tags         []string        `json:"tags"`
+	Caps         json.RawMessage `json:"caps,omitempty"`
+	NodeID       string          `json:"nodeID,omitempty"`
+	StableNodeID string          `json:"stableNodeID,omitempty"`
+	MagicDNS     string          `json:"magicDNS,omitempty"`
+	Host         string          `json:"host,omitempty"`
+	Lineage      []string        `json:"lineage"` // root first, self last
+	Children     []string        `json:"children,omitempty"`
+	KillReason   string          `json:"killReason,omitempty"`
+	CreatedAt    int64           `json:"createdAt"`
+	UpdatedAt    int64           `json:"updatedAt"`
 }
 
 type AuditRecord struct {
@@ -258,20 +304,47 @@ type AuditRecord struct {
 	TraceID   string `json:"traceID"`
 	ActingFor string `json:"actingFor,omitempty"`
 	TenantID  string `json:"tenantID,omitempty"`
-	Detail    string `json:"detail,omitempty"` // v0.1, optional
-	PrevHash  string `json:"prevHash"`
-	Hash      string `json:"hash"`
-	HostSig   string `json:"hostSig"`
+	// Detail is a JSON object (the contract's AuditRecord.detail).
+	Detail   json.RawMessage `json:"detail,omitempty"`
+	PrevHash string          `json:"prevHash"`
+	Hash     string          `json:"hash"`
+	HostSig  string          `json:"hostSig,omitempty"`
+	// Chain and Seq are assigned by mgmt (read side).
+	Chain string `json:"chain,omitempty"`
+	Seq   int64  `json:"seq,omitempty"`
+}
+
+// Note wraps free text as an audit detail object.
+func Note(s string) json.RawMessage {
+	b, _ := json.Marshal(map[string]string{"note": s})
+	return b
 }
 
 type AuditBatch struct {
 	Records []AuditRecord `json:"records"`
 }
 
+// ChainStatus is one chain's verification.
+type ChainStatus struct {
+	Chain    string `json:"chain"`
+	OK       bool   `json:"ok"`
+	Records  int    `json:"records"`
+	BrokenAt int64  `json:"brokenAt,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+// AuditResponse is one page of GET /v1/audit.
 type AuditResponse struct {
-	Records  []AuditRecord `json:"records"`
-	Verified bool          `json:"verified"`
-	Problems []string      `json:"problems,omitempty"`
+	Items      []AuditRecord `json:"items"`
+	NextCursor *string       `json:"nextCursor"`
+	Chains     []ChainStatus `json:"chains"`
+	Verified   bool          `json:"verified"`
+}
+
+// Page is the generic /v1 list envelope.
+type Page[T any] struct {
+	Items      []T     `json:"items"`
+	NextCursor *string `json:"nextCursor"`
 }
 
 // WorkloadNamespace is the object namespace of a workload's entry node
@@ -279,7 +352,7 @@ type AuditResponse struct {
 // the twd.jsonc tailnet.tags).
 const WorkloadNamespace = "_workload"
 
-// Namespace returns the object namespace for POST /v0/objects: the DO
+// Namespace returns the object namespace for POST /v1/objects: the DO
 // class name, or WorkloadNamespace for the workload entry node (class "").
 func Namespace(workload, class string) string {
 	if class == "" {

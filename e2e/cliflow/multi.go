@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -132,17 +131,20 @@ func (m *MultiEnv) Run() {
 
 	// twd up: the operator tailnet is tenant A.
 	upArgs := []string{"up", "--tailnet", m.A.Tailnet, "--api-key-file", m.A.APIKeyFile, "--yes", "--ephemeral",
-		"--hostname-prefix", m.Prefix, "--control-url", m.A.ControlURL, "--allow-sibling-egress"}
+		"--hostname-prefix", m.Prefix, "--control-url", m.A.ControlURL, "--allow-sibling-egress",
+		"--mgmt-hostname", m.Prefix + "mgmt", "--host-id", strings.TrimSuffix(m.Prefix, "-")}
 	if m.TSAPIURL != "" {
 		upArgs = append(upArgs, "--tsapi-url", m.TSAPIURL)
 	}
 	var up struct {
-		TenantID string `json:"tenantID"`
-		HostID   string `json:"hostID"`
+		TenantID   string `json:"tenantID"`
+		HostID     string `json:"hostID"`
+		MgmtNodeID string `json:"mgmtNodeID"`
 	}
 	d := m.MustJSON(&up, upArgs...)
 	m.A.TenantID = up.TenantID
 	res.Numbers["up_ready_ms"] = msOf(d)
+	m.Env.TrackInfra(up.MgmtNodeID)
 
 	// twd tenant add: tenant B on its own tailnet.
 	var ta struct {
@@ -403,21 +405,24 @@ func (m *MultiEnv) Run() {
 				}
 				got = append(got, dn.what+" denied")
 			}
-			// mgmt's socket needs the per-host token (RT-03); the probe is
-			// given it on the command line so that a refusal proves the
-			// sandbox blocks the socket, not just the token.
-			tok := strings.TrimSpace(string(must(os.ReadFile(filepath.Join(m.StateDir, "hostd", "mgmt.token")))))
-			if err := probe("/usr/bin/curl", "-sf", "--max-time", "3", "-H", "Twd-Host-Token: "+tok, "--unix-socket", mgmtSock, "http://twd-mgmt/v0/healthz"); err == nil {
-				t.Fatalf("(d) tenant %s's workerd sandbox can reach mgmt's admin socket", src.Key)
+			// Normal operation is tsnet only: mgmt has no unix socket. The
+			// operator console is mgmt's loopback proxy, whose credential
+			// (0600, under mgmt's state) must be out of every sandbox's
+			// reach; the host's node state too.
+			if _, err := os.Stat(mgmtSock); err == nil {
+				t.Fatalf("(d) mgmt serves a unix socket in normal operation (%s)", mgmtSock)
 			}
-			if err := exec.Command("/usr/bin/curl", "-sf", "--max-time", "3", "-H", "Twd-Host-Token: "+tok, "--unix-socket", mgmtSock, "http://twd-mgmt/v0/healthz").Run(); err != nil {
-				t.Fatalf("(d) control: mgmt socket unreachable outside the sandbox too: %v", err)
+			lb := filepath.Join(m.StateDir, "mgmt", "loopback.json")
+			if _, err := os.Stat(lb); err != nil {
+				t.Fatalf("(d) control: mgmt's loopback descriptor %s is missing: %v", lb, err)
 			}
-			// … and without the token the socket admits nobody, sandbox or not (RT-03).
-			if out, _ := exec.Command("/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "3", "--unix-socket", mgmtSock, "http://twd-mgmt/v0/tenants").Output(); strings.TrimSpace(string(out)) != "401" {
-				t.Fatalf("(d) mgmt socket without the host token answered %q, want 401", out)
+			if err := probe("/bin/cat", lb); err == nil {
+				t.Fatalf("(d) tenant %s's workerd sandbox can read mgmt's loopback credential", src.Key)
 			}
-			got = append(got, "mgmt admin socket denied (and 401 without the host token)")
+			if err := probe("/bin/ls", filepath.Join(m.StateDir, "hostd", "tsnet")); err == nil {
+				t.Fatalf("(d) tenant %s's workerd sandbox can list the host node's state", src.Key)
+			}
+			got = append(got, "no mgmt unix socket; loopback credential and host node state denied")
 			if err := probe("/bin/ls", src.hostDOStorage); err != nil {
 				t.Fatalf("(d) tenant %s's sandbox can't list its own DO storage: %v", src.Key, err)
 			}

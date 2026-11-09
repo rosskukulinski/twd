@@ -46,7 +46,7 @@ func doctorMicroVM(s *state) (string, string, string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		var hv hostd.StatusView
-		if s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv) == nil {
+		if s.hostd().Do(ctx, "GET", "/v1/status", nil, &hv) == nil {
 			n, vms := 0, 0
 			for _, w := range hv.Workloads {
 				if w.Tier == "microvm" {

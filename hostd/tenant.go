@@ -158,10 +158,15 @@ func (k *keySource) AuthKey(ctx context.Context, req netd.KeyRequest) (string, e
 		// new node ID with /ready.
 		h.log.Warn("saved node state rejected by control; re-minting under the same hostname", "object", o.ID, "hostname", o.Hostname)
 		rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
-		err := h.mgmt.Remint(rctx, o.ID, mgmtapi.RemintRequest{Epoch: w.epochNow(), Reason: "saved node state rejected by control (NeedsLogin)"})
+		c, err := h.mgmt.Remint(rctx, o.ID, mgmtapi.RemintRequest{Epoch: w.epochNow(), Reason: "saved node state rejected by control (NeedsLogin)"})
 		rcancel()
+		if err == nil && c.AuthKey != "" {
+			return c.AuthKey, nil // the re-mint answers with the new key
+		}
 		if err != nil {
-			return "", fmt.Errorf("hostd: remint %s: %w", o.ID, err)
+			if e, ok := mgmtapi.AsError(err); !ok || e.Code != mgmtapi.CodeIdentityPending {
+				return "", fmt.Errorf("hostd: remint %s: %w", o.ID, err)
+			}
 		}
 	}
 	backoff := 100 * time.Millisecond

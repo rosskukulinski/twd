@@ -188,7 +188,7 @@ func TenantAuditRecord(objectID, traceID, actingFor string, rec map[string]any) 
 		q, _ := json.Marshal(string(b[:maxTenantNoteBytes]) + "…")
 		b = []byte(`{"truncated":true,"note":` + string(q) + `}`)
 	}
-	ar.Detail = string(b)
+	ar.Detail = b
 	return ar
 }
 
@@ -266,7 +266,7 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 			}
 			h.mu.Unlock()
 			if late {
-				h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "principal", ActingFor: req.ActingFor, Detail: "acting for " + req.ActingFor, TraceID: newTraceID()})
+				h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "principal", ActingFor: req.ActingFor, Detail: mgmtapi.Note("acting for " + req.ActingFor), TraceID: newTraceID()})
 				h.saveObjects()
 			}
 			writeJSON(w, 200, objView(o))
@@ -391,7 +391,7 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 
 func (h *Host) pushAPI() http.Handler {
 	m := http.NewServeMux()
-	m.HandleFunc("POST /v0/push/kill", func(w http.ResponseWriter, r *http.Request) {
+	m.HandleFunc("POST /v1/push/kill", func(w http.ResponseWriter, r *http.Request) {
 		var k mgmtapi.KillOrder
 		if err := json.NewDecoder(r.Body).Decode(&k); err != nil || k.ObjectID == "" {
 			writeAPIError(w, &apiError{Code: "bad_request", Detail: "objectID required"})
@@ -402,20 +402,20 @@ func (h *Host) pushAPI() http.Handler {
 	})
 	// twd down --purge: forget killed objects (their tombstones) so a
 	// redeploy on this state dir starts from a clean registry.
-	m.HandleFunc("POST /v0/purge", func(w http.ResponseWriter, r *http.Request) {
+	m.HandleFunc("POST /v1/purge", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "purged": h.Purge()})
 	})
-	m.HandleFunc("POST /v0/push/assignments", func(w http.ResponseWriter, r *http.Request) {
+	m.HandleFunc("POST /v1/push/assignments", func(w http.ResponseWriter, r *http.Request) {
 		h.TriggerSync()
 		writeJSON(w, 200, map[string]any{"ok": true})
 	})
-	m.HandleFunc("GET /v0/status", func(w http.ResponseWriter, r *http.Request) {
+	m.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, h.Status())
 	})
 	// Operator checks of a workload's microVM (twd host vmcheck): guest
 	// stats, DO volume fsync latency, and the no-keys-in-guest scan. The
 	// socket is the user's (0700 dir); answers carry no key material.
-	m.HandleFunc("POST /v0/vm/check", func(w http.ResponseWriter, r *http.Request) {
+	m.HandleFunc("POST /v1/vm/check", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		rep, err := h.VMCheck(r.Context(), q.Get("tenant"), q.Get("workload"), q.Get("keyscan") == "1")
 		if err != nil {
@@ -487,7 +487,7 @@ func EgressEnforcement(sandbox string) string {
 	return EgressUnenforced
 }
 
-// StatusView is GET /v0/status.
+// StatusView is GET /v1/status (hostd's local API).
 type StatusView struct {
 	HostID string
 	// Sandbox is the host's process sandbox: "seatbelt", "landlock (ABI n)"

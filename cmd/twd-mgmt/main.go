@@ -3,14 +3,17 @@
 // (API-key or WIF), the per-tenant registration throttle, spawn checks,
 // kill, the reaper and the hash-chained audit log.
 //
-// It serves the v0 API (docs/contracts/mgmt-api.md) on a unix socket
-// (peer uid must match) and, optionally, on the operator tailnet via tsnet
-// with WhoIs auth. In WIF mode it is also an OIDC issuer, served on a local
-// listener and/or via Funnel.
+// It serves the /v1 API (api/openapi.yaml) on its own tsnet node on the
+// operator tailnet, authenticated by WhoIs; the twd CLI on the same machine
+// reaches it through the node's loopback proxy (<state-dir>/loopback.json).
+// Only with -local-dev (twd dev, hermetic tests) does it also serve a unix
+// socket guarded by the per-host token. In WIF mode it is also an OIDC
+// issuer, served via Funnel (and/or a local listener).
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -43,8 +46,9 @@ func run() error {
 	home, _ := os.UserHomeDir()
 	var (
 		stateDir     = flag.String("state-dir", filepath.Join(home, ".twd", "mgmt"), "state directory (0700): db, custody, issuer key")
-		socket       = flag.String("socket", filepath.Join(home, ".twd", "run", "mgmt.sock"), "unix socket for the v0 API (\"\" to disable)")
-		tokenFile    = flag.String("host-token-file", filepath.Join(home, ".twd", "hostd", "mgmt.token"), "per-host bearer token for the unix socket (0600; minted here, read by twd-hostd and the twd CLI; sent as Twd-Host-Token)")
+		localDev     = flag.Bool("local-dev", false, "ALSO serve the API on a unix socket guarded by the per-host token (twd dev, hermetic tests). Normal operation is tsnet only")
+		socket       = flag.String("socket", filepath.Join(home, ".twd", "run", "mgmt.sock"), "-local-dev: the unix socket path")
+		tokenFile    = flag.String("host-token-file", filepath.Join(home, ".twd", "hostd", "mgmt.token"), "-local-dev: per-host bearer token for the unix socket (0600; minted here, read by twd-hostd and the twd CLI; sent as Twd-Host-Token)")
 		rotateToken  = flag.Bool("rotate-host-token", false, "mint a fresh host token at start (twd up does this)")
 		dbDSN        = flag.String("db", "", "store: SQLite path (default <state-dir>/mgmt.db) or postgres://… DSN")
 		dbDSNFile    = flag.String("db-file", "", "read the store DSN from this file (keeps a Postgres password off argv)")
@@ -52,7 +56,9 @@ func run() error {
 		issuerURL    = flag.String("issuer-url", "", "WIF: public https issuer origin (default with -funnel: https://<tsnet name>)")
 		issuerListen = flag.String("issuer-listen", "", "WIF: also serve the issuer on this local address (plain HTTP, e.g. behind a proxy)")
 		funnel       = flag.Bool("funnel", false, "WIF: serve the issuer publicly via tsnet ListenFunnel :443 (needs -tsnet-hostname)")
-		tsHostname   = flag.String("tsnet-hostname", "", "serve the API on the operator tailnet as this tsnet node (e.g. twd-mgmt)")
+		tsHostname   = flag.String("tsnet-hostname", "", "serve the API on the operator tailnet as this tsnet node (e.g. twd-mgmt); required unless -local-dev")
+		noLoopback   = flag.Bool("no-loopback", false, "don't publish the node's loopback proxy for the local twd CLI (<state-dir>/loopback.json)")
+		version      = flag.String("version", "", "reported by GET /v1/status")
 		tsControl    = flag.String("tsnet-control-url", "", "operator tailnet control URL (required with -tsnet-hostname)")
 		tsAuthFile   = flag.String("tsnet-authkey-file", "", "file with the operator-tailnet auth key for the first join (TS_AUTHKEY=…); without it the node state must already be logged in (twd up does the interactive login)")
 		tsTags       = flag.String("tsnet-tags", mgmt.MgmtTag, "comma-separated tags the mgmt node advertises")
@@ -141,6 +147,10 @@ func run() error {
 		}
 		defer ts.Close()
 		self.DNSName = strings.TrimSuffix(st.Self.DNSName, ".")
+		self.NodeID = string(st.Self.ID)
+		if len(st.TailscaleIPs) > 0 {
+			self.IP = st.TailscaleIPs[0].String()
+		}
 		if st.CurrentTailnet != nil {
 			self.Tailnet = st.CurrentTailnet.MagicDNSSuffix
 		}
@@ -165,8 +175,13 @@ func run() error {
 		log.Info("OIDC issuer", "base", issuer.BaseURL)
 	}
 
-	m, err := mgmt.New(mgmt.Config{Store: store, Custody: custody, Broker: &mgmt.Broker{BaseURL: *tsapiURL, Issuer: issuer},
-		IDSecret: secret, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log})
+	mcfg := mgmt.Config{Store: store, Custody: custody, Broker: &mgmt.Broker{BaseURL: *tsapiURL, Issuer: issuer},
+		IDSecret: secret, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log,
+		OperatorTailnet: self.Tailnet, OperatorControlURL: *tsControl}
+	if ts != nil {
+		mcfg.TailnetDial = ts.Dial // kill/assignment pushes to hosts' own nodes
+	}
+	m, err := mgmt.New(mcfg)
 	if err != nil {
 		return err
 	}
@@ -177,9 +192,12 @@ func run() error {
 	if issuer != nil {
 		self.Issuer = issuer.BaseURL
 	}
-	api := &mgmt.Server{M: m, Self: self}
+	api := &mgmt.Server{M: m, Self: self, Version: *version}
 	if *admins != "" {
 		api.Admins = strings.Split(*admins, ",")
+	}
+	if ts == nil && !*localDev {
+		return errors.New("no listeners: normal operation is tsnet only (-tsnet-hostname); -local-dev serves the unix socket for twd dev and tests")
 	}
 	errc := make(chan error, 4)
 	serve := func(name string, ln net.Listener, h http.Handler) *http.Server {
@@ -193,7 +211,9 @@ func run() error {
 		return srv
 	}
 	var servers []*http.Server
-	if *socket != "" {
+	loopbackPath := filepath.Join(*stateDir, "loopback.json")
+	os.Remove(loopbackPath)
+	if *localDev && *socket != "" {
 		// RT-03: same-uid peercred is not authorization. Every request on
 		// the socket must carry the per-host token (minted here into a 0600
 		// file under hostd's state dir; hostd and the CLI read it).
@@ -207,6 +227,7 @@ func run() error {
 		}
 		defer os.Remove(*socket)
 		log.Info("host token", "file", *tokenFile, "rotated", *rotateToken)
+		api.Listeners = append(api.Listeners, "unix:"+*socket)
 		servers = append(servers, serve("unix", ln, mgmt.LocalHandler(api.Handler(), token)))
 	}
 	if ts != nil {
@@ -233,7 +254,30 @@ func run() error {
 			return err
 		}
 		th := api.TailnetHandler(whois, api.Handler())
+		api.Listeners = append(api.Listeners, "tsnet:80")
 		servers = append(servers, serve("tsnet", ln, th))
+		if !*noLoopback {
+			// The operator console: the twd CLI on this machine dials mgmt's
+			// own tailnet IP through the node's SOCKS5 loopback proxy, so
+			// its requests carry mgmt's identity (WhoIs → operator). The
+			// credential lives in a 0600 file next to the state; nothing
+			// listens on a unix socket.
+			addr, cred, _, err := ts.Loopback()
+			if err != nil {
+				return fmt.Errorf("tsnet loopback: %w", err)
+			}
+			lb := mgmt.Loopback{Addr: addr, ProxyCred: cred, MgmtIP: self.IP, DNSName: self.DNSName, HTTPS: self.HTTPS, PID: os.Getpid()}
+			b, _ := json.Marshal(lb)
+			if err := os.WriteFile(loopbackPath+".tmp", b, 0o600); err != nil {
+				return err
+			}
+			if err := os.Rename(loopbackPath+".tmp", loopbackPath); err != nil {
+				return err
+			}
+			defer os.Remove(loopbackPath)
+			api.Listeners = append(api.Listeners, "loopback:"+addr)
+			log.Info("operator console", "loopback", addr, "file", loopbackPath)
+		}
 		if self.HTTPS {
 			// The API over the node's own HTTPS certificate: what `twd
 			// link` uses from a developer machine. tailnet-only (ListenTLS
@@ -242,6 +286,7 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("tsnet tls: %w", err)
 			}
+			api.Listeners = append(api.Listeners, "tsnet:443")
 			servers = append(servers, serve("tsnet-tls", tln, th))
 		} else if *tsTLS {
 			log.Warn("HTTPS is not enabled on this tailnet: the API is served on :80 only (twd link needs https)")
@@ -254,6 +299,7 @@ func run() error {
 			if err != nil {
 				return fmt.Errorf("funnel: %w", err)
 			}
+			api.Listeners = append(api.Listeners, "funnel:443")
 			servers = append(servers, serve("funnel", fl, issuer.Handler()))
 		}
 	}
@@ -268,7 +314,7 @@ func run() error {
 		servers = append(servers, serve("issuer", ln, issuer.Handler()))
 	}
 	if len(servers) == 0 {
-		return errors.New("no listeners: set -socket and/or -tsnet-hostname")
+		return errors.New("no listeners: set -tsnet-hostname (normal operation) or -local-dev")
 	}
 	select {
 	case <-ctx.Done():

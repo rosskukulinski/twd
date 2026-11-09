@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,11 +28,15 @@ import (
 
 const prodControl = "https://controlplane.tailscale.com"
 
-// baseSnippet is what `twd up` needs in the tenant policy: tag:twd owns
-// twd's tags (DX.md quickstart). apikey mode (no mgmt node).
-func baseSnippet() policy.Snippet {
-	return policy.Snippet{TagOwners: map[string][]string{"tag:twd": {"autogroup:admin"}}}
-}
+// baseSnippet is what `twd up` needs in the tenant policy in apikey mode:
+// tag:twd owns twd's tags (DX.md quickstart), plus the tags of mgmt's and
+// the hosts' own nodes and the grants between them (normal operation is
+// tsnet only: hostd talks to mgmt over the tailnet, mgmt pushes kills to
+// the host's node).
+func baseSnippet() policy.Snippet { return policy.InfraSnippet(defaultPushPort) }
+
+// defaultPushPort is where hostd's node accepts mgmt's pushes.
+const defaultPushPort = 7474
 
 // keylessSnippet is the policy keyless mode needs (ADR-026): the tags of
 // mgmt's and hosts' own nodes, the funnel attribute for the WIF issuer,
@@ -39,16 +44,11 @@ func baseSnippet() policy.Snippet {
 // tailnet (twd link). Applying it needs an API key (--policy-apply in
 // apikey mode); in keyless mode it is printed for the admin console.
 func keylessSnippet() policy.Snippet {
-	return policy.Snippet{
-		TagOwners: map[string][]string{
-			"tag:twd":      {"autogroup:admin"},
-			mgmt.MgmtTag:   {"autogroup:admin"},
-			"tag:twd-host": {"autogroup:admin", "tag:twd"},
-		},
-		Grants: []map[string]any{{"src": []string{"autogroup:admin"}, "dst": []string{mgmt.MgmtTag}, "ip": []string{"tcp:443", "tcp:80"},
-			"app": map[string]any{mgmt.AdminCap: []any{map[string]any{}}}}},
-		NodeAttrs: []map[string]any{{"target": []string{mgmt.MgmtTag}, "attr": []string{"funnel"}}},
-	}
+	s := policy.InfraSnippet(defaultPushPort)
+	s.Grants = append(s.Grants, map[string]any{"src": []string{"autogroup:admin"}, "dst": []string{mgmt.MgmtTag}, "ip": []string{"tcp:443", "tcp:80"},
+		"app": map[string]any{mgmt.AdminCap: []any{map[string]any{}}}})
+	s.NodeAttrs = []map[string]any{{"target": []string{mgmt.MgmtTag}, "attr": []string{"funnel"}}}
+	return s
 }
 
 // keylessPolicyOptions lets the keyless snippet through Check (RT-06):
@@ -124,6 +124,8 @@ func cmdUp(args []string) error {
 	wifID := f.String("wif-client-id", "", "keyless: the mint trust credential's client ID (default: prompt after printing the console steps)")
 	wifLife := f.String("wif-lifecycle-client-id", "", "keyless: the lifecycle trust credential's client ID (optional)")
 	loginTO := f.Duration("login-timeout", 5*time.Minute, "keyless: how long to wait for the browser login")
+	localDev := f.Bool("local-dev", false, "DEVELOPMENT ONLY: hostd and the CLI use mgmt's unix socket with the per-host token instead of the tailnet (hermetic tests). Normal operation is tsnet only")
+	pushPort := f.Int("push-port", defaultPushPort, "port on this host's own tailnet node where mgmt pushes kills")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -229,14 +231,18 @@ func cmdUp(args []string) error {
 	}
 	res := upResult{StateDir: s.Dir, HostID: *hostID, Timings: timings}
 
-	// mgmt's own tailnet node: always in keyless mode (it carries the API
-	// and the WIF issuer); opt-in in apikey mode (--mgmt-hostname).
+	// mgmt's own tailnet node carries the API (WhoIs auth, and the local
+	// CLI through its loopback) and, in keyless mode, the WIF issuer. It is
+	// the only transport in normal operation; --local-dev may skip it.
 	mgmtHostname := *mgmtHost
-	if !apikeyMode && mgmtHostname == "" {
+	if mgmtHostname == "" {
 		mgmtHostname = s.Cfg.MgmtHostname
-		if mgmtHostname == "" {
+		if mgmtHostname == "" && (!*localDev || !apikeyMode) {
 			mgmtHostname = defaultMgmtHostname
 		}
+	}
+	if s.configured() && s.Cfg.LocalDev != *localDev {
+		return fail("state_conflict", fmt.Sprintf("%s was set up with --local-dev=%v", s.Dir, s.Cfg.LocalDev)).withFix("twd down --purge, remove " + s.Dir + ", then twd up again")
 	}
 	if s.configured() && s.Cfg.MgmtHostname != "" && mgmtHostname != "" && mgmtHostname != s.Cfg.MgmtHostname {
 		return fail("state_conflict", "mgmt's node in "+s.Dir+" is named "+s.Cfg.MgmtHostname).withFix("drop --mgmt-hostname, or use another --state-dir")
@@ -252,6 +258,16 @@ func cmdUp(args []string) error {
 			}
 		}
 		firstJoin := !isFile(filepath.Join(s.mgmtTsnetDir(), "tailscaled.state"))
+		if firstJoin && authKey == "" && apikeyMode {
+			// apikey mode: the API key mints mgmt's node key (tag:twd-mgmt);
+			// no browser login. The key is used in-process and never stored.
+			k, err := api.CreateKey(ctx, tsapi.KeyOptions{Tags: []string{mgmt.MgmtTag}, Preauthorized: true, ExpirySeconds: 600, Description: "twd mgmt node " + mgmtHostname})
+			if err != nil {
+				return fail("bootstrap_failed", "could not mint mgmt's node key with the API key", err.Error()).
+					withFix("the policy needs tagOwners \"" + mgmt.MgmtTag + "\": [\"autogroup:admin\"] (twd up --policy-apply adds it), and the key's owner must be an admin")
+			}
+			authKey = k.Secret
+		}
 		if firstJoin && authKey == "" {
 			fmt.Fprintf(out, "twd up · keyless · mgmt joins your tailnet as %q (tag %s), then you create one trust credential (no API key)\n", mgmtHostname, mgmt.MgmtTag)
 			fmt.Fprintf(out, "› policy   before logging in, make sure your tailnet policy has (admin console › Access controls):\n")
@@ -327,6 +343,7 @@ func cmdUp(args []string) error {
 	s.Cfg.InsecureSharedHost = *insecureSH
 	s.Cfg.Heartbeat, s.Cfg.KillTombstone, s.Cfg.DeviceDeleteDelay = hb.String(), tomb.String(), delDelay.String()
 	s.Cfg.AllowSiblingEgress = *siblings
+	s.Cfg.LocalDev, s.Cfg.PushPort = *localDev, *pushPort
 	if err := s.save(); err != nil {
 		return err
 	}
@@ -358,42 +375,21 @@ func cmdUp(args []string) error {
 	}
 	timings["mgmt_ready"] = ms(time.Since(t0))
 
-	// Host registered and heartbeating.
-	hs := time.Now()
-	for {
-		var hosts []struct {
-			ID       string `json:"hostID"`
-			LastSeen int64  `json:"lastSeen"`
-		}
-		if s.mgmt().Do(ctx, "GET", "/v0/hosts", nil, &hosts) == nil {
-			live := false
-			for _, h := range hosts {
-				if h.ID == *hostID && time.Since(time.UnixMilli(h.LastSeen)) < 10*time.Second {
-					live = true
-				}
-			}
-			if live && s.hostd().Do(ctx, "GET", "/v0/status", nil, nil) == nil {
-				break
-			}
-		}
-		if time.Since(hs) > 60*time.Second || !s.supervisorAlive() {
-			return fail("host_unavailable", "twd-hostd did not register with twd-mgmt", "log: "+s.log("hostd")).withFix("twd logs --component hostd")
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	timings["host_ready"] = ms(time.Since(t0))
+	// Tenant (operator = tenant = you). In normal operation the host's own
+	// node needs a join key minted through the tenant's credential, so the
+	// tenant comes first; in keyless mode that key exists only once the
+	// trust credential does.
 
-	// Tenant (operator = tenant = you).
 	tid := s.Cfg.TenantID
 	if tid == "" {
 		tid = tenantIDFor(*tailnet)
 	}
 	if apikeyMode {
-		if err := s.mgmt().Do(ctx, "GET", "/v0/tenants/"+tid, nil, nil); err != nil {
+		if err := s.mgmt().Do(ctx, "GET", "/v1/tenants/"+tid, nil, nil); err != nil {
 			var tr struct {
 				TenantID string `json:"tenantID"`
 			}
-			if err := s.mgmt().Do(ctx, "POST", "/v0/tenants", map[string]any{"tenantID": tid, "tailnet": *tailnet,
+			if err := s.mgmt().Do(ctx, "POST", "/v1/tenants", map[string]any{"tenantID": tid, "tailnet": *tailnet,
 				"controlURL": *control, "mintMode": "apikey", "apiKeyFile": absKey}, &tr); err != nil {
 				return err
 			}
@@ -406,6 +402,9 @@ func cmdUp(args []string) error {
 			if ce, ok := err.(*cliErr); ok && ce.Code == "wif_credential_required" {
 				// Keep what we have so the next run completes the setup.
 				s.save()
+				if !*localDev {
+					fmt.Fprintf(out, "› host     twd-hostd waits for its join key: it is minted through the trust credential once the IDs are given\n")
+				}
 			}
 			return err
 		}
@@ -417,6 +416,35 @@ func cmdUp(args []string) error {
 	}
 	res.TenantID = tid
 	timings["tenant_ready"] = ms(time.Since(t0))
+
+	// The host's own node: minted by mgmt (POST /v1/hosts) through the
+	// tenant's credential, handed to hostd as a single-use join file.
+	if !*localDev && !isFile(filepath.Join(s.hostTsnetDir(), "tailscaled.state")) {
+		js := time.Now()
+		if err := s.mintHostJoin(ctx, *hostID, tid); err != nil {
+			return err
+		}
+		timings["host_join_key"] = ms(time.Since(js))
+	}
+	// Host registered and heartbeating.
+	hs := time.Now()
+	for {
+		var h struct {
+			ID       string `json:"hostID"`
+			LastSeen int64  `json:"lastSeen"`
+			Status   string `json:"status"`
+		}
+		if s.mgmt().Do(ctx, "GET", "/v1/hosts/"+*hostID, nil, &h) == nil && h.Status == "live" {
+			if s.hostd().Do(ctx, "GET", "/v1/status", nil, nil) == nil {
+				break
+			}
+		}
+		if time.Since(hs) > 3*time.Minute || !s.supervisorAlive() {
+			return fail("host_unavailable", "twd-hostd did not register with twd-mgmt", "log: "+s.log("hostd")).withFix("twd logs --component hostd")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	timings["host_ready"] = ms(time.Since(t0))
 
 	if apikeyMode {
 		miss, err := policy.Missing(pol, baseSnippet())
@@ -626,12 +654,14 @@ func cmdSupervise(args []string) error {
 	if err != nil {
 		return err
 	}
-	margs := []string{mgmtBin, "-state-dir", filepath.Join(s.Dir, "mgmt"), "-socket", s.mgmtSock(),
+	margs := []string{mgmtBin, "-state-dir", filepath.Join(s.Dir, "mgmt"), "-device-delete-delay", s.Cfg.DeviceDeleteDelay, "-version", version}
+	if s.Cfg.LocalDev {
 		// RT-03: a fresh per-host token on every mgmt start (twd up, a
 		// supervisor/systemd restart). hostd re-reads the file when it
 		// changes and the CLI reads it per call, so rotation never strands
 		// a running hostd.
-		"-host-token-file", s.hostTokenFile(), "-rotate-host-token", "-device-delete-delay", s.Cfg.DeviceDeleteDelay}
+		margs = append(margs, "-local-dev", "-socket", s.mgmtSock(), "-host-token-file", s.hostTokenFile(), "-rotate-host-token")
+	}
 	if s.Cfg.TSAPIURL != "" {
 		margs = append(margs, "-tsapi-url", s.Cfg.TSAPIURL)
 	}
@@ -643,13 +673,30 @@ func cmdSupervise(args []string) error {
 			margs = append(margs, "-funnel", "-issuer-url", s.Cfg.IssuerURL)
 		}
 	}
-	hargs := []string{hostdBin, "-mgmt", "unix://" + s.mgmtSock(), "-mgmt-token-file", s.hostTokenFile(), "-host-id", s.Cfg.HostID,
+	hargs := []string{hostdBin, "-host-id", s.Cfg.HostID,
 		"-data-dir", filepath.Join(s.Dir, "hostd"), "-run-dir", s.hostdRunDir(), "-workerd", s.Cfg.Workerd,
 		"-heartbeat", s.Cfg.Heartbeat, "-kill-tombstone", s.Cfg.KillTombstone, "-hostname-prefix", s.Cfg.HostnamePrefix,
 		// No tenant's workerd may touch twd's state (mgmt custody, every
 		// tenant's node keys and DO storage) or its sockets, except its own.
 		"-sandbox", "auto", "-sandbox-deny", strings.Join([]string{filepath.Join(s.Dir, "mgmt"), filepath.Join(s.Dir, "hostd"),
 			s.logDir(), s.configPath(), filepath.Join(s.Dir, "tenants"), s.runDir()}, ",")}
+	if s.Cfg.LocalDev {
+		hargs = append(hargs, "-local-dev", "-mgmt", "unix://"+s.mgmtSock(), "-mgmt-token-file", s.hostTokenFile())
+	} else {
+		// Normal operation: hostd's own node, mgmt over the tailnet (by
+		// tailnet IP: a MagicDNS name resolves only once the peer is in the
+		// netmap, and mgmt's node keeps its IP across restarts).
+		mgmtURL := "http://" + s.Cfg.MgmtIP
+		if s.Cfg.MgmtIP == "" {
+			mgmtURL = "http://" + s.Cfg.MgmtDNSName
+		}
+		port := s.Cfg.PushPort
+		if port == 0 {
+			port = defaultPushPort
+		}
+		hargs = append(hargs, "-mgmt", mgmtURL, "-tsnet-control-url", s.Cfg.ControlURL, "-tsnet-dir", s.hostTsnetDir(),
+			"-join-token-file", s.hostJoinFile(), "-push-port", strconv.Itoa(port))
+	}
 	if s.Cfg.Ephemeral {
 		hargs = append(hargs, "-ephemeral")
 	}
@@ -799,26 +846,26 @@ func cmdDown(args []string) error {
 				var kr struct {
 					Killed []string `json:"killed"`
 				}
-				if err := s.mgmt().DoHeaders(ctx, "POST", "/v0/objects/"+o.ID+"/kill", map[string]any{"cascade": true, "reason": "twd down --purge"},
+				if err := s.mgmt().DoHeaders(ctx, "DELETE", "/v1/objects/"+o.ID+"?cascade=true&reason="+url.QueryEscape("twd down --purge"), nil,
 					&kr, map[string]string{"Twd-Actor": actor()}); err == nil {
 					res.Killed = append(res.Killed, kr.Killed...)
 				}
 			}
 		}
 		var fr struct {
-			Flushed int `json:"flushed"`
+			Deleted []string `json:"deleted"`
 		}
-		s.mgmt().Do(ctx, "POST", "/v0/flush", nil, &fr)
-		res.Flushed = fr.Flushed
+		s.mgmt().Do(ctx, "POST", "/v1/device-delete-runs", nil, &fr)
+		res.Flushed = len(fr.Deleted)
 		// Forget the killed objects (mgmt rows, hostd tombstones) so the
 		// same workload deploys again on this state dir.
 		for _, tn := range s.tenants() {
 			var pr mgmt.PurgeResult
-			if err := s.mgmt().Do(ctx, "POST", "/v0/tenants/"+tn.TenantID+"/purge", nil, &pr); err == nil {
+			if err := s.mgmt().Do(ctx, "DELETE", "/v1/tenants/"+tn.TenantID+"/objects", nil, &pr); err == nil {
 				res.Purged += len(pr.Purged)
 			}
 		}
-		s.hostd().Do(ctx, "POST", "/v0/purge", nil, nil)
+		s.hostd().Do(ctx, "POST", "/v1/purge", nil, nil)
 		res.Timings["purge"] = ms(time.Since(t0))
 	}
 	pid := s.supervisorPID()
@@ -886,6 +933,8 @@ type tenantStatus struct {
 }
 
 type statusResult struct {
+	Transport  string                 `json:"transport"`
+	HostStatus string                 `json:"hostStatus,omitempty"`
 	StateDir   string                 `json:"stateDir"`
 	Tailnet    string                 `json:"tailnet"`
 	MintMode   string                 `json:"mintMode"`
@@ -930,28 +979,28 @@ func cmdStatus(args []string) error {
 		var st struct {
 			Pending int `json:"pendingDeviceDeletes"`
 		}
-		s.mgmt().Do(ctx, "GET", "/v0/status", nil, &st)
+		s.mgmt().Do(ctx, "GET", "/v1/status", nil, &st)
 		r.Pending = st.Pending
 		var tn struct {
 			Q    int     `json:"mintQueue"`
 			Rate float64 `json:"effectiveRegistrationsPerMinute"`
 		}
-		s.mgmt().Do(ctx, "GET", "/v0/tenants/"+s.Cfg.TenantID, nil, &tn)
+		s.mgmt().Do(ctx, "GET", "/v1/tenants/"+s.Cfg.TenantID, nil, &tn)
 		r.MintQueue, r.Rate = tn.Q, tn.Rate
-		var hosts []struct {
+		var h struct {
 			ID       string `json:"hostID"`
 			LastSeen int64  `json:"lastSeen"`
+			Status   string `json:"status"`
 		}
-		s.mgmt().Do(ctx, "GET", "/v0/hosts", nil, &hosts)
-		for _, h := range hosts {
-			if h.ID == s.Cfg.HostID {
-				r.HostAgeMS = time.Since(time.UnixMilli(h.LastSeen)).Milliseconds()
-				r.Host = r.HostAgeMS < 10_000
-			}
+		if s.mgmt().Do(ctx, "GET", "/v1/hosts/"+s.Cfg.HostID, nil, &h) == nil {
+			r.HostAgeMS = time.Since(time.UnixMilli(h.LastSeen)).Milliseconds()
+			r.Host = h.Status == "live"
+			r.HostStatus = h.Status
 		}
 	}
+	r.Transport = s.transport()
 	var hv hostd.StatusView
-	hostOK := r.Supervisor && s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv) == nil
+	hostOK := r.Supervisor && s.hostd().Do(ctx, "GET", "/v1/status", nil, &hv) == nil
 	if hostOK {
 		r.Workloads = hv.Workloads
 		for _, o := range hv.Objects {
@@ -967,7 +1016,7 @@ func cmdStatus(args []string) error {
 				Q    int     `json:"mintQueue"`
 				Rate float64 `json:"effectiveRegistrationsPerMinute"`
 			}
-			s.mgmt().Do(ctx, "GET", "/v0/tenants/"+t.TenantID, nil, &tn)
+			s.mgmt().Do(ctx, "GET", "/v1/tenants/"+t.TenantID, nil, &tn)
 			ts.MintQueue, ts.Rate = tn.Q, tn.Rate
 		}
 		for _, o := range hv.Objects {
@@ -985,7 +1034,7 @@ func cmdStatus(args []string) error {
 			}
 			return "✗"
 		}
-		fmt.Printf("twd status · %s · tailnet %s · mint mode %s\n", s.Dir, s.Cfg.Tailnet, r.MintMode)
+		fmt.Printf("twd status · %s · tailnet %s · mint mode %s · transport %s\n", s.Dir, s.Cfg.Tailnet, r.MintMode, r.Transport)
 		fmt.Printf("%s supervisor  pid %d\n", mark(r.Supervisor), s.supervisorPID())
 		if r.MgmtNode != "" {
 			fmt.Printf("%s node        %s (%s; API over the tailnet, WhoIs auth)\n", mark(r.Mgmt), r.MgmtNode, mgmt.MgmtTag)
@@ -1030,8 +1079,7 @@ func remoteStatus(f *flags, s *state) error {
 	if err != nil {
 		return err
 	}
-	var hosts []mgmt.Host
-	s.mgmt().Do(ctx, "GET", "/v0/hosts", nil, &hosts)
+	hosts, _ := listAll[mgmt.Host](ctx, s.mgmt(), "/v1/hosts", 0)
 	type tenantView struct {
 		TenantRef
 		Deployments []mgmt.DeploymentView `json:"deployments"`
@@ -1039,7 +1087,7 @@ func remoteStatus(f *flags, s *state) error {
 	var tenants []tenantView
 	for _, t := range s.tenants() {
 		tv := tenantView{TenantRef: t}
-		s.mgmt().Do(ctx, "GET", "/v0/deployments?tenant="+url.QueryEscape(t.TenantID), nil, &tv.Deployments)
+		tv.Deployments, _ = listAll[mgmt.DeploymentView](ctx, s.mgmt(), "/v1/deployments?latest=true&tenant="+url.QueryEscape(t.TenantID), 0)
 		tenants = append(tenants, tv)
 	}
 	live := 0
@@ -1084,7 +1132,7 @@ func tierLine(s *state) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var hv hostd.StatusView
-	_ = s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv)
+	_ = s.hostd().Do(ctx, "GET", "/v1/status", nil, &hv)
 	sb := hv.Sandbox
 	switch {
 	case sb == "":

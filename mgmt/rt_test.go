@@ -22,32 +22,32 @@ func TestNodeCertificates(t *testing.T) {
 	e := newTestEnv(t, nil)
 	c, h1 := e.c, e.asHost("h1")
 	var tn struct{ TenantID string }
-	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
-	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 100, "tiers": []string{"process"}}, nil)
+	c.ok("POST", "/v1/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tn)
+	h1.ok("PUT", "/v1/hosts/h1", map[string]any{"capacityNodes": 100, "tiers": []string{"process"}}, nil)
 	bundle := makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})
-	c.ok("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "support", "bundle": bundle}, nil)
+	c.ok("POST", "/v1/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "support", "bundle": bundle}, nil)
 
 	var root, child CreateObjectResponse
-	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, &root)
-	h1.ok("GET", "/v0/objects/"+root.ObjectID+"/credential?epoch=1", nil, &Credential{})
-	h1.ok("POST", "/v0/objects/"+root.ObjectID+"/ready", map[string]any{"nodeID": "1", "stableNodeID": "nROOT", "magicDNS": root.ObjectID + ".t.ts.net"}, nil)
+	h1.ok("POST", "/v1/objects", map[string]any{"tenantID": tn.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, &root)
+	h1.ok("POST", "/v1/objects/"+root.ObjectID+"/credentials?epoch=1", nil, &Credential{})
+	h1.ok("PATCH", "/v1/objects/"+root.ObjectID, map[string]any{"status": "ready", "nodeID": "1", "stableNodeID": "nROOT", "magicDNS": root.ObjectID + ".t.ts.net"}, nil)
 	lim := map[string]any{"acme.com/cap/mcp": map[string]any{"tools": []string{"lookup_order"}}}
-	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "namespace": "LookupAgent", "objectName": "c1",
+	h1.ok("POST", "/v1/objects", map[string]any{"tenantID": tn.TenantID, "namespace": "LookupAgent", "objectName": "c1",
 		"parent": map[string]string{"objectID": root.ObjectID}, "caps": lim}, &child)
-	h1.ok("GET", "/v0/objects/"+child.ObjectID+"/credential?epoch=1", nil, &Credential{})
-	h1.ok("POST", "/v0/objects/"+child.ObjectID+"/ready", map[string]any{"nodeID": "2", "stableNodeID": "nCHILD"}, nil)
+	h1.ok("POST", "/v1/objects/"+child.ObjectID+"/credentials?epoch=1", nil, &Credential{})
+	h1.ok("PATCH", "/v1/objects/"+child.ObjectID, map[string]any{"status": "ready", "nodeID": "2", "stableNodeID": "nCHILD"}, nil)
 
 	var tv struct {
 		OBOPublicKey string `json:"oboPublicKey"`
 	}
-	c.ok("GET", "/v0/tenants/"+tn.TenantID, nil, &tv)
+	c.ok("GET", "/v1/tenants/"+tn.TenantID, nil, &tv)
 	pub, err := base64.StdEncoding.DecodeString(tv.OBOPublicKey)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		t.Fatalf("tenant OBO public key: %q %v", tv.OBOPublicKey, err)
 	}
 
 	var cert NodeCertView
-	h1.ok("GET", "/v0/certs/nCHILD?tenant="+tn.TenantID, nil, &cert)
+	h1.ok("GET", "/v1/certificates/nCHILD?tenant="+tn.TenantID, nil, &cert)
 	if cert.ObjectID != child.ObjectID || cert.Payload == nil || cert.Payload.ParentID != root.ObjectID || cert.Payload.RootID != root.ObjectID ||
 		cert.Payload.Tags[0] != "tag:twd-agent-support-sub" || !strings.Contains(string(cert.Payload.Lim), "lookup_order") {
 		t.Fatalf("cert view: %+v payload %+v", cert, cert.Payload)
@@ -61,19 +61,21 @@ func TestNodeCertificates(t *testing.T) {
 	}
 	// The root has no lim.
 	var rc NodeCertView
-	h1.ok("GET", "/v0/certs/nROOT?tenant="+tn.TenantID, nil, &rc)
+	h1.ok("GET", "/v1/certificates/nROOT?tenant="+tn.TenantID, nil, &rc)
 	if len(rc.Payload.Lim) != 0 || rc.Payload.ParentID != "" {
 		t.Fatalf("root cert: %+v", rc.Payload)
 	}
 	// Unknown node / wrong tenant: 404 (the receiver then applies the plain
 	// WhoIs caps: not a twd object). Killed: 410.
-	h1.fail("GET", "/v0/certs/nNOBODY?tenant="+tn.TenantID, nil, 404, "not_found")
-	h1.fail("GET", "/v0/certs/nCHILD?tenant=tn_other", nil, 404, "not_found")
-	c.ok("POST", "/v0/objects/"+child.ObjectID+"/kill", map[string]any{"reason": "test"}, nil)
-	h1.fail("GET", "/v0/certs/nCHILD?tenant="+tn.TenantID, nil, 410, "killed")
+	h1.fail("GET", "/v1/certificates/nNOBODY?tenant="+tn.TenantID, nil, 404, "not_found")
+	h1.fail("GET", "/v1/certificates/nCHILD?tenant=tn_other", nil, 404, "not_found")
+	c.ok("DELETE", "/v1/objects/"+child.ObjectID+killQuery(false, "test"), nil, nil)
+	h1.fail("GET", "/v1/certificates/nCHILD?tenant="+tn.TenantID, nil, 410, "killed")
 	// The audit trail records the certificate and lim at ready.
-	var aud struct{ Records []AuditRecord }
-	c.ok("GET", "/v0/audit?object="+child.ObjectID, nil, &aud)
+	var aud struct {
+		Records []AuditRecord `json:"items"`
+	}
+	c.ok("GET", "/v1/audit?object="+child.ObjectID, nil, &aud)
 	sawReady := false
 	for _, r := range aud.Records {
 		if r.Kind == "ready" {
@@ -86,7 +88,7 @@ func TestNodeCertificates(t *testing.T) {
 }
 
 // RT-03: the unix socket admits nobody without the per-host token, not even
-// for /v0/healthz, and the token file is minted 0600 and rotatable.
+// for /v1/healthz, and the token file is minted 0600 and rotatable.
 func TestHostTokenOnUnixSocket(t *testing.T) {
 	e := newTestEnv(t, nil)
 	hc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -108,7 +110,7 @@ func TestHostTokenOnUnixSocket(t *testing.T) {
 		json.NewDecoder(res.Body).Decode(&eb)
 		return res.StatusCode, eb.Code
 	}
-	for _, path := range []string{"/v0/healthz", "/v0/tenants", "/v0/hosts", "/v0/audit"} {
+	for _, path := range []string{"/v1/healthz", "/v1/tenants", "/v1/hosts", "/v1/audit"} {
 		if st, code := get(path, ""); st != 401 || code != "host_token_required" {
 			t.Fatalf("%s without token: %d %s", path, st, code)
 		}
@@ -116,7 +118,7 @@ func TestHostTokenOnUnixSocket(t *testing.T) {
 			t.Fatalf("%s with a wrong token: %d %s", path, st, code)
 		}
 	}
-	if st, _ := get("/v0/healthz", e.token); st != 200 {
+	if st, _ := get("/v1/healthz", e.token); st != 200 {
 		t.Fatalf("healthz with the token: %d", st)
 	}
 	// Token file: minted 0600, stable across loads, rotated on demand.
@@ -141,13 +143,13 @@ func TestHostTokenOnUnixSocket(t *testing.T) {
 func TestAuditIngestProvenance(t *testing.T) {
 	e := newTestEnv(t, nil)
 	h1 := e.asHost("h1")
-	e.c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, nil) // a mgmt-chain record
+	e.c.ok("POST", "/v1/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, nil) // a mgmt-chain record
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 10, "auditPubKey": base64.StdEncoding.EncodeToString(pub)}, nil)
+	h1.ok("PUT", "/v1/hosts/h1", map[string]any{"capacityNodes": 10, "tiers": []string{"process"}, "auditPubKey": base64.StdEncoding.EncodeToString(pub)}, nil)
 	prev := ""
 	mk := func(kind, source string) map[string]any {
 		r := map[string]any{"ts": time.Now().UTC().Format(time.RFC3339Nano), "objectID": "o1", "kind": kind, "traceID": "tr-1", "prevHash": prev,
-			"detail": `{"claimedKind":"allow","grant":"example.com/cap/mcp: refund"}`}
+			"detail": map[string]any{"claimedKind": "allow", "grant": "example.com/cap/mcp: refund"}}
 		if source != "" {
 			r["source"] = source
 		}
@@ -158,8 +160,8 @@ func TestAuditIngestProvenance(t *testing.T) {
 		return r
 	}
 	// Refused before anything is appended: the chain head stays put.
-	for _, bad := range [][2]string{{"allow", "tenant"}, {"deny", "tenant"}, {"kill", "tenant"}, {"tenant_note", "host"}, {"tenant_note", ""}, {"allow", "mgmt"}, {"allow", "bogus"}} {
-		h1.fail("POST", "/v0/audit", map[string]any{"records": []any{mk(bad[0], bad[1])}}, 400, "bad_request")
+	for _, bad := range [][2]string{{"allow", "tenant"}, {"deny", "tenant"}, {"kill", "tenant"}, {"tenant_note", "host"}, {"tenant_note", ""}, {"allow", "mgmt"}} {
+		h1.fail("POST", "/v1/audit", map[string]any{"records": []any{mk(bad[0], bad[1])}}, 400, "bad_request")
 	}
 	var resp struct {
 		Accepted int
@@ -171,15 +173,15 @@ func TestAuditIngestProvenance(t *testing.T) {
 		prev = r["hash"].(string)
 		good = append(good, r)
 	}
-	h1.ok("POST", "/v0/audit", map[string]any{"records": good}, &resp)
+	h1.ok("POST", "/v1/audit", map[string]any{"records": good}, &resp)
 	if resp.Accepted != 3 || !resp.Chain.OK {
 		t.Fatalf("ingest %+v", resp)
 	}
 	var aud struct {
-		Records  []AuditRecord
+		Records  []AuditRecord `json:"items"`
 		Verified bool
 	}
-	e.c.ok("GET", "/v0/audit?chain=host:h1", nil, &aud)
+	e.c.ok("GET", "/v1/audit?chain=host:h1", nil, &aud)
 	if len(aud.Records) != 3 || !aud.Verified {
 		t.Fatalf("query: %+v", aud)
 	}
@@ -191,7 +193,7 @@ func TestAuditIngestProvenance(t *testing.T) {
 	if aud.Records[2].Kind != KindTenantNote {
 		t.Fatalf("tenant record kind %q", aud.Records[2].Kind)
 	}
-	e.c.ok("GET", "/v0/audit?chain=mgmt&limit=1", nil, &aud)
+	e.c.ok("GET", "/v1/audit?chain=mgmt&limit=1", nil, &aud)
 	if len(aud.Records) == 0 || aud.Records[0].Source != SourceMgmt {
 		t.Fatalf("mgmt chain source: %+v", aud.Records)
 	}

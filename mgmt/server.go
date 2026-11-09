@@ -108,7 +108,29 @@ type SelfInfo struct {
 	// Transport is how this request reached mgmt: "tsnet" (normal
 	// operation) or "local-dev" (the unix socket behind --local-dev).
 	Transport string `json:"transport,omitempty"`
+	// NodeID is mgmt's own stable node ID (not serialised): a caller with
+	// this WhoIs identity is the operator console (loopback).
+	NodeID string `json:"-"`
+	// IP is mgmt's tailnet IPv4.
+	IP string `json:"ip,omitempty"`
 }
+
+// Loopback is <state>/mgmt/loopback.json (0600): how the twd CLI on the
+// host machine reaches mgmt through mgmt's own tsnet node (tsnet
+// Loopback: a SOCKS5 proxy on 127.0.0.1 with a per-start credential). The
+// connection then arrives from mgmt's own node, which WhoIs resolves to
+// the operator principal. No API runs on a unix socket in this mode.
+type Loopback struct {
+	Addr      string `json:"addr"`      // 127.0.0.1:port (SOCKS5 + HTTP proxy)
+	ProxyCred string `json:"proxyCred"` // SOCKS5 password (user "tsnet")
+	MgmtIP    string `json:"mgmtIP"`    // dial this through the proxy
+	DNSName   string `json:"dnsName,omitempty"`
+	HTTPS     bool   `json:"https"`
+	PID       int    `json:"pid"`
+}
+
+// String never prints the credential.
+func (Loopback) String() string { return "mgmt.Loopback{[REDACTED]}" }
 
 func decodeB64(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }
 
@@ -366,6 +388,13 @@ func (s *Server) TailnetHandler(whois WhoIsFunc, h http.Handler) http.Handler {
 		}
 		p := Principal{NodeID: wi.NodeID, Tags: wi.Tags, Caps: wi.Caps}
 		switch {
+		case s.Self.NodeID != "" && wi.NodeID == s.Self.NodeID:
+			// mgmt's own node: the operator console on the host machine
+			// (the twd CLI dials through the node's loopback proxy, so the
+			// connection carries mgmt's identity). Local admin, like the
+			// local-dev socket, but over the tsnet listener.
+			p.Kind = "local"
+			p.Login = "operator"
 		case slices.Contains(wi.Tags, HostTag):
 			p.Kind = "host"
 			hosts, _ := s.M.store.ListHosts(r.Context(), Page{})

@@ -193,6 +193,13 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 			rd = bytes.NewReader(bb)
 		}
 		req, _ := http.NewRequestWithContext(ctx, method, "http://twd-mgmt"+path, rd)
+		if rd != nil {
+			ct := "application/json"
+			if method == "PATCH" {
+				ct = "application/merge-patch+json"
+			}
+			req.Header.Set("Content-Type", ct)
+		}
 		req.Header.Set("Twd-Host-ID", hostID)
 		req.Header.Set(mgmt.HostTokenHeader, hostToken)
 		resp, err := hc.Do(req)
@@ -201,20 +208,23 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		rb, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
+		if resp.StatusCode/100 != 2 {
 			t.Logf("%s %s → %d %s", method, path, resp.StatusCode, rb) // error bodies never contain keys
 		} else if out != nil {
 			json.Unmarshal(rb, out)
 		}
+		if resp.StatusCode/100 == 2 {
+			return 200 // every success is "ok" to the checks below (201/202 included)
+		}
 		return resp.StatusCode
 	}
 	var tn struct{ TenantID string }
-	if call("POST", "/v0/tenants", map[string]any{"tailnet": tailnet, "controlURL": prodControl, "mintMode": "apikey", "apiKeyFile": keyFile}, &tn) != 200 {
+	if call("POST", "/v1/tenants", map[string]any{"tailnet": tailnet, "controlURL": prodControl, "mintMode": "apikey", "apiKeyFile": keyFile}, &tn) != 200 {
 		t.Fatal("tenant")
 	}
-	call("POST", "/v0/hosts/register", map[string]any{"hostID": hostID, "capacityNodes": 4, "tiers": []string{"process"}}, nil)
+	call("PUT", "/v1/hosts/"+hostID, map[string]any{"capacityNodes": 4, "tiers": []string{"process"}}, nil)
 	var dep mgmt.DeployResponse
-	if call("POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": prefix,
+	if call("POST", "/v1/deployments", map[string]any{"tenantID": tn.TenantID, "workload": prefix,
 		"namespaces": []mgmt.ClassConfig{{Class: prefix, Tags: []string{"tag:ttest"}, Agent: true}}}, &dep) != 200 {
 		t.Fatal("deploy")
 	}
@@ -223,11 +233,11 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 	// and an ephemeral sub-agent that joins. The spawn reads (never writes)
 	// tailnet 1's policy for the ⊆ check.
 	var rootObj, child mgmt.CreateObjectResponse
-	if call("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "namespace": prefix, "objectName": "root"}, &rootObj) != 200 {
+	if call("POST", "/v1/objects", map[string]any{"tenantID": tn.TenantID, "workload": prefix, "namespace": prefix, "objectName": "root"}, &rootObj) != 200 {
 		t.Fatal("create root")
 	}
 	t0 := time.Now()
-	st := call("POST", "/v0/objects", map[string]any{"tenantID": tn.TenantID, "namespace": prefix, "objectName": "child",
+	st := call("POST", "/v1/objects", map[string]any{"tenantID": tn.TenantID, "workload": prefix, "namespace": prefix, "objectName": "child",
 		"parent": map[string]string{"objectID": rootObj.ObjectID}, "ttl": "10m"}, &child)
 	res.check(t, "spawn_checked_against_real_policy", st == 200, "spawn status "+itoa(st))
 	res.Numbers["spawn_check_ms"] = ms(time.Since(t0))
@@ -238,9 +248,9 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 
 	// Credential release: fenced by epoch.
 	var cred mgmt.Credential
-	res.check(t, "stale_epoch_rejected", call("GET", "/v0/objects/"+child.ObjectID+"/credential?epoch=99", nil, nil) == 409, "want 409 lease_lost")
+	res.check(t, "stale_epoch_rejected", call("POST", "/v1/objects/"+child.ObjectID+"/credentials?epoch=99", nil, nil) == 409, "want 409 lease_lost")
 	t1 := time.Now()
-	if call("GET", "/v0/objects/"+child.ObjectID+"/credential?epoch="+itoa(int(dep.Epoch))+"&wait=30", nil, &cred) != 200 || cred.AuthKey == "" {
+	if call("POST", "/v1/objects/"+child.ObjectID+"/credentials?epoch="+itoa(int(dep.Epoch))+"&wait=30", nil, &cred) != 200 || cred.AuthKey == "" {
 		t.Fatal("credential")
 	}
 	res.Numbers["create_to_credential_ms"] = ms(time.Since(t1))
@@ -261,17 +271,17 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 	trackedDevices = append(trackedDevices, stable)
 	dev, err := api.GetDevice(ctx, stable)
 	res.check(t, "device_tagged_ttest", err == nil && len(dev.Tags) == 1 && dev.Tags[0] == "tag:ttest", errStr(err)+" tags="+strings.Join(dev.Tags, ","))
-	if call("POST", "/v0/objects/"+child.ObjectID+"/ready", map[string]any{"nodeID": stable, "stableNodeID": stable,
+	if call("PATCH", "/v1/objects/"+child.ObjectID, map[string]any{"status": "ready", "nodeID": stable, "stableNodeID": stable,
 		"magicDNS": strings.TrimSuffix(stt.Self.DNSName, "."), "epoch": dep.Epoch}, nil) != 200 {
 		t.Fatal("ready")
 	}
 	// The single-use key is spent: a second credential fetch is refused.
-	res.check(t, "credential_not_rereleased", call("GET", "/v0/objects/"+child.ObjectID+"/credential?epoch="+itoa(int(dep.Epoch)), nil, nil) == 409, "")
+	res.check(t, "credential_not_rereleased", call("POST", "/v1/objects/"+child.ObjectID+"/credentials?epoch="+itoa(int(dep.Epoch)), nil, nil) == 409, "")
 
 	// Cascade kill from the root.
 	var kr mgmt.KillResult
 	t3 := time.Now()
-	call("POST", "/v0/objects/"+rootObj.ObjectID+"/kill", map[string]any{"cascade": true, "reason": "e2e"}, &kr)
+	call("DELETE", "/v1/objects/"+rootObj.ObjectID+"?cascade=true&reason=e2e", nil, &kr)
 	res.Numbers["kill_api_ms"] = ms(time.Since(t3))
 	res.check(t, "cascade_killed_both", len(kr.Killed) == 2, strings.Join(kr.Killed, ","))
 	res.check(t, "kill_deleted_device", len(kr.DevicesDeleted) == 1 && kr.DevicesDeleted[0] == child.ObjectID, strings.Join(kr.DevicesDeleted, ","))
@@ -293,16 +303,16 @@ func TestMgmtRealMintJoinKill(t *testing.T) {
 		res.check(t, "device_absent_from_list", !present, "still listed")
 	}
 	var hb mgmt.HeartbeatResponse
-	call("POST", "/v0/hosts/"+hostID+"/heartbeat", map[string]any{"liveNodes": 0}, &hb)
+	call("PUT", "/v1/hosts/"+hostID+"/status", map[string]any{"liveNodes": 0, "leases": []any{}}, &hb)
 	res.check(t, "revocation_to_host", len(hb.RevokeObjects) == 2, strings.Join(hb.RevokeObjects, ","))
 
 	var aud struct {
-		Records  []mgmt.AuditRecord
+		Items    []mgmt.AuditRecord
 		Verified bool
 	}
-	call("GET", "/v0/audit?object="+child.ObjectID, nil, &aud)
+	call("GET", "/v1/audit?object="+child.ObjectID, nil, &aud)
 	var kinds []string
-	for _, r := range aud.Records {
+	for _, r := range aud.Items {
 		kinds = append(kinds, r.Kind)
 	}
 	res.check(t, "audit_chain", aud.Verified && strings.Join(kinds, ",") == "spawn,mint,deny,credential,ready,kill", strings.Join(kinds, ","))

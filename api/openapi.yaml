@@ -47,8 +47,8 @@ info:
     - JSON everywhere. Timestamps are unix **milliseconds** unless the field
       says otherwise (`AuditRecord.ts` is RFC 3339).
     - **Pagination.** Every list returns `{"items": [...], "nextCursor":
-      "..." | null}`. `?limit=` defaults to 50 and is capped at 500 (a larger
-      value is clamped, not refused). `?cursor=` is opaque; it encodes the
+      "..." | null}`. `?limit=` defaults to 50; 1–500 is accepted and anything
+      else is `400 bad_request`. `?cursor=` is opaque; it encodes the
       stable sort key `(createdAt, id)` (audit: `(ts, chain, seq)`), so a page
       is stable under concurrent inserts. A cursor that does not decode is
       `400 bad_cursor`. Filters are query parameters and must be repeated
@@ -1545,7 +1545,7 @@ components:
     limit:
       name: limit
       in: query
-      description: Page size. Values above 500 are clamped to 500.
+      description: Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
       schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
     cursor:
       name: cursor
@@ -1828,7 +1828,8 @@ components:
         | `forbidden` | 403 | role ok, but outside the caller's records / namespaces |
         | `host_not_registered` | 403 | `tag:twd-host` node that never did `PUT /v1/hosts/{id}` |
         | `host_identity_mismatch` | 403 | host ID bound to another node |
-        | `delegation_invalid` | 403 | spawn caps ⊄ parent, or child tag not owned by the parent's |
+        | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
+        | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
         | `not_found` | 404 | — |
         | `unknown_tenant` | 404 | — |
         | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1865,6 +1866,7 @@ components:
         - host_not_registered
         - host_identity_mismatch
         - delegation_invalid
+        - delegation_exceeds_parent
         - not_found
         - unknown_tenant
         - unknown_namespace
@@ -1889,11 +1891,10 @@ components:
         - policy_unavailable
         - internal
     TombstoneError:
-      description: "`410 Gone`: the error plus the kill record."
+      description: "`410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`)."
       allOf:
         - $ref: "#/components/schemas/Error"
         - type: object
-          required: [tombstone]
           properties:
             tombstone: { $ref: "#/components/schemas/Tombstone" }
     Tombstone:
@@ -2407,7 +2408,7 @@ components:
         `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
         `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
         `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-        `preflight` (optional; dryRun deploys), `host_add`.
+        `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
       enum:
         - allow
         - deny
@@ -2433,6 +2434,9 @@ components:
         - reap
         - preflight
         - host_add
+        - credential
+        - obo_root
+        - object_update
     AuditSource:
       type: string
       description: "`mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content)."
@@ -2457,7 +2461,11 @@ components:
         code: { type: string }
         traceID: { type: string }
         actingFor: { type: string }
-        detail: { type: object, additionalProperties: true }
+        detail:
+          description: Structured detail (mgmt records) or free text (host `tenant_note`s).
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: string }
         prevHash: { type: string, description: "`\"\"` for the first record of a chain." }
         hash: { type: string, pattern: "^[0-9a-f]{64}$" }
         hostSig: { type: string, description: base64 ed25519 over utf8(hash); host chains only. }

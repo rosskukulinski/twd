@@ -130,6 +130,9 @@ func TestE2EMac(t *testing.T) {
 		for _, id := range res.NodeIDs {
 			tracker.Track(id, "twd")
 		}
+		for _, id := range res.InfraNodeIDs {
+			tracker.Track(id, "twd-infra") // mgmt's and the host's own nodes: kept by twd down, deleted here by ID
+		}
 		crep := tracker.Cleanup(cctx, prefix)
 		for _, k := range keys {
 			api.DeleteKey(cctx, k)

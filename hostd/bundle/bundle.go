@@ -1,6 +1,6 @@
 // Package bundle reads and writes twd deployment bundles: a tar of the built
 // worker modules plus twd.jsonc and wrangler.jsonc (contract: POST
-// /v0/deployments), and parses the parts of both configs twd-hostd uses.
+// /v1/deployments), and parses the parts of both configs twd-hostd uses.
 package bundle
 
 import (

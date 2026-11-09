@@ -314,11 +314,19 @@ func cmdDeploy(args []string) error {
 	defer cancel()
 	mc := s.mgmt()
 
-	// Preflight tailnet.connects and tagOwners against the tenant policy.
+	// Build first: the preflight is a dry-run deploy of the real bundle
+	// (POST /v1/deployments?dryRun=true), so mgmt checks exactly the tags
+	// and tailnet.connects it would mint and nothing is created.
+	bs := time.Now()
+	tb, jsBytes, err := a.build(vars)
+	if err != nil {
+		return err
+	}
+	res.BundleBytes = jsBytes
+	res.Timings["build"] = ms(time.Since(bs))
 	var pf mgmt.PreflightResult
 	policyUnavailable := ""
-	if err := mc.Do(ctx, "POST", "/v0/tenants/"+tn.TenantID+"/preflight",
-		mgmt.PreflightRequest{SrcTags: a.srcTags(), Connects: a.Cfg.Tailnet.Connects}, &pf); err != nil {
+	if err := mc.Do(ctx, "POST", "/v1/deployments?dryRun=true", map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}, &pf); err != nil {
 		me, ok := mgmtapi.AsError(err)
 		if !ok || me.Code != "policy_unavailable" {
 			return err
@@ -353,13 +361,6 @@ func cmdDeploy(args []string) error {
 		return e
 	}
 
-	bs := time.Now()
-	tb, jsBytes, err := a.build(vars)
-	if err != nil {
-		return err
-	}
-	res.BundleBytes = jsBytes
-	res.Timings["build"] = ms(time.Since(bs))
 	if !*f.json {
 		main := "dist/index.js"
 		if a.Runtime == bundle.RuntimeNode {
@@ -369,7 +370,7 @@ func cmdDeploy(args []string) error {
 	}
 	ds := time.Now()
 	var dr mgmt.DeployResponse
-	if err := mc.Do(ctx, "POST", "/v0/deployments", map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}, &dr); err != nil {
+	if err := mc.Do(ctx, "POST", "/v1/deployments", map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}, &dr); err != nil {
 		return err
 	}
 	res.DeploymentID, res.Host = dr.DeploymentID, dr.Host
@@ -384,7 +385,7 @@ func cmdDeploy(args []string) error {
 	var v mgmt.DeploymentView
 	activeAt := time.Duration(0)
 	for {
-		if err := mc.Do(ctx, "GET", "/v0/deployments/"+dr.DeploymentID, nil, &v); err != nil {
+		if err := mc.Do(ctx, "GET", "/v1/deployments/"+dr.DeploymentID, nil, &v); err != nil {
 			return err
 		}
 		if v.Status == "failed" {

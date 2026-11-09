@@ -40,7 +40,8 @@ func Policy() policy.Snippet {
 	app := func(tools ...string) map[string]any {
 		return map[string]any{MCPCap: []any{map[string]any{"tools": tools}}}
 	}
-	return policy.Snippet{
+	infra := policy.InfraSnippet(7474)
+	s := policy.Snippet{
 		TagOwners: map[string][]string{
 			"tag:twd-wl-agent":          owners,
 			"tag:twd-wl-mcp":            owners,
@@ -59,6 +60,11 @@ func Policy() policy.Snippet {
 			{"src": []string{"tag:twd-agent-support-sub"}, "dst": []string{"tag:twd-wl-mcp"}, "ip": []string{"tcp:80"}, "app": app("lookup_order")},
 		},
 	}
+	for k, v := range infra.TagOwners {
+		s.TagOwners[k] = v
+	}
+	s.Grants = append(s.Grants, infra.Grants...)
+	return s
 }
 
 // BuildBinaries builds twd, twd-mgmt and twd-hostd into a temp dir.
@@ -149,7 +155,11 @@ type Results struct {
 	Cleanup map[string]any     `json:"cleanup"`
 	// IDs this run created via twd (for leftover checks; never printed keys).
 	NodeIDs []string `json:"nodeIDs"`
-	KeyIDs  []string `json:"keyIDs"`
+	// InfraNodeIDs are mgmt's and the host's own nodes (tag:twd-mgmt,
+	// tag:twd-host): kept by `twd down` (state is kept for the next up), so
+	// they are excluded from the leftover check and deleted by the harness.
+	InfraNodeIDs []string `json:"infraNodeIDs"`
+	KeyIDs       []string `json:"keyIDs"`
 }
 
 // NewResults returns empty results.
@@ -342,8 +352,11 @@ func mcpCall(hc *http.Client, ip, tool string, args map[string]any) (map[string]
 func (e *Env) upArgs() []string {
 	// --allow-sibling-egress: the agent and the MCP server share this host;
 	// check (d) needs the spawned child to reach the server over the tailnet.
+	// Normal operation is tsnet only: mgmt's and the host's own nodes are
+	// named after this run so leftovers are attributable.
 	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", e.APIKeyFile, "--yes",
-		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL, "--allow-sibling-egress"}
+		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL, "--allow-sibling-egress",
+		"--mgmt-hostname", e.Prefix + "mgmt", "--host-id", strings.TrimSuffix(e.Prefix, "-")}
 	if !e.Persistent {
 		upArgs = append(upArgs, "--ephemeral")
 	}
@@ -455,13 +468,15 @@ func (e *Env) Run() {
 	res.pass("up_apikey_needs_tailnet", "tailnet_required")
 
 	var up struct {
-		TenantID string             `json:"tenantID"`
-		HostID   string             `json:"hostID"`
-		PolicyOK bool               `json:"policyOK"`
-		Timings  map[string]float64 `json:"timingsMs"`
+		TenantID   string             `json:"tenantID"`
+		HostID     string             `json:"hostID"`
+		MgmtNodeID string             `json:"mgmtNodeID"`
+		PolicyOK   bool               `json:"policyOK"`
+		Timings    map[string]float64 `json:"timingsMs"`
 	}
 	d := e.MustJSON(&up, upArgs...)
 	res.Numbers["up_ready_ms"] = msOf(d)
+	e.TrackInfra(up.MgmtNodeID)
 	res.Numbers["up_mgmt_ready_ms"] = up.Timings["mgmt_ready"]
 	res.Numbers["up_host_ready_ms"] = up.Timings["host_ready"]
 	res.pass("up", fmt.Sprintf("tenant %s host %s in %v", up.TenantID, up.HostID, d.Round(time.Millisecond)))
@@ -844,6 +859,45 @@ func Leftovers(ctx context.Context, api *tsapi.Client, res *Results) (devices, k
 
 // Objects lists every object (twd ls --all).
 func (e *Env) Objects() []Object { return e.objects() }
+
+// TrackInfra records mgmt's node (from `twd up`) and the host's own node
+// (from `twd host ls`) in Res.InfraNodeIDs, and asserts the transport is
+// tsnet: no unix socket in use (`twd doctor` transport row).
+func (e *Env) TrackInfra(mgmtNodeID string) {
+	t := e.T
+	t.Helper()
+	add := func(id string) {
+		if id != "" && !slices.Contains(e.Res.InfraNodeIDs, id) {
+			e.Res.InfraNodeIDs = append(e.Res.InfraNodeIDs, id)
+		}
+	}
+	add(mgmtNodeID)
+	var hosts []struct {
+		HostID, NodeID, Status string
+	}
+	e.MustJSON(&hosts, "host", "ls")
+	for _, h := range hosts {
+		add(h.NodeID)
+		if h.Status != "live" || h.NodeID == "" {
+			t.Fatalf("host %s is %q with node %q: the host must be live on its own tag:twd-host node", h.HostID, h.Status, h.NodeID)
+		}
+	}
+	var doc struct {
+		Checks []struct{ Name, Status, Detail string }
+	}
+	e.MustJSON(&doc, "doctor")
+	for _, c := range doc.Checks {
+		if c.Name == "transport" {
+			if c.Status != "ok" || !strings.HasPrefix(c.Detail, "tsnet:") {
+				t.Fatalf("doctor transport: %s %s", c.Status, c.Detail)
+			}
+			e.Res.pass("transport_tsnet_only", c.Detail)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(e.StateDir, "run", "mgmt.sock")); err == nil {
+		t.Fatalf("mgmt serves a unix socket in normal operation")
+	}
+}
 
 // RunPrefixes names one real-tailnet run's nodes: the test client + echo
 // get ttest-<label>-<run>- and every node twd creates gets twd-<label>-<run>-.

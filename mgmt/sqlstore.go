@@ -559,7 +559,7 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	var d Deployment
 	var ns string
 	var ml, md int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.Bundle)
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &d.Bundle)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}

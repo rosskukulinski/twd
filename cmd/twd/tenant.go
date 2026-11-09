@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"slices"
+
 	"fmt"
+	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -37,8 +40,7 @@ func (s *state) tenants() []TenantRef {
 		if s.remoteTenants == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
-			var ts []mgmt.Tenant
-			s.mgmt().Do(ctx, "GET", "/v0/tenants", nil, &ts)
+			ts, _ := listAll[mgmt.Tenant](ctx, s.mgmt(), "/v1/tenants", 0)
 			s.remoteTenants = []TenantRef{}
 			for _, t := range ts {
 				s.remoteTenants = append(s.remoteTenants, TenantRef{Tailnet: t.Tailnet, TenantID: t.ID, MintMode: t.MintMode, ControlURL: t.ControlURL})
@@ -85,10 +87,13 @@ func tenantFlag(f *flags) *string {
 	return f.String("tenant", "", "tenant: its tailnet, tenant ID or tailnet label (default: the `twd up` tenant)")
 }
 
+// objectsOf lists a tenant's objects (every page; max > 0 caps the count).
 func (s *state) objectsOf(ctx context.Context, tenantID string) ([]mgmt.Object, error) {
-	var objs []mgmt.Object
-	err := s.mgmt().Do(ctx, "GET", "/v0/objects?tenant="+url.QueryEscape(tenantID), nil, &objs)
-	return objs, err
+	return s.objectsOfN(ctx, tenantID, 0)
+}
+
+func (s *state) objectsOfN(ctx context.Context, tenantID string, max int) ([]mgmt.Object, error) {
+	return listAll[mgmt.Object](ctx, s.mgmt(), "/v1/objects?tenant="+url.QueryEscape(tenantID), max)
 }
 
 func cmdTenant(args []string) error {
@@ -105,7 +110,7 @@ func cmdTenant(args []string) error {
 		}
 	}
 	if sub < 0 {
-		return fail("bad_request", "twd tenant needs a subcommand: add | ls", "usage: twd "+usageOf("tenant"))
+		return fail("bad_request", "twd tenant needs a subcommand: add | ls | set | rm", "usage: twd "+usageOf("tenant"))
 	}
 	rest := append(append([]string{}, args[:sub]...), args[sub+1:]...)
 	switch args[sub] {
@@ -113,6 +118,10 @@ func cmdTenant(args []string) error {
 		return cmdTenantAdd(rest)
 	case "ls", "list":
 		return cmdTenantLs(rest)
+	case "set":
+		return cmdTenantSet(rest)
+	case "rm", "remove", "delete":
+		return cmdTenantRm(rest)
 	}
 	return fail("bad_request", fmt.Sprintf("unknown subcommand %q", args[sub]), "usage: twd "+usageOf("tenant"))
 }
@@ -217,7 +226,7 @@ func cmdTenantAdd(args []string) error {
 
 	tid := tenantIDFor(tailnet)
 	var existing mgmt.Tenant
-	if err := s.mgmt().Do(ctx, "GET", "/v0/tenants/"+tid, nil, &existing); err == nil {
+	if err := s.mgmt().Do(ctx, "GET", "/v1/tenants/"+tid, nil, &existing); err == nil {
 		if existing.Tailnet != tailnet {
 			return fail("state_conflict", fmt.Sprintf("tenant ID %s is taken by tailnet %s", tid, existing.Tailnet))
 		}
@@ -230,7 +239,7 @@ func cmdTenantAdd(args []string) error {
 		var tr struct {
 			TenantID string `json:"tenantID"`
 		}
-		if err := s.mgmt().Do(ctx, "POST", "/v0/tenants", body, &tr); err != nil {
+		if err := s.mgmt().Do(ctx, "POST", "/v1/tenants", body, &tr); err != nil {
 			return err
 		}
 		tid = tr.TenantID
@@ -321,7 +330,7 @@ func cmdTenantLs(args []string) error {
 			Q    int     `json:"mintQueue"`
 			Rate float64 `json:"effectiveRegistrationsPerMinute"`
 		}
-		s.mgmt().Do(ctx, "GET", "/v0/tenants/"+t.TenantID, nil, &tn)
+		s.mgmt().Do(ctx, "GET", "/v1/tenants/"+t.TenantID, nil, &tn)
 		e.Rate, e.Queue = tn.Rate, tn.Q
 		if objs, err := s.objectsOf(ctx, t.TenantID); err == nil {
 			for _, o := range objs {
@@ -359,7 +368,7 @@ func tailscaledExposed(s *state, sock string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var hv hostd.StatusView
-	if err := s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv); err != nil {
+	if err := s.hostd().Do(ctx, "GET", "/v1/status", nil, &hv); err != nil {
 		return "twd-hostd is not answering, so running workloads can't be checked"
 	}
 	if !strings.HasPrefix(hv.Sandbox, hostd.SandboxLandlock) {
@@ -371,4 +380,131 @@ func tailscaledExposed(s *state, sock string) string {
 		}
 	}
 	return ""
+}
+
+// cmdTenantSet is `twd tenant set <tenant> [--max-objects N] [--registrations-per-minute N]
+// [--pool P] [--tier process|microvm] [--wif-client-id ID] [--wif-lifecycle-client-id ID|-]`:
+// a JSON Merge Patch (PATCH /v1/tenants/{id}); "-" clears a field.
+func cmdTenantSet(args []string) error {
+	f := newFlags("tenant set")
+	maxObj := f.Int("max-objects", 0, "object quota")
+	rpm := f.Int("registrations-per-minute", 0, "node registration throttle")
+	pool := f.String("pool", "", "host pool the tenant's deployments are placed on (\"-\" = any host)")
+	tier := f.String("tier", "", "default isolation tier: process | microvm (\"-\" = unset)")
+	wifID := f.String("wif-client-id", "", "switch to mint mode wif with this mint trust credential")
+	wifLife := f.String("wif-lifecycle-client-id", "", "lifecycle trust credential (\"-\" = clear)")
+	pos, err := f.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fail("bad_request", "twd tenant set needs one tenant", "usage: twd "+usageOf("tenant"))
+	}
+	s, err := openState(*f.stateDir)
+	if err != nil {
+		return err
+	}
+	if err := s.requireUp(); err != nil {
+		return err
+	}
+	tn, err := s.tenant(pos[0])
+	if err != nil {
+		return err
+	}
+	patch := map[string]any{}
+	val := func(v string) any {
+		if v == "-" {
+			return nil
+		}
+		return v
+	}
+	if *maxObj > 0 {
+		patch["maxObjects"] = *maxObj
+	}
+	if *rpm > 0 {
+		patch["registrationsPerMinute"] = *rpm
+	}
+	if *pool != "" {
+		patch["pool"] = val(*pool)
+	}
+	if *tier != "" {
+		patch["tier"] = val(*tier)
+	}
+	if *wifID != "" {
+		patch["mintMode"], patch["wifClientID"] = "wif", *wifID
+	}
+	if *wifLife != "" {
+		patch["wifLifecycleClientID"] = val(*wifLife)
+	}
+	if len(patch) == 0 {
+		return fail("bad_request", "nothing to set", "usage: twd "+usageOf("tenant"))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var t mgmt.Tenant
+	if err := s.mgmt().DoHeaders(ctx, "PATCH", "/v1/tenants/"+tn.TenantID, patch, &t,
+		map[string]string{"Content-Type": "application/merge-patch+json", "Twd-Actor": actor()}); err != nil {
+		return err
+	}
+	emit(f, t, func() {
+		fmt.Printf("✓ tenant   %s (%s) updated · mint mode %s · %d objects max · %d registrations/min · pool %q · tier %q\n",
+			t.Tailnet, t.ID, t.MintMode, t.MaxObjects, t.RegistrationsPerMinute, t.Pool, t.Tier)
+	})
+	return nil
+}
+
+// cmdTenantRm is `twd tenant rm <tenant> [--force]` (DELETE /v1/tenants/{id}):
+// refused while objects are live unless --force kills and purges them.
+func cmdTenantRm(args []string) error {
+	f := newFlags("tenant rm")
+	force := f.Bool("force", false, "kill every live object (cascade) and purge before deleting")
+	pos, err := f.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fail("bad_request", "twd tenant rm needs one tenant", "usage: twd "+usageOf("tenant"))
+	}
+	s, err := openState(*f.stateDir)
+	if err != nil {
+		return err
+	}
+	if err := s.requireUp(); err != nil {
+		return err
+	}
+	tn, err := s.tenant(pos[0])
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	q := ""
+	if *force {
+		q = "?force=true"
+	}
+	var res struct {
+		TenantID           string   `json:"tenantID"`
+		Killed             []string `json:"killed"`
+		Purged             []string `json:"purged"`
+		DeploymentsStopped []string `json:"deploymentsStopped"`
+	}
+	if err := s.mgmt().DoHeaders(ctx, "DELETE", "/v1/tenants/"+tn.TenantID+q, nil, &res, map[string]string{"Twd-Actor": actor()}); err != nil {
+		if me, ok := mgmtapi.AsError(err); ok && me.Code == "tenant_has_live_objects" {
+			return fail("tenant_has_live_objects", me.Message).withFix("twd tenant rm " + pos[0] + " --force")
+		}
+		return err
+	}
+	// Forget it locally too.
+	if !s.remote() {
+		if s.Cfg.TenantID == tn.TenantID {
+			s.Cfg.TenantID = ""
+		}
+		s.Cfg.Tenants = slices.DeleteFunc(s.Cfg.Tenants, func(t TenantRef) bool { return t.TenantID == tn.TenantID })
+		s.save()
+	}
+	res.TenantID = tn.TenantID
+	emit(f, res, func() {
+		fmt.Printf("✓ tenant   %s (%s) removed · %d objects killed · %d forgotten · %d deployments stopped\n", tn.Tailnet, tn.TenantID, len(res.Killed), len(res.Purged), len(res.DeploymentsStopped))
+	})
+	return nil
 }

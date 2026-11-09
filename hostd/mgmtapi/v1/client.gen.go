@@ -22,6 +22,7 @@ import (
 const (
 	AuditKindAllow        AuditKind = "allow"
 	AuditKindCreate       AuditKind = "create"
+	AuditKindCredential   AuditKind = "credential"
 	AuditKindDeny         AuditKind = "deny"
 	AuditKindDeploy       AuditKind = "deploy"
 	AuditKindDeviceDelete AuditKind = "device_delete"
@@ -31,6 +32,8 @@ const (
 	AuditKindHostRegister AuditKind = "host_register"
 	AuditKindKill         AuditKind = "kill"
 	AuditKindMint         AuditKind = "mint"
+	AuditKindObjectUpdate AuditKind = "object_update"
+	AuditKindOboRoot      AuditKind = "obo_root"
 	AuditKindPreflight    AuditKind = "preflight"
 	AuditKindPrincipal    AuditKind = "principal"
 	AuditKindPurge        AuditKind = "purge"
@@ -53,6 +56,8 @@ func (e AuditKind) Valid() bool {
 		return true
 	case AuditKindCreate:
 		return true
+	case AuditKindCredential:
+		return true
 	case AuditKindDeny:
 		return true
 	case AuditKindDeploy:
@@ -70,6 +75,10 @@ func (e AuditKind) Valid() bool {
 	case AuditKindKill:
 		return true
 	case AuditKindMint:
+		return true
+	case AuditKindObjectUpdate:
+		return true
+	case AuditKindOboRoot:
 		return true
 	case AuditKindPreflight:
 		return true
@@ -158,41 +167,42 @@ func (e DeploymentStatus) Valid() bool {
 
 // Defines values for ErrorCode.
 const (
-	ErrorCodeAlreadyJoined         ErrorCode = "already_joined"
-	ErrorCodeBadBundle             ErrorCode = "bad_bundle"
-	ErrorCodeBadCursor             ErrorCode = "bad_cursor"
-	ErrorCodeBadRequest            ErrorCode = "bad_request"
-	ErrorCodeBootstrapFailed       ErrorCode = "bootstrap_failed"
-	ErrorCodeDelegationInvalid     ErrorCode = "delegation_invalid"
-	ErrorCodeExists                ErrorCode = "exists"
-	ErrorCodeForbidden             ErrorCode = "forbidden"
-	ErrorCodeHostHoldsLeases       ErrorCode = "host_holds_leases"
-	ErrorCodeHostIdentityMismatch  ErrorCode = "host_identity_mismatch"
-	ErrorCodeHostNotRegistered     ErrorCode = "host_not_registered"
-	ErrorCodeHostTokenInvalid      ErrorCode = "host_token_invalid"
-	ErrorCodeHostTokenRequired     ErrorCode = "host_token_required"
-	ErrorCodeHostTokenUnconfigured ErrorCode = "host_token_unconfigured"
-	ErrorCodeIdentityConflict      ErrorCode = "identity_conflict"
-	ErrorCodeIdentityPending       ErrorCode = "identity_pending"
-	ErrorCodeImmutableField        ErrorCode = "immutable_field"
-	ErrorCodeInternal              ErrorCode = "internal"
-	ErrorCodeKilled                ErrorCode = "killed"
-	ErrorCodeLeaseHeld             ErrorCode = "lease_held"
-	ErrorCodeLeaseLost             ErrorCode = "lease_lost"
-	ErrorCodeNamespaceAmbiguous    ErrorCode = "namespace_ambiguous"
-	ErrorCodeNoHost                ErrorCode = "no_host"
-	ErrorCodeNoIdentity            ErrorCode = "no_identity"
-	ErrorCodeNotAdmin              ErrorCode = "not_admin"
-	ErrorCodeNotFound              ErrorCode = "not_found"
-	ErrorCodeNotReady              ErrorCode = "not_ready"
-	ErrorCodeObjectQuotaExceeded   ErrorCode = "object_quota_exceeded"
-	ErrorCodePolicyUnavailable     ErrorCode = "policy_unavailable"
-	ErrorCodePreconditionFailed    ErrorCode = "precondition_failed"
-	ErrorCodeSpawnBudgetExceeded   ErrorCode = "spawn_budget_exceeded"
-	ErrorCodeSuperseded            ErrorCode = "superseded"
-	ErrorCodeTenantHasLiveObjects  ErrorCode = "tenant_has_live_objects"
-	ErrorCodeUnknownNamespace      ErrorCode = "unknown_namespace"
-	ErrorCodeUnknownTenant         ErrorCode = "unknown_tenant"
+	ErrorCodeAlreadyJoined           ErrorCode = "already_joined"
+	ErrorCodeBadBundle               ErrorCode = "bad_bundle"
+	ErrorCodeBadCursor               ErrorCode = "bad_cursor"
+	ErrorCodeBadRequest              ErrorCode = "bad_request"
+	ErrorCodeBootstrapFailed         ErrorCode = "bootstrap_failed"
+	ErrorCodeDelegationExceedsParent ErrorCode = "delegation_exceeds_parent"
+	ErrorCodeDelegationInvalid       ErrorCode = "delegation_invalid"
+	ErrorCodeExists                  ErrorCode = "exists"
+	ErrorCodeForbidden               ErrorCode = "forbidden"
+	ErrorCodeHostHoldsLeases         ErrorCode = "host_holds_leases"
+	ErrorCodeHostIdentityMismatch    ErrorCode = "host_identity_mismatch"
+	ErrorCodeHostNotRegistered       ErrorCode = "host_not_registered"
+	ErrorCodeHostTokenInvalid        ErrorCode = "host_token_invalid"
+	ErrorCodeHostTokenRequired       ErrorCode = "host_token_required"
+	ErrorCodeHostTokenUnconfigured   ErrorCode = "host_token_unconfigured"
+	ErrorCodeIdentityConflict        ErrorCode = "identity_conflict"
+	ErrorCodeIdentityPending         ErrorCode = "identity_pending"
+	ErrorCodeImmutableField          ErrorCode = "immutable_field"
+	ErrorCodeInternal                ErrorCode = "internal"
+	ErrorCodeKilled                  ErrorCode = "killed"
+	ErrorCodeLeaseHeld               ErrorCode = "lease_held"
+	ErrorCodeLeaseLost               ErrorCode = "lease_lost"
+	ErrorCodeNamespaceAmbiguous      ErrorCode = "namespace_ambiguous"
+	ErrorCodeNoHost                  ErrorCode = "no_host"
+	ErrorCodeNoIdentity              ErrorCode = "no_identity"
+	ErrorCodeNotAdmin                ErrorCode = "not_admin"
+	ErrorCodeNotFound                ErrorCode = "not_found"
+	ErrorCodeNotReady                ErrorCode = "not_ready"
+	ErrorCodeObjectQuotaExceeded     ErrorCode = "object_quota_exceeded"
+	ErrorCodePolicyUnavailable       ErrorCode = "policy_unavailable"
+	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
+	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
+	ErrorCodeSuperseded              ErrorCode = "superseded"
+	ErrorCodeTenantHasLiveObjects    ErrorCode = "tenant_has_live_objects"
+	ErrorCodeUnknownNamespace        ErrorCode = "unknown_namespace"
+	ErrorCodeUnknownTenant           ErrorCode = "unknown_tenant"
 )
 
 // Valid indicates whether the value is a known member of the ErrorCode enum.
@@ -207,6 +217,8 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodeBadRequest:
 		return true
 	case ErrorCodeBootstrapFailed:
+		return true
+	case ErrorCodeDelegationExceedsParent:
 		return true
 	case ErrorCodeDelegationInvalid:
 		return true
@@ -546,7 +558,7 @@ type AuditBatch struct {
 // `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-// `preflight` (optional; dryRun deploys), `host_add`.
+// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
 type AuditKind string
 
 // AuditPage defines model for AuditPage.
@@ -569,12 +581,14 @@ type AuditRecord struct {
 	ActingFor *string `json:"actingFor,omitempty"`
 
 	// Chain `mgmt` or `host:<hostID>`.
-	Chain  *string                 `json:"chain,omitempty"`
-	Code   *string                 `json:"code,omitempty"`
-	Detail *map[string]interface{} `json:"detail,omitempty"`
-	Dst    *string                 `json:"dst,omitempty"`
-	Grant  *string                 `json:"grant,omitempty"`
-	Hash   string                  `json:"hash"`
+	Chain *string `json:"chain,omitempty"`
+	Code  *string `json:"code,omitempty"`
+
+	// Detail Structured detail (mgmt records) or free text (host `tenant_note`s).
+	Detail *AuditRecord_Detail `json:"detail,omitempty"`
+	Dst    *string             `json:"dst,omitempty"`
+	Grant  *string             `json:"grant,omitempty"`
+	Hash   string              `json:"hash"`
 
 	// HostSig base64 ed25519 over utf8(hash); host chains only.
 	HostSig *string `json:"hostSig,omitempty"`
@@ -584,7 +598,7 @@ type AuditRecord struct {
 	// `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-	// `preflight` (optional; dryRun deploys), `host_add`.
+	// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
 	Kind     AuditKind `json:"kind"`
 	ObjectID *string   `json:"objectID,omitempty"`
 
@@ -597,6 +611,17 @@ type AuditRecord struct {
 	TenantID *string      `json:"tenantID,omitempty"`
 	TraceID  *string      `json:"traceID,omitempty"`
 	TS       time.Time    `json:"ts"`
+}
+
+// AuditRecordDetail0 defines model for AuditRecord.Detail.0.
+type AuditRecordDetail0 map[string]interface{}
+
+// AuditRecordDetail1 defines model for AuditRecord.Detail.1.
+type AuditRecordDetail1 = string
+
+// AuditRecord_Detail Structured detail (mgmt records) or free text (host `tenant_note`s).
+type AuditRecord_Detail struct {
+	union json.RawMessage
 }
 
 // AuditSource `mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content).
@@ -745,7 +770,8 @@ type Error struct {
 	// | `forbidden` | 403 | role ok, but outside the caller's records / namespaces |
 	// | `host_not_registered` | 403 | `tag:twd-host` node that never did `PUT /v1/hosts/{id}` |
 	// | `host_identity_mismatch` | 403 | host ID bound to another node |
-	// | `delegation_invalid` | 403 | spawn caps ⊄ parent, or child tag not owned by the parent's |
+	// | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
+	// | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
 	// | `not_found` | 404 | — |
 	// | `unknown_tenant` | 404 | — |
 	// | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -796,7 +822,8 @@ type Error struct {
 // | `forbidden` | 403 | role ok, but outside the caller's records / namespaces |
 // | `host_not_registered` | 403 | `tag:twd-host` node that never did `PUT /v1/hosts/{id}` |
 // | `host_identity_mismatch` | 403 | host ID bound to another node |
-// | `delegation_invalid` | 403 | spawn caps ⊄ parent, or child tag not owned by the parent's |
+// | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
+// | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
 // | `not_found` | 404 | — |
 // | `unknown_tenant` | 404 | — |
 // | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1352,7 +1379,7 @@ type Tombstone struct {
 	Workload string `json:"workload"`
 }
 
-// TombstoneError `410 Gone`: the error plus the kill record.
+// TombstoneError `410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`).
 type TombstoneError struct {
 	// Code The catalog. Status in parentheses.
 	//
@@ -1369,7 +1396,8 @@ type TombstoneError struct {
 	// | `forbidden` | 403 | role ok, but outside the caller's records / namespaces |
 	// | `host_not_registered` | 403 | `tag:twd-host` node that never did `PUT /v1/hosts/{id}` |
 	// | `host_identity_mismatch` | 403 | host ID bound to another node |
-	// | `delegation_invalid` | 403 | spawn caps ⊄ parent, or child tag not owned by the parent's |
+	// | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
+	// | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
 	// | `not_found` | 404 | — |
 	// | `unknown_tenant` | 404 | — |
 	// | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1404,8 +1432,8 @@ type TombstoneError struct {
 	Snippet *string `json:"snippet,omitempty"`
 
 	// Tombstone The kill record of an object. Kept until the tenant's terminal objects are purged.
-	Tombstone Tombstone `json:"tombstone"`
-	TraceID   string    `json:"trace_id"`
+	Tombstone *Tombstone `json:"tombstone,omitempty"`
+	TraceID   string     `json:"trace_id"`
 }
 
 // Transport `tsnet` in normal operation; `local-dev` when the unix socket is serving.
@@ -1524,7 +1552,7 @@ type Conflict = Error
 // `https://twd.dev/errors/<code>`; `trace_id` correlates with audit.
 type Forbidden = Error
 
-// Gone `410 Gone`: the error plus the kill record.
+// Gone `410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`).
 type Gone = TombstoneError
 
 // LeaseLost The DX.md error catalog shape. `code` is stable and machine-readable;
@@ -1553,7 +1581,7 @@ type Unauthorized = Error
 
 // ListAuditParams defines parameters for ListAudit.
 type ListAuditParams struct {
-	// Limit Page size. Values above 500 are clamped to 500.
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
@@ -1584,7 +1612,7 @@ type GetCertificateParams struct {
 
 // ListDeploymentsParams defines parameters for ListDeployments.
 type ListDeploymentsParams struct {
-	// Limit Page size. Values above 500 are clamped to 500.
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
@@ -1619,7 +1647,7 @@ type GetDeploymentParams struct {
 
 // ListHostsParams defines parameters for ListHosts.
 type ListHostsParams struct {
-	// Limit Page size. Values above 500 are clamped to 500.
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
@@ -1646,7 +1674,7 @@ type GetHostParams struct {
 
 // ListHostAssignmentsParams defines parameters for ListHostAssignments.
 type ListHostAssignmentsParams struct {
-	// Limit Page size. Values above 500 are clamped to 500.
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
@@ -1655,7 +1683,7 @@ type ListHostAssignmentsParams struct {
 
 // ListObjectsParams defines parameters for ListObjects.
 type ListObjectsParams struct {
-	// Limit Page size. Values above 500 are clamped to 500.
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
@@ -1715,7 +1743,7 @@ type CreateObjectCredentialParamsReason string
 
 // ListTenantsParams defines parameters for ListTenants.
 type ListTenantsParams struct {
-	// Limit Page size. Values above 500 are clamped to 500.
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
 	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
 
 	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
@@ -1928,6 +1956,68 @@ func (a OIDCConfiguration) MarshalJSON() ([]byte, error) {
 		}
 	}
 	return json.Marshal(object)
+}
+
+// AsAuditRecordDetail0 returns the union data inside the AuditRecord_Detail as a AuditRecordDetail0
+func (t AuditRecord_Detail) AsAuditRecordDetail0() (AuditRecordDetail0, error) {
+	var body AuditRecordDetail0
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromAuditRecordDetail0 overwrites any union data inside the AuditRecord_Detail as the provided AuditRecordDetail0
+func (t *AuditRecord_Detail) FromAuditRecordDetail0(v AuditRecordDetail0) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeAuditRecordDetail0 performs a merge with any union data inside the AuditRecord_Detail, using the provided AuditRecordDetail0
+func (t *AuditRecord_Detail) MergeAuditRecordDetail0(v AuditRecordDetail0) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsAuditRecordDetail1 returns the union data inside the AuditRecord_Detail as a AuditRecordDetail1
+func (t AuditRecord_Detail) AsAuditRecordDetail1() (AuditRecordDetail1, error) {
+	var body AuditRecordDetail1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromAuditRecordDetail1 overwrites any union data inside the AuditRecord_Detail as the provided AuditRecordDetail1
+func (t *AuditRecord_Detail) FromAuditRecordDetail1(v AuditRecordDetail1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeAuditRecordDetail1 performs a merge with any union data inside the AuditRecord_Detail, using the provided AuditRecordDetail1
+func (t *AuditRecord_Detail) MergeAuditRecordDetail1(v AuditRecordDetail1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t AuditRecord_Detail) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *AuditRecord_Detail) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
 }
 
 // AsObjectCreateTTL0 returns the union data inside the ObjectCreate_TTL as a ObjectCreateTTL0

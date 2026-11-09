@@ -486,3 +486,22 @@ func ApplyWith(ctx context.Context, api API, s Snippet, o Options) (ApplyResult,
 	res.Changed, res.NewETag = true, ne
 	return res, nil
 }
+
+// InfraSnippet is the policy every twd deployment needs for its own nodes
+// (normal operation is tsnet only): tag:twd owns twd's tags; mgmt's node is
+// tag:twd-mgmt and each host's node tag:twd-host (owned by tag:twd so the
+// trust credential can mint host join keys); hosts call mgmt's API on
+// :80/:443 and mgmt pushes kills to the hosts' nodes on pushPort.
+func InfraSnippet(pushPort int) Snippet {
+	return Snippet{
+		TagOwners: map[string][]string{
+			"tag:twd":      {"autogroup:admin"},
+			"tag:twd-mgmt": {"autogroup:admin"},
+			"tag:twd-host": {"autogroup:admin", "tag:twd"},
+		},
+		Grants: []map[string]any{
+			{"src": []string{"tag:twd-host"}, "dst": []string{"tag:twd-mgmt"}, "ip": []string{"tcp:443", "tcp:80"}},
+			{"src": []string{"tag:twd-mgmt"}, "dst": []string{"tag:twd-host"}, "ip": []string{fmt.Sprintf("tcp:%d", pushPort)}},
+		},
+	}
+}

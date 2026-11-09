@@ -264,7 +264,7 @@ func (m *Mgmt) CreateTenant(ctx context.Context, r TenantRequest) (Tenant, error
 	if err := m.store.CreateTenant(ctx, t); err != nil {
 		return Tenant{}, err
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "tenant"}, map[string]any{"tailnet": t.Tailnet, "mintMode": t.MintMode})
+	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "tenant_create"}, map[string]any{"tailnet": t.Tailnet, "mintMode": t.MintMode})
 	return t, nil
 }
 
@@ -302,7 +302,7 @@ func (m *Mgmt) UpdateTenantWIF(ctx context.Context, tenantID string, u WIFUpdate
 		return Tenant{}, err
 	}
 	m.broker.Forget(t.ID)
-	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "tenant"}, map[string]any{"tailnet": t.Tailnet, "mintMode": t.MintMode, "wifUpdated": true,
+	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "tenant_update"}, map[string]any{"tailnet": t.Tailnet, "mintMode": t.MintMode, "wifUpdated": true,
 		"lifecycle": t.WIFLifecycleClientID != ""})
 	return t, nil
 }
