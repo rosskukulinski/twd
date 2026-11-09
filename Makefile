@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -132,6 +132,16 @@ e2e-keyless: deps
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2ekeyless -count=1 -v -timeout 25m ./e2e/keyless/...
 
+## e2e-oauth: M12 on tailnet 1: `twd up --oauth-client-file` (mint mode oauth: an OAuth client with
+## auth_keys + devices:core + policy_file:read, tag:twd; no browser, no Funnel, no API key given to twd)
+## → checks (a)–(f), `twd link` over https and http, remote deploy/kill/audit, zero leftovers. The API
+## key creates and deletes the OAuth client, mints the test's own nodes and cleans up by ID.
+e2e-oauth: deps
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-oauth: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2eoauth -count=1 -v -timeout 25m ./e2e/oauth/...
+
 ## release: self-contained tarballs in dist/ (darwin-arm64, linux-arm64, linux-amd64): Go binaries
 ## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
 ## install.sh, VERSION, SHA256SUMS. darwin binaries are ad-hoc signed (run on macOS).
@@ -217,6 +227,7 @@ lint: api-check
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags e2ekeyless ./e2e/keyless/...
+	$(GO) vet -tags e2eoauth ./e2e/oauth/...
 	$(GO) vet -tags e2embp ./e2e/mbp/...
 	$(GO) vet -tags e2elinux ./e2e/linux/...
 	$(GO) vet -tags sdk ./e2e/sdk/...

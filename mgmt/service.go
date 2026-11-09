@@ -84,7 +84,7 @@ type Mgmt struct {
 	// noDeviceScope: tenants whose credential got a 403 on a device delete
 	// (an OAuth client without devices:core); kills then warn up front.
 	noDeviceScope map[string]bool
-	deviceKept    map[string]bool // killed objects whose device delete was refused (403)
+	deviceKept    map[string]bool               // killed objects whose device delete was refused (403)
 	oboKeys       map[string]ed25519.PrivateKey // tenant → OBO root key (loaded from custody)
 	volMu         sync.Mutex                    // VolumeKey create-if-absent
 	ctx           context.Context

@@ -298,7 +298,11 @@ func cmdLink(args []string) error {
 	if ep == "" {
 		// Auto-discover: the plain-HTTP listener on `twd-mgmt` (MagicDNS
 		// search domain) tells us its full name and whether it has HTTPS.
-		l.Endpoint = "http://twd-mgmt"
+		name := "twd-mgmt"
+		if n := os.Getenv("TWD_LINK_DISCOVER_NAME"); n != "" {
+			name = n // hermetic tests: never resolve the real twd-mgmt on this machine's own tailnet
+		}
+		l.Endpoint = "http://" + name
 		s.Link = l
 		w, err := s.whoami(ctx)
 		if err != nil {

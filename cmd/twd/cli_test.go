@@ -272,6 +272,10 @@ func TestCLILink(t *testing.T) {
 	// The developer box: linked through its own tsnet node (test transport;
 	// the product path is the machine's Tailscale). No HTTPS on testcontrol.
 	ep := "http://" + up.MgmtIP
+	// Auto-discovery resolves `twd-mgmt` through this machine's MagicDNS;
+	// a developer Mac may run a real twd-mgmt there, so point it at a name
+	// that can't resolve (the test never talks to the machine's tailnet).
+	t.Setenv("TWD_LINK_DISCOVER_NAME", "twd-mgmt-hermetic.invalid")
 	if _, se, _, err := dev.Twd("link"); err == nil || !strings.Contains(se, "mgmt_not_found") {
 		t.Fatalf("link auto-discovery without MagicDNS should fail mgmt_not_found: %v %s", err, se)
 	}
