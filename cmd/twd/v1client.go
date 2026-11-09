@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/mgmt"
 )
 
 // Helpers for the /v1 API (api/openapi.yaml): paged lists and the host
@@ -79,6 +80,9 @@ func (s *state) mintHostJoin(ctx context.Context, hostID, tenantID string) error
 		if me, ok := mgmtapi.AsError(err); ok && me.Code == "exists" {
 			return fail("state_conflict", "mgmt already has a host "+hostID+" bound to another node", me.Message).
 				withFix("twd host rm "+hostID+" --drain   (then twd up again)", "or twd up --host-id <another id>")
+		}
+		if me, ok := mgmtapi.AsError(err); ok && me.Code == "policy_missing_tag_owners" {
+			return policyMissingTagOwners("mgmt could not mint the host's "+mgmt.HostTag+" join key: "+me.Message, nil)
 		}
 		return err
 	}

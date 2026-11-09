@@ -22,6 +22,8 @@ type TenantPatch struct {
 	APIKeyFile             *string
 	WIFClientID            *string
 	WIFLifecycleClientID   *string
+	OAuthClientID          *string
+	OAuthClientFile        *string
 	RegistrationsPerMinute *int
 	MaxObjects             *int
 	Pool                   *string
@@ -40,9 +42,9 @@ func (m *Mgmt) UpdateTenant(ctx context.Context, id string, p TenantPatch) (Tena
 	changed := map[string]any{}
 	if p.MintMode != nil {
 		switch *p.MintMode {
-		case MintAPIKey, MintWIF:
+		case MintAPIKey, MintWIF, MintOAuth:
 		default:
-			return Tenant{}, errf(400, "bad_request", "mintMode must be apikey or wif")
+			return Tenant{}, errf(400, "bad_request", "mintMode must be oauth, apikey or wif")
 		}
 		t.MintMode = *p.MintMode
 		changed["mintMode"] = t.MintMode
@@ -58,6 +60,14 @@ func (m *Mgmt) UpdateTenant(ctx context.Context, id string, p TenantPatch) (Tena
 	if p.WIFLifecycleClientID != nil {
 		t.WIFLifecycleClientID = *p.WIFLifecycleClientID
 		changed["lifecycle"] = t.WIFLifecycleClientID != ""
+	}
+	if p.OAuthClientID != nil {
+		t.OAuthClientID = *p.OAuthClientID
+		changed["oauthClientID"] = t.OAuthClientID
+	}
+	if p.OAuthClientFile != nil {
+		t.OAuthClientFile = *p.OAuthClientFile
+		changed["oauthClientFile"] = t.OAuthClientFile != ""
 	}
 	if p.RegistrationsPerMinute != nil {
 		if *p.RegistrationsPerMinute <= 0 {
@@ -96,6 +106,12 @@ func (m *Mgmt) UpdateTenant(ctx context.Context, id string, p TenantPatch) (Tena
 		if m.broker.Issuer == nil {
 			return Tenant{}, errf(400, "bad_request", "mintMode wif needs twd-mgmt to run with an issuer (-issuer-url)")
 		}
+	case MintOAuth:
+		id, err := checkOAuthFile(t.OAuthClientFile, t.OAuthClientID)
+		if err != nil {
+			return Tenant{}, err
+		}
+		t.OAuthClientID = id
 	}
 	t.UpdatedAt = m.now().UnixMilli()
 	if err := m.store.UpdateTenant(ctx, t); err != nil {
@@ -272,6 +288,11 @@ func (m *Mgmt) CreateHost(ctx context.Context, r HostCreate) (HostJoin, bool, er
 	k, err := api.CreateKey(ctx, tsapi.KeyOptions{Tags: tags, Preauthorized: true, ExpirySeconds: int(HostJoinKeyExpiry / time.Second),
 		Description: "twd host " + r.HostID})
 	if err != nil {
+		if tsapi.IsTagsNotPermitted(err) {
+			e := errf(403, "policy_missing_tag_owners", "the control plane refused to mint a %s key with tenant %s's %s credential: %v", HostTag, t.ID, t.MintMode, err)
+			e.Snippet = TagOwnersSnippet()
+			return HostJoin{}, false, e
+		}
 		return HostJoin{}, false, errf(502, "bootstrap_failed", "mint host join key: %v", err)
 	}
 	now := m.now().UnixMilli()
@@ -573,3 +594,10 @@ func (m *Mgmt) deploymentStatus(ctx context.Context, d Deployment) (string, stri
 }
 
 var _ = fmt.Sprintf
+
+// TagOwnersSnippet is the tagOwners twd's own nodes need: tag:twd (the
+// mint credential's tag) must own the mgmt and host tags so an OAuth
+// client or trust credential tagged tag:twd can mint their keys.
+func TagOwnersSnippet() string {
+	return `"tagOwners": { "tag:twd": ["autogroup:admin"], "` + MgmtTag + `": ["autogroup:admin", "tag:twd"], "` + HostTag + `": ["autogroup:admin", "tag:twd"] }`
+}

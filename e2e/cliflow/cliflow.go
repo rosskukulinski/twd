@@ -96,9 +96,13 @@ type Env struct {
 	WorkDir    string
 	Tailnet    string
 	APIKeyFile string
-	ControlURL string
-	TSAPIURL   string // "" = production API
-	Prefix     string // hostname prefix (twd-e2e-<run>-)
+	// OAuthClientFile, if set, runs twd up in oauth mint mode (M12) with
+	// this 0600 client file instead of APIKeyFile; Tailnet is then only
+	// the expected (discovered) tailnet, not a flag.
+	OAuthClientFile string
+	ControlURL      string
+	TSAPIURL        string // "" = production API
+	Prefix          string // hostname prefix (twd-e2e-<run>-)
 	// NewNode starts a tagged (tag:ttest) tsnet test node named Prefix+role.
 	NewNode func(role string) *nettest.Node
 	// ClientTagged: test nodes carry tag:ttest (production control). On
@@ -354,9 +358,17 @@ func (e *Env) upArgs() []string {
 	// check (d) needs the spawned child to reach the server over the tailnet.
 	// Normal operation is tsnet only: mgmt's and the host's own nodes are
 	// named after this run so leftovers are attributable.
-	upArgs := []string{"up", "--tailnet", e.Tailnet, "--api-key-file", e.APIKeyFile, "--yes",
+	cred := []string{"--tailnet", e.Tailnet, "--api-key-file", e.APIKeyFile}
+	if e.OAuthClientFile != "" {
+		cred = []string{"--oauth-client-file", e.OAuthClientFile}
+		if e.ControlURL != "https://controlplane.tailscale.com" {
+			cred = append(cred, "--tailnet", e.Tailnet) // testcontrol's MagicDNS suffix isn't the fake API's tailnet
+		}
+	}
+	upArgs := append([]string{"up"}, cred...)
+	upArgs = append(upArgs, "--yes",
 		"--hostname-prefix", e.Prefix, "--control-url", e.ControlURL, "--allow-sibling-egress",
-		"--mgmt-hostname", e.Prefix + "mgmt", "--host-id", strings.TrimSuffix(e.Prefix, "-")}
+		"--mgmt-hostname", e.Prefix+"mgmt", "--host-id", strings.TrimSuffix(e.Prefix, "-"))
 	if !e.Persistent {
 		upArgs = append(upArgs, "--ephemeral")
 	}
@@ -461,11 +473,19 @@ func (e *Env) TrackObjectNodes() {
 func (e *Env) Run() {
 	t, res := e.T, e.Res
 	upArgs := e.upArgs()
-	// apikey mode needs an explicit --tailnet (never this machine's tailscaled).
-	if _, se, _, err := e.Twd("up", "--yes", "--api-key-file", e.APIKeyFile); err == nil || !strings.Contains(se, "tailnet_required") {
-		t.Fatalf("twd up --api-key-file without --tailnet should fail with tailnet_required: %v %s", err, se)
+	if e.OAuthClientFile != "" {
+		// No mode on a fresh state dir: the three options, no browser flow.
+		if _, se, _, err := e.Twd("up", "--yes"); err == nil || !strings.Contains(se, "mint_mode_required") || !strings.Contains(se, "--oauth-client-file") {
+			t.Fatalf("twd up without a mint mode should list the options (mint_mode_required): %v %s", err, se)
+		}
+		res.pass("up_without_mode_lists_options", "mint_mode_required, OAuth client first")
+	} else {
+		// apikey mode needs an explicit --tailnet (never this machine's tailscaled).
+		if _, se, _, err := e.Twd("up", "--yes", "--api-key-file", e.APIKeyFile); err == nil || !strings.Contains(se, "tailnet_required") {
+			t.Fatalf("twd up --api-key-file without --tailnet should fail with tailnet_required: %v %s", err, se)
+		}
+		res.pass("up_apikey_needs_tailnet", "tailnet_required")
 	}
-	res.pass("up_apikey_needs_tailnet", "tailnet_required")
 
 	var up struct {
 		TenantID   string             `json:"tenantID"`

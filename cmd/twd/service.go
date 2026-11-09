@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
@@ -59,6 +60,32 @@ func serviceActive() (installed, active bool) {
 		return launchdActive()
 	}
 	return systemdActive()
+}
+
+// serviceOf is serviceActive for this state dir only: a service installed
+// for another state dir (e.g. the operator's real ~/.twd while a test runs
+// with --state-dir) is none of this command's business, and must never be
+// stopped or removed by it.
+func serviceOf(s *state) (installed, active bool) {
+	inst, act := serviceActive()
+	if !inst || !serviceIsFor(s) {
+		return false, false
+	}
+	return inst, act
+}
+
+// serviceIsFor reports whether the installed unit/plist runs s.Dir.
+func serviceIsFor(s *state) bool {
+	b, err := os.ReadFile(serviceUnitPath())
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "darwin" {
+		var esc strings.Builder
+		xml.EscapeText(&esc, []byte(s.Dir))
+		return strings.Contains(string(b), "<string>"+esc.String()+"</string>")
+	}
+	return strings.Contains(string(b), "__supervise --state-dir "+unitQuote(s.Dir)+"\n")
 }
 
 // serviceUnitPath is the unit file / plist path.

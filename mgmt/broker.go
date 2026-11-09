@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -39,7 +40,12 @@ var ErrNoLifecycle = errors.New("tenant has no lifecycle credential (kill tier 2
 //   - apikey: the tenant's API key file (homelab / tests) for every purpose;
 //   - wif: sign a 5-minute JWT with the platform issuer and exchange it at
 //     /api/v2/oauth/token-exchange for the purpose's trust credential
-//     (mint → wifClientID; lifecycle and policy reads → wifLifecycleClientID).
+//     (mint → wifClientID; lifecycle and policy reads → wifLifecycleClientID);
+//   - oauth: the tenant's OAuth client (secret in a 0600 file on this host,
+//     re-read at each exchange) for every purpose: client-credentials grant
+//     at /api/v2/oauth/token; a 401 drops the token and retries once. What
+//     the client may do is its scopes' business (auth_keys always;
+//     devices:core for device deletes, policy_file:read for preflight).
 //
 // Access tokens are cached until shortly before they expire.
 type Broker struct {
@@ -50,6 +56,7 @@ type Broker struct {
 
 	mu     sync.Mutex
 	tokens map[string]cachedToken
+	oauth  map[string]*tsapi.OAuthSource // tenantID|clientID|file
 }
 
 type cachedToken struct {
@@ -92,8 +99,58 @@ func (b *Broker) API(ctx context.Context, t Tenant, purpose string) (TailnetAPI,
 		}
 		c.APIKey = tok
 		return c, nil
+	case MintOAuth:
+		c.Tokens = b.oauthSource(t)
+		return c, nil
 	}
 	return nil, fmt.Errorf("unknown mint mode %q", t.MintMode)
+}
+
+// oauthSource returns the tenant's cached OAuth token source.
+func (b *Broker) oauthSource(t Tenant) *tsapi.OAuthSource {
+	key := t.ID + "|" + t.OAuthClientID + "|" + t.OAuthClientFile
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s, ok := b.oauth[key]; ok {
+		return s
+	}
+	if b.oauth == nil {
+		b.oauth = map[string]*tsapi.OAuthSource{}
+	}
+	file, wantID := t.OAuthClientFile, t.OAuthClientID
+	s := &tsapi.OAuthSource{BaseURL: b.BaseURL, HTTP: b.HTTP, Now: func() time.Time { return b.clock().Now() },
+		Load: func() (tsapi.OAuthCredentials, error) {
+			c, err := tsapi.LoadOAuthFile(file)
+			if err != nil {
+				return c, fmt.Errorf("tenant %s oauth client: %w", t.ID, err)
+			}
+			if wantID != "" && c.ClientID != wantID {
+				return tsapi.OAuthCredentials{}, fmt.Errorf("tenant %s oauth client: %s now holds client %s, not %s (update the tenant)", t.ID, file, c.ClientID, wantID)
+			}
+			return c, nil
+		}}
+	b.oauth[key] = s
+	return s
+}
+
+// checkOAuthFile validates an oauth tenant's credential file (absolute,
+// 0600, a tskey-client- secret) and returns the client ID (wantID, or the
+// one the file names). The secret is not kept.
+func checkOAuthFile(file, wantID string) (string, error) {
+	if file == "" {
+		return "", errf(400, "bad_request", "mintMode oauth needs oauthClientFile (a 0600 file with TS_OAUTH_CLIENT_ID and TS_OAUTH_CLIENT_SECRET)")
+	}
+	if !filepath.IsAbs(file) {
+		return "", errf(400, "bad_request", "oauthClientFile must be an absolute path")
+	}
+	c, err := tsapi.LoadOAuthFile(file)
+	if err != nil {
+		return "", errf(400, "bad_request", "oauthClientFile: %v", err)
+	}
+	if wantID != "" && wantID != c.ClientID {
+		return "", errf(400, "bad_request", "oauthClientID %s does not match the client in %s (%s)", wantID, file, c.ClientID)
+	}
+	return c.ClientID, nil
 }
 
 // Forget drops a tenant's cached access tokens (after its client IDs
@@ -104,6 +161,11 @@ func (b *Broker) Forget(tenantID string) {
 	for k := range b.tokens {
 		if strings.HasPrefix(k, tenantID+"|") {
 			delete(b.tokens, k)
+		}
+	}
+	for k := range b.oauth {
+		if strings.HasPrefix(k, tenantID+"|") {
+			delete(b.oauth, k)
 		}
 	}
 }

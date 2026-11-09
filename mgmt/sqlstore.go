@@ -247,6 +247,9 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		{"objects", "kill_cascade", "ALTER TABLE objects ADD COLUMN kill_cascade BIGINT NOT NULL DEFAULT 0"},
 		{"objects", "kill_root", "ALTER TABLE objects ADD COLUMN kill_root TEXT NOT NULL DEFAULT ''"},
 		{"objects", "acting_for", "ALTER TABLE objects ADD COLUMN acting_for TEXT NOT NULL DEFAULT ''"},
+		// M12: oauth mint mode (client ID + credential file path; never the secret).
+		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
+		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {
@@ -358,12 +361,12 @@ func jsonStr(v any) string {
 
 // ---- tenants ----
 
-const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at"
+const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at, oauth_client_id, oauth_client_file"
 
 func scanTenant(sc interface{ Scan(...any) error }) (Tenant, error) {
 	var t Tenant
 	var rpm, mo int64
-	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt)
+	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt, &t.OAuthClientID, &t.OAuthClientFile)
 	t.RegistrationsPerMinute, t.MaxObjects = int(rpm), int(mo)
 	if t.UpdatedAt == 0 {
 		t.UpdatedAt = t.CreatedAt
@@ -378,9 +381,9 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 	if t.UpdatedAt == 0 {
 		t.UpdatedAt = t.CreatedAt
 	}
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
 		t.ID, t.Tailnet, t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID,
-		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt)
+		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -390,8 +393,8 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 // UpdateTenant rewrites a tenant's mint configuration (mode, key file,
 // WIF client IDs) and limits; ID, tailnet and createdAt are immutable.
 func (s *SQLStore) UpdateTenant(ctx context.Context, t Tenant) error {
-	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=? WHERE id=?"),
-		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.ID)
+	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=?, oauth_client_id=?, oauth_client_file=? WHERE id=?"),
+		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile, t.ID)
 	if err != nil {
 		return err
 	}

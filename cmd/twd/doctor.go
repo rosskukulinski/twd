@@ -185,7 +185,17 @@ func cmdDoctor(args []string) error {
 		case s != nil && s.remote():
 			return "info", "this machine is linked to " + s.Link.Endpoint + " (twd link: your Tailscale identity, no key or token here)", ""
 		case s == nil || !s.configured():
-			return "skip", "twd up not run here (default: keyless wif; --api-key-file: apikey)", ""
+			return "skip", "twd up not run here (recommended: --oauth-client-file <file> = mint mode oauth; --wif; --api-key-file)", ""
+		case s.Cfg.oauth():
+			d := "oauth: OAuth client " + s.Cfg.OAuthClientID + " from " + s.Cfg.OAuthClientFile + " mints every node key (no browser, no Funnel, no API key)"
+			st, err := os.Stat(s.Cfg.OAuthClientFile)
+			switch {
+			case err != nil:
+				return "fail", d + "; " + err.Error(), "restore the file (TS_OAUTH_CLIENT_ID=…, TS_OAUTH_CLIENT_SECRET=tskey-client-…, mode 0600)"
+			case st.Mode().Perm()&0o077 != 0:
+				return "warn", fmt.Sprintf("%s; the file has mode %#o: other users can read the secret, and twd-mgmt refuses it", d, st.Mode().Perm()), "chmod 600 " + s.Cfg.OAuthClientFile
+			}
+			return "ok", d, ""
 		case s.Cfg.keyless():
 			d := "wif (keyless): mgmt node " + s.Cfg.MgmtDNSName + " serves the OIDC issuer " + s.Cfg.IssuerURL + " over Funnel; trust credential client ID " + s.Cfg.WIFClientID + " (public)"
 			if s.Cfg.WIFLifecycleClientID == "" {
@@ -193,7 +203,7 @@ func cmdDoctor(args []string) error {
 			}
 			return "ok", d + ", lifecycle credential " + s.Cfg.WIFLifecycleClientID, ""
 		}
-		return "ok", "apikey: the API key file " + s.Cfg.APIKeyFile + " mints every node key (alternative mode; keyless is the default)", ""
+		return "ok", "apikey: the API key file " + s.Cfg.APIKeyFile + " mints every node key (fallback mode; an OAuth client is recommended)", ""
 	})
 
 	run("transport", func() (string, string, string) {
@@ -229,6 +239,9 @@ func cmdDoctor(args []string) error {
 		}
 		if s != nil && s.Cfg.keyless() && *keyF == "" {
 			return "skip", "keyless mode: no API key on this machine (nodes are minted through the WIF trust credential)", ""
+		}
+		if s != nil && s.Cfg.oauth() && *keyF == "" {
+			return "skip", "oauth mode: no API key on this machine (nodes are minted through the OAuth client)", ""
 		}
 		if tn == "" || kf == "" {
 			return "skip", "no API key file configured (keyless mode needs none; apikey mode: twd up --api-key-file)", ""

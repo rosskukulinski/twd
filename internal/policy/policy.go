@@ -523,14 +523,15 @@ func ApplyWith(ctx context.Context, api API, s Snippet, o Options) (ApplyResult,
 
 // InfraSnippet is the policy every twd deployment needs for its own nodes
 // (normal operation is tsnet only): tag:twd owns twd's tags; mgmt's node is
-// tag:twd-mgmt and each host's node tag:twd-host (owned by tag:twd so the
-// trust credential can mint host join keys); hosts call mgmt's API on
-// :80/:443 and mgmt pushes kills to the hosts' nodes on pushPort.
+// tag:twd-mgmt and each host's node tag:twd-host, both owned by tag:twd so
+// the mint credential (an OAuth client or trust credential tagged tag:twd)
+// can mint their keys with no interactive login (M12); hosts call mgmt's
+// API on :80/:443 and mgmt pushes kills to the hosts' nodes on pushPort.
 func InfraSnippet(pushPort int) Snippet {
 	return Snippet{
 		TagOwners: map[string][]string{
 			"tag:twd":      {"autogroup:admin"},
-			"tag:twd-mgmt": {"autogroup:admin"},
+			"tag:twd-mgmt": {"autogroup:admin", "tag:twd"},
 			"tag:twd-host": {"autogroup:admin", "tag:twd"},
 		},
 		Grants: []map[string]any{
@@ -538,4 +539,12 @@ func InfraSnippet(pushPort int) Snippet {
 			{"src": []string{"tag:twd-mgmt"}, "dst": []string{"tag:twd-host"}, "ip": []string{fmt.Sprintf("tcp:%d", pushPort)}},
 		},
 	}
+}
+
+// AdminGrant makes src (autogroup:admin in the operator snippet) twd
+// admins over the tailnet: it reaches mgmt's API on :443/:80 with the
+// admin app capability (WhoIs; `twd link`).
+func AdminGrant(src, mgmtTag, adminCap string) map[string]any {
+	return map[string]any{"src": []string{src}, "dst": []string{mgmtTag}, "ip": []string{"tcp:443", "tcp:80"},
+		"app": map[string]any{adminCap: []any{map[string]any{}}}}
 }

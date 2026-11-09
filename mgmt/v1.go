@@ -186,7 +186,10 @@ func (a *v1api) tombstoneOf(o Object) tombstone {
 	if at, pending := a.s.M.pendingDeleteAt(o.ID); pending {
 		t.DeviceDeleteAt = at
 	} else {
-		t.DeviceDeleted = o.StableNodeID != "" || o.NodeID != ""
+		a.s.M.mu.Lock()
+		kept := a.s.M.deviceKept[o.ID]
+		a.s.M.mu.Unlock()
+		t.DeviceDeleted = (o.StableNodeID != "" || o.NodeID != "") && !kept
 	}
 	return t
 }
@@ -402,7 +405,7 @@ func (a *v1api) UpdateTenant(w http.ResponseWriter, r *http.Request, id v1.Tenan
 		var sp *string
 		var ip *int
 		switch k {
-		case "mintMode", "apiKeyFile", "wifClientID", "wifLifecycleClientID", "pool", "tier":
+		case "mintMode", "apiKeyFile", "wifClientID", "wifLifecycleClientID", "oauthClientID", "oauthClientFile", "pool", "tier":
 			var s string
 			if !null {
 				if err := json.Unmarshal(raw, &s); err != nil {
@@ -444,6 +447,10 @@ func (a *v1api) UpdateTenant(w http.ResponseWriter, r *http.Request, id v1.Tenan
 			p.WIFClientID = sp
 		case "wifLifecycleClientID":
 			p.WIFLifecycleClientID = sp
+		case "oauthClientID":
+			p.OAuthClientID = sp
+		case "oauthClientFile":
+			p.OAuthClientFile = sp
 		case "pool":
 			p.Pool = sp
 		case "tier":

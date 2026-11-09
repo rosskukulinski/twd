@@ -214,7 +214,7 @@ func TestE2EKeyless(t *testing.T) {
 	// minted by the test, standing in for the browser login) → the console
 	// steps are printed and the stack keeps running, waiting for the IDs.
 	mgmtKey := keyTo("mgmt", []string{mgmt.MgmtTag}, true)
-	upArgs := []string{"up", "--yes", "--control-url", prodControl, "--hostname-prefix", twdPrefix, "--mgmt-hostname", testPrefix + "mgmt",
+	upArgs := []string{"up", "--wif", "--yes", "--control-url", prodControl, "--hostname-prefix", twdPrefix, "--mgmt-hostname", testPrefix + "mgmt",
 		"--mgmt-authkey-file", mgmtKey, "--ephemeral", "--allow-sibling-egress"}
 	t1 := time.Now()
 	so, se, d, err := host.Twd(append(upArgs, "--json")...)

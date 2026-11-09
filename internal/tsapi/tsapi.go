@@ -28,6 +28,10 @@ type Client struct {
 	Tailnet string // e.g. "tail7906d5.ts.net"; required (never "-" implicitly)
 	APIKey  string
 	HTTP    *http.Client
+	// Tokens, if set, supplies the bearer token instead of APIKey (an
+	// OAuth client's access token). A 401 invalidates it and the request
+	// is retried once with a fresh token.
+	Tokens TokenSource
 }
 
 func (c *Client) String() string { return "tsapi.Client{" + c.Tailnet + "}" }
@@ -116,23 +120,47 @@ func (c *Client) do(ctx context.Context, method, path string, body, out any) err
 // doHdr is do with extra request headers; it returns the response headers.
 // out may be *[]byte to receive the raw body.
 func (c *Client) doHdr(ctx context.Context, method, path string, hdr http.Header, body, out any) (http.Header, error) {
-	if c.Tailnet == "" || c.APIKey == "" {
-		return nil, errors.New("tsapi: Tailnet and APIKey are required")
+	if c.Tailnet == "" || (c.APIKey == "" && c.Tokens == nil) {
+		return nil, errors.New("tsapi: Tailnet and APIKey (or Tokens) are required")
 	}
-	base := c.BaseURL
-	if base == "" {
-		base = DefaultBaseURL
-	}
-	var rd io.Reader
+	var bodyBytes []byte
 	ctype := "application/json"
 	if rb, ok := body.(RawBody); ok {
-		rd, ctype = bytes.NewReader(rb.Body), rb.ContentType
+		bodyBytes, ctype = rb.Body, rb.ContentType
 	} else if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		rd = bytes.NewReader(b)
+		bodyBytes = b
+	}
+	for attempt := 0; ; attempt++ {
+		bearer := c.APIKey
+		if c.Tokens != nil {
+			t, err := c.Tokens.Token(ctx)
+			if err != nil {
+				return nil, err
+			}
+			bearer = t
+		}
+		rh, err := c.send(ctx, method, path, hdr, body != nil, bodyBytes, ctype, bearer, out)
+		if c.Tokens != nil && attempt == 0 && IsUnauthorized(err) {
+			// The access token expired or was revoked early: exchange once more.
+			c.Tokens.Invalidate()
+			continue
+		}
+		return rh, err
+	}
+}
+
+func (c *Client) send(ctx context.Context, method, path string, hdr http.Header, hasBody bool, bodyBytes []byte, ctype, bearer string, out any) (http.Header, error) {
+	base := c.BaseURL
+	if base == "" {
+		base = DefaultBaseURL
+	}
+	var rd io.Reader
+	if hasBody {
+		rd = bytes.NewReader(bodyBytes)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, base+path, rd)
 	if err != nil {
@@ -141,8 +169,8 @@ func (c *Client) doHdr(ctx context.Context, method, path string, hdr http.Header
 	for k, v := range hdr {
 		req.Header[k] = v
 	}
-	req.Header.Set("Authorization", "Bearer "+c.APIKey)
-	if body != nil {
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	if hasBody {
 		req.Header.Set("Content-Type", ctype)
 	}
 	hc := c.HTTP

@@ -45,10 +45,31 @@ type fakeTS struct {
 	issuerJWKS func() []byte
 	wantAud    string
 	apiToken   string
+	// OAuth clients (M12): client ID → its secret and scopes.
+	oauthClients   map[string]fakeOAuthClient
+	oauthTokens    map[string]string // access token → client ID
+	oauthExchanges int
+	refuseTags     map[string]bool // tags the control plane refuses ("not permitted")
+}
+
+type fakeOAuthClient struct {
+	secret string
+	scopes []string
+}
+
+// oauthScope reports whether an OAuth access token's client has scope
+// (true for non-OAuth tokens).
+func (f *fakeTS) oauthScope(auth, scope string) bool {
+	id, ok := f.oauthTokens[auth]
+	if !ok {
+		return true
+	}
+	return slices.Contains(f.oauthClients[id].scopes, scope)
 }
 
 func newFakeTS(t *testing.T) *fakeTS {
-	f := &fakeTS{t: t, keys: map[string]map[string]any{}, secrets: map[string]string{}, apiToken: "fake-api-token"}
+	f := &fakeTS{t: t, keys: map[string]map[string]any{}, secrets: map[string]string{}, apiToken: "fake-api-token",
+		oauthClients: map[string]fakeOAuthClient{}, oauthTokens: map[string]string{}, refuseTags: map[string]bool{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -70,15 +91,34 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{"access_token": "wif-access-" + r.Form.Get("client_id"), "expires_in": 3600})
 		return
 	}
+	if r.URL.Path == "/api/v2/oauth/token" {
+		r.ParseForm()
+		c, ok := f.oauthClients[r.Form.Get("client_id")]
+		if r.Form.Get("grant_type") != "client_credentials" || !ok || c.secret != r.Form.Get("client_secret") {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"error":"invalid_client"}`))
+			return
+		}
+		f.oauthExchanges++
+		tok := fmt.Sprintf("oauth-access-%s-%d", r.Form.Get("client_id"), f.oauthExchanges)
+		f.oauthTokens[tok] = r.Form.Get("client_id")
+		json.NewEncoder(w).Encode(map[string]any{"access_token": tok, "token_type": "Bearer", "expires_in": 3600})
+		return
+	}
 	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if auth != f.apiToken && !strings.HasPrefix(auth, "wif-access-") {
+	if _, isOAuth := f.oauthTokens[auth]; auth != f.apiToken && !strings.HasPrefix(auth, "wif-access-") && !isOAuth {
 		w.WriteHeader(401)
+		w.Write([]byte(`{"message":"invalid or expired token"}`))
 		return
 	}
 	switch {
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/keys"):
 		if strings.HasPrefix(auth, "wif-access-") && auth != "wif-access-mint-client" {
 			w.WriteHeader(403) // only the mint credential has auth_keys
+			return
+		}
+		if !f.oauthScope(auth, "auth_keys") {
+			w.WriteHeader(403)
 			return
 		}
 		if f.rateLimitNext > 0 {
@@ -90,6 +130,15 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		var body map[string]any
 		json.NewDecoder(r.Body).Decode(&body)
+		if tags, _ := getPath(body, "capabilities", "devices", "create", "tags").([]any); len(tags) > 0 {
+			for _, tg := range tags {
+				if f.refuseTags[fmt.Sprint(tg)] {
+					w.WriteHeader(400)
+					fmt.Fprintf(w, `{"message":"requested tags [%s] are invalid or not permitted"}`, tg)
+					return
+				}
+			}
+		}
 		id := fmt.Sprintf("k%d", len(f.keys)+1)
 		secret := "tskey-" + "auth-" + id + "-" + strings.Repeat("s", 20)
 		f.keys[id], f.secrets[id] = body, secret
@@ -97,12 +146,17 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "DELETE" && strings.Contains(r.URL.Path, "/keys/"):
 		f.deletedKeys = append(f.deletedKeys, r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/v2/device/"):
-		if auth == "wif-access-mint-client" {
+		if auth == "wif-access-mint-client" || !f.oauthScope(auth, "devices:core") {
 			w.WriteHeader(403)
+			w.Write([]byte(`{"message":"insufficient scope"}`))
 			return
 		}
 		f.deletedDevices = append(f.deletedDevices, strings.TrimPrefix(r.URL.Path, "/api/v2/device/"))
 	case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/acl"):
+		if !f.oauthScope(auth, "policy_file:read") {
+			w.WriteHeader(403)
+			return
+		}
 		f.policyFetches++
 		if r.Header.Get("If-None-Match") == `"p1"` {
 			f.notModified++

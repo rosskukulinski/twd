@@ -160,6 +160,8 @@ paths:
                 value: { tailnet: tail7906d5.ts.net, mintMode: wif, wifClientID: k123, wifLifecycleClientID: k456 }
               apikey:
                 value: { tailnet: tail7906d5.ts.net, mintMode: apikey, apiKeyFile: /Users/me/.config/tailnet1_api.env }
+              oauth:
+                value: { tailnet: tail7906d5.ts.net, mintMode: oauth, oauthClientID: kOAuth123CNTRL, oauthClientFile: /Users/me/.config/twd/oauth.env }
       responses:
         "201":
           description: Created.
@@ -177,7 +179,7 @@ paths:
       tags: [tenants]
       operationId: ListTenants
       summary: List tenants
-      description: Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+      description: Hosts may list tenants too (they deny every tenant's `apiKeyFile` and `oauthClientFile` path to their workload sandboxes).
       x-twd-role: admin|host
       parameters:
         - $ref: "#/components/parameters/limit"
@@ -221,8 +223,9 @@ paths:
       summary: Update a tenant (JSON Merge Patch)
       description: |
         Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-        `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-        Switching to `wif` or changing a WIF client ID drops cached tokens.
+        `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+        `maxObjects`, `pool`, `tier`.
+        Switching mode or changing a client ID / credential file drops cached tokens.
         `tailnet` and `controlURL` are immutable (`400 immutable_field`).
       x-twd-role: admin
       x-twd-audit: true
@@ -1831,6 +1834,7 @@ components:
         | `host_identity_mismatch` | 403 | host ID bound to another node |
         | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
         | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
+        | `policy_missing_tag_owners` | 403 | the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) |
         | `not_found` | 404 | — |
         | `unknown_tenant` | 404 | — |
         | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1868,6 +1872,7 @@ components:
         - host_identity_mismatch
         - delegation_invalid
         - delegation_exceeds_parent
+        - policy_missing_tag_owners
         - not_found
         - unknown_tenant
         - unknown_namespace
@@ -1975,8 +1980,8 @@ components:
     # ------------------------------------------------------------- tenants
     MintMode:
       type: string
-      description: "`wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key)."
-      enum: [wif, apikey, static]
+      description: "`oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key)."
+      enum: [oauth, wif, apikey, static]
     Tier:
       type: string
       enum: [process, microvm]
@@ -1993,6 +1998,12 @@ components:
           description: "`apikey` mode: absolute path, read at use; the key is never stored or returned."
         wifClientID: { type: string, description: Public client ID of the mint trust credential (`auth_keys`). }
         wifLifecycleClientID: { type: string, description: "Public client ID of the lifecycle credential (`devices:core`, `policy_file:read`)." }
+        oauthClientID:
+          type: string
+          description: "`oauth` mode: the OAuth client's public ID (`TS_OAUTH_CLIENT_ID`). The secret is never stored or returned."
+        oauthClientFile:
+          type: string
+          description: "`oauth` mode: absolute path of the 0600 file with `TS_OAUTH_CLIENT_ID=…` / `TS_OAUTH_CLIENT_SECRET=tskey-client-…`, read at use on the mgmt host (a looser mode is refused)."
         wif: { $ref: "#/components/schemas/WIFInfo" }
         registrationsPerMinute: { type: integer, minimum: 1, default: 200 }
         maxObjects: { type: integer, minimum: 1, default: 1000 }
@@ -2022,6 +2033,8 @@ components:
         apiKeyFile: { type: string }
         wifClientID: { type: string }
         wifLifecycleClientID: { type: string }
+        oauthClientID: { type: string }
+        oauthClientFile: { type: string }
         registrationsPerMinute: { type: integer, minimum: 1 }
         maxObjects: { type: integer, minimum: 1 }
         pool: { type: string }
@@ -2035,6 +2048,8 @@ components:
         apiKeyFile: { type: [string, "null"] }
         wifClientID: { type: [string, "null"] }
         wifLifecycleClientID: { type: [string, "null"] }
+        oauthClientID: { type: [string, "null"] }
+        oauthClientFile: { type: [string, "null"] }
         registrationsPerMinute: { type: integer, minimum: 1 }
         maxObjects: { type: integer, minimum: 1 }
         pool: { type: [string, "null"] }
@@ -2358,6 +2373,21 @@ components:
         devicesDeleted: { type: array, items: { type: string } }
         devicesDeleting: { type: array, items: { type: string }, description: Device deletes scheduled (`-device-delete-delay`). }
         errors: { type: object, additionalProperties: { type: string } }
+        warnings:
+          type: array
+          description: Non-fatal findings. The kill itself succeeded (tier 1 push, killed status, tombstone).
+          items: { $ref: "#/components/schemas/KillWarning" }
+    KillWarning:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [device_delete_unavailable]
+          description: "`device_delete_unavailable`: the tenant's credential may not delete devices (an OAuth client without `devices:core`); the killed node is unreachable but its device stays in the admin console until removed."
+        message: { type: string }
+        objects: { type: array, items: { type: string } }
+        fix: { type: string, description: How to add the missing scope. }
 
     # --------------------------------------------------------- credentials
     Credential:

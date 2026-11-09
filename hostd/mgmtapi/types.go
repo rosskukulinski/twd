@@ -33,6 +33,7 @@ type Tenant struct {
 	ControlURL             string `json:"controlURL,omitempty"`
 	MintMode               string `json:"mintMode"` // "apikey" | "wif" | "static" (v0.1, tests only)
 	APIKeyFile             string `json:"apiKeyFile,omitempty"`
+	OAuthClientFile        string `json:"oauthClientFile,omitempty"` // oauth mode: the 0600 client file (path only)
 	WIFClientID            string `json:"wifClientID,omitempty"`
 	RegistrationsPerMinute int    `json:"registrationsPerMinute,omitempty"`
 	MaxObjects             int    `json:"maxObjects,omitempty"`

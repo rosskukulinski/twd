@@ -3,8 +3,9 @@
 // ~/.twd), app scaffolding and deploys, and the day-2 commands (kill,
 // audit, ls, logs, status).
 //
-//	twd up                                                   # keyless: tailnet login + WIF trust credential (ADR-026)
-//	twd up --tailnet <tailnet> --api-key-file <file> --yes   # alternative: apikey mint mode (tests, homelab)
+//	twd up --oauth-client-file <file> [--service] --yes      # recommended (M12): OAuth client, no browser, no Funnel
+//	twd up --wif                                             # keyless: tailnet login + WIF trust credential (ADR-026)
+//	twd up --tailnet <tailnet> --api-key-file <file> --yes   # fallback: apikey mint mode (tests)
 //	twd link twd-mgmt.<tailnet>.ts.net                       # a developer machine: every command below goes to mgmt over the tailnet (WhoIs)
 //	twd init hello --template agent && cd hello && twd deploy
 //	twd ls · twd kill <object> --cascade · twd audit <object> · twd logs <workload>
@@ -38,7 +39,7 @@ var commands []command
 
 func init() {
 	commands = []command{
-		{name: "up", usage: "up [--yes] [--service] [--wif-client-id <id>]  |  up --tailnet <tailnet> --api-key-file <file> [--yes] [--policy-apply]", help: "start twd-mgmt + twd-hostd on this machine; keyless by default (tailnet login + WIF trust credential), --api-key-file for apikey mode", run: cmdUp},
+		{name: "up", usage: "up --oauth-client-file <file> [--service] [--yes]  |  up --wif [--wif-client-id <id>]  |  up --tailnet <tailnet> --api-key-file <file> [--policy-apply]", help: "start twd-mgmt + twd-hostd on this machine; recommended: an OAuth client (no browser, no Funnel); --wif for the keyless browser flow, --api-key-file as the fallback", run: cmdUp},
 		{name: "down", usage: "down [--purge] [--service]", help: "stop everything twd up started (--purge: kill every object and delete its device first)", run: cmdDown},
 		{name: "link", usage: "link [twd-mgmt.<tailnet>.ts.net] [--unlink]", help: "developer machine: use a remote twd-mgmt over your own Tailscale connection (WhoIs identity; no key or token)", run: cmdLink},
 		{name: "status", usage: "status", help: "health of mgmt, the host, the tenant and deployments", run: cmdStatus},

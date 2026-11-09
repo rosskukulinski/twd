@@ -303,6 +303,9 @@ func cmdKill(args []string) error {
 		for id, e := range kr.Errors {
 			fmt.Printf("  warning %s: %s\n", id, e)
 		}
+		for _, w := range kr.Warnings {
+			fmt.Printf("› %s  %s (%s)\n  fix: %s\n", w.Code, w.Message, strings.Join(w.Objects, ", "), w.Fix)
+		}
 	})
 	return nil
 }

@@ -25,7 +25,11 @@ import (
 // machine's own Tailscale connection; mgmt authenticates the caller by
 // WhoIs (ADR-026), so there is no token or key on this machine.
 type Link struct {
-	Endpoint string `json:"endpoint"`          // https://twd-mgmt.<tailnet>.ts.net
+	Endpoint string `json:"endpoint"` // https://twd-mgmt.<tailnet>.ts.net (or http:// when the tailnet has no HTTPS)
+	// Scheme is how the link reached mgmt ("https" or "http"); http is the
+	// fallback when HTTPS certificates are unavailable (the traffic is
+	// still WireGuard-encrypted and WhoIs-authenticated).
+	Scheme   string `json:"scheme,omitempty"`
 	Tailnet  string `json:"tailnet,omitempty"` // mgmt's tailnet (MagicDNS suffix)
 	MgmtNode string `json:"mgmtNode,omitempty"`
 	Login    string `json:"login,omitempty"` // who mgmt said we are at link time
@@ -200,6 +204,7 @@ func linkErr(l *Link, err error) error {
 
 type linkResult struct {
 	Endpoint string      `json:"endpoint"`
+	Scheme   string      `json:"scheme,omitempty"`
 	Tailnet  string      `json:"tailnet,omitempty"`
 	MgmtNode string      `json:"mgmtNode,omitempty"`
 	Login    string      `json:"login"`
@@ -308,15 +313,27 @@ func cmdLink(args []string) error {
 		}
 	}
 	ep = strings.TrimSuffix(ep, "/")
-	if !strings.Contains(ep, "://") {
+	explicit := strings.Contains(ep, "://")
+	if !explicit {
 		ep = "https://" + ep
 	}
 	l.Endpoint = ep
 	s.Link = l
 	w, err := s.whoami(ctx)
+	if err != nil && !explicit && !isMgmtAPIErr(err) {
+		// No scheme given: HTTPS first, then plain HTTP on :80 (mgmt
+		// serves both; :443 only when the tailnet issues certificates).
+		l.Endpoint = "http://" + strings.TrimPrefix(ep, "https://")
+		if w2, err2 := s.whoami(ctx); err2 == nil {
+			ep, w, err = l.Endpoint, w2, nil
+		} else {
+			l.Endpoint = ep
+		}
+	}
 	if err != nil {
 		return err
 	}
+	l.Scheme = strings.SplitN(ep, "://", 2)[0]
 	if !w.Admin {
 		return fail("not_admin", w.Actor+" is not a twd admin at "+ep).withFix("ask the tailnet admin for the " + mgmt.AdminCap + " grant to " + mgmt.MgmtTag)
 	}
@@ -324,9 +341,12 @@ func cmdLink(args []string) error {
 	if err := l.save(s.linkPath()); err != nil {
 		return err
 	}
-	res := linkResult{Endpoint: ep, Tailnet: l.Tailnet, MgmtNode: l.MgmtNode, Login: w.Login, Actor: w.Actor, NodeID: w.NodeID, Admin: w.Admin, Tenants: s.tenants(), Path: s.linkPath()}
+	res := linkResult{Endpoint: ep, Scheme: l.Scheme, Tailnet: l.Tailnet, MgmtNode: l.MgmtNode, Login: w.Login, Actor: w.Actor, NodeID: w.NodeID, Admin: w.Admin, Tenants: s.tenants(), Path: s.linkPath()}
 	emit(f, res, func() {
 		fmt.Printf("✓ linked    %s · tailnet %s · you are %s (admin, by WhoIs: no key or token stored)\n", ep, l.Tailnet, w.Actor)
+		if l.Scheme == "http" {
+			fmt.Printf("  over plain HTTP on :80 (no HTTPS certificate on mgmt's node): WireGuard encrypts it and WhoIs authenticates it\n")
+		}
 		for _, t := range res.Tenants {
 			fmt.Printf("✓ tenant    %s (%s, mint mode %s)\n", t.Tailnet, t.TenantID, mintModeName(t.MintMode))
 		}
@@ -343,4 +363,15 @@ func mintModeName(m string) string {
 		return "apikey"
 	}
 	return m
+}
+
+// isMgmtAPIErr reports an error that mgmt itself answered (a typed API
+// error, e.g. not_admin): the transport worked, so no scheme fallback.
+func isMgmtAPIErr(err error) bool {
+	var ce *cliErr
+	if errors.As(err, &ce) {
+		return ce.Code != "mgmt_unreachable" && ce.Code != "internal"
+	}
+	_, ok := mgmtapi.AsError(err)
+	return ok
 }
