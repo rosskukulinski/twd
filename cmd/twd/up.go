@@ -585,7 +585,9 @@ func cmdUp(args []string) error {
 		// grants are checked when the client can read the policy.
 		res.PolicyOK = true
 		if policyReadable {
-			if miss, err := policy.Missing(pol, operatorSnippet()); err == nil && !miss.Empty() {
+			// Grants only: tag ownership is proven by the mints, and other
+			// owners of tag:twd (a group, say) are fine.
+			if miss, err := policy.Missing(pol, policy.Snippet{Grants: operatorSnippet().Grants}); err == nil && !miss.Empty() {
 				res.PolicyOK, res.PolicyDiff = false, miss.HuJSON()
 			}
 		}
