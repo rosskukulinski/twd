@@ -145,6 +145,9 @@ func (m *MultiEnv) Run() {
 	m.A.TenantID = up.TenantID
 	res.Numbers["up_ready_ms"] = msOf(d)
 	m.Env.TrackInfra(up.MgmtNodeID)
+	// Cleanup is per tailnet (Tenant.Res): mgmt's and the host's own nodes
+	// live on tenant A's tailnet.
+	m.A.Res.InfraNodeIDs = append(m.A.Res.InfraNodeIDs, m.Res.InfraNodeIDs...)
 
 	// twd tenant add: tenant B on its own tailnet.
 	var ta struct {
