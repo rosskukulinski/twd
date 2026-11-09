@@ -232,7 +232,7 @@ func TestE2EOAuth(t *testing.T) {
 	res.Numbers["scenario_ms"] = float64(time.Since(t0).Milliseconds())
 	var cfg struct {
 		Tailnet, MintMode, APIKeyFile, OAuthClientFile, OAuthClientID, IssuerURL, MgmtDNSName string
-		HTTPS                                                                                bool
+		HTTPS                                                                                 bool
 	}
 	cb, _ := os.ReadFile(filepath.Join(state, "twd.json"))
 	json.Unmarshal(cb, &cfg)
