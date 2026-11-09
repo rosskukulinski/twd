@@ -139,8 +139,9 @@ func run() error {
 		// mgmt's node must be in our netmap before the first request.
 		wctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		for {
-			if err := mc.Do(wctx, "GET", "/v1/healthz", nil, nil); err == nil {
-				break
+			err := mc.Do(wctx, "GET", "/v1/healthz", nil, nil)
+			if _, typed := mgmtapi.AsError(err); err == nil || typed {
+				break // any answer from mgmt means the path is open
 			} else if wctx.Err() != nil {
 				cancel()
 				return fmt.Errorf("mgmt %s unreachable over the tailnet: %w (does the policy grant tag:twd-host → tag:twd-mgmt?)", *mgmtAddr, err)

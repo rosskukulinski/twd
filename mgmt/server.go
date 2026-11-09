@@ -403,7 +403,9 @@ func (s *Server) TailnetHandler(whois WhoIsFunc, h http.Handler) http.Handler {
 					p.HostID = hst.ID
 				}
 			}
-			if p.HostID == "" && !(r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/hosts/") && strings.Count(r.URL.Path, "/") == 3) {
+			registerOrProbe := (r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/hosts/") && strings.Count(r.URL.Path, "/") == 3) ||
+				(r.Method == http.MethodGet && (r.URL.Path == "/v1/healthz" || r.URL.Path == "/v1/whoami"))
+			if p.HostID == "" && !registerOrProbe {
 				writeErr(w, r, errf(403, "host_not_registered", "node %s (%s) has not registered; PUT /v1/hosts/{id} first", wi.NodeID, HostTag))
 				return
 			}
