@@ -996,6 +996,8 @@ func cmdStatus(args []string) error {
 			r.HostAgeMS = time.Since(time.UnixMilli(h.LastSeen)).Milliseconds()
 			r.Host = h.Status == "live"
 			r.HostStatus = h.Status
+		} else if !s.Cfg.LocalDev && !isFile(filepath.Join(s.hostTsnetDir(), "tailscaled.state")) {
+			r.HostStatus = "pending" // hostd waits for its join key (keyless: minted once the trust credential exists)
 		}
 	}
 	r.Transport = s.transport()
