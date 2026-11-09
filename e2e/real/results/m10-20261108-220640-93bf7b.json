@@ -1,0 +1,66 @@
+{
+  "run": "m10-93bf7b",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T22:06:40-08:00",
+  "checks": {
+    "a_verified_caller_via_workload": "PASS \u003cnil\u003e map[agent:k1 caller:map[node:ttest-m10-93bf7b-client.tail7906d5.ts.net nodeId:nJJBQJ5pdG11CNTRL tags:[tag:ttest] user:\u003cnil\u003e] calls:1 state:map[visits:1] upstream:\u003cnil\u003e]",
+    "create_lifecycle_trust_credential": "PASS \u003cnil\u003e",
+    "create_mint_trust_credential": "PASS \u003cnil\u003e",
+    "deploy_local_wif": "PASS mcp twd-m10-93bf7b-mcp-ckoay72hrm.tail7906d5.ts.net in 2.104s",
+    "doctor_labels_keyless": "PASS ok wif (keyless): mgmt node ttest-m10-93bf7b-mgmt.tail7906d5.ts.net serves the OIDC issuer https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net over Funnel; trust credential client ID TJ9Pq5WhVr11CNTRL-kQGr5KhPVr11CNTRL (public), lifecycle credential TJ9Pq5WhVr11CNTRL-kq6LNKCmr521CNTRL | skip keyless mode: no API key on this machine (nodes are minted through the WIF trust credential)",
+    "down": "PASS 2 objects purged, 2 devices deleted, 705ms",
+    "issuer_public_via_funnel": "PASS https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net/t/tn_tail7906d5 in 1m47.02s",
+    "link_admin_by_whois": "PASS {Endpoint:https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net Tailnet:tail7906d5.ts.net Actor:tag:ttest (nuhXCyW4z711CNTRL) NodeID:nuhXCyW4z711CNTRL Admin:true Tenants:[{TenantID:tn_tail7906d5 MintMode:wif}]}",
+    "no_api_key_in_twd_state": "PASS twd.json: {MintMode:wif APIKeyFile: MgmtDNSName:ttest-m10-93bf7b-mgmt.tail7906d5.ts.net MgmtNodeID:ntv9jE6Zsk11CNTRL IssuerURL:https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net Tailnet:tail7906d5.ts.net HTTPS:true}",
+    "noadmin_refused_with_snippet": "PASS error [not_admin]: node ttest-m10-93bf7b-noadmin.tail7906d5.ts.net [tag:ttest-noadmin] is not a twd admin: no twd.dev/cap/admin capability from a grant to tag:twd-mgmt (and not in -admins)\n  missing: {\"cap\":\"twd.dev/cap/admin\",\"dst\":\"tag:twd-mgmt\",\"src\":\"tag:ttest-noadmin\"}\n  mgmt identified this connection by WhoIs (your Tailscale login or node) and found no twd.dev/cap/admin capability.\n  fix: ask the tailnet admin to add this grant to the tailnet policy (autogroup:admin members already have it from twd up's base snippet):\n      {\"src\": [\"tag:ttest-noadmin\"], \"dst\": [\"tag:twd-mgmt\"], \"ip\": [\"tcp:443\", \"tcp:80\"], \"app\": {\"twd.dev/cap/admin\": [{}]}}\n    then re-run; or log in to the host and use twd there\n    add to your tailnet policy:\n      {\"src\": [\"tag:ttest-noadmin\"], \"dst\": [\"tag:twd-mgmt\"], \"ip\": [\"tcp:443\", \"tcp:80\"], \"app\": {\"twd.dev/cap/admin\": [{}]}}\n  trace 090308e0198c06dbe363c65e070a3ea0 · https://twd.dev/e/not_admin\n",
+    "object_node_minted_via_wif": "PASS object twd-m10-93bf7b-supportagent-ahly4td64c.tail7906d5.ts.net ([tag:twd-agent-support]) answers on its own node; mint mode wif, no API key on the host",
+    "remote_audit_kill": "PASS verified=true kill=true",
+    "remote_audit_mints_and_deployer": "PASS verified=true mints=3 deployBy=true",
+    "remote_deploy": "PASS agent twd-m10-93bf7b-agent-4k7ecz4mpv.tail7906d5.ts.net in 3.47s (preflight via the lifecycle credential's policy read)",
+    "remote_kill": "PASS killed [supportagent-ahly4td64c] in 1.824s",
+    "remote_ls_deployed_by": "PASS deployedBy tag:ttest (nuhXCyW4z711CNTRL)",
+    "stack_running_before_credential": "PASS mgmt up, host \"pending\", transport \"tsnet (loopback through mgmt's node)\" while waiting for the trust credential",
+    "transport_tsnet_only": "PASS doctor \"ok tsnet: mgmt API on its own node ttest-m10-93bf7b-mgmt.tail7906d5.ts.net (WhoIs); hostd on its own tag:twd-host node twd-host-h-mini; this CLI dials through mgmt's loopback proxy\" · mgmt.sock exists=false · hosts [{HostID:h-mini NodeID:n1wL72QncW11CNTRL Status:live DNSName:twd-host-h-mini.tail7906d5.ts.net}]",
+    "up_keyless_complete": "PASS tenant tn_tail7906d5 mode wif (keyless) wif {IssuerPublicMs:446.762 Check:{MintMode:wif Mint:true MintError: Lifecycle:ok LifecycleError: PolicyRead:true PolicyReadError: Issuer:https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net/t/tn_tail7906d5} TenantCreated:true}",
+    "up_waits_for_trust_credential": "PASS err=exit status 1 stderr=\n› trust    twd mints its nodes' auth keys WITHOUT an API key: Tailscale trusts mgmt's OIDC issuer (served over\n           Funnel from this machine) for one pinned subject. Create the trust credential(s) once, in the admin console:\n\n  1. Open  https://login.tailscale.com/admin/settings/trust-credentials   (tailnet tail7906d5.ts.net)\n     › Trust credentials › Add trust credential   (the console has no pre-fill for custom issuers yet; paste these)\n  2. Mint credential (required):\n       Issuer:    https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net/t/tn_tail7906d5\n       Subject:   twd:tenant:tn_tail7906d5:mint\n       Scopes:    auth_keys                   Tags: tag:twd\n       Audience:  leave the default (api.tailscale.com/\u003cclient ID\u003e)\n  3. Lifecycle credential (recommended; enables kill tier 2 = device delete, the reaper, spawn checks and deploy preflight):\n       Issuer:    https://ttest-m10-93bf7b-mgmt.tail7906d5.ts.net/t/tn_tail7906d5\n       Subject:   twd:tenant:tn_tail7906d5:lifecycle\n       Scopes:    devices:core, policy_file:read     Tags: tag:twd\n  4. Copy each credential's client ID (it is public; twd stores only that) and paste it below.\n     Non-interactive: twd up --wif-client-id \u003cmint ID\u003e [--wif-lifecycle-client-id \u003clifecycle ID\u003e]\n\n› host     twd-hostd waits for its join key: it is minted through the trust credential once the IDs are given\n{\"error\":{\"code\":\"wif_credential_required\",\"message\":\"keyless mode needs the trust credential's client ID (see the steps above)\",\"detail\":[\"twd-mgmt and twd-hostd keep running; the tenant is created when the ID is given\"],\"fix\":[\"twd up --wif-client-id \\u003cmint ID\\u003e [--wif-lifecycle-client-id \\u003clifecycle ID\\u003e]\"]}}\n stdout="
+  },
+  "numbers": {
+    "deploy_mcp_ready_ms": 1895.839,
+    "down_ms": 705.042,
+    "first_object_node_ready_ms": 8436,
+    "funnel_first_fetch_ms": 107020,
+    "link_ms": 1615,
+    "noadmin_link_ms": 1527,
+    "remote_deploy_cli_ms": 3470,
+    "remote_deploy_ready_ms": 1841.45,
+    "remote_kill_cli_ms": 1824,
+    "up_step1_ms": 3521,
+    "up_step2_ms": 8067,
+    "up_total_ms": 119312
+  },
+  "notes": [
+    "policy changed (validated, If-Match \"87d6044ec812a63d74fb53245c54e4bfffdf2904783c61f0e6ea68c7d870acda\"): added \"tagOwners\": {\n  \"tag:twd-host\": [\"tag:twd\"],\n},\n (previous copy: /Users/ross/.config/tailnet-agents-design/tailnet1_acl.pre-m10-93bf7b.hujson)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 8,
+    "devices_left": 0,
+    "devices_tracked": 8,
+    "errors": null,
+    "trust_credentials_deleted": 2,
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 3,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": [
+    "n4HcPxYkRC21CNTRL",
+    "nesfZgcTcg11CNTRL",
+    "nsaX3CZFfJ11CNTRL"
+  ],
+  "infraNodeIDs": null,
+  "keyIDs": [
+    "k6fK8pZSxN11CNTRL",
+    "k2rCEAQWsa11CNTRL",
+    "k7drGX95rX11CNTRL"
+  ]
+}
