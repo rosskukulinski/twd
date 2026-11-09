@@ -3,21 +3,25 @@
 **Result: every item in BUILD-PLAN.md's definition of done is met, and Linux is a first-class host (LINUX-PLAN.md).** twd installs on a clean MacBook (`mbp`) and on fresh Linux VMs and works end to end against real tailnets. Unit and e2e suites pass on macOS and Linux, re-measured on the final tree (branch `final-verify`, fast-forward of master; STATUS.md "Final verification"). `make release` writes `dist/twd-0.1.0-<commit>-{darwin-arm64,linux-arm64,linux-amd64}.tar.gz`.
 
 ## Install it on another Mac
-Follow `docs/INSTALL.md`. Short version (M10, keyless by default; STATUS.md "M10"):
+Follow `docs/INSTALL.md`. Short version (M12: an OAuth client is the default; STATUS.md "M12"):
 ```sh
 scp dist/twd-0.1.0-<commit>-darwin-arm64.tar.gz other-mac:
 ssh other-mac 'tar xzf twd-*.tar.gz && ./twd-*/install.sh'        # ~6 s, no sudo, installs into ~/.twd
-# host
-twd up [--service]      # prints the policy snippet → a login URL (mgmt's node joins as tag:twd-mgmt) → the admin-console
-                        # steps for the WIF trust credential (issuer over Funnel) → paste the client ID → ready. No API key.
-twd doctor              # workerd, esbuild, sandbox active, mint_mode wif (keyless), system tailscaled NOT used
+# once, in the admin console: policy (tag:twd owns tag:twd-mgmt and tag:twd-host; host ⇄ mgmt + admin grants;
+# no nodeAttrs), then Settings › OAuth clients › Generate: Auth Keys (write) + tag:twd
+# [+ Devices › Core (write), tag:twd: kill deletes devices] [+ Policy File (read): preflight + spawn checks]
+printf 'TS_OAUTH_CLIENT_ID=%s\nTS_OAUTH_CLIENT_SECRET=%s\n' <id> <tskey-client-…> > ~/.config/twd/oauth.env && chmod 600 ~/.config/twd/oauth.env
+# host: no browser, no Funnel, no HTTPS requirement
+twd up --oauth-client-file ~/.config/twd/oauth.env --service --yes
+twd doctor              # mint_mode ok oauth (warns if the file is not 0600), transport tsnet, system tailscaled NOT used
 # your laptop (on the same tailnet, as an admin)
-twd link twd-mgmt.<tailnet>.ts.net      # WhoIs identity over your own Tailscale connection; no key or token
+twd link twd-mgmt.<tailnet>.ts.net      # WhoIs identity over your own Tailscale; https first, then http on :80
 twd init hello --template agent && cd hello && twd dev && twd deploy && twd ls && twd audit --all
-# alternative (tests, no HTTPS): apikey mode
+# alternatives: keyless browser flow (WIF; HTTPS + Funnel) and the API-key fallback
+twd up --wif
 twd up --tailnet <your-test-tailnet> --api-key-file <file with TS_API_KEY=…> --yes
 ```
-twd never uses the host's Tailscale app or login for its nodes: mgmt's node and every object node are tsnet nodes. The one-time console step that remains is the trust credential: creating new devices needs a control-plane credential, and WIF is its keyless form (ADR-026).
+`twd up` with no credential lists these three options and exits. twd never uses the host's Tailscale app or login for its nodes: mgmt's node, the host's node and every object node are tsnet nodes, minted by the OAuth client.
 
 ## What was verified (measured, final runs on master)
 | Acceptance test | Result |

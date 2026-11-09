@@ -26,11 +26,17 @@ import (
 type Config struct {
 	Tailnet  string `json:"tailnet"`
 	TenantID string `json:"tenantID,omitempty"`
-	// MintMode is "wif" (keyless, the default: mgmt's OIDC issuer + a
-	// Tailscale trust credential) or "apikey" (--api-key-file). Empty
-	// means apikey (state written before M10).
+	// MintMode is "oauth" (the default since M12: a Tailscale OAuth client
+	// whose secret stays in a 0600 file; no browser, no Funnel), "wif"
+	// (keyless browser flow: mgmt's OIDC issuer over Funnel + a trust
+	// credential) or "apikey" (--api-key-file). Empty means apikey (state
+	// written before M10).
 	MintMode   string `json:"mintMode,omitempty"`
 	APIKeyFile string `json:"apiKeyFile,omitempty"` // apikey mode: path only; the key itself is never copied
+	// oauth mode: the client file's absolute path (read at use by the CLI
+	// and twd-mgmt; never copied) and the client's public ID.
+	OAuthClientFile string `json:"oauthClientFile,omitempty"`
+	OAuthClientID   string `json:"oauthClientID,omitempty"`
 	// Keyless mode: mgmt's own tailnet node (tag:twd-mgmt), joined by
 	// interactive login in `twd up`; the API is served on it (WhoIs auth)
 	// and the WIF issuer over Funnel.
@@ -85,10 +91,24 @@ type state struct {
 // keyless reports whether this state runs in keyless (WIF) mint mode.
 func (c Config) keyless() bool { return c.MintMode == "wif" }
 
+// oauth reports whether this state mints through an OAuth client (M12).
+func (c Config) oauth() bool { return c.MintMode == "oauth" }
+
+// modeName is the mint mode's short name ("apikey" for pre-M10 state).
+func (c Config) modeName() string {
+	if c.MintMode == "" {
+		return "apikey"
+	}
+	return c.MintMode
+}
+
 // mintMode names the mode for humans.
 func (c Config) mintMode() string {
-	if c.keyless() {
+	switch {
+	case c.keyless():
 		return "wif (keyless)"
+	case c.oauth():
+		return "oauth"
 	}
 	return "apikey"
 }

@@ -158,6 +158,9 @@ func (h *Host) sandboxDeny() []string {
 		if t.info.APIKeyFile != "" {
 			deny = append(deny, t.info.APIKeyFile)
 		}
+		if t.info.OAuthClientFile != "" {
+			deny = append(deny, t.info.OAuthClientFile)
+		}
 	}
 	h.mu.Unlock()
 	// Every tenant mgmt knows, including ones this host has no workload of
@@ -168,6 +171,9 @@ func (h *Host) sandboxDeny() []string {
 		for _, t := range ts {
 			if t.APIKeyFile != "" {
 				deny = append(deny, t.APIKeyFile)
+			}
+			if t.OAuthClientFile != "" {
+				deny = append(deny, t.OAuthClientFile)
 			}
 		}
 	}

@@ -147,7 +147,7 @@ Customer tailnets. Admin only.
 
 `ListTenants` · role **admin\|host** · audited: no
 
-Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+Hosts may list tenants too (they deny every tenant's `apiKeyFile` and `oauthClientFile` path to their workload sandboxes).
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
@@ -199,8 +199,9 @@ Includes `oboPublicKey` (hostd pins it) and, in wif mode, `wif` (issuer and subj
 `UpdateTenant` · role **admin** · audited: yes
 
 Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-`apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-Switching to `wif` or changing a WIF client ID drops cached tokens.
+`apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+`maxObjects`, `pool`, `tier`.
+Switching mode or changing a client ID / credential file drops cached tokens.
 `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 
 | Parameter | In | Type | Required | Description |
@@ -1262,7 +1263,7 @@ is policy HuJSON to paste when a grant is missing; `doc_url` is
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `code` | `ErrorCode` | yes | The catalog. Status in parentheses. \| code \| status \| when \| \|---\|---\|---\| \| `bad_request` \| 400 \| malformed body, parameter or filter \| \| `bad_cursor` \| 400 \| `cursor` does not decode \| \| `bad_bundle` \| 400 \| bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` \| \| `immutable_field` \| 400 \| PATCH touches a field the caller may not change \| \| `no_identity` \| 401 \| WhoIs failed for the connection \| \| `host_token_required` \| 401 \| local-dev socket without `Twd-Host-Token` \| \| `host_token_invalid` \| 403 \| local-dev socket, wrong token \| \| `not_admin` \| 403 \| tailnet caller without `twd.dev/cap/admin` (`snippet` given) \| \| `forbidden` \| 403 \| role ok, but outside the caller's records / namespaces \| \| `host_not_registered` \| 403 \| `tag:twd-host` node that never did `PUT /v1/hosts/{id}` \| \| `host_identity_mismatch` \| 403 \| host ID bound to another node \| \| `delegation_invalid` \| 403 \| child tag not owned by the parent's, parent unknown (404) or dead (410) \| \| `delegation_exceeds_parent` \| 403 \| spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) \| \| `not_found` \| 404 \| — \| \| `unknown_tenant` \| 404 \| — \| \| `unknown_namespace` \| 404 \| `(workload, class)` not declared \| \| `exists` \| 409 \| create of an existing ID \| \| `lease_lost` \| 409 \| epoch/holder fence failed \| \| `lease_held` \| 409 \| another host holds the lease \| \| `already_joined` \| 409 \| credential for an object that has a node \| \| `identity_conflict` \| 409 \| object ID collision across identities \| \| `namespace_ambiguous` \| 409 \| class declared by several workloads, `workload` missing \| \| `not_ready` \| 409 \| certificate requested before `ready` \| \| `superseded` \| 409 \| undeploy of a non-latest deployment \| \| `tenant_has_live_objects` \| 409 \| tenant delete without `force` \| \| `host_holds_leases` \| 409 \| host delete without `drain` \| \| `killed` \| 410 \| tombstone (`TombstoneError`) \| \| `precondition_failed` \| 412 \| `If-Match` mismatch \| \| `object_quota_exceeded` \| 429 \| tenant `maxObjects` \| \| `spawn_budget_exceeded` \| 429 \| `maxLive` / `maxDepth` \| \| `bootstrap_failed` \| 502 \| control plane refused the mint \| \| `host_token_unconfigured` \| 503 \| local-dev mgmt without a token (fail closed) \| \| `identity_pending` \| 503 \| mint still queued (`Retry-After: 1`) \| \| `no_host` \| 503 \| no live host for the deployment \| \| `policy_unavailable` \| 503 \| mgmt cannot read the tenant policy \| \| `internal` \| 500 \| — \| |
+| `code` | `ErrorCode` | yes | The catalog. Status in parentheses. \| code \| status \| when \| \|---\|---\|---\| \| `bad_request` \| 400 \| malformed body, parameter or filter \| \| `bad_cursor` \| 400 \| `cursor` does not decode \| \| `bad_bundle` \| 400 \| bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` \| \| `immutable_field` \| 400 \| PATCH touches a field the caller may not change \| \| `no_identity` \| 401 \| WhoIs failed for the connection \| \| `host_token_required` \| 401 \| local-dev socket without `Twd-Host-Token` \| \| `host_token_invalid` \| 403 \| local-dev socket, wrong token \| \| `not_admin` \| 403 \| tailnet caller without `twd.dev/cap/admin` (`snippet` given) \| \| `forbidden` \| 403 \| role ok, but outside the caller's records / namespaces \| \| `host_not_registered` \| 403 \| `tag:twd-host` node that never did `PUT /v1/hosts/{id}` \| \| `host_identity_mismatch` \| 403 \| host ID bound to another node \| \| `delegation_invalid` \| 403 \| child tag not owned by the parent's, parent unknown (404) or dead (410) \| \| `delegation_exceeds_parent` \| 403 \| spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) \| \| `policy_missing_tag_owners` \| 403 \| the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) \| \| `not_found` \| 404 \| — \| \| `unknown_tenant` \| 404 \| — \| \| `unknown_namespace` \| 404 \| `(workload, class)` not declared \| \| `exists` \| 409 \| create of an existing ID \| \| `lease_lost` \| 409 \| epoch/holder fence failed \| \| `lease_held` \| 409 \| another host holds the lease \| \| `already_joined` \| 409 \| credential for an object that has a node \| \| `identity_conflict` \| 409 \| object ID collision across identities \| \| `namespace_ambiguous` \| 409 \| class declared by several workloads, `workload` missing \| \| `not_ready` \| 409 \| certificate requested before `ready` \| \| `superseded` \| 409 \| undeploy of a non-latest deployment \| \| `tenant_has_live_objects` \| 409 \| tenant delete without `force` \| \| `host_holds_leases` \| 409 \| host delete without `drain` \| \| `killed` \| 410 \| tombstone (`TombstoneError`) \| \| `precondition_failed` \| 412 \| `If-Match` mismatch \| \| `object_quota_exceeded` \| 429 \| tenant `maxObjects` \| \| `spawn_budget_exceeded` \| 429 \| `maxLive` / `maxDepth` \| \| `bootstrap_failed` \| 502 \| control plane refused the mint \| \| `host_token_unconfigured` \| 503 \| local-dev mgmt without a token (fail closed) \| \| `identity_pending` \| 503 \| mint still queued (`Retry-After: 1`) \| \| `no_host` \| 503 \| no live host for the deployment \| \| `policy_unavailable` \| 503 \| mgmt cannot read the tenant policy \| \| `internal` \| 500 \| — \| |
 | `doc_url` | string (uri) | yes |  |
 | `message` | string | yes |  |
 | `missing` | object | no | What is missing. Shape depends on `code` (e.g. `{src, dst, cap, field}` for `delegation_invalid`). |
@@ -1288,6 +1289,7 @@ The catalog. Status in parentheses.
 | `host_identity_mismatch` | 403 | host ID bound to another node |
 | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
 | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
+| `policy_missing_tag_owners` | 403 | the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) |
 | `not_found` | 404 | — |
 | `unknown_tenant` | 404 | — |
 | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1312,7 +1314,7 @@ The catalog. Status in parentheses.
 | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
 | `internal` | 500 | — |
 
-Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity`, `host_token_required`, `host_token_invalid`, `not_admin`, `forbidden`, `host_not_registered`, `host_identity_mismatch`, `delegation_invalid`, `delegation_exceeds_parent`, `not_found`, `unknown_tenant`, `unknown_namespace`, `exists`, `lease_lost`, `lease_held`, `already_joined`, `identity_conflict`, `namespace_ambiguous`, `not_ready`, `superseded`, `tenant_has_live_objects`, `host_holds_leases`, `killed`, `precondition_failed`, `object_quota_exceeded`, `spawn_budget_exceeded`, `bootstrap_failed`, `host_token_unconfigured`, `identity_pending`, `no_host`, `policy_unavailable`, `internal`
+Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity`, `host_token_required`, `host_token_invalid`, `not_admin`, `forbidden`, `host_not_registered`, `host_identity_mismatch`, `delegation_invalid`, `delegation_exceeds_parent`, `policy_missing_tag_owners`, `not_found`, `unknown_tenant`, `unknown_namespace`, `exists`, `lease_lost`, `lease_held`, `already_joined`, `identity_conflict`, `namespace_ambiguous`, `not_ready`, `superseded`, `tenant_has_live_objects`, `host_holds_leases`, `killed`, `precondition_failed`, `object_quota_exceeded`, `spawn_budget_exceeded`, `bootstrap_failed`, `host_token_unconfigured`, `identity_pending`, `no_host`, `policy_unavailable`, `internal`
 
 #### `Health`
 
@@ -1441,6 +1443,16 @@ Enum: `pending`, `live`, `stale`, `draining`
 | `killed` | array of string | yes |  |
 | `pushMs` | number | no |  |
 | `pushed` | array of string | no | Objects whose host acknowledged the tier-1 push. |
+| `warnings` | array of `KillWarning` | no | Non-fatal findings. The kill itself succeeded (tier 1 push, killed status, tombstone). |
+
+#### `KillWarning`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `code` | string: `device_delete_unavailable` | yes | `device_delete_unavailable`: the tenant's credential may not delete devices (an OAuth client without `devices:core`); the killed node is unreachable but its device stays in the admin console until removed. |
+| `fix` | string | no | How to add the missing scope. |
+| `message` | string | yes |  |
+| `objects` | array of string | no |  |
 
 #### `Lease`
 
@@ -1452,9 +1464,9 @@ Enum: `pending`, `live`, `stale`, `draining`
 
 #### `MintMode`
 
-`wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key).
+`oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 
-Enum: `wif`, `apikey`, `static`
+Enum: `oauth`, `wif`, `apikey`, `static`
 
 #### `NodeCertificate`
 
@@ -1644,7 +1656,9 @@ the last page.
 | `controlURL` | string (uri) | no | Non-default control plane (testcontrol, headscale). |
 | `createdAt` | integer (int64) | yes |  |
 | `maxObjects` | integer | yes |  |
-| `mintMode` | `MintMode` | yes | `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key). |
+| `mintMode` | `MintMode` | yes | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
+| `oauthClientFile` | string | no | `oauth` mode: absolute path of the 0600 file with `TS_OAUTH_CLIENT_ID=…` / `TS_OAUTH_CLIENT_SECRET=tskey-client-…`, read at use on the mgmt host (a looser mode is refused). |
+| `oauthClientID` | string | no | `oauth` mode: the OAuth client's public ID (`TS_OAUTH_CLIENT_ID`). The secret is never stored or returned. |
 | `oboPublicKey` | string | no | base64 Ed25519 key that verifies this tenant's node certificates; hostd pins it. |
 | `pool` | string | no | Host pool the tenant's deployments are placed on (hosts with a matching `pool`; empty = any host). |
 | `registrationsPerMinute` | integer | yes |  |
@@ -1663,7 +1677,9 @@ the last page.
 | `apiKeyFile` | string | no |  |
 | `controlURL` | string (uri) | no |  |
 | `maxObjects` | integer | no |  |
-| `mintMode` | `MintMode` | yes | `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key). |
+| `mintMode` | `MintMode` | yes | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
+| `oauthClientFile` | string | no |  |
+| `oauthClientID` | string | no |  |
 | `pool` | string | no |  |
 | `registrationsPerMinute` | integer | no |  |
 | `tailnet` | string | yes |  |
@@ -1698,7 +1714,9 @@ JSON Merge Patch over the updatable fields. `null` clears an optional field.
 |---|---|---|---|
 | `apiKeyFile` | string \| null | no |  |
 | `maxObjects` | integer | no |  |
-| `mintMode` | `MintMode` | no | `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key). |
+| `mintMode` | `MintMode` | no | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
+| `oauthClientFile` | string \| null | no |  |
+| `oauthClientID` | string \| null | no |  |
 | `pool` | string \| null | no |  |
 | `registrationsPerMinute` | integer | no |  |
 | `tier` | `Tier` | no |  |
@@ -1766,7 +1784,7 @@ A fenced release of a volume's data key. Never logged.
 | `lifecycleError` | string | no |  |
 | `mint` | boolean | yes | The mint credential's token exchange succeeded (its `auth_keys` scope is only proven by the first real mint). |
 | `mintError` | string | no |  |
-| `mintMode` | `MintMode` | yes | `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key). |
+| `mintMode` | `MintMode` | yes | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
 | `policyRead` | boolean | yes | The lifecycle credential read the policy (`policy_file:read`). |
 | `policyReadError` | string | no |  |
 

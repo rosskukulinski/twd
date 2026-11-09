@@ -38,6 +38,11 @@ type fakeTS struct {
 	devDel    map[string]bool
 	n         int
 	setPolicy int
+	// OAuth (M12): the one client this fake knows, and its tokens.
+	oauthID, oauthSecret string
+	oauthTokens          map[string]bool
+	oauthExchanges       int
+	bearers              map[string]int // bearer → requests (which credential minted)
 }
 
 func newFakeTS(t *testing.T) *fakeTS {
@@ -49,14 +54,35 @@ func newFakeTS(t *testing.T) *fakeTS {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fakeTS{policy: p, keys: map[string]bool{}, devDel: map[string]bool{}}
+	return &fakeTS{policy: p, keys: map[string]bool{}, devDel: map[string]bool{}, oauthTokens: map[string]bool{}, bearers: map[string]int{}}
 }
 
 func (f *fakeTS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := r.URL.Path
+	if p == "/api/v2/oauth/token" {
+		r.ParseForm()
+		if f.oauthSecret == "" || r.Form.Get("client_id") != f.oauthID || r.Form.Get("client_secret") != f.oauthSecret {
+			w.WriteHeader(401)
+			w.Write([]byte(`{"error":"invalid_client"}`))
+			return
+		}
+		f.oauthExchanges++
+		tok := fmt.Sprintf("oauth-access-%d", f.oauthExchanges)
+		f.oauthTokens[tok] = true
+		json.NewEncoder(w).Encode(map[string]any{"access_token": tok, "expires_in": 3600})
+		return
+	}
+	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	f.bearers[bearer]++
+	if strings.HasPrefix(bearer, "oauth-access-") && !f.oauthTokens[bearer] {
+		w.WriteHeader(401)
+		return
+	}
 	switch {
+	case r.Method == "GET" && strings.HasSuffix(p, "/devices"):
+		w.WriteHeader(403) // the OAuth client has no devices:core read: twd falls back to the netmap / --tailnet
 	case r.Method == "GET" && strings.HasSuffix(p, "/acl"):
 		w.Header().Set("ETag", fmt.Sprintf(`"e%d"`, f.etag))
 		w.Write(f.policy)
@@ -236,7 +262,7 @@ func TestCLILink(t *testing.T) {
 	if up.MgmtIP == "" || up.MgmtNode == "" || up.MintMode != "apikey" {
 		t.Fatalf("twd up with a mgmt node: %+v", up)
 	}
-	if _, se, _, err := host.Twd("up", "--yes", "--control-url", ctl.URL); err == nil || !strings.Contains(se, "state_conflict") {
+	if _, se, _, err := host.Twd("up", "--wif", "--yes", "--control-url", ctl.URL); err == nil || !strings.Contains(se, "state_conflict") {
 		t.Fatalf("keyless twd up on an apikey state dir should be state_conflict: %v %s", err, se)
 	}
 	// A second twd up (supervisor running) must not touch the node.
@@ -246,6 +272,10 @@ func TestCLILink(t *testing.T) {
 	// The developer box: linked through its own tsnet node (test transport;
 	// the product path is the machine's Tailscale). No HTTPS on testcontrol.
 	ep := "http://" + up.MgmtIP
+	// Auto-discovery resolves `twd-mgmt` through this machine's MagicDNS;
+	// a developer Mac may run a real twd-mgmt there, so point it at a name
+	// that can't resolve (the test never talks to the machine's tailnet).
+	t.Setenv("TWD_LINK_DISCOVER_NAME", "twd-mgmt-hermetic.invalid")
 	if _, se, _, err := dev.Twd("link"); err == nil || !strings.Contains(se, "mgmt_not_found") {
 		t.Fatalf("link auto-discovery without MagicDNS should fail mgmt_not_found: %v %s", err, se)
 	}
@@ -514,4 +544,141 @@ func TestDoctor(t *testing.T) {
 func sandboxAvailable() bool {
 	sb, _ := hostd.ResolveSandbox(hostd.SandboxAuto)
 	return sb == hostd.SandboxSeatbelt || sb == hostd.SandboxLandlock
+}
+
+// TestCLIOAuth is M12 hermetically: `twd up --oauth-client-file` (mint mode
+// oauth: no browser, no Funnel, no API key anywhere) against testcontrol
+// and a fake Tailscale API with an OAuth token endpoint. Refusals first
+// (no mode → the three options; a group-readable file; a policy without
+// tag:twd as owner of tag:twd-mgmt/tag:twd-host → policy_missing_tag_owners
+// before anything is minted), then the whole E2E-MAC scenario (a)–(f) in
+// oauth mode, with every key minted by OAuth access tokens.
+func TestCLIOAuth(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short")
+	}
+	wd, err := nettest.WorkerdBinary()
+	if err != nil || !hostdtest.HasNode() {
+		t.Skip("needs workerd and node (make deps)")
+	}
+	t.Setenv("TWD_WORKERD", wd)
+	ctl, err := nettest.StartControl()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ctl.Close()
+	ctl.Server.SetGlobalAppCaps(tailcfg.PeerCapMap{
+		nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue},
+		cliflow.MCPCap:  []tailcfg.RawMessage{`{"tools":["lookup_order"]}`},
+	})
+	fts := newFakeTS(t)
+	fts.oauthID, fts.oauthSecret = "kTestOAuthCNTRL", "tskey-"+"client-kTestOAuthCNTRL-"+strings.Repeat("S", 24)
+	api := httptest.NewServer(fts)
+	defer api.Close()
+	bin := cliflow.BuildBinaries(t)
+	state, _ := hostdtest.ShortDir("twd-oa-")
+	work := t.TempDir()
+	cred := filepath.Join(work, "oauth.env")
+	os.WriteFile(cred, []byte("TS_OAUTH_CLIENT_ID="+fts.oauthID+"\nTS_OAUTH_CLIENT_SECRET="+fts.oauthSecret+"\n"), 0o644)
+	os.Chmod(cred, 0o644)
+	res := cliflow.NewResults("hermetic-oauth", "ttest.ts.net")
+	var nodes []*nettest.Node
+	e := &cliflow.Env{T: t, BinDir: bin, StateDir: state, WorkDir: work, Tailnet: "ttest.ts.net", OAuthClientFile: cred,
+		ControlURL: ctl.URL, TSAPIURL: api.URL, Prefix: "twd-o-", Res: res,
+		NewNode: func(role string) *nettest.Node {
+			n, err := nettest.NewNode(context.Background(), ctl.URL, nettest.DummyKey, "ttest-"+role, filepath.Join(work, role))
+			if err != nil {
+				t.Fatal(err)
+			}
+			nodes = append(nodes, n)
+			return n
+		}}
+	t.Cleanup(func() {
+		if t.Failed() {
+			for _, c := range []string{"supervisor", "mgmt", "hostd"} {
+				b, _ := os.ReadFile(filepath.Join(state, "logs", c+".log"))
+				t.Logf("%s log (tail):\n%s", c, hostdtest.Trim(string(b[max(0, len(b)-5000):]), 5000))
+			}
+		}
+		e.Twd("down", "--purge")
+		for _, n := range nodes {
+			n.Close()
+		}
+		os.RemoveAll(state)
+	})
+	up := []string{"up", "--oauth-client-file", cred, "--tailnet", "ttest.ts.net", "--yes", "--control-url", ctl.URL, "--tsapi-url", api.URL,
+		"--hostname-prefix", "twd-o-", "--mgmt-hostname", "twd-o-mgmt", "--host-id", "twd-o", "--ephemeral", "--allow-sibling-egress"}
+	// 1. A group/world-readable client file is refused before anything happens.
+	if _, se, _, err := e.Twd(up...); err == nil || !strings.Contains(se, "credential_file_insecure") || !strings.Contains(se, "chmod 600") {
+		t.Fatalf("0644 client file: %v %s", err, se)
+	}
+	os.Chmod(cred, 0o600)
+	// 2. Policy lacks tag:twd as an owner of the infra tags: typed error with
+	// the snippet, BEFORE any key is minted or node joined.
+	fts.mu.Lock()
+	good := fts.policy
+	fts.policy = []byte(`{"tagOwners": {"tag:twd": ["autogroup:admin"], "tag:twd-mgmt": ["autogroup:admin"]}}`)
+	minted := fts.n
+	fts.mu.Unlock()
+	_, se, _, err := e.Twd(up...)
+	if err == nil || !strings.Contains(se, "policy_missing_tag_owners") || !strings.Contains(se, `"tag:twd-mgmt": ["autogroup:admin","tag:twd"]`) {
+		t.Fatalf("policy without tag:twd owners: %v %s", err, se)
+	}
+	fts.mu.Lock()
+	if fts.n != minted {
+		t.Fatalf("%d keys minted before the policy was fixed", fts.n-minted)
+	}
+	fts.policy = good
+	fts.mu.Unlock()
+	if _, err := os.Stat(filepath.Join(state, "mgmt", "tsnet", "tailscaled.state")); err == nil {
+		t.Fatal("mgmt's node joined before the policy was fixed")
+	}
+	res.Pass("oauth_refusals", "0644 → credential_file_insecure; no tag:twd owner → policy_missing_tag_owners, nothing minted")
+
+	// 3. The scenario (a)–(f) in oauth mode.
+	e.Run()
+	var cfg struct {
+		MintMode, APIKeyFile, OAuthClientFile, OAuthClientID, IssuerURL string
+	}
+	b, _ := os.ReadFile(filepath.Join(state, "twd.json"))
+	json.Unmarshal(b, &cfg)
+	if cfg.MintMode != "oauth" || cfg.APIKeyFile != "" || cfg.OAuthClientFile != cred || cfg.OAuthClientID != fts.oauthID || cfg.IssuerURL != "" ||
+		strings.Contains(string(b), "tskey-") {
+		t.Fatalf("twd.json in oauth mode: %+v", cfg)
+	}
+	var doc struct {
+		Checks []struct{ Name, Status, Detail string }
+	}
+	e.MustJSON(&doc, "doctor")
+	for _, c := range doc.Checks {
+		if c.Name == "mint_mode" && (c.Status != "ok" || !strings.HasPrefix(c.Detail, "oauth: OAuth client "+fts.oauthID)) {
+			t.Fatalf("doctor mint_mode: %s %s", c.Status, c.Detail)
+		}
+		if c.Name == "api_key" && c.Status != "skip" {
+			t.Fatalf("doctor api_key in oauth mode: %s %s", c.Status, c.Detail)
+		}
+	}
+	os.Chmod(cred, 0o640)
+	e.MustJSON(&doc, "doctor")
+	for _, c := range doc.Checks {
+		if c.Name == "mint_mode" && (c.Status != "warn" || !strings.Contains(c.Detail, "0640")) {
+			t.Fatalf("doctor mint_mode with a loose file: %s %s", c.Status, c.Detail)
+		}
+	}
+	os.Chmod(cred, 0o600)
+	e.Down()
+	fts.mu.Lock()
+	defer fts.mu.Unlock()
+	if fts.oauthExchanges == 0 || fts.bearers["fake-not-a-key"] != 0 {
+		t.Fatalf("oauth exchanges %d, API-key requests %d", fts.oauthExchanges, fts.bearers["fake-not-a-key"])
+	}
+	for _, c := range []string{"mgmt", "hostd", "supervisor"} {
+		lb, _ := os.ReadFile(filepath.Join(state, "logs", c+".log"))
+		if strings.Contains(string(lb), "SSSSSSSS") || strings.Contains(string(lb), "oauth-access-") {
+			t.Fatalf("%s log carries the OAuth secret or an access token", c)
+		}
+	}
+	res.Numbers["oauth_exchanges"] = float64(fts.oauthExchanges)
+	out, _ := json.MarshalIndent(res, "", "  ")
+	t.Logf("results:\n%s", out)
 }

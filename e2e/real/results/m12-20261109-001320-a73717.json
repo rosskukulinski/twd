@@ -1,0 +1,105 @@
+{
+  "checks": {
+    "a_A_own_agent": "PASS caller ttest-m12-a73717-a-client.tail7906d5.ts.net (nwN4KADdJd11CNTRL) [tag:ttest]; agent ttest-m12-a73717-supportagent-wxkzx4gp4y.tail7906d5.ts.net egress → own echo as ttest-m12-a73717-supportagent-wxkzx4gp4y.tail7906d5.ts.net.",
+    "a_B_own_agent": "PASS caller ttest-m12-a73717-b-client.tail2c3a48.ts.net (n3S4M4XPSs11CNTRL) [tag:ttest]; agent ttest-m12-a73717-supportagent-sg52skdtzk.tail2c3a48.ts.net egress → own echo as ttest-m12-a73717-supportagent-sg52skdtzk.tail2c3a48.ts.net.",
+    "b_distinct_identities": "PASS agent:SupportAgent/a1 → A supportagent-wxkzx4gp4y node nTQb2nqN9L11CNTRL (ttest-m12-a73717-supportagent-wxkzx4gp4y.tail7906d5.ts.net) · B supportagent-sg52skdtzk node nHtxnSYyJ911CNTRL (ttest-m12-a73717-supportagent-sg52skdtzk.tail2c3a48.ts.net); workload nodes ttest-m12-a73717-agent-tr35rei75c.tail7906d5.ts.net / ttest-m12-a73717-agent-dxph6blr7r.tail2c3a48.ts.net; workerd pids 16826 / 16890",
+    "c_isolation_A_to_B": "PASS echo name peer_not_visible in 3 ms; echo FQDN peer_not_visible in 1 ms; echo IP peer_not_visible in 1 ms; agent name peer_not_visible in 1 ms; agent FQDN peer_not_visible in 1 ms; agent IP peer_not_visible in 1 ms; workload FQDN peer_not_visible in 1 ms; workload IP peer_not_visible in 1 ms",
+    "c_isolation_B_to_A": "PASS echo name peer_not_visible in 2 ms; echo FQDN peer_not_visible in 1 ms; echo IP peer_not_visible in 2 ms; agent name peer_not_visible in 2 ms; agent FQDN peer_not_visible in 1 ms; agent IP peer_not_visible in 1 ms; workload FQDN peer_not_visible in 1 ms; workload IP peer_not_visible in 1 ms",
+    "d_lim_enforced_A": "PASS same-tag child with lim=[lookup_order]: refund cap_missing, lookup_order ok; parent refund true",
+    "d_lim_enforced_B": "PASS same-tag child with lim=[lookup_order]: refund cap_missing, lookup_order ok; parent refund true",
+    "d_state_isolation_A": "PASS tenant dirs 0700; workerd pid 16826 under Seatbelt: tenant B state dir denied, tenant B node state denied, tenant B DO storage denied, tenant B API key file denied, its own tenant's node keys denied, no mgmt unix socket; loopback credential and host node state denied; own DO storage readable",
+    "d_state_isolation_B": "PASS tenant dirs 0700; workerd pid 16890 under Seatbelt: tenant A state dir denied, tenant A node state denied, tenant A DO storage denied, tenant A API key file denied, its own tenant's node keys denied, no mgmt unix socket; loopback credential and host node state denied; own DO storage readable",
+    "deploy_same_app": "PASS agent → A ttest-m12-a73717-agent-tr35rei75c.tail7906d5.ts.net · B ttest-m12-a73717-agent-dxph6blr7r.tail2c3a48.ts.net",
+    "down": "PASS 6 objects purged, 8 devices deleted, 6.004s",
+    "e_kill_A_spares_B": "PASS killed [supportagent-wxkzx4gp4y supportagent-c5ksdbawow] in 170ms; A's agent → 410 object_killed in 1.006ms; B's agent and workload still 200 (3×), B object ready",
+    "f_audit_A": "PASS 34 records, all tenant tn_tail7906d5, chain verified, kinds map[create:3 credential:4 deny:8 deploy:2 host_add:1 kill:2 mint:4 obo_root:1 preflight:2 ready:4 spawn:2 tenant_create:1]",
+    "f_audit_B": "PASS 31 records, all tenant tn_tail2c3a48, chain verified, kinds map[create:3 credential:4 deny:8 deploy:2 mint:4 obo_root:1 preflight:2 ready:4 spawn:2 tenant_create:1]",
+    "tenants": "PASS A tail7906d5.ts.net (tn_tail7906d5, operator) · B tail2c3a48.ts.net (tn_tail2c3a48) via `twd tenant add` in 514ms",
+    "transport_tsnet_only": "PASS tsnet: mgmt API on its own node ttest-m12-a73717-mgmt.tail7906d5.ts.net (WhoIs); hostd on its own tag:twd-host node twd-host-ttest-m12-a73717; this CLI dials through mgmt's loopback proxy"
+  },
+  "notes": [
+    "tailnet-2 discovered: tail2c3a48.ts.net (from the API-minted test client's MagicDNS name)",
+    "tail7906d5.ts.net: policy already had the scenario's tagOwners and grants (not written)",
+    "tail2c3a48.ts.net: policy changed (validated, If-Match \"718cf5dbab10de14a2ea409404346fd32521af005b57aa8af06730c5a517325d\"): added \"tagOwners\": {\n  \"tag:twd-mgmt\": [\"tag:twd\"],\n},\n (previous copy: /Users/ross/.config/tailnet-agents-design/tailnet2_acl.pre-m7-a73717.hujson)"
+  ],
+  "numbers": {
+    "deploy_A_ms": 4966.364,
+    "deploy_A_ready_ms": 4741.829,
+    "deploy_B_ms": 2160.051,
+    "deploy_B_ready_ms": 1934.787,
+    "down_ms": 6004.338,
+    "kill_A_cli_ms": 170.149,
+    "tenant_add_ms": 514.289,
+    "up_ready_ms": 10728.369
+  },
+  "run": "m7-a73717",
+  "tenants": {
+    "tail2c3a48.ts.net": {
+      "run": "m7-a73717-B",
+      "tailnet": "tail2c3a48.ts.net",
+      "date": "2026-11-09T00:13:26-08:00",
+      "checks": {},
+      "numbers": {},
+      "cleanup": {
+        "devices_deleted_by_cleanup": 6,
+        "devices_left": 0,
+        "devices_tracked": 6,
+        "test_keys_minted": 2,
+        "test_keys_revoke_errors": null,
+        "twd_devices_left_after_down": 0,
+        "twd_devices_tracked": 4,
+        "twd_keys_tracked": 4,
+        "twd_keys_valid_after_down": 0,
+        "untracked_run_devices": null
+      },
+      "nodeIDs": [
+        "ngo19mCNjy11CNTRL",
+        "nLzRiNWS3Z11CNTRL",
+        "nHtxnSYyJ911CNTRL",
+        "nMBZxnBz9V11CNTRL"
+      ],
+      "infraNodeIDs": null,
+      "keyIDs": [
+        "kLjUqNypo711CNTRL",
+        "kgt5V2dEj311CNTRL",
+        "kLTD4AycfY11CNTRL",
+        "kvX8Xcfhfa11CNTRL"
+      ]
+    },
+    "tail7906d5.ts.net": {
+      "run": "m7-a73717-A",
+      "tailnet": "tail7906d5.ts.net",
+      "date": "2026-11-09T00:13:26-08:00",
+      "checks": {},
+      "numbers": {},
+      "cleanup": {
+        "devices_deleted_by_cleanup": 8,
+        "devices_left": 0,
+        "devices_tracked": 8,
+        "test_keys_minted": 2,
+        "test_keys_revoke_errors": null,
+        "twd_devices_left_after_down": 0,
+        "twd_devices_tracked": 4,
+        "twd_keys_tracked": 4,
+        "twd_keys_valid_after_down": 0,
+        "untracked_run_devices": null
+      },
+      "nodeIDs": [
+        "niuE3u85S711CNTRL",
+        "n6U1iMAD7G11CNTRL",
+        "nTQb2nqN9L11CNTRL",
+        "nEyVd7uKGr11CNTRL"
+      ],
+      "infraNodeIDs": [
+        "nJ8qett4Ku11CNTRL",
+        "nMTCraR9j511CNTRL"
+      ],
+      "keyIDs": [
+        "kUTySMbtP311CNTRL",
+        "kNX6P2tsYX11CNTRL",
+        "kxPNEmzGzj11CNTRL",
+        "k9uvAZgnEK11CNTRL"
+      ]
+    }
+  }
+}

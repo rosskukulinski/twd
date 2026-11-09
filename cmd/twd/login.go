@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/tsapi"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
@@ -72,6 +74,9 @@ func joinMgmtNode(ctx context.Context, o joinOpts) (*mgmtNode, error) {
 		}
 		if n.ErrMessage != nil {
 			msg := *n.ErrMessage
+			if tsapi.IsTagsNotPermitted(errors.New(msg)) {
+				return nil, policyMissingTagOwners("the control server refused the join of "+o.Hostname+" with tags "+strings.Join(o.Tags, ", "), errors.New(msg))
+			}
 			e := fail("bootstrap_failed", "the control server refused the join", msg)
 			if strings.Contains(strings.ToLower(msg), "tag") {
 				e.Fix = append(e.Fix, "the account you logged in with must be allowed to own "+strings.Join(o.Tags, ", ")+" (tagOwners); add the snippet printed above, then run twd up again")

@@ -196,6 +196,7 @@ const (
 	ErrorCodeNotFound                ErrorCode = "not_found"
 	ErrorCodeNotReady                ErrorCode = "not_ready"
 	ErrorCodeObjectQuotaExceeded     ErrorCode = "object_quota_exceeded"
+	ErrorCodePolicyMissingTagOwners  ErrorCode = "policy_missing_tag_owners"
 	ErrorCodePolicyUnavailable       ErrorCode = "policy_unavailable"
 	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
 	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
@@ -266,6 +267,8 @@ func (e ErrorCode) Valid() bool {
 		return true
 	case ErrorCodeObjectQuotaExceeded:
 		return true
+	case ErrorCodePolicyMissingTagOwners:
+		return true
 	case ErrorCodePolicyUnavailable:
 		return true
 	case ErrorCodePreconditionFailed:
@@ -324,9 +327,25 @@ func (e HostStatusEnum) Valid() bool {
 	}
 }
 
+// Defines values for KillWarningCode.
+const (
+	DeviceDeleteUnavailable KillWarningCode = "device_delete_unavailable"
+)
+
+// Valid indicates whether the value is a known member of the KillWarningCode enum.
+func (e KillWarningCode) Valid() bool {
+	switch e {
+	case DeviceDeleteUnavailable:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for MintMode.
 const (
 	Apikey MintMode = "apikey"
+	Oauth  MintMode = "oauth"
 	Static MintMode = "static"
 	Wif    MintMode = "wif"
 )
@@ -335,6 +354,8 @@ const (
 func (e MintMode) Valid() bool {
 	switch e {
 	case Apikey:
+		return true
+	case Oauth:
 		return true
 	case Static:
 		return true
@@ -772,6 +793,7 @@ type Error struct {
 	// | `host_identity_mismatch` | 403 | host ID bound to another node |
 	// | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
 	// | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
+	// | `policy_missing_tag_owners` | 403 | the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) |
 	// | `not_found` | 404 | — |
 	// | `unknown_tenant` | 404 | — |
 	// | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -824,6 +846,7 @@ type Error struct {
 // | `host_identity_mismatch` | 403 | host ID bound to another node |
 // | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
 // | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
+// | `policy_missing_tag_owners` | 403 | the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) |
 // | `not_found` | 404 | — |
 // | `unknown_tenant` | 404 | — |
 // | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -997,7 +1020,24 @@ type KillResult struct {
 
 	// Pushed Objects whose host acknowledged the tier-1 push.
 	Pushed *[]string `json:"pushed,omitempty"`
+
+	// Warnings Non-fatal findings. The kill itself succeeded (tier 1 push, killed status, tombstone).
+	Warnings *[]KillWarning `json:"warnings,omitempty"`
 }
+
+// KillWarning defines model for KillWarning.
+type KillWarning struct {
+	// Code `device_delete_unavailable`: the tenant's credential may not delete devices (an OAuth client without `devices:core`); the killed node is unreachable but its device stays in the admin console until removed.
+	Code KillWarningCode `json:"code"`
+
+	// Fix How to add the missing scope.
+	Fix     *string   `json:"fix,omitempty"`
+	Message string    `json:"message"`
+	Objects *[]string `json:"objects,omitempty"`
+}
+
+// KillWarningCode `device_delete_unavailable`: the tenant's credential may not delete devices (an OAuth client without `devices:core`); the killed node is unreachable but its device stays in the admin console until removed.
+type KillWarningCode string
 
 // Lease defines model for Lease.
 type Lease struct {
@@ -1008,7 +1048,7 @@ type Lease struct {
 	Namespace string `json:"namespace"`
 }
 
-// MintMode `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key).
+// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 type MintMode string
 
 // NodeCertificate defines model for NodeCertificate.
@@ -1269,8 +1309,14 @@ type Tenant struct {
 	CreatedAt  int64   `json:"createdAt"`
 	MaxObjects int     `json:"maxObjects"`
 
-	// MintMode `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key).
+	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode MintMode `json:"mintMode"`
+
+	// OauthClientFile `oauth` mode: absolute path of the 0600 file with `TS_OAUTH_CLIENT_ID=…` / `TS_OAUTH_CLIENT_SECRET=tskey-client-…`, read at use on the mgmt host (a looser mode is refused).
+	OauthClientFile *string `json:"oauthClientFile,omitempty"`
+
+	// OauthClientID `oauth` mode: the OAuth client's public ID (`TS_OAUTH_CLIENT_ID`). The secret is never stored or returned.
+	OauthClientID *string `json:"oauthClientID,omitempty"`
 
 	// OboPublicKey base64 Ed25519 key that verifies this tenant's node certificates; hostd pins it.
 	OboPublicKey *string `json:"oboPublicKey,omitempty"`
@@ -1305,8 +1351,10 @@ type TenantCreate struct {
 	ControlURL *string `json:"controlURL,omitempty"`
 	MaxObjects *int    `json:"maxObjects,omitempty"`
 
-	// MintMode `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key).
+	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode               MintMode `json:"mintMode"`
+	OauthClientFile        *string  `json:"oauthClientFile,omitempty"`
+	OauthClientID          *string  `json:"oauthClientID,omitempty"`
 	Pool                   *string  `json:"pool,omitempty"`
 	RegistrationsPerMinute *int     `json:"registrationsPerMinute,omitempty"`
 	Tailnet                string   `json:"tailnet"`
@@ -1340,8 +1388,10 @@ type TenantPatch struct {
 	APIKeyFile nullable.Nullable[string] `json:"apiKeyFile,omitempty"`
 	MaxObjects *int                      `json:"maxObjects,omitempty"`
 
-	// MintMode `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key).
+	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode               *MintMode                 `json:"mintMode,omitempty"`
+	OauthClientFile        nullable.Nullable[string] `json:"oauthClientFile,omitempty"`
+	OauthClientID          nullable.Nullable[string] `json:"oauthClientID,omitempty"`
 	Pool                   nullable.Nullable[string] `json:"pool,omitempty"`
 	RegistrationsPerMinute *int                      `json:"registrationsPerMinute,omitempty"`
 	Tier                   *Tier                     `json:"tier,omitempty"`
@@ -1398,6 +1448,7 @@ type TombstoneError struct {
 	// | `host_identity_mismatch` | 403 | host ID bound to another node |
 	// | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
 	// | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
+	// | `policy_missing_tag_owners` | 403 | the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) |
 	// | `not_found` | 404 | — |
 	// | `unknown_tenant` | 404 | — |
 	// | `unknown_namespace` | 404 | `(workload, class)` not declared |
@@ -1463,7 +1514,7 @@ type WIFCheckResult struct {
 	Mint      bool    `json:"mint"`
 	MintError *string `json:"mintError,omitempty"`
 
-	// MintMode `wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key).
+	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode MintMode `json:"mintMode"`
 
 	// PolicyRead The lifecycle credential read the policy (`policy_file:read`).
@@ -2655,7 +2706,7 @@ type ClientInterface interface {
 
 	// ListTenants List tenants
 	//
-	// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+	// Hosts may list tenants too (they deny every tenant's `apiKeyFile` and `oauthClientFile` path to their workload sandboxes).
 	//
 	// Corresponds with GET /v1/tenants (the `ListTenants` operationId).
 	ListTenants(ctx context.Context, params *ListTenantsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
@@ -2696,8 +2747,9 @@ type ClientInterface interface {
 	// UpdateTenantWithBody Update a tenant (JSON Merge Patch)
 	//
 	// Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-	// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-	// Switching to `wif` or changing a WIF client ID drops cached tokens.
+	// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+	// `maxObjects`, `pool`, `tier`.
+	// Switching mode or changing a client ID / credential file drops cached tokens.
 	// `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 	//
 	// Takes any type of body and a specified content type.
@@ -2708,8 +2760,9 @@ type ClientInterface interface {
 	// UpdateTenant Update a tenant (JSON Merge Patch)
 	//
 	// Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-	// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-	// Switching to `wif` or changing a WIF client ID drops cached tokens.
+	// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+	// `maxObjects`, `pool`, `tier`.
+	// Switching mode or changing a client ID / credential file drops cached tokens.
 	// `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 	//
 	// Takes a body of the `application/json` content type.
@@ -2720,8 +2773,9 @@ type ClientInterface interface {
 	// UpdateTenantWithApplicationMergePatchPlusJSONBody Update a tenant (JSON Merge Patch)
 	//
 	// Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-	// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-	// Switching to `wif` or changing a WIF client ID drops cached tokens.
+	// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+	// `maxObjects`, `pool`, `tier`.
+	// Switching mode or changing a client ID / credential file drops cached tokens.
 	// `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 	//
 	// Takes a body of the `application/merge-patch+json` content type.
@@ -3652,7 +3706,7 @@ func (c *Client) GetStatus(ctx context.Context, reqEditors ...RequestEditorFn) (
 
 // ListTenants List tenants
 //
-// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+// Hosts may list tenants too (they deny every tenant's `apiKeyFile` and `oauthClientFile` path to their workload sandboxes).
 //
 // Corresponds with GET /v1/tenants (the `ListTenants` operationId).
 func (c *Client) ListTenants(ctx context.Context, params *ListTenantsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -3743,8 +3797,9 @@ func (c *Client) GetTenant(ctx context.Context, id TenantID, params *GetTenantPa
 // UpdateTenantWithBody Update a tenant (JSON Merge Patch)
 //
 // Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-// Switching to `wif` or changing a WIF client ID drops cached tokens.
+// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+// `maxObjects`, `pool`, `tier`.
+// Switching mode or changing a client ID / credential file drops cached tokens.
 // `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 //
 // Takes any type of body and a specified content type.
@@ -3765,8 +3820,9 @@ func (c *Client) UpdateTenantWithBody(ctx context.Context, id TenantID, params *
 // UpdateTenant Update a tenant (JSON Merge Patch)
 //
 // Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-// Switching to `wif` or changing a WIF client ID drops cached tokens.
+// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+// `maxObjects`, `pool`, `tier`.
+// Switching mode or changing a client ID / credential file drops cached tokens.
 // `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 //
 // Takes a body of the `application/json` content type.
@@ -3787,8 +3843,9 @@ func (c *Client) UpdateTenant(ctx context.Context, id TenantID, params *UpdateTe
 // UpdateTenantWithApplicationMergePatchPlusJSONBody Update a tenant (JSON Merge Patch)
 //
 // Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-// Switching to `wif` or changing a WIF client ID drops cached tokens.
+// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+// `maxObjects`, `pool`, `tier`.
+// Switching mode or changing a client ID / credential file drops cached tokens.
 // `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 //
 // Takes a body of the `application/merge-patch+json` content type.
@@ -6701,7 +6758,7 @@ type ClientWithResponsesInterface interface {
 
 	// ListTenantsWithResponse List tenants
 	//
-	// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+	// Hosts may list tenants too (they deny every tenant's `apiKeyFile` and `oauthClientFile` path to their workload sandboxes).
 	//
 	// Returns a wrapper object for the known response body format(s).
 	//
@@ -6748,8 +6805,9 @@ type ClientWithResponsesInterface interface {
 	// UpdateTenantWithBodyWithResponse Update a tenant (JSON Merge Patch)
 	//
 	// Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-	// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-	// Switching to `wif` or changing a WIF client ID drops cached tokens.
+	// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+	// `maxObjects`, `pool`, `tier`.
+	// Switching mode or changing a client ID / credential file drops cached tokens.
 	// `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 	//
 	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
@@ -6760,8 +6818,9 @@ type ClientWithResponsesInterface interface {
 	// UpdateTenantWithResponse Update a tenant (JSON Merge Patch)
 	//
 	// Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-	// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-	// Switching to `wif` or changing a WIF client ID drops cached tokens.
+	// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+	// `maxObjects`, `pool`, `tier`.
+	// Switching mode or changing a client ID / credential file drops cached tokens.
 	// `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 	//
 	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
@@ -6772,8 +6831,9 @@ type ClientWithResponsesInterface interface {
 	// UpdateTenantWithApplicationMergePatchPlusJSONBodyWithResponse Update a tenant (JSON Merge Patch)
 	//
 	// Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-	// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-	// Switching to `wif` or changing a WIF client ID drops cached tokens.
+	// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+	// `maxObjects`, `pool`, `tier`.
+	// Switching mode or changing a client ID / credential file drops cached tokens.
 	// `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 	//
 	// Takes a body of the `application/merge-patch+json` content type, and returns a wrapper object for the known response body format(s).
@@ -11292,7 +11352,7 @@ func (c *ClientWithResponses) GetStatusWithResponse(ctx context.Context, reqEdit
 
 // ListTenantsWithResponse List tenants
 //
-// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+// Hosts may list tenants too (they deny every tenant's `apiKeyFile` and `oauthClientFile` path to their workload sandboxes).
 //
 // Returns a wrapper object for the known response body format(s).
 //
@@ -11369,8 +11429,9 @@ func (c *ClientWithResponses) GetTenantWithResponse(ctx context.Context, id Tena
 // UpdateTenantWithBodyWithResponse Update a tenant (JSON Merge Patch)
 //
 // Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-// Switching to `wif` or changing a WIF client ID drops cached tokens.
+// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+// `maxObjects`, `pool`, `tier`.
+// Switching mode or changing a client ID / credential file drops cached tokens.
 // `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 //
 // Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
@@ -11387,8 +11448,9 @@ func (c *ClientWithResponses) UpdateTenantWithBodyWithResponse(ctx context.Conte
 // UpdateTenantWithResponse Update a tenant (JSON Merge Patch)
 //
 // Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-// Switching to `wif` or changing a WIF client ID drops cached tokens.
+// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+// `maxObjects`, `pool`, `tier`.
+// Switching mode or changing a client ID / credential file drops cached tokens.
 // `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 //
 // Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
@@ -11405,8 +11467,9 @@ func (c *ClientWithResponses) UpdateTenantWithResponse(ctx context.Context, id T
 // UpdateTenantWithApplicationMergePatchPlusJSONBodyWithResponse Update a tenant (JSON Merge Patch)
 //
 // Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
-// `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
-// Switching to `wif` or changing a WIF client ID drops cached tokens.
+// `apiKeyFile`, `oauthClientID`, `oauthClientFile`, `registrationsPerMinute`,
+// `maxObjects`, `pool`, `tier`.
+// Switching mode or changing a client ID / credential file drops cached tokens.
 // `tailnet` and `controlURL` are immutable (`400 immutable_field`).
 //
 // Takes a body of the `application/merge-patch+json` content type, and returns a wrapper object for the known response body format(s).

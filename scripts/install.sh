@@ -137,4 +137,4 @@ case ":$PATH:" in
 	;;
 esac
 say ""
-say "Next: twd doctor   then   twd up   (keyless: login URL + one trust credential; see INSTALL.md)"
+say "Next: twd doctor   then   twd up --oauth-client-file <file>   (an OAuth client: no browser, no Funnel; see INSTALL.md)"

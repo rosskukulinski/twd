@@ -1,0 +1,93 @@
+{
+  "run": "m12-e27628",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T23:57:49-08:00",
+  "checks": {
+    "a_verified_caller": "PASS nodeId npbbUdcb9Z11CNTRL tags [tag:ttest] (workload and the object's own node twd-m12-e27628-supportagent-n4qnteslnx.tail7906d5.ts.net)",
+    "b_egress_own_node": "PASS echo WhoIs = twd-m12-e27628-supportagent-n4qnteslnx.tail7906d5.ts.net.",
+    "c_mcp_caps": "PASS lookup_order allowed; refund → cap_missing",
+    "create_oauth_client": "PASS \u003cnil\u003e",
+    "d_spawn": "PASS child lookupagent-cbibdc6nbh node twd-m12-e27628-lookupagent-cbibdc6nbh.tail7906d5.ts.net tags [tag:twd-agent-support-sub] caps {\n        \"example.com/cap/mcp\": {\n          \"tools\": [\n            \"lookup_order\"\n          ]\n        }\n      }; lim enforced: same-tag child supportagent-75zcbhn6sh (tag [tag:twd-agent-support], lim {\n        \"example.com/cap/mcp\": {\n          \"tools\": [\n            \"lookup_order\"\n          ]\n        }\n      }) → refund cap_missing, lookup_order ok; parent refund ok=true",
+    "deploy": "PASS agent twd-m12-e27628-agent-txsvnt5pjo.tail7906d5.ts.net, mcp twd-m12-e27628-mcp-ziz4kkktad.tail7906d5.ts.net",
+    "doctor_mint_mode_oauth": "PASS ok oauth: OAuth client kP5fAmK16811CNTRL from /var/folders/fg/s42mstjn1pl7nrh9p4ph21qc0000gn/T/TestE2EOAuth919108151/001/oauth.env mints every node key (no browser, no Funnel, no API key)",
+    "e_kill_cascade": "PASS cli 152ms, push 55.5 ms, new requests → 410 object_killed in ≤1ms, via workload 410 killed",
+    "f_audit_chain": "PASS \"ttest-m12-e27628-client.tail7906d5.ts.net → twd-m12-e27628-supportagent-n4qnteslnx → twd-m12-e27628-lookupagent-cbibdc6nbh\", 6 records for the sub-agent, chain verified",
+    "https_cert_prefetched": "PASS mgmt's certificate ready 4s after the scenario",
+    "link_http": "PASS {Endpoint:http://twd-m12-e27628-mgmt.tail7906d5.ts.net Scheme:http Tailnet:tail7906d5.ts.net Actor:tag:ttest (nDYHFozan411CNTRL) NodeID:nDYHFozan411CNTRL Admin:true Tenants:[{TenantID:tn_tail7906d5 MintMode:oauth}]} in 1.543s (plain HTTP on :80, WhoIs)",
+    "link_https": "PASS {Endpoint:https://twd-m12-e27628-mgmt.tail7906d5.ts.net Scheme:https Tailnet:tail7906d5.ts.net Actor:tag:ttest (nV1d923z1B11CNTRL) NodeID:nV1d923z1B11CNTRL Admin:true Tenants:[{TenantID:tn_tail7906d5 MintMode:oauth}]} in 1.678s (no scheme given: https first)",
+    "no_secret_in_logs": "PASS mgmt.log has no tskey-[REDACTED] and no Funnel listener",
+    "oauth_mode_no_api_key_no_funnel": "PASS twd.json: mode oauth, apiKeyFile \"\", client kP5fAmK16811CNTRL, issuer \"\", tailnet tail7906d5.ts.net (discovered)",
+    "preflight_missing_grant": "PASS acl_denied with HuJSON snippet",
+    "remote_audit": "FAIL verified=true mints=6 deployBy=true kill=false",
+    "remote_deploy": "PASS mcp2 twd-m12-e27628-mcp2-rid6z2peha.tail7906d5.ts.net in 8.779s (node minted by the OAuth client)",
+    "remote_kill": "PASS killed [mcp2-rid6z2peha], device delete []/[mcp2-rid6z2peha], warnings [] in 6.724s",
+    "remote_ls_deployed_by": "PASS deployedBy tag:ttest (nV1d923z1B11CNTRL)",
+    "remote_ls_over_http": "PASS 2 deployments over http",
+    "status": "PASS healthy",
+    "transport_tsnet_only": "PASS tsnet: mgmt API on its own node twd-m12-e27628-mgmt.tail7906d5.ts.net (WhoIs); hostd on its own tag:twd-host node twd-host-twd-m12-e27628; this CLI dials through mgmt's loopback proxy",
+    "up": "PASS tenant tn_tail7906d5 host twd-m12-e27628 in 11.026s",
+    "up_without_mode_lists_options": "PASS mint_mode_required, OAuth client first"
+  },
+  "numbers": {
+    "agent_egress_ms": 7.116,
+    "agent_first_request_ms": 91.805,
+    "cert_wait_after_scenario_ms": 4002,
+    "delegate_ms": 1764.711,
+    "deploy_agent_active_ms": 1397.609,
+    "deploy_agent_cli_ms": 6560.828,
+    "deploy_agent_ready_ms": 6470.392,
+    "deploy_mcp_cli_ms": 1873.273,
+    "deploy_mcp_ready_ms": 1806.588,
+    "first_object_node_ready_ms": 1830.211,
+    "kill_api_ms": 84.405,
+    "kill_cli_ms": 151.96,
+    "kill_push_ms": 55.545,
+    "killed_new_request_ms": 0.886,
+    "killed_via_workload_ms": 2.836,
+    "link_http_ms": 1543,
+    "link_https_ms": 1677,
+    "remote_deploy_cli_ms": 8778,
+    "remote_kill_cli_ms": 6724,
+    "scenario_ms": 40322,
+    "spawn_ready_ms": 1774.529,
+    "up_host_ready_ms": 11012.083,
+    "up_mgmt_ready_ms": 8731.571,
+    "up_ready_ms": 11025.936
+  },
+  "notes": [
+    "policy already had the scenario's tagOwners and grants (not written)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 12,
+    "devices_left": 0,
+    "devices_tracked": 12,
+    "errors": null,
+    "oauth_client_deleted": "kP5fAmK16811CNTRL",
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 6,
+    "twd_keys_valid_after_down": 0,
+    "twd_named_devices_left": null,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": [
+    "nqCEXGU9qe11CNTRL",
+    "nRdezmKz1G11CNTRL",
+    "nvsvho2HkE11CNTRL",
+    "nTBvVeBj8s11CNTRL",
+    "n792xbxsqd11CNTRL",
+    "n1xNNbqgPq11CNTRL"
+  ],
+  "infraNodeIDs": [
+    "navQciwiVc11CNTRL",
+    "nmikGnhrJv11CNTRL"
+  ],
+  "keyIDs": [
+    "kNf2ZssGf211CNTRL",
+    "kRUW6zzUx611CNTRL",
+    "kb2U1KhHLu11CNTRL",
+    "kj74wgJ4gG11CNTRL",
+    "kNxgGUY4HZ11CNTRL",
+    "k6MrBpC7wS11CNTRL",
+    "kU5FexzGLY11CNTRL"
+  ]
+}

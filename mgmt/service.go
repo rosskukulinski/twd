@@ -81,11 +81,15 @@ type Mgmt struct {
 	depStatus map[string]DeploymentStatus
 	pushURLs  map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
 	pending   map[string]*pendingDelete
-	oboKeys   map[string]ed25519.PrivateKey // tenant → OBO root key (loaded from custody)
-	volMu     sync.Mutex                    // VolumeKey create-if-absent
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	// noDeviceScope: tenants whose credential got a 403 on a device delete
+	// (an OAuth client without devices:core); kills then warn up front.
+	noDeviceScope map[string]bool
+	deviceKept    map[string]bool               // killed objects whose device delete was refused (403)
+	oboKeys       map[string]ed25519.PrivateKey // tenant → OBO root key (loaded from custody)
+	volMu         sync.Mutex                    // VolumeKey create-if-absent
+	ctx           context.Context
+	cancel        context.CancelFunc
+	wg            sync.WaitGroup
 }
 
 // New returns a Mgmt; call Start to run the mint workers and reaper.
@@ -114,7 +118,7 @@ func New(cfg Config) (*Mgmt, error) {
 	m := &Mgmt{cfg: cfg, store: cfg.Store, custody: cfg.Custody, broker: cfg.Broker, clock: cfg.Clock, log: cfg.Log,
 		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, waiters: map[string]chan struct{}{},
 		spawnMu: map[string]*sync.Mutex{}, depStatus: map[string]DeploymentStatus{}, pushURLs: map[string]string{},
-		pending: map[string]*pendingDelete{}}
+		pending: map[string]*pendingDelete{}, noDeviceScope: map[string]bool{}, deviceKept: map[string]bool{}}
 	if cfg.PushTimeout == 0 {
 		m.cfg.PushTimeout = 2 * time.Second
 	}
@@ -220,6 +224,8 @@ type TenantRequest struct {
 	APIKeyFile             string `json:"apiKeyFile,omitempty"`
 	WIFClientID            string `json:"wifClientID,omitempty"`
 	WIFLifecycleClientID   string `json:"wifLifecycleClientID,omitempty"`
+	OAuthClientID          string `json:"oauthClientID,omitempty"`
+	OAuthClientFile        string `json:"oauthClientFile,omitempty"`
 	RegistrationsPerMinute int    `json:"registrationsPerMinute,omitempty"`
 	MaxObjects             int    `json:"maxObjects,omitempty"`
 }
@@ -246,11 +252,17 @@ func (m *Mgmt) CreateTenant(ctx context.Context, r TenantRequest) (Tenant, error
 		if m.broker.Issuer == nil {
 			return Tenant{}, errf(400, "bad_request", "mintMode wif needs twd-mgmt to run with an issuer (-issuer-url)")
 		}
+	case MintOAuth:
+		id, err := checkOAuthFile(r.OAuthClientFile, r.OAuthClientID)
+		if err != nil {
+			return Tenant{}, err
+		}
+		r.OAuthClientID = id
 	default:
-		return Tenant{}, errf(400, "bad_request", "mintMode must be apikey or wif")
+		return Tenant{}, errf(400, "bad_request", "mintMode must be oauth, apikey or wif")
 	}
 	t := Tenant{ID: r.ID, Tailnet: r.Tailnet, ControlURL: r.ControlURL, MintMode: r.MintMode, APIKeyFile: r.APIKeyFile,
-		WIFClientID: r.WIFClientID, WIFLifecycleClientID: r.WIFLifecycleClientID,
+		WIFClientID: r.WIFClientID, WIFLifecycleClientID: r.WIFLifecycleClientID, OAuthClientID: r.OAuthClientID, OAuthClientFile: r.OAuthClientFile,
 		RegistrationsPerMinute: r.RegistrationsPerMinute, MaxObjects: r.MaxObjects, CreatedAt: m.now().UnixMilli()}
 	if t.ID == "" {
 		t.ID = newID("tn_")[:11]
@@ -1376,6 +1388,36 @@ type KillResult struct {
 	Pushed          []string          `json:"pushed,omitempty"`
 	PushMS          float64           `json:"pushMs,omitempty"`
 	Errors          map[string]string `json:"errors,omitempty"`
+	Warnings        []KillWarning     `json:"warnings,omitempty"`
+}
+
+// KillWarning is a non-fatal finding of a kill (the kill itself held).
+type KillWarning struct {
+	Code    string   `json:"code"`
+	Message string   `json:"message"`
+	Objects []string `json:"objects,omitempty"`
+	Fix     string   `json:"fix,omitempty"`
+}
+
+// CodeDeviceDeleteUnavailable: the tenant's credential may not delete
+// devices (an OAuth client without the devices:core scope).
+const CodeDeviceDeleteUnavailable = "device_delete_unavailable"
+
+// DeviceScopeFix tells the operator how to let kills delete devices.
+const DeviceScopeFix = "the OAuth client lacks the devices:core scope: in the admin console (Settings › Trust credentials) generate a new OAuth client with Auth Keys (write) AND Devices › Core (write), both with tag tag:twd, write it to the same credential file (0600), then revoke the old client; until then remove killed devices in the admin console (Machines)"
+
+// errDeviceDeleteUnavailable wraps a 403 on a device delete.
+var errDeviceDeleteUnavailable = errors.New(CodeDeviceDeleteUnavailable)
+
+func (r *KillResult) warnDeviceDelete(id string) {
+	for i := range r.Warnings {
+		if r.Warnings[i].Code == CodeDeviceDeleteUnavailable {
+			r.Warnings[i].Objects = append(r.Warnings[i].Objects, id)
+			return
+		}
+	}
+	r.Warnings = append(r.Warnings, KillWarning{Code: CodeDeviceDeleteUnavailable, Objects: []string{id}, Fix: DeviceScopeFix,
+		Message: "killed (unreachable, tombstoned), but the tenant's credential may not delete devices, so the device stays listed in the admin console"})
 }
 
 // Kill marks the object (and with cascade, every descendant) killed, pushes
@@ -1462,13 +1504,22 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		if prev != StatusReady {
 			m.revokeKey(ctx, killed)
 		}
-		deleted, scheduled := false, false
+		deleted, scheduled, unavailable := false, false, false
 		if killed.StableNodeID != "" || killed.NodeID != "" {
 			if m.cfg.DeviceDeleteDelay > 0 {
 				m.scheduleDelete(killed)
 				scheduled = true
 				res.DevicesDeleting = append(res.DevicesDeleting, o.ID)
-			} else if err := m.deleteDevice(ctx, killed); err != nil {
+				m.mu.Lock()
+				unavailable = m.noDeviceScope[o.TenantID]
+				m.mu.Unlock()
+				if unavailable {
+					res.warnDeviceDelete(o.ID) // learned from an earlier 403; the scheduled delete still tries
+				}
+			} else if err := m.deleteDevice(ctx, killed); errors.Is(err, errDeviceDeleteUnavailable) {
+				unavailable = true
+				res.warnDeviceDelete(o.ID)
+			} else if err != nil {
 				res.Errors[o.ID] = "device delete: " + err.Error()
 			} else {
 				deleted = true
@@ -1479,6 +1530,10 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			"parent": o.ParentID, "deviceDeleted": deleted, "prevStatus": prev, "pushed": slices.Contains(res.Pushed, o.ID)}
 		if scheduled {
 			detail["deviceDeleteIn"] = m.cfg.DeviceDeleteDelay.String()
+		}
+		if unavailable {
+			detail["deviceDelete"] = CodeDeviceDeleteUnavailable
+			detail["fix"] = DeviceScopeFix
 		}
 		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By}, detail)
 	}
@@ -1558,7 +1613,10 @@ func (m *Mgmt) runDelete(id string) {
 	st := time.Now()
 	err := m.deleteDevice(ctx, pd.o)
 	detail := map[string]any{"nodeID": pd.o.StableNodeID, "ms": time.Since(st).Milliseconds()}
-	if err != nil {
+	if errors.Is(err, errDeviceDeleteUnavailable) {
+		detail["error"], detail["code"], detail["fix"] = err.Error(), CodeDeviceDeleteUnavailable, DeviceScopeFix
+		m.log.Warn("device delete unavailable: the tenant's OAuth client has no devices:core scope", "object", id, "tenant", pd.o.TenantID)
+	} else if err != nil {
 		detail["error"] = err.Error()
 		m.log.Warn("device delete failed", "object", id, "err", err)
 	}
@@ -1655,7 +1713,20 @@ func (m *Mgmt) deleteDevice(ctx context.Context, o Object) error {
 	if err != nil {
 		return err
 	}
-	return api.DeleteDevice(ctx, dev)
+	err = api.DeleteDevice(ctx, dev)
+	if t.MintMode == MintOAuth && tsapi.IsForbidden(err) {
+		m.mu.Lock()
+		m.noDeviceScope[t.ID] = true
+		m.deviceKept[o.ID] = true
+		m.mu.Unlock()
+		return fmt.Errorf("%w: %v", errDeviceDeleteUnavailable, err)
+	}
+	if err == nil && t.MintMode == MintOAuth {
+		m.mu.Lock()
+		delete(m.noDeviceScope, t.ID) // the scope was added (new client in the file)
+		m.mu.Unlock()
+	}
+	return err
 }
 
 // ---- reaper ----
