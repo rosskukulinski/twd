@@ -121,6 +121,6 @@ type AuditFilter struct {
 	Kinds     []string
 	Since     string // RFC 3339; records with ts >= Since
 	Until     string
-	Limit     int    // deprecated: use Page.Limit
+	Limit     int // deprecated: use Page.Limit
 	Page      Page
 }

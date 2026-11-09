@@ -116,8 +116,8 @@ func location(w http.ResponseWriter, path string) { w.Header().Set("Location", p
 
 type hostView struct {
 	Host
-	Status  string  `json:"status"`
-	DNSName string  `json:"dnsName,omitempty"`
+	Status  string `json:"status"`
+	DNSName string `json:"dnsName,omitempty"`
 	Push    *struct {
 		Port int    `json:"port,omitempty"`
 		URL  string `json:"url,omitempty"`
