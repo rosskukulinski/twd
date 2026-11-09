@@ -462,7 +462,7 @@ func TestDoctor(t *testing.T) {
 		got[c.Name] = c.Status
 	}
 	want := map[string]string{"binaries": "ok", "workerd": "ok", "bundler": "ok", "twd_home_writable": "ok",
-		"state_dir_writable": "ok", "mint_mode": "skip", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "node_egress": "skip", "system_tailscaled_not_used": "ok"}
+		"state_dir_writable": "ok", "mint_mode": "skip", "transport": "skip", "api_key": "skip", "sandbox": "skip", "host_sockets": "skip", "node_egress": "skip", "system_tailscaled_not_used": "ok"}
 	if runtime.GOOS == "linux" {
 		want["host_sockets"] = "ok"
 		if hs := procsb.ScanHostSockets(); len(hs.Hard) > 0 {

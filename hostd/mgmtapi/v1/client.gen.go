@@ -2655,6 +2655,8 @@ type ClientInterface interface {
 
 	// ListTenants List tenants
 	//
+	// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+	//
 	// Corresponds with GET /v1/tenants (the `ListTenants` operationId).
 	ListTenants(ctx context.Context, params *ListTenantsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
 
@@ -3649,6 +3651,8 @@ func (c *Client) GetStatus(ctx context.Context, reqEditors ...RequestEditorFn) (
 }
 
 // ListTenants List tenants
+//
+// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
 //
 // Corresponds with GET /v1/tenants (the `ListTenants` operationId).
 func (c *Client) ListTenants(ctx context.Context, params *ListTenantsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
@@ -6696,6 +6700,8 @@ type ClientWithResponsesInterface interface {
 	GetStatusWithResponse(ctx context.Context, reqEditors ...RequestEditorFn) (*GetStatusResponse, error)
 
 	// ListTenantsWithResponse List tenants
+	//
+	// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
 	//
 	// Returns a wrapper object for the known response body format(s).
 	//
@@ -11285,6 +11291,8 @@ func (c *ClientWithResponses) GetStatusWithResponse(ctx context.Context, reqEdit
 }
 
 // ListTenantsWithResponse List tenants
+//
+// Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
 //
 // Returns a wrapper object for the known response body format(s).
 //

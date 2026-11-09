@@ -177,7 +177,8 @@ paths:
       tags: [tenants]
       operationId: ListTenants
       summary: List tenants
-      x-twd-role: admin
+      description: Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+      x-twd-role: admin|host
       parameters:
         - $ref: "#/components/parameters/limit"
         - $ref: "#/components/parameters/cursor"

@@ -848,7 +848,7 @@ func TestTailnetAuth(t *testing.T) {
 	if c := code("100.64.0.2:1", "PUT", "/v1/hosts/h1/status", `{}`); c != 403 {
 		t.Fatalf("host2 acting as h1: %d", c)
 	}
-	if c := code("100.64.0.1:1", "GET", "/v1/tenants", ``); c != 403 {
+	if c := code("100.64.0.1:1", "GET", "/v1/status", ``); c != 403 {
 		t.Fatalf("host on admin endpoint: %d", c)
 	}
 	if c, b := call("100.64.0.1:1", "GET", "/v1/whoami", ``); c != 200 || b["kind"] != "host" || b["hostID"] != "h1" || b["admin"] != false {

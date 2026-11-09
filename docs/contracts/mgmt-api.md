@@ -125,7 +125,7 @@ hostd's API, not this document's.
 | `GET` | `/v1/objects/{id}/certificate` | host\|admin | no | `GetObjectCertificate` | Read the object's node certificate |
 | `POST` | `/v1/objects/{id}/credentials` | host | yes | `CreateObjectCredential` | Mint a single-use auth key for the object's node |
 | `GET` | `/v1/status` | admin | no | `GetStatus` | mgmt status |
-| `GET` | `/v1/tenants` | admin | no | `ListTenants` | List tenants |
+| `GET` | `/v1/tenants` | admin\|host | no | `ListTenants` | List tenants |
 | `POST` | `/v1/tenants` | admin | yes | `CreateTenant` | Create a tenant |
 | `GET` | `/v1/tenants/{id}` | admin\|host | no | `GetTenant` | Read a tenant |
 | `PATCH` | `/v1/tenants/{id}` | admin | yes | `UpdateTenant` | Update a tenant (JSON Merge Patch) |
@@ -145,7 +145,9 @@ Customer tailnets. Admin only.
 
 ### `GET /v1/tenants` — List tenants
 
-`ListTenants` · role **admin** · audited: no
+`ListTenants` · role **admin\|host** · audited: no
+
+Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
