@@ -54,10 +54,7 @@ const NoAdminTag = "tag:ttest-noadmin"
 // the keyless base (mgmt/host tags, Funnel, autogroup:admin's admin cap),
 // the admin cap for tag:ttest (the linked CLI) and a non-admin tag.
 func Policy() policy.Snippet {
-	s := cliflow.Policy()
-	s.TagOwners["tag:twd"] = []string{"autogroup:admin"}
-	s.TagOwners[mgmt.MgmtTag] = []string{"autogroup:admin"}
-	s.TagOwners["tag:twd-host"] = []string{"autogroup:admin", "tag:twd"}
+	s := cliflow.Policy() // includes policy.InfraSnippet: twd/mgmt/host tagOwners + host ⇄ mgmt grants
 	s.TagOwners[NoAdminTag] = []string{"autogroup:admin"}
 	adminApp := map[string]any{mgmt.AdminCap: []any{map[string]any{}}}
 	s.Grants = append(s.Grants,
@@ -236,9 +233,17 @@ func TestE2EKeyless(t *testing.T) {
 	tracker.Track(cfg.MgmtNodeID, "mgmt-node")
 	tenantID := "tn_" + strings.Split(tailnet, ".")[0]
 	issuer := cfg.IssuerURL + "/t/" + tenantID
-	var st struct{ Healthy bool }
-	host.MustJSON(&st, "status")
-	check("stack_running_before_credential", st.Healthy, "twd status healthy while waiting for the trust credential")
+	// mgmt is up; the host's own node waits for a join key that only the
+	// trust credential can mint, so it is "pending" (twd status exits 1).
+	var st struct {
+		Mgmt, Host bool
+		HostStatus string
+		Transport  string
+	}
+	so, _, _, _ = host.Twd("status", "--json")
+	json.Unmarshal([]byte(so), &st)
+	check("stack_running_before_credential", st.Mgmt && !st.Host && st.HostStatus == "pending" && strings.HasPrefix(st.Transport, "tsnet"),
+		fmt.Sprintf("mgmt up, host %q, transport %q while waiting for the trust credential", st.HostStatus, st.Transport))
 
 	// 3. The issuer becomes public (Funnel; first HTTPS cert).
 	pub := publicHTTP()
@@ -299,6 +304,22 @@ func TestE2EKeyless(t *testing.T) {
 		}
 	}
 	check("doctor_labels_keyless", strings.HasPrefix(dmode, "ok wif (keyless)") && strings.HasPrefix(dkey, "skip keyless"), dmode+" | "+dkey)
+	// tsnet only: hostd on its own tag:twd-host node, no unix socket.
+	dtr := ""
+	for _, c := range doc.Checks {
+		if c.Name == "transport" {
+			dtr = c.Status + " " + c.Detail
+		}
+	}
+	_, sockErr := os.Stat(filepath.Join(state, "run", "mgmt.sock"))
+	var hosts []struct{ HostID, NodeID, Status, DNSName string }
+	host.MustJSON(&hosts, "host", "ls")
+	hostLive := len(hosts) == 1 && hosts[0].Status == "live" && hosts[0].NodeID != "" && strings.HasPrefix(hosts[0].DNSName, "twd-host-")
+	if hostLive {
+		tracker.Track(hosts[0].NodeID, "host-node")
+	}
+	check("transport_tsnet_only", strings.HasPrefix(dtr, "ok tsnet:") && sockErr != nil && hostLive,
+		fmt.Sprintf("doctor %q · mgmt.sock exists=%v · hosts %+v", dtr, sockErr == nil, hosts))
 
 	// 6. A local deploy on the host (mcp), nodes minted through WIF.
 	mcpDir, agentDir := filepath.Join(work, "mcp"), filepath.Join(work, "agent")

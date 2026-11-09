@@ -150,16 +150,16 @@ func TestStoreMigratesLegacyObjects(t *testing.T) {
 func TestAPIIdentityScope(t *testing.T) {
 	e := newTestEnv(t, nil)
 	c, h1 := e.c, e.asHost("h1")
-	h1.ok("POST", "/v0/hosts/register", map[string]any{"hostID": "h1", "capacityNodes": 100, "tiers": []string{"process"}}, nil)
+	h1.ok("PUT", "/v1/hosts/h1", map[string]any{"capacityNodes": 100, "tiers": []string{"process"}}, nil)
 	var ta, tb struct{ TenantID string }
-	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "a.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile, "registrationsPerMinute": 10}, &ta)
-	c.ok("POST", "/v0/tenants", map[string]any{"tailnet": "b.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tb)
+	c.ok("POST", "/v1/tenants", map[string]any{"tailnet": "a.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile, "registrationsPerMinute": 10}, &ta)
+	c.ok("POST", "/v1/tenants", map[string]any{"tailnet": "b.ts.net", "mintMode": "apikey", "apiKeyFile": e.keyFile}, &tb)
 	if ta.TenantID == tb.TenantID {
 		t.Fatal("tenant IDs collide")
 	}
 	bundle := makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})
 	for _, d := range []struct{ tenant, w string }{{ta.TenantID, "one"}, {ta.TenantID, "two"}, {tb.TenantID, "one"}} {
-		c.ok("POST", "/v0/deployments", map[string]any{"tenantID": d.tenant, "workload": d.w, "bundle": bundle}, nil)
+		c.ok("POST", "/v1/deployments", map[string]any{"tenantID": d.tenant, "workload": d.w, "bundle": bundle}, nil)
 	}
 	create := func(tenant, w, name string, parent string) CreateObjectResponse {
 		t.Helper()
@@ -168,7 +168,7 @@ func TestAPIIdentityScope(t *testing.T) {
 			body["namespace"], body["parent"] = "LookupAgent", map[string]string{"objectID": parent}
 		}
 		var r CreateObjectResponse
-		h1.ok("POST", "/v0/objects", body, &r)
+		h1.ok("POST", "/v1/objects", body, &r)
 		return r
 	}
 	a1 := create(ta.TenantID, "one", "alice", "")
@@ -181,29 +181,29 @@ func TestAPIIdentityScope(t *testing.T) {
 	if again := create(ta.TenantID, "two", "alice", ""); again.ObjectID != a2.ObjectID {
 		t.Fatal("create is not idempotent per (tenant, workload, class, name)")
 	}
-	h1.fail("POST", "/v0/objects", map[string]any{"tenantID": ta.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, 409, "namespace_ambiguous")
+	h1.fail("POST", "/v1/objects", map[string]any{"tenantID": ta.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, 409, "namespace_ambiguous")
 	// Unambiguous without a workload (compat): tenant B has one workload.
 	var bc CreateObjectResponse
-	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": tb.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, &bc)
+	h1.ok("POST", "/v1/objects", map[string]any{"tenantID": tb.TenantID, "namespace": "SupportAgent", "objectName": "alice"}, &bc)
 	if bc.ObjectID != b1.ObjectID {
 		t.Fatalf("compat create: %s, want %s", bc.ObjectID, b1.ObjectID)
 	}
-	h1.fail("POST", "/v0/objects", map[string]any{"tenantID": ta.TenantID, "workload": "nope", "namespace": "SupportAgent", "objectName": "alice"}, 404, "unknown_namespace")
-	h1.fail("POST", "/v0/objects", map[string]any{"tenantID": ta.TenantID, "workload": "two", "namespace": WorkloadNamespace, "objectName": "one"}, 400, "bad_request")
+	h1.fail("POST", "/v1/objects", map[string]any{"tenantID": ta.TenantID, "workload": "nope", "namespace": "SupportAgent", "objectName": "alice"}, 404, "unknown_namespace")
+	h1.fail("POST", "/v1/objects", map[string]any{"tenantID": ta.TenantID, "workload": "two", "namespace": WorkloadNamespace, "objectName": "one"}, 400, "bad_request")
 
 	// Spawn without a workload inherits the parent's.
 	var kid CreateObjectResponse
-	h1.ok("POST", "/v0/objects", map[string]any{"tenantID": ta.TenantID, "namespace": "LookupAgent", "objectName": "c1",
+	h1.ok("POST", "/v1/objects", map[string]any{"tenantID": ta.TenantID, "namespace": "LookupAgent", "objectName": "c1",
 		"parent": map[string]string{"objectID": a2.ObjectID}}, &kid)
 	if o, err := e.m.GetObject(context.Background(), kid.ObjectID); err != nil || o.Workload != "two" || o.ParentID != a2.ObjectID {
 		t.Fatalf("spawned child: %+v %v", o, err)
 	}
 	// A parent from another tenant is refused.
-	h1.fail("POST", "/v0/objects", map[string]any{"tenantID": tb.TenantID, "namespace": "LookupAgent", "objectName": "x",
+	h1.fail("POST", "/v1/objects", map[string]any{"tenantID": tb.TenantID, "namespace": "LookupAgent", "objectName": "x",
 		"parent": map[string]string{"objectID": a1.ObjectID}}, 404, "delegation_invalid")
 
 	var objs []Object
-	c.ok("GET", "/v0/objects?tenant="+ta.TenantID+"&workload=two", nil, &objs)
+	c.items("/v1/objects?tenant="+ta.TenantID+"&workload=two", &objs)
 	if len(objs) != 2 {
 		t.Fatalf("list tenant A workload two: %+v", objs)
 	}
@@ -212,7 +212,7 @@ func TestAPIIdentityScope(t *testing.T) {
 			t.Fatalf("list leaked %+v", o)
 		}
 	}
-	c.ok("GET", "/v0/objects?tenant="+tb.TenantID, nil, &objs)
+	c.items("/v1/objects?tenant="+tb.TenantID, &objs)
 	for _, o := range objs {
 		if o.TenantID != tb.TenantID {
 			t.Fatalf("tenant B list has %+v", o)
@@ -235,9 +235,9 @@ func TestAPIIdentityScope(t *testing.T) {
 
 	// Audit by tenant has only that tenant's records.
 	var ar struct {
-		Records []AuditRecord `json:"records"`
+		Records []AuditRecord `json:"items"`
 	}
-	c.ok("GET", "/v0/audit?tenant="+tb.TenantID, nil, &ar)
+	c.ok("GET", "/v1/audit?tenant="+tb.TenantID, nil, &ar)
 	if len(ar.Records) == 0 {
 		t.Fatal("no tenant B audit")
 	}

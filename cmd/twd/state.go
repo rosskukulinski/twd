@@ -7,6 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/rosskukulinski/twd/mgmt"
+	"golang.org/x/net/proxy"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,9 +45,16 @@ type Config struct {
 	WIFLifecycleClientID string `json:"wifLifecycleClientID,omitempty"`
 	ControlURL           string `json:"controlURL"`
 	TSAPIURL             string `json:"tsapiURL,omitempty"`
-	HostID               string `json:"hostID"`
-	HostnamePrefix       string `json:"hostnamePrefix,omitempty"`
-	Ephemeral            bool   `json:"ephemeral,omitempty"`
+	// LocalDev (twd up --local-dev): mgmt also serves a unix socket with
+	// the per-host token and hostd talks to it there (hermetic tests, twd
+	// dev). Normal operation is tsnet only: the CLI reaches mgmt through
+	// mgmt's node loopback proxy, hostd through its own tag:twd-host node.
+	LocalDev bool `json:"localDev,omitempty"`
+	// PushPort is the port on hostd's node where mgmt pushes kills.
+	PushPort       int    `json:"pushPort,omitempty"`
+	HostID         string `json:"hostID"`
+	HostnamePrefix string `json:"hostnamePrefix,omitempty"`
+	Ephemeral      bool   `json:"ephemeral,omitempty"`
 	// InsecureSharedHost (twd up --insecure-shared-host): without a process
 	// sandbox, still serve process-tier workloads of several tenants
 	// (incl. Node-tier apps whose egress is then unenforced, RT-08).
@@ -248,13 +259,75 @@ func (s *state) supervisorAlive() bool { return pidAlive(s.supervisorPID()) }
 // only by the twd user. Linked (`twd link`), it is HTTPS to mgmt's tailnet
 // node over this machine's own Tailscale connection, authenticated by
 // WhoIs: the caller's tailnet identity, no token.
+func (s *state) loopbackPath() string { return filepath.Join(s.Dir, "mgmt", "loopback.json") }
+func (s *state) hostJoinFile() string { return filepath.Join(s.Dir, "hostd", "join.env") }
+func (s *state) hostTsnetDir() string { return filepath.Join(s.Dir, "hostd", "tsnet") }
+
+// loopback reads mgmt's loopback descriptor (nil if mgmt is not up).
+func (s *state) loopback() *mgmt.Loopback {
+	b, err := os.ReadFile(s.loopbackPath())
+	if err != nil {
+		return nil
+	}
+	var lb mgmt.Loopback
+	if json.Unmarshal(b, &lb) != nil || lb.Addr == "" || lb.MgmtIP == "" {
+		return nil
+	}
+	return &lb
+}
+
+// transport names how this CLI reaches mgmt (twd doctor, twd status).
+func (s *state) transport() string {
+	switch {
+	case s.remote() && s.Link.Tsnet != nil:
+		return "tsnet (link, CLI node)"
+	case s.remote():
+		return "tsnet (link, this machine's Tailscale)"
+	case s.Cfg.LocalDev:
+		return "local-dev (unix socket + host token)"
+	}
+	return "tsnet (loopback through mgmt's node)"
+}
+
+// mgmt is the client for this state: the linked endpoint, the local-dev
+// unix socket, or (normal operation) mgmt's own tailnet IP dialled through
+// the node's SOCKS5 loopback proxy, so the request carries mgmt's identity
+// and WhoIs makes it the operator.
 func (s *state) mgmt() *mgmtapi.Client {
 	if s.remote() {
 		return s.Link.client()
 	}
-	c, _ := mgmtapi.NewClient("unix://" + s.mgmtSock())
-	c.TokenFile = s.hostTokenFile()
+	if s.Cfg.LocalDev {
+		c, _ := mgmtapi.NewClient("unix://" + s.mgmtSock())
+		c.TokenFile = s.hostTokenFile()
+		return c
+	}
+	lb := s.loopback()
+	if lb == nil {
+		// mgmt not up yet (or not in this mode): a client that fails fast.
+		c, _ := mgmtapi.NewClient("http://127.0.0.1:1")
+		c.HTTP = &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, fmt.Errorf("twd-mgmt's loopback descriptor %s is not there (mgmt not running?)", s.loopbackPath())
+		}}}
+		return c
+	}
+	c, _ := mgmtapi.NewClient("http://" + lb.MgmtIP)
+	c.HTTP = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: socksDialer(lb.Addr, lb.ProxyCred), MaxIdleConnsPerHost: 8}}
 	return c
+}
+
+// socksDialer dials through tsnet's loopback SOCKS5 proxy (user "tsnet").
+func socksDialer(addr, cred string) func(ctx context.Context, network, address string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		d, err := proxy.SOCKS5("tcp", addr, &proxy.Auth{User: "tsnet", Password: cred}, &net.Dialer{Timeout: 10 * time.Second})
+		if err != nil {
+			return nil, err
+		}
+		if cd, ok := d.(proxy.ContextDialer); ok {
+			return cd.DialContext(ctx, network, address)
+		}
+		return d.Dial(network, address)
+	}
 }
 
 func (s *state) hostd() *mgmtapi.Client {
@@ -265,7 +338,7 @@ func (s *state) hostd() *mgmtapi.Client {
 func (s *state) mgmtHealthy(ctx context.Context) bool {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	return s.mgmt().Do(ctx, "GET", "/v0/healthz", nil, nil) == nil
+	return s.mgmt().Do(ctx, "GET", "/v1/healthz", nil, nil) == nil
 }
 
 // ---- binaries ----

@@ -45,7 +45,12 @@ type Tenant struct {
 	WIFLifecycleClientID   string `json:"wifLifecycleClientID,omitempty"` // optional (RFC §4.4 credential 2)
 	RegistrationsPerMinute int    `json:"registrationsPerMinute"`
 	MaxObjects             int    `json:"maxObjects"`
-	CreatedAt              int64  `json:"createdAt"`
+	// Pool places the tenant's deployments on hosts with the same pool
+	// ("" = any host). Tier is the default isolation tier.
+	Pool      string `json:"pool,omitempty"`
+	Tier      string `json:"tier,omitempty"`
+	CreatedAt int64  `json:"createdAt"`
+	UpdatedAt int64  `json:"updatedAt"`
 }
 
 // Host is a twd-hostd instance.
@@ -55,9 +60,18 @@ type Host struct {
 	Tiers         []string `json:"tiers"`
 	NodeID        string   `json:"nodeID,omitempty"`      // operator-tailnet stable node ID (tsnet mode)
 	AuditPubKey   string   `json:"auditPubKey,omitempty"` // base64 ed25519, verifies hostSig
-	LiveNodes     int      `json:"liveNodes"`
-	LastSeen      int64    `json:"lastSeen"` // unix ms
+	Pool          string   `json:"pool,omitempty"`
+	// PushPort is hostd's push listener on its own tsnet node (0 = none;
+	// local-dev hosts register a unix:// push URL instead, kept in memory).
+	PushPort  int   `json:"pushPort,omitempty"`
+	LiveNodes int   `json:"liveNodes"`
+	LastSeen  int64 `json:"lastSeen"` // unix ms
+	CreatedAt int64 `json:"createdAt"`
+	UpdatedAt int64 `json:"updatedAt"`
 }
+
+// Pending reports a host created by `twd host add` that never registered.
+func (h Host) Pending() bool { return h.LastSeen == 0 }
 
 // Live reports whether the host heartbeated within the host lease TTL.
 func (h Host) Live(now time.Time) bool {
@@ -87,6 +101,8 @@ type Deployment struct {
 	// caller (`twd link`), or the local actor on the unix socket.
 	DeployedBy string `json:"deployedBy,omitempty"`
 	CreatedAt  int64  `json:"createdAt"`
+	// StoppedAt is set by undeploy (DELETE /v1/deployments/{id}).
+	StoppedAt int64 `json:"stoppedAt,omitempty"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per
@@ -118,6 +134,14 @@ type Object struct {
 	KeyID        string          `json:"-"`
 	KeyExpires   int64           `json:"-"`
 	KillReason   string          `json:"killReason,omitempty"`
+	// Kill record (the /v1 tombstone): when, by whom, whether as part of a
+	// cascade and which object the kill was issued on.
+	KilledAt    int64  `json:"killedAt,omitempty"`
+	KilledBy    string `json:"killedBy,omitempty"`
+	KillCascade bool   `json:"killCascade,omitempty"`
+	KillRoot    string `json:"killRoot,omitempty"`
+	// ActingFor is the principal the object was created for (audit head).
+	ActingFor string `json:"actingFor,omitempty"`
 	// Cert is the node certificate (internal/nodecert) signed at ready with
 	// the tenant's OBO root key; it binds Caps (lim) to StableNodeID.
 	Cert      string   `json:"cert,omitempty"`

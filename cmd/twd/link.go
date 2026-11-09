@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,6 +46,9 @@ type LinkTsnet struct {
 	AuthKeyFile string `json:"authKeyFile,omitempty"`
 	// Tags the node advertises (e.g. tag:ttest for the e2e admin client).
 	Tags []string `json:"tags,omitempty"`
+	// Ephemeral: the node was joined interactively by `twd link --tsnet`;
+	// it registers as ephemeral so it disappears when the state is removed.
+	Ephemeral bool `json:"ephemeral,omitempty"`
 }
 
 func loadLink(path string) (*Link, error) {
@@ -74,7 +79,7 @@ func (l *Link) save(path string) error {
 func (l *Link) client() *mgmtapi.Client {
 	c, err := mgmtapi.NewClient(l.Endpoint)
 	if err != nil {
-		c = &mgmtapi.Client{Base: l.Endpoint, HTTP: &http.Client{Timeout: 30 * time.Second}}
+		c = &mgmtapi.Client{Base: l.Endpoint}
 	}
 	c.HTTP = &http.Client{Timeout: 60 * time.Second, Transport: &http.Transport{DialContext: l.dial, MaxIdleConnsPerHost: 4}}
 	return c
@@ -138,7 +143,7 @@ func (l *Link) tsnetNode(ctx context.Context) (*tsnet.Server, error) {
 		return linkTsnetNode, nil
 	}
 	t := l.Tsnet
-	ts := &tsnet.Server{Hostname: t.Hostname, Dir: t.Dir, ControlURL: t.ControlURL, AdvertiseTags: t.Tags,
+	ts := &tsnet.Server{Hostname: t.Hostname, Dir: t.Dir, ControlURL: t.ControlURL, AdvertiseTags: t.Tags, Ephemeral: t.Ephemeral,
 		Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
 	if t.AuthKeyFile != "" {
 		if k, err := tsapi.LoadEnvFile(t.AuthKeyFile, "TS_AUTHKEY"); err == nil {
@@ -159,7 +164,7 @@ func (l *Link) tsnetNode(ctx context.Context) (*tsnet.Server, error) {
 // not_admin error with the grant to add.
 func (s *state) whoami(ctx context.Context) (*mgmt.WhoAmI, error) {
 	var w mgmt.WhoAmI
-	if err := s.mgmt().Do(ctx, "GET", "/v0/whoami", nil, &w); err != nil {
+	if err := s.mgmt().Do(ctx, "GET", "/v1/whoami", nil, &w); err != nil {
 		return nil, linkErr(s.Link, err)
 	}
 	return &w, nil
@@ -214,11 +219,13 @@ type linkResult struct {
 func cmdLink(args []string) error {
 	f := newFlags("link")
 	unlink := f.Bool("unlink", false, "forget the linked mgmt")
-	tsDir := f.String("tsnet-dir", "", "test transport: make the CLI its own tsnet node with state here (instead of this machine's Tailscale)")
-	tsHost := f.String("tsnet-hostname", "twd-cli", "test transport: the CLI node's hostname")
-	tsCtl := f.String("control-url", prodControl, "test transport: control URL for the CLI node")
-	tsKey := f.String("tsnet-authkey-file", "", "test transport: TS_AUTHKEY=… file for the CLI node's first join")
-	tsTags := f.String("tsnet-tags", "", "test transport: comma-separated tags the CLI node advertises")
+	tsnetF := f.Bool("tsnet", false, "this machine has no Tailscale: the CLI runs its own ephemeral tsnet node (state under <state>/cli, interactive login the first time; your login is the identity mgmt sees)")
+	tsDir := f.String("tsnet-dir", "", "--tsnet: node state dir (default <state>/cli); tests pass one explicitly")
+	tsHost := f.String("tsnet-hostname", "", "--tsnet: the CLI node's hostname (default twd-cli-<user>)")
+	tsCtl := f.String("control-url", prodControl, "--tsnet: control URL for the CLI node")
+	tsKey := f.String("tsnet-authkey-file", "", "--tsnet: TS_AUTHKEY=… file for an unattended first join (tests); default: interactive login")
+	tsTags := f.String("tsnet-tags", "", "--tsnet: comma-separated tags the CLI node advertises (tests)")
+	loginTO := f.Duration("login-timeout", 5*time.Minute, "--tsnet: how long to wait for the browser login")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -251,10 +258,34 @@ func cmdLink(args []string) error {
 		ep = pos[0]
 	}
 	l := &Link{LinkedAt: time.Now().UTC().Format(time.RFC3339)}
-	if *tsDir != "" {
-		l.Tsnet = &LinkTsnet{Dir: *tsDir, Hostname: *tsHost, ControlURL: *tsCtl, AuthKeyFile: *tsKey}
+	if *tsnetF || *tsDir != "" {
+		dir := *tsDir
+		if dir == "" {
+			dir = filepath.Join(s.Dir, "cli")
+		}
+		hn := *tsHost
+		if hn == "" {
+			hn = "twd-cli-" + strings.ToLower(actor())
+			hn = regexp.MustCompile(`[^a-z0-9-]+`).ReplaceAllString(strings.Split(hn, "@")[0], "-")
+		}
+		l.Tsnet = &LinkTsnet{Dir: dir, Hostname: hn, ControlURL: *tsCtl, AuthKeyFile: *tsKey, Ephemeral: *tsKey == "" && *tsTags == ""}
 		if *tsTags != "" {
 			l.Tsnet.Tags = strings.Split(*tsTags, ",")
+		}
+		if *tsKey == "" && !isFile(filepath.Join(dir, "tailscaled.state")) {
+			// Interactive login in this terminal: the URL is printed, the
+			// node state is kept under dir so later commands need no login.
+			out := io.Writer(os.Stdout)
+			if *f.json {
+				out = os.Stderr
+			}
+			lctx, lcancel := context.WithTimeout(context.Background(), *loginTO)
+			n, err := joinMgmtNode(lctx, joinOpts{Dir: dir, Hostname: hn, ControlURL: *tsCtl, Tags: l.Tsnet.Tags, Timeout: *loginTO, Out: out})
+			lcancel()
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "✓ node     %s joined as you (%s); the CLI dials mgmt through it\n", n.DNSName, strings.Join(n.Tags, ","))
 		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

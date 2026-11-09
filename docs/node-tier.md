@@ -133,7 +133,7 @@ header (RT-05), plus `callerObjectId`/`lim` when the caller is a twd object
 whose caps were narrowed by its node certificate (RT-01).
 
 hostd makes the state visible and refuses the dangerous combination:
-- `twd status` and `GET /v0/status` show `egress unenforced` for every
+- `twd status` and `GET /v1/status` show `egress unenforced` for every
   Node-tier workload on such a host; `twd doctor` warns (`node_egress`);
 - a Node-tier deployment on a host **without any process sandbox** that
   serves other tenants fails with `egress_unenforced` (and the general
@@ -172,7 +172,7 @@ INSTALL.md `host_sockets`).
   SIGTERM, then SIGKILL after 3 s, for the whole group.
 - **Logs.** stdout and stderr go to `<instance>/app.log`; read them with
   `twd logs <workload>` (`-f` to follow).
-- **Status.** `GET /v0/status` shows `Runtime: "node"`, `Node.{PID, Starts,
+- **Status.** `GET /v1/status` shows `Runtime: "node"`, `Node.{PID, Starts,
   ReadyMs, LogFile, DataDir}`.
 - **Environment.** The app does not inherit hostd's environment. It gets
   `PATH`, `HOME`/`TWD_DATA_DIR` (persistent:

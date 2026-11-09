@@ -72,7 +72,11 @@ func StartControl() (*Control, error) {
 		Nodes: []*tailcfg.DERPNode{{Name: "t1", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
 			STUNPort: stunPort, DERPPort: ln.Addr().(*net.TCPAddr).Port, InsecureForTests: true, STUNTestIP: "127.0.0.1"}},
 	}}}
-	ctl := &testcontrol.Server{DERPMap: dm, MagicDNSDomain: MagicDNSDomain, Logf: logger.Discard,
+	// TagOwners non-nil: a node that advertises tags gets them (as the real
+	// control plane does at signup), so WhoIs sees tag:twd-host /
+	// tag:twd-mgmt / object tags in hermetic runs. Ownership itself is not
+	// checked here.
+	ctl := &testcontrol.Server{DERPMap: dm, MagicDNSDomain: MagicDNSDomain, Logf: logger.Discard, TagOwners: map[string][]string{},
 		DNSConfig: &tailcfg.DNSConfig{Proxied: true}}
 	ctl.HTTPTestServer = httptest.NewUnstartedServer(ctl)
 	ctl.HTTPTestServer.Start()

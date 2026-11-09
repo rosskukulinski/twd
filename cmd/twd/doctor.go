@@ -16,6 +16,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/internal/esbundle"
 	"github.com/rosskukulinski/twd/internal/tsapi"
+	"github.com/rosskukulinski/twd/mgmt"
 )
 
 // version is set at release build time (-ldflags -X main.version=…).
@@ -195,6 +196,27 @@ func cmdDoctor(args []string) error {
 		return "ok", "apikey: the API key file " + s.Cfg.APIKeyFile + " mints every node key (alternative mode; keyless is the default)", ""
 	})
 
+	run("transport", func() (string, string, string) {
+		switch {
+		case s == nil:
+			return "skip", "no state", ""
+		case s.remote():
+			return "ok", "tsnet: " + s.transport() + " → " + s.Link.Endpoint + " (WhoIs identity; no key or token here)", ""
+		case !s.configured():
+			return "skip", "twd up not run here (normal operation: tsnet only)", ""
+		case s.Cfg.LocalDev:
+			return "warn", "local-dev: mgmt serves a unix socket with the per-host token and hostd uses it (twd up --local-dev; development only, not the product transport)", "twd down --purge, remove " + s.Dir + ", twd up (without --local-dev)"
+		}
+		d := "tsnet: mgmt API on its own node " + s.Cfg.MgmtDNSName + " (WhoIs); hostd on its own tag:twd-host node " + mgmt.HostNodeName(s.Cfg.HostID) + "; this CLI dials through mgmt's loopback proxy"
+		if isFile(s.mgmtSock()) {
+			return "fail", d + "; but a mgmt unix socket exists at " + s.mgmtSock(), "a stale or foreign twd-mgmt -local-dev is running; stop it"
+		}
+		if s.supervisorAlive() && s.loopback() == nil {
+			return "warn", d + "; mgmt's loopback descriptor is missing (mgmt starting?)", "twd status"
+		}
+		return "ok", d, ""
+	})
+
 	run("api_key", func() (string, string, string) {
 		tn, kf := *tailnetF, *keyF
 		if s != nil {
@@ -247,7 +269,7 @@ func cmdDoctor(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		var hv hostd.StatusView
-		if err := s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv); err != nil {
+		if err := s.hostd().Do(ctx, "GET", "/v1/status", nil, &hv); err != nil {
 			return "skip", "hostd status unavailable: " + firstLine(err.Error()), ""
 		}
 		var unenforced []string

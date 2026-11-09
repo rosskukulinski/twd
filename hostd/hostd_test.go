@@ -478,9 +478,9 @@ func TestHostd(t *testing.T) {
 		var resp mgmtapi.AuditResponse
 		deadline := time.Now().Add(5 * time.Second)
 		for {
-			e.Mgmt.Do(context.Background(), "GET", "/v0/audit", nil, &resp)
+			resp = e.Audit("")
 			kinds := map[string]bool{}
-			for _, r := range resp.Records {
+			for _, r := range resp.Items {
 				kinds[r.Kind] = true
 			}
 			if kinds["spawn"] && kinds["kill"] && kinds["deny"] {
@@ -492,7 +492,7 @@ func TestHostd(t *testing.T) {
 			time.Sleep(100 * time.Millisecond)
 		}
 		if !resp.Verified {
-			t.Fatalf("audit chain not verified: %v", resp.Problems)
+			t.Fatalf("audit chain not verified: %v", resp.Chains)
 		}
 	})
 }

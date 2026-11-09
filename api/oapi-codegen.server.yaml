@@ -1,0 +1,13 @@
+# oapi-codegen config: server interfaces + types + embedded spec for twd-mgmt.
+# Regenerate with `make api`; CI checks the output is current (`make api-check`).
+package: v1
+output: mgmt/api/v1/api.gen.go
+generate:
+  models: true
+  std-http-server: true
+  strict-server: true
+  embedded-spec: true
+output-options:
+  nullable-type: true
+  skip-prune: false
+  name-normalizer: ToCamelCaseWithInitialisms

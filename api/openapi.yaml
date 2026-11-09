@@ -1,0 +1,2583 @@
+openapi: 3.1.0
+info:
+  title: twd management API
+  version: "1.0.0-pre"
+  summary: twd-mgmt ⇄ twd-hostd ⇄ twd CLI contract (/v1)
+  description: |
+    This document is the **single source of truth** for `/v1`. Go server
+    interfaces and types (`mgmt/api/v1`), the hostd/CLI client
+    (`hostd/mgmtapi/v1`) and `docs/contracts/mgmt-api.md` are generated from
+    it (`make api`); none of them is hand-edited. `/v0` is gone: twd is
+    pre-release and `/v1` is a breaking replacement with no compatibility shim.
+
+    ## Transport and authentication (tsnet-only in normal operation)
+
+    mgmt serves the API on **its own tsnet node** `twd-mgmt` (`tag:twd-mgmt`),
+    on `:80` and, when the tailnet has HTTPS, on `:443` with the node's
+    certificate (tailnet-only). The OIDC issuer (`/.well-known/...`, `/jwks`,
+    `/t/{tenant}/...`) is the only thing served over Funnel.
+
+    Every tailnet request is authenticated by **Tailscale WhoIs on the
+    connection**, never by a bearer token or API key:
+
+    - **host** — the peer node carries `tag:twd-host`. hostd runs its own
+      tsnet node `twd-host-<hostID>`; the node is bound to the `hostID` it
+      registered with (`PUT /v1/hosts/{id}`), and may only act on that host's
+      records and on the namespaces it holds a lease for.
+    - **admin** — the peer's WhoIs `CapMap` holds the app capability
+      `twd.dev/cap/admin` toward `tag:twd-mgmt` (granted by the base policy
+      snippet to `autogroup:admin`; tenants may grant it to users, groups or
+      tags such as a CI node). `twd-mgmt -admins <logins>` is an override.
+    - everyone else: `403 not_admin` with the grant `snippet` to add.
+
+    Each operation declares its role in `x-twd-role` (`admin`, `host`,
+    `admin|host`, `any`). The security scheme `tailnetWhoIs` documents this;
+    it is **not** a token scheme and no header is sent.
+
+    The unix socket + host token (RT-03) survives **only** behind
+    `--local-dev` (`twd dev`, hermetic tests). It is the `localHostToken`
+    scheme; `twd doctor` reports `transport: tsnet` in normal operation and
+    flags any local-socket use.
+
+    mgmt → hostd pushes (kill, assignments) go to the host's tsnet node and are
+    hostd's API, not this document's.
+
+    ## Conventions
+
+    - JSON everywhere. Timestamps are unix **milliseconds** unless the field
+      says otherwise (`AuditRecord.ts` is RFC 3339).
+    - **Pagination.** Every list returns `{"items": [...], "nextCursor":
+      "..." | null}`. `?limit=` defaults to 50; 1–500 is accepted and anything
+      else is `400 bad_request`. `?cursor=` is opaque; it encodes the
+      stable sort key `(createdAt, id)` (audit: `(ts, chain, seq)`), so a page
+      is stable under concurrent inserts. A cursor that does not decode is
+      `400 bad_cursor`. Filters are query parameters and must be repeated
+      unchanged with the cursor.
+    - **ETags.** Every single-resource `GET` sets a strong `ETag`
+      (`"<sha256-prefix of the canonical JSON>"`). `PATCH`/`DELETE` accept
+      `If-Match`; a stale value is `412 precondition_failed`. `If-None-Match`
+      on `GET` answers `304`.
+    - **PATCH** bodies are partial JSON following **JSON Merge Patch (RFC
+      7396)**: absent keys are untouched, `null` clears a field. Media type
+      `application/merge-patch+json` (plain `application/json` is accepted).
+    - **DELETE** takes options as query parameters, never a body.
+    - **Async creates** answer `202 Accepted` with a `Location` header to poll.
+    - **Tombstones.** A killed object stays readable as `410 Gone` whose body
+      is the typed error plus the kill record (`TombstoneError`).
+    - **Errors** are the DX.md catalog shape
+      `{code, message, missing?, snippet?, doc_url, trace_id}` and also set
+      `Twd-Error: <code>`; `identity_pending` sets `Retry-After: 1`.
+    - **Audit.** Every mutating operation is marked `x-twd-audit: true` and
+      writes to mgmt's hash chain with the caller's actor (`deployedBy`,
+      `by`): the WhoIs login for users, `<tag> (<stableNodeID>)` for tagged
+      admin nodes, `host:<id>` for hosts, `Twd-Actor` or `local` on the
+      local-dev socket.
+
+    ## Decisions recorded here
+
+    - **Preflight is `POST /v1/deployments?dryRun=true`** (decided by Ross,
+      2026-11-08): the request body is exactly a real deploy's; mgmt parses
+      `twd.jsonc` from the bundle as a deploy would (`tailnet.tags`,
+      `tailnet.objects.*.tags` → `srcTags`; `tailnet.connects`), checks grants
+      and tagOwners against the policy cache and answers `200 PreflightResult`
+      (missing grants with HuJSON snippets). Nothing is created, no lease is
+      taken, and the only audit record is an optional `kind: preflight`.
+      There is no separate preflight resource.
+    - **Audit verification is `GET /v1/audit/verification`**: the noun form.
+      It is a read-only report, so a resource name fits, and it needs no
+      custom-method (`:verb`) syntax that routers, generators and linters
+      treat specially. No reason was found to prefer `:verify`.
+    - **Credentials and key grants are `POST`** (`…/credentials`,
+      `…/keys`): each call *creates* a single-use grant (a fresh auth key, a
+      fenced key release) and is audited, so a `GET` would be wrong.
+    - The only other RPC-shaped operations are diagnostics that produce a
+      report: `POST /v1/tenants/{id}/wif-check` (a live token exchange) and
+      `POST /v1/device-delete-runs` (execute the scheduled device deletes
+      now). Both are documented as such.
+
+  contact:
+    name: twd
+    url: https://twd.dev
+  license:
+    name: Proprietary
+    identifier: LicenseRef-Proprietary
+
+servers:
+  - url: https://twd-mgmt.{tailnet}
+    description: mgmt's tsnet node over the tailnet (HTTPS when the tailnet has it)
+    variables:
+      tailnet:
+        default: example.ts.net
+        description: the operator tailnet's MagicDNS suffix
+  - url: http://twd-mgmt.{tailnet}
+    description: mgmt's tsnet node, plain HTTP on :80 (tailnet-only)
+    variables:
+      tailnet:
+        default: example.ts.net
+  - url: http+unix://~/.twd/run/mgmt.sock
+    description: "--local-dev only: the unix socket with the host token (twd dev, hermetic tests)"
+
+tags:
+  - name: tenants
+    description: Customer tailnets. Admin only.
+  - name: hosts
+    description: twd-hostd instances. A host writes its own record; admins read.
+  - name: deployments
+    description: Deploys of a workload bundle to a host.
+  - name: objects
+    description: DO instances, agents and sub-agents, each with its own tailnet node.
+  - name: credentials
+    description: Single-use auth keys and node certificates.
+  - name: audit
+    description: Hash-chained, append-only audit log.
+  - name: volumes
+    description: dm-crypt data keys for DO volumes (microVM tier).
+  - name: operational
+    description: Health, status, identity, maintenance.
+  - name: oidc
+    description: The WIF issuer, served over Funnel. Public, unauthenticated.
+
+security:
+  - tailnetWhoIs: []
+  - localHostToken: []
+
+paths:
+  # ---------------------------------------------------------------- tenants
+  /v1/tenants:
+    post:
+      tags: [tenants]
+      operationId: CreateTenant
+      summary: Create a tenant
+      x-twd-role: admin
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantCreate" }
+            examples:
+              wif:
+                value: { tailnet: tail7906d5.ts.net, mintMode: wif, wifClientID: k123, wifLifecycleClientID: k456 }
+              apikey:
+                value: { tailnet: tail7906d5.ts.net, mintMode: apikey, apiKeyFile: /Users/me/.config/tailnet1_api.env }
+      responses:
+        "201":
+          description: Created.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [tenants]
+      operationId: ListTenants
+      summary: List tenants
+      description: Hosts may list tenants too (they deny every tenant's `apiKeyFile` path to their workload sandboxes).
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: One page of tenants, ordered by `(createdAt, tenantID)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/tenants/{id}:
+    parameters:
+      - $ref: "#/components/parameters/tenantID"
+    get:
+      tags: [tenants]
+      operationId: GetTenant
+      summary: Read a tenant
+      description: Includes `oboPublicKey` (hostd pins it) and, in wif mode, `wif` (issuer and subjects).
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/ifNoneMatch"
+      responses:
+        "200":
+          description: The tenant.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [tenants]
+      operationId: UpdateTenant
+      summary: Update a tenant (JSON Merge Patch)
+      description: |
+        Updatable: `mintMode`, `wifClientID`, `wifLifecycleClientID`,
+        `apiKeyFile`, `registrationsPerMinute`, `maxObjects`, `pool`, `tier`.
+        Switching to `wif` or changing a WIF client ID drops cached tokens.
+        `tailnet` and `controlURL` are immutable (`400 immutable_field`).
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: "#/components/schemas/TenantPatch" }
+            examples:
+              switchToWif:
+                value: { mintMode: wif, wifClientID: k123, wifLifecycleClientID: k456 }
+              raiseQuota:
+                value: { maxObjects: 5000, registrationsPerMinute: 400 }
+              clearLifecycle:
+                value: { wifLifecycleClientID: null }
+          application/json:
+            schema: { $ref: "#/components/schemas/TenantPatch" }
+      responses:
+        "200":
+          description: The updated tenant.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Tenant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [tenants]
+      operationId: DeleteTenant
+      summary: Delete a tenant
+      description: |
+        `409 tenant_has_live_objects` while any object of the tenant is live,
+        unless `force=true`: then every live object is killed (cascade, device
+        deletes through the tenant credential), killed/failed objects are
+        purged, deployments and leases are released, and the whole cascade is
+        audited (`kind: tenant_delete`). The tenant's custody entries (OBO root,
+        volume keys) are removed last.
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+        - name: force
+          in: query
+          description: Cascade-kill live objects and purge before deleting.
+          schema: { type: boolean, default: false }
+      responses:
+        "202":
+          description: Accepted; the cascade runs. Poll `GET /v1/tenants/{id}` until `404`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TenantDeleteResult" }
+        "204":
+          description: Deleted (nothing was live).
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Live objects exist and `force` was not set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: tenant_has_live_objects
+                message: "tenant tn_tail7906d5 has 3 live objects; pass ?force=true to kill and purge them"
+                missing: { liveObjects: 3 }
+                doc_url: https://twd.dev/errors/tenant_has_live_objects
+                trace_id: 7f3a…
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/tenants/{id}/objects:
+    parameters:
+      - $ref: "#/components/parameters/tenantID"
+    delete:
+      tags: [tenants, objects]
+      operationId: PurgeTenantObjects
+      summary: Purge terminal objects of a tenant
+      description: |
+        Forgets the tenant's objects in the given terminal `state`s (default:
+        both `killed` and `failed`) so the same `(workload, namespace, name)`
+        can be created again. Pending device deletes for them run first. Live
+        objects are never touched (there is no `force` here; use `DELETE
+        /v1/objects/{id}` to kill). Each removal is audited (`kind: purge`).
+        Replaces `POST /v0/tenants/{id}/purge`.
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - name: state
+          in: query
+          description: Terminal states to purge. Repeatable. Any other value is `400 bad_request`.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { type: string, enum: [killed, failed] }
+            default: [killed, failed]
+      responses:
+        "200":
+          description: Purged.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PurgeResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/tenants/{id}/wif-check:
+    parameters:
+      - $ref: "#/components/parameters/tenantID"
+    post:
+      tags: [tenants]
+      operationId: CheckTenantWIF
+      summary: Verify a wif tenant's trust credentials (diagnostic)
+      description: |
+        A live diagnostic, not a state change: one fresh token exchange per
+        credential and a policy read with the lifecycle one
+        (`policy_file:read`). It is a `POST` because it performs work on the
+        control plane; it creates nothing. `400 bad_request` for non-wif tenants.
+      x-twd-role: admin
+      responses:
+        "200":
+          description: The check report.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WIFCheckResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------------ hosts
+  /v1/hosts:
+    post:
+      tags: [hosts, credentials]
+      operationId: CreateHost
+      summary: Add a host and mint its single-use join key
+      description: |
+        `twd host add`: creates the host record (status `pending`) and mints a
+        **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+        through the operator tenant's trust credential (wif) or API key
+        (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+        with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+        node to the record. Calling it again for a host that has not bound a
+        node yet mints a fresh key (`200`); a bound host is `409 exists`
+        (delete it first). The key is never logged. Audited
+        (`kind: host_add`).
+      x-twd-role: admin
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HostCreate" }
+            example: { hostID: h-mbp, tenantID: tn_tail7906d5 }
+      responses:
+        "201":
+          description: Created; the join key.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostJoin" }
+        "200":
+          description: The pending host exists; a fresh join key.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostJoin" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: Unknown operator tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "502":
+          description: The control plane refused the mint (`bootstrap_failed`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [hosts]
+      operationId: ListHosts
+      summary: List hosts
+      x-twd-role: admin
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: live
+          in: query
+          description: Only hosts that heartbeated within the host lease TTL (10 s).
+          schema: { type: boolean }
+      responses:
+        "200":
+          description: One page of hosts, ordered by `(createdAt, hostID)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/hosts/{id}:
+    parameters:
+      - $ref: "#/components/parameters/hostID"
+    put:
+      tags: [hosts]
+      operationId: RegisterHost
+      summary: Register or re-register a host (idempotent)
+      description: |
+        The host's own record. Over the tailnet the WhoIs node (`tag:twd-host`)
+        is bound to this `hostID` on first registration; a different node using
+        the same ID is `403 host_identity_mismatch`. Re-registering with the
+        same node replaces capacity, tiers, `auditPubKey` and `push`. Hosts
+        re-register on every restart.
+
+        A host that was created through `twd host add` exists before its first
+        `PUT` (status `pending`); the `PUT` activates it.
+      x-twd-role: host
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HostRegistration" }
+            example:
+              capacityNodes: 200
+              tiers: [process]
+              auditPubKey: "MCowBQYDK2VwAyEA…"
+              push: { port: 7474 }
+      responses:
+        "200":
+          description: Re-registered.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Host" }
+        "201":
+          description: First registration of this host ID.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Host" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403":
+          description: Another node owns this host ID, or the caller is not a `tag:twd-host` node.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: host_identity_mismatch
+                message: host h-7f2a is registered to another node
+                doc_url: https://twd.dev/errors/host_identity_mismatch
+                trace_id: 7f3a…
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [hosts]
+      operationId: GetHost
+      summary: Read a host
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/ifNoneMatch"
+      responses:
+        "200":
+          description: The host.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Host" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [hosts]
+      operationId: DeleteHost
+      summary: Drain and remove a host
+      description: |
+        `409 host_holds_leases` while the host holds any namespace lease,
+        unless `drain=true`: then its deployments are marked `draining`, its
+        objects are killed (cascade), leases are released and the record goes.
+        Pushes to the host stop. The host's tsnet device is deleted through the
+        operator credential when mgmt has one; otherwise it is reported in
+        `devicesLeft`.
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+        - name: drain
+          in: query
+          description: Kill the host's objects and release its leases first.
+          schema: { type: boolean, default: false }
+      responses:
+        "202":
+          description: Accepted; the drain runs. Poll `GET /v1/hosts/{id}` until `404`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostDeleteResult" }
+        "204":
+          description: Removed (it held nothing).
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The host holds leases and `drain` was not set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: host_holds_leases
+                message: "host h-7f2a holds 2 leases; pass ?drain=true"
+                missing: { leases: ["tn_tail7906d5/agent", "tn_tail7906d5/mcp"] }
+                doc_url: https://twd.dev/errors/host_holds_leases
+                trace_id: 7f3a…
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/hosts/{id}/status:
+    parameters:
+      - $ref: "#/components/parameters/hostID"
+    put:
+      tags: [hosts]
+      operationId: ReportHostStatus
+      summary: Heartbeat (replace the host's reported status)
+      description: |
+        Every 3 s. Renews the host lease (TTL 10 s) and every namespace lease
+        in `leases` (TTL 15 s; a renew succeeds while `(holder, epoch)` still
+        matches). The reply lists the leases that are no longer held
+        (`revoke`) and the objects killed in the last 10 min in namespaces
+        this host holds (`revokeObjects`; they repeat until the window passes,
+        so the host's kill must be idempotent). Replaces
+        `POST /v0/hosts/{id}/heartbeat`. Not audited (3 s cadence).
+      x-twd-role: host
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HostStatus" }
+      responses:
+        "200":
+          description: Renewed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostStatusResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: The host never registered (`host_not_registered`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/hosts/{id}/assignments:
+    parameters:
+      - $ref: "#/components/parameters/hostID"
+    get:
+      tags: [hosts, deployments]
+      operationId: ListHostAssignments
+      summary: List the deployments assigned to a host
+      x-twd-role: host|admin
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: One page of assignments, ordered by `(createdAt, deploymentID)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AssignmentPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------ deployments
+  /v1/deployments:
+    post:
+      tags: [deployments]
+      operationId: CreateDeployment
+      summary: Deploy a workload (async), or preflight it with dryRun
+      description: |
+        mgmt reads `twd.jsonc` from the bundle (a tar, optionally gzipped;
+        the shallowest `twd.jsonc`): `tailnet.tags` (the `_workload` entry
+        node), `tailnet.objects.<Class>.{tags, agent, ttl, node}`,
+        `tailnet.spawn.{maxLive ≤ 64, maxDepth ≤ 3}`, `tailnet.connects`,
+        `tier`. A bundle with neither `tailnet.tags` nor `tailnet.objects` is
+        `400 bad_bundle`.
+
+        **Deploy** (`dryRun` absent or false): picks a host (`host` pins one),
+        acquires the `(tenant, workload)` lease at `epoch+1`, stores the
+        bundle, pushes the assignment to the host and answers `202` with
+        `Location: /v1/deployments/{id}`. Poll it until `status` is `active`
+        or `failed`.
+
+        **Preflight** (`dryRun=true`): the same body and parser, but mgmt
+        only checks the policy: every src tag must be in `tagOwners`, and
+        each `tailnet.connects` entry that is a tag (or `*`) needs a grant
+        with an `ip` part whose `src` matches every src tag. Names are
+        reported `unchecked`. Nothing is written, no lease is taken, and the
+        answer is `200 PreflightResult`. `503 policy_unavailable` when mgmt
+        cannot read the policy (wif tenant without a lifecycle credential);
+        the CLI then prints `preflight skipped` and deploys.
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - name: dryRun
+          in: query
+          description: Preflight only; see the description.
+          schema: { type: boolean, default: false }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeploymentCreate" }
+      responses:
+        "200":
+          description: "`dryRun=true`: the preflight report. Nothing was deployed."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PreflightResult" }
+        "202":
+          description: Accepted; the host is starting the workload.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "400":
+          description: Bad body or bundle.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                badBundle:
+                  value:
+                    code: bad_bundle
+                    message: "twd.jsonc declares neither tailnet.tags nor tailnet.objects"
+                    doc_url: https://twd.dev/errors/bad_bundle
+                    trace_id: 7f3a…
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: Unknown tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: unknown_tenant
+                message: tenant tn_nope not found
+                doc_url: https://twd.dev/errors/unknown_tenant
+                trace_id: 7f3a…
+        "503":
+          description: No live host can take the workload, or the policy cannot be read (dryRun).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                noHost:
+                  value:
+                    code: no_host
+                    message: no live host with tier process
+                    doc_url: https://twd.dev/errors/no_host
+                    trace_id: 7f3a…
+                policyUnavailable:
+                  value:
+                    code: policy_unavailable
+                    message: "tenant tn_tail7906d5 has no lifecycle credential; the policy cannot be read"
+                    doc_url: https://twd.dev/errors/policy_unavailable
+                    trace_id: 7f3a…
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [deployments]
+      operationId: ListDeployments
+      summary: List deployments
+      x-twd-role: admin
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: tenant
+          in: query
+          schema: { type: string }
+        - name: workload
+          in: query
+          schema: { type: string }
+        - name: host
+          in: query
+          schema: { type: string }
+        - name: latest
+          in: query
+          description: Only the newest deployment of each `(tenant, workload)` (what `twd ls` shows).
+          schema: { type: boolean, default: false }
+      responses:
+        "200":
+          description: One page of deployments, ordered by `(createdAt, deploymentID)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeploymentPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deployments/{id}:
+    parameters:
+      - $ref: "#/components/parameters/deploymentID"
+    get:
+      tags: [deployments]
+      operationId: GetDeployment
+      summary: Read a deployment and its status
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/ifNoneMatch"
+      responses:
+        "200":
+          description: The deployment, with the host-reported status and the entry node.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Deployment" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [deployments]
+      operationId: DeleteDeployment
+      summary: Undeploy
+      description: |
+        Kills every object of the deployment (cascade; pushed to the host, then
+        device deletes), releases the `(tenant, workload)` lease, marks the
+        deployment `stopped` and audits it (`kind: undeploy`). The record stays
+        readable (`status: stopped`) for history; a later deploy of the same
+        workload supersedes it. Only the latest deployment of a workload can be
+        undeployed (`409 superseded` otherwise).
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+        - name: reason
+          in: query
+          schema: { type: string, maxLength: 200 }
+      responses:
+        "202":
+          description: Accepted; the kills are in flight.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KillResult" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deployments/{id}/bundle:
+    parameters:
+      - $ref: "#/components/parameters/deploymentID"
+    get:
+      tags: [deployments]
+      operationId: GetDeploymentBundle
+      summary: Download the raw bundle
+      description: Hosts fetch the bundle named by `Assignment.bundleURL`. Only the lease holder (or an admin) may read it.
+      x-twd-role: host|admin
+      responses:
+        "200":
+          description: The bundle bytes (tar, optionally gzipped) exactly as uploaded.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/x-tar:
+              schema: { type: string, format: binary }
+            application/gzip:
+              schema: { type: string, format: binary }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ---------------------------------------------------------------- objects
+  /v1/objects:
+    post:
+      tags: [objects]
+      operationId: CreateObject
+      summary: Create an object (async mint)
+      description: |
+        hostd calls this on first `create()`/`spawn()`. The identity is
+        `(tenant, workload, namespace = DO class, objectName)`; the object ID
+        `<class-slug>-<b32(hmac)[:10]>` is also the node hostname.
+
+        - Idempotent by identity: an existing live object is returned with
+          `200`; a new one is `202` with `Location: /v1/objects/{id}` and
+          `status: pending`. A killed identity is `410 killed`
+          (`TombstoneError`); an ID collision with another identity is
+          `409 identity_conflict`.
+        - `namespace: "_workload"` is the workload entry node; `workload`
+          must equal `objectName` (`400`). An unknown `(workload, class)` is
+          `404 unknown_namespace`; without `workload`, several workloads
+          declaring the class is `409 namespace_ambiguous`.
+        - `parent` makes it a spawn: `caps ⊆ parent` (receiver merge
+          semantics over the policy; `403 delegation_invalid` with
+          `missing: {src, dst, cap, field}`), every child tag owned by the
+          parent's (`tagOwners`), and the spawn budget (`maxLive`,
+          `maxDepth`; `429 spawn_budget_exceeded`). A spawn with a `ttl` gets
+          an ephemeral key.
+        - The mint is queued behind the tenant throttle
+          (`registrationsPerMinute`) and quota (`maxObjects`;
+          `429 object_quota_exceeded`).
+        Spawn checks are unchanged from v0.
+      x-twd-role: host
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ObjectCreate" }
+            examples:
+              entryNode:
+                value: { tenantID: tn_tail7906d5, workload: agent, namespace: _workload, objectName: agent, actingFor: ross@example.com, traceID: 01J… }
+              spawn:
+                value:
+                  tenantID: tn_tail7906d5
+                  workload: agent
+                  namespace: SubAgent
+                  objectName: researcher-1
+                  parent: { objectID: agent-k3j5m7p9qa }
+                  caps: { "acme.com/cap/mcp": { tools: [search] } }
+                  ttl: 10m
+      responses:
+        "200":
+          description: The object already existed (idempotent create).
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Object" }
+        "202":
+          description: Accepted; the mint is queued.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Object" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403":
+          description: Delegation refused, or the host does not hold the namespace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: delegation_invalid
+                message: "caps[\"acme.com/cap/mcp\"].tools[1] is not granted to the parent"
+                missing: { src: "tag:twd-wl-agent", dst: "tag:mcp", cap: "acme.com/cap/mcp", field: "caps[\"acme.com/cap/mcp\"].tools[1]" }
+                doc_url: https://twd.dev/errors/delegation_invalid
+                trace_id: 7f3a…
+        "404":
+          description: Unknown tenant or namespace.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: unknown_namespace
+                message: "workload agent declares no class Widget"
+                doc_url: https://twd.dev/errors/unknown_namespace
+                trace_id: 7f3a…
+        "409":
+          description: "`identity_conflict` or `namespace_ambiguous`."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: namespace_ambiguous
+                message: "class Agent is declared by workloads agent and agent2; pass workload"
+                doc_url: https://twd.dev/errors/namespace_ambiguous
+                trace_id: 7f3a…
+        "410": { $ref: "#/components/responses/Gone" }
+        "429":
+          description: Spawn budget or tenant quota.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                spawnBudget:
+                  value:
+                    code: spawn_budget_exceeded
+                    message: "root agent-k3j5m7p9qa already has 64 live descendants"
+                    doc_url: https://twd.dev/errors/spawn_budget_exceeded
+                    trace_id: 7f3a…
+                quota:
+                  value:
+                    code: object_quota_exceeded
+                    message: "tenant tn_tail7906d5 has 1000 objects (maxObjects)"
+                    doc_url: https://twd.dev/errors/object_quota_exceeded
+                    trace_id: 7f3a…
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [objects]
+      operationId: ListObjects
+      summary: List objects (with lineage)
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: tenant
+          in: query
+          schema: { type: string }
+        - name: workload
+          in: query
+          schema: { type: string }
+        - name: namespace
+          in: query
+          description: DO class name, or `_workload`.
+          schema: { type: string }
+        - name: state
+          in: query
+          description: Repeatable. Default is every state, tombstones included.
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/ObjectStatus" }
+        - name: parent
+          in: query
+          description: Direct children of this object ID.
+          schema: { type: string }
+        - name: root
+          in: query
+          description: The whole tree under this root object ID.
+          schema: { type: string }
+      responses:
+        "200":
+          description: One page of objects, ordered by `(createdAt, objectID)`. Hosts see only the namespaces they hold.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ObjectPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/objects/{id}:
+    parameters:
+      - $ref: "#/components/parameters/objectID"
+    get:
+      tags: [objects]
+      operationId: GetObject
+      summary: Read an object (lineage, children, kill record)
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/ifNoneMatch"
+      responses:
+        "200":
+          description: The object.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Object" }
+        "304": { $ref: "#/components/responses/NotModified" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [objects]
+      operationId: UpdateObject
+      summary: Update an object (JSON Merge Patch)
+      description: |
+        Two callers, two subsets:
+
+        - **host** (lease holder): `{status: "ready", nodeID, stableNodeID,
+          magicDNS, epoch}` reports the node joined. `epoch` fences the
+          commit (`409 lease_lost`). mgmt then signs the **node certificate**
+          (`{v, tenant, objectID, stableNodeID, tags, lim?, parent?, root,
+          iat, exp}`, 24 h, the tenant's OBO root key) and stores it; the
+          `ready` audit detail adds `cert: true` and `lim`. If the object was
+          killed during the join the answer is `410 killed` and mgmt deletes
+          the device that just appeared. Replaces `POST /v0/objects/{id}/ready`.
+        - **admin**: `{ttl}` sets or clears (`null`) the TTL; the reaper
+          applies it.
+
+        Any other field, or a host sending admin fields (and vice versa), is
+        `400 immutable_field`.
+      x-twd-role: host|admin
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: "#/components/schemas/ObjectPatch" }
+            examples:
+              ready:
+                value: { status: ready, nodeID: "100.101.102.103", stableNodeID: nQ1k…, magicDNS: agent-k3j5m7p9qa.tail7906d5.ts.net, epoch: 3 }
+              ttl:
+                value: { ttl: 600 }
+          application/json:
+            schema: { $ref: "#/components/schemas/ObjectPatch" }
+      responses:
+        "200":
+          description: "The updated object (`status: ready` carries `cert`)."
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Object" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/LeaseLost" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+    delete:
+      tags: [objects]
+      operationId: DeleteObject
+      summary: Kill an object
+      description: |
+        Marks the object (and with `cascade=true` every descendant) killed,
+        pushes the kill to the lease-holding host (tier 1, ≤ 2 s per push;
+        the heartbeat's `revokeObjects` is the fallback), then deletes the
+        device(s) through the tenant credential (tier 2; deferred by
+        `-device-delete-delay` so the host's tombstone answers
+        `410 object_killed` while peers still have the node). Audited
+        (`kind: kill`, `detail.by`, `pushed`, `deviceDeleteIn`).
+
+        Hosts may kill only objects in namespaces they hold (`403`).
+        A later `GET` is `410 Gone` with the kill record. Replaces
+        `POST /v0/objects/{id}/kill`.
+      x-twd-role: admin|host
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+        - name: cascade
+          in: query
+          description: Also kill the subtree below this object.
+          schema: { type: boolean, default: false }
+        - name: reason
+          in: query
+          schema: { type: string, maxLength: 200 }
+      responses:
+        "202":
+          description: Accepted; tier 1 is done or pushed, device deletes are scheduled.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/KillResult" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/objects/{id}/credentials:
+    parameters:
+      - $ref: "#/components/parameters/objectID"
+    post:
+      tags: [objects, credentials]
+      operationId: CreateObjectCredential
+      summary: Mint a single-use auth key for the object's node
+      description: |
+        Creates one single-use, tagged auth key (≤ 5 min) and releases it
+        **only** to the host that holds the namespace lease at `epoch`
+        (`409 lease_lost` otherwise). Long-polls a pending mint for `wait`
+        seconds (default 10, max 30; `503 identity_pending` + `Retry-After: 1`
+        after that). An expired unused key is revoked and re-minted
+        automatically. `Cache-Control: no-store`.
+
+        `reason=rejoin_rejected` is the **re-mint**: the saved node state was
+        rejected by control, so mgmt deletes the old device, clears the node
+        certificate and mints again under the same hostname. Replaces
+        `GET /v0/objects/{id}/credential` and `POST …/remint`. Audited
+        (`kind: mint` / `remint`). The key is never logged.
+      x-twd-role: host
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/epoch"
+        - name: wait
+          in: query
+          description: Seconds to wait for a pending mint.
+          schema: { type: integer, minimum: 0, maximum: 30, default: 10 }
+        - name: reason
+          in: query
+          description: "`rejoin_rejected` requests a re-mint; omitted for a first join."
+          schema: { type: string, enum: [rejoin_rejected] }
+      responses:
+        "201":
+          description: The key. Single use; it expires at `expiresAt`.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Credential" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: "`lease_lost` (wrong epoch or holder) or `already_joined` (the node exists; rejoin from saved state, or re-mint with `reason`)."
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              examples:
+                leaseLost:
+                  value:
+                    code: lease_lost
+                    message: "the caller does not hold the namespace lease at this epoch (want 4, have 3)"
+                    doc_url: https://twd.dev/errors/lease_lost
+                    trace_id: 7f3a…
+                alreadyJoined:
+                  value:
+                    code: already_joined
+                    message: "agent-k3j5m7p9qa already has node nQ1k…; rejoin from saved state or pass ?reason=rejoin_rejected"
+                    doc_url: https://twd.dev/errors/already_joined
+                    trace_id: 7f3a…
+        "410": { $ref: "#/components/responses/Gone" }
+        "502":
+          description: The control plane refused the mint (`bootstrap_failed`); the object is `failed`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: bootstrap_failed
+                message: "mint via trust credential failed: 403 tag:twd-wl-agent not owned by tag:twd"
+                doc_url: https://twd.dev/errors/bootstrap_failed
+                trace_id: 7f3a…
+        "503":
+          description: Still minting (`identity_pending`).
+          headers:
+            Retry-After:
+              schema: { type: integer, const: 1 }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: identity_pending
+                message: "agent-k3j5m7p9qa is queued behind the tenant throttle"
+                doc_url: https://twd.dev/errors/identity_pending
+                trace_id: 7f3a…
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/objects/{id}/certificate:
+    parameters:
+      - $ref: "#/components/parameters/objectID"
+    get:
+      tags: [objects, credentials]
+      operationId: GetObjectCertificate
+      summary: Read the object's node certificate
+      description: |
+        The certificate mgmt signed at `ready` (re-issued on fetch when missing
+        or within 1 h of expiry). The receiving netd verifies it against the
+        tenant's `oboPublicKey` and narrows the caller's caps to `cert.lim`;
+        a certificate that fails verification, names another node or cannot
+        be fetched makes netd withhold the caller's caps. `410 killed` for
+        tombstones. Replaces `GET /v0/certs/{nodeID}`; see also
+        `GET /v1/certificates/{stableNodeID}` for lookup by node.
+      x-twd-role: host|admin
+      responses:
+        "200":
+          description: The certificate.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeCertificate" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The object has no node yet (`not_ready`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "410": { $ref: "#/components/responses/Gone" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/certificates/{stableNodeID}:
+    get:
+      tags: [credentials]
+      operationId: GetCertificate
+      summary: Look up a node certificate by stable node ID
+      description: |
+        The receiver-side lookup: "is the peer that just connected a twd
+        object, and what is its `lim`?" `404 not_found` when no live object
+        of the tenant has that node (the receiver then applies the WhoIs caps
+        unchanged: the peer is not a twd object); `410 killed` for a tombstone.
+      x-twd-role: host|admin
+      parameters:
+        - name: stableNodeID
+          in: path
+          required: true
+          schema: { type: string }
+        - name: tenant
+          in: query
+          required: true
+          description: The receiving object's tenant (certificates are per tenant).
+          schema: { type: string }
+      responses:
+        "200":
+          description: The certificate.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NodeCertificate" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------------ audit
+  /v1/audit:
+    post:
+      tags: [audit]
+      operationId: AppendAudit
+      summary: Append a batch of host audit records
+      description: |
+        Append-only. Each host has its own chain `host:<hostID>`; every
+        record carries `prevHash`, `hash` and `hostSig`
+        (`hash = hex(sha256(canonical body without hash/hostSig))`,
+        `hostSig = base64(ed25519.Sign(hostKey, utf8(hash)))`, verified
+        against the registered `auditPubKey`). `kind` and `hash` are required
+        on every record. Provenance (RT-02): `source: tenant` is allowed only
+        with `kind: tenant_note` and vice versa; `source: mgmt` is refused;
+        a missing source means `host`. The store refuses UPDATE/DELETE on
+        audit rows. Mutating by nature; it *is* the audit.
+      x-twd-role: host
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AuditBatch" }
+      responses:
+        "201":
+          description: Appended; the chain status after the append.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditAppendResult" }
+        "400":
+          description: A record is malformed, breaks the chain, or claims a forbidden source.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: bad_request
+                message: "record 3: source \"tenant\" requires kind tenant_note"
+                doc_url: https://twd.dev/errors/bad_request
+                trace_id: 7f3a…
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [audit]
+      operationId: ListAudit
+      summary: Query audit records
+      x-twd-role: admin
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: object
+          in: query
+          description: Records about this object ID.
+          schema: { type: string }
+        - name: human
+          in: query
+          description: Records whose `actingFor` is this principal (the human at the head of a chain).
+          schema: { type: string }
+        - name: trace
+          in: query
+          schema: { type: string }
+        - name: tenant
+          in: query
+          schema: { type: string }
+        - name: chain
+          in: query
+          description: "`mgmt` or `host:<hostID>`."
+          schema: { type: string }
+        - name: kind
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            items: { $ref: "#/components/schemas/AuditKind" }
+        - name: since
+          in: query
+          description: Records at or after this time (RFC 3339 or unix ms).
+          schema: { type: string }
+        - name: until
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: One page, ordered by `(ts, chain, seq)`, with per-chain verification of the records returned.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/audit/verification:
+    get:
+      tags: [audit]
+      operationId: GetAuditVerification
+      summary: Verify every audit chain
+      description: Recomputes every hash and link of every chain and checks each chain head; detects modified, removed, reordered and truncated records.
+      x-twd-role: admin
+      responses:
+        "200":
+          description: The verification report (`ok` is the AND over chains).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuditVerification" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ---------------------------------------------------------------- volumes
+  /v1/volumes/{id}/keys:
+    parameters:
+      - $ref: "#/components/parameters/volumeID"
+    post:
+      tags: [volumes, credentials]
+      operationId: CreateVolumeKeyGrant
+      summary: Release a volume's dm-crypt data key to the lease holder
+      description: |
+        Creates a key grant: the 256-bit data key of the `(tenant, workload)`
+        DO volume (custody name `twd/<tenant>/volumes/<workload>/dek`,
+        created on first use) is released only to the host holding the
+        workload's lease at `epoch` (`409 lease_lost`). Audited
+        (`kind: volume_key`). `Cache-Control: no-store`. The key is never
+        logged. Replaces `GET /v0/volumes/key`.
+      x-twd-role: host
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/epoch"
+      responses:
+        "201":
+          description: The grant.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VolumeKeyGrant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/LeaseLost" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------ operational
+  /v1/healthz:
+    get:
+      tags: [operational]
+      operationId: GetHealthz
+      summary: Liveness
+      description: Any authenticated principal (hosts included). On the local-dev socket the host token is still required (fail closed).
+      x-twd-role: any
+      responses:
+        "200":
+          description: Alive.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/status:
+    get:
+      tags: [operational]
+      operationId: GetStatus
+      summary: mgmt status
+      x-twd-role: admin
+      responses:
+        "200":
+          description: Counters and the transport mgmt is serving on.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Status" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/whoami:
+    get:
+      tags: [operational]
+      operationId: WhoAmI
+      summary: Who the caller is, as mgmt sees it
+      description: "`twd link` uses it to learn the endpoint and refuse non-admins early. Any authenticated principal, hosts included."
+      x-twd-role: any
+      responses:
+        "200":
+          description: The caller's principal and mgmt's self-description.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WhoAmI" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/device-delete-runs:
+    post:
+      tags: [operational]
+      operationId: CreateDeviceDeleteRun
+      summary: Run the scheduled device deletes now
+      description: |
+        Kill tier 2 is deferred by `-device-delete-delay`; this creates a run
+        that executes every pending delete immediately (what `twd down` does
+        before stopping mgmt). Each delete is audited (`kind: device_delete`).
+        Replaces `POST /v0/flush`.
+      x-twd-role: admin
+      x-twd-audit: true
+      responses:
+        "201":
+          description: The run's outcome.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceDeleteRun" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------------- oidc
+  /.well-known/openid-configuration:
+    get:
+      tags: [oidc]
+      operationId: GetOIDCConfiguration
+      summary: OIDC discovery (base issuer)
+      security: []
+      servers:
+        - url: https://twd-mgmt.{tailnet}
+          description: Funnel (public)
+          variables: { tailnet: { default: example.ts.net } }
+      responses:
+        "200":
+          description: The discovery document.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OIDCConfiguration" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /jwks:
+    get:
+      tags: [oidc]
+      operationId: GetJWKS
+      summary: Issuer signing keys
+      security: []
+      responses:
+        "200":
+          description: The JWK set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JWKS" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /t/{tenant}/.well-known/openid-configuration:
+    get:
+      tags: [oidc]
+      operationId: GetTenantOIDCConfiguration
+      summary: OIDC discovery (per-tenant issuer `…/t/{tenant}`)
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/tenantPath"
+      responses:
+        "200":
+          description: The discovery document with `issuer = <base>/t/{tenant}`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OIDCConfiguration" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /t/{tenant}/jwks:
+    get:
+      tags: [oidc]
+      operationId: GetTenantJWKS
+      summary: Per-tenant issuer signing keys (same key set)
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/tenantPath"
+      responses:
+        "200":
+          description: The JWK set.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/JWKS" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+# =========================================================================
+components:
+  securitySchemes:
+    tailnetWhoIs:
+      type: mutualTLS
+      description: |
+        **Not a token.** The caller's identity is the Tailscale node behind the
+        connection, resolved by WhoIs on mgmt's tsnet listener. No header is
+        sent. Roles: `host` = the peer carries `tag:twd-host` (bound to a
+        hostID at registration); `admin` = the peer's WhoIs CapMap holds
+        `twd.dev/cap/admin` toward `tag:twd-mgmt`. `mutualTLS` is the closest
+        OpenAPI scheme type (identity comes from the transport, not from a
+        credential in the request); the actual mechanism is WireGuard node
+        identity + WhoIs, and the `:80` listener is tailnet-only plaintext.
+      x-twd-mechanism: tailscale-whois
+    localHostToken:
+      type: apiKey
+      in: header
+      name: Twd-Host-Token
+      description: |
+        `--local-dev` only (`twd dev`, hermetic tests): the unix socket
+        `~/.twd/run/mgmt.sock` with the 256-bit token from
+        `~/.twd/hostd/mgmt.token` (RT-03). Every request needs it, `/v1/healthz`
+        included; a mgmt without a token answers `503 host_token_unconfigured`.
+        The host names itself with `Twd-Host-ID`; admins may set `Twd-Actor`.
+        Never used in normal operation; `twd doctor` flags it.
+
+  parameters:
+    limit:
+      name: limit
+      in: query
+      description: Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
+      schema: { type: integer, minimum: 1, maximum: 500, default: 50 }
+    cursor:
+      name: cursor
+      in: query
+      description: Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
+      schema: { type: string, maxLength: 512 }
+    ifMatch:
+      name: If-Match
+      in: header
+      description: Only apply if the resource's current `ETag` matches; otherwise `412 precondition_failed`.
+      schema: { type: string }
+    ifNoneMatch:
+      name: If-None-Match
+      in: header
+      description: Answer `304` when the `ETag` still matches.
+      schema: { type: string }
+    epoch:
+      name: epoch
+      in: query
+      required: true
+      description: The namespace lease epoch the caller believes it holds. Fenced in the store (`409 lease_lost`).
+      schema: { type: integer, format: int64, minimum: 1 }
+    tenantID:
+      name: id
+      in: path
+      required: true
+      description: Tenant ID (`tn_…` when generated; one safe path element).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
+    tenantPath:
+      name: tenant
+      in: path
+      required: true
+      schema: { type: string }
+    hostID:
+      name: id
+      in: path
+      required: true
+      description: Host ID (one safe path element).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$" }
+    deploymentID:
+      name: id
+      in: path
+      required: true
+      description: Deployment ID (`dp_…`).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
+    objectID:
+      name: id
+      in: path
+      required: true
+      description: Object ID (`<class-slug>-<b32(hmac)[:10]>`, also the node hostname).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
+    volumeID:
+      name: id
+      in: path
+      required: true
+      description: "Volume ID `<tenantID>:<workload>` (one volume per workload; `:` is a legal path character)."
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[a-z0-9][a-z0-9-]{0,62}$" }
+      example: "tn_tail7906d5:agent"
+
+  headers:
+    ETag:
+      description: Strong validator of the representation; send it back in `If-Match` / `If-None-Match`.
+      schema: { type: string }
+    Location:
+      description: URL of the created (or accepted) resource to poll.
+      schema: { type: string, format: uri-reference }
+
+  responses:
+    Error:
+      description: Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code.
+      headers:
+        Twd-Error: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: internal
+            message: "store: database is locked"
+            doc_url: https://twd.dev/errors/internal
+            trace_id: 7f3a…
+    BadRequest:
+      description: Malformed request, body, filter or cursor.
+      headers:
+        Twd-Error: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            badRequest:
+              value:
+                code: bad_request
+                message: "mintMode apikey needs apiKeyFile"
+                doc_url: https://twd.dev/errors/bad_request
+                trace_id: 7f3a…
+            badCursor:
+              value:
+                code: bad_cursor
+                message: "cursor does not decode; start again without it"
+                doc_url: https://twd.dev/errors/bad_cursor
+                trace_id: 7f3a…
+            immutableField:
+              value:
+                code: immutable_field
+                message: "tailnet cannot be changed; create a new tenant"
+                missing: { field: tailnet }
+                doc_url: https://twd.dev/errors/immutable_field
+                trace_id: 7f3a…
+    Forbidden:
+      description: The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces.
+      headers:
+        Twd-Error: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            notAdmin:
+              summary: A tailnet caller without the admin cap gets the exact grant to add.
+              value:
+                code: not_admin
+                message: "ross@example.com is not a twd admin on this tailnet"
+                missing: { src: "ross@example.com", dst: "tag:twd-mgmt", cap: "twd.dev/cap/admin" }
+                snippet: "{\"src\": [\"ross@example.com\"], \"dst\": [\"tag:twd-mgmt\"], \"ip\": [\"tcp:443\",\"tcp:80\"], \"app\": {\"twd.dev/cap/admin\": [{}]}}"
+                doc_url: https://twd.dev/errors/not_admin
+                trace_id: 7f3a…
+            forbidden:
+              value:
+                code: forbidden
+                message: "host h-7f2a does not hold tn_tail7906d5/agent"
+                doc_url: https://twd.dev/errors/forbidden
+                trace_id: 7f3a…
+            hostNotRegistered:
+              value:
+                code: host_not_registered
+                message: "node nQ1k… (tag:twd-host) has not registered; PUT /v1/hosts/{id} first"
+                doc_url: https://twd.dev/errors/host_not_registered
+                trace_id: 7f3a…
+    Unauthorized:
+      description: No identity on the connection (WhoIs failed), or the local-dev socket was used without `Twd-Host-Token`.
+      headers:
+        Twd-Error: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            noIdentity:
+              value:
+                code: no_identity
+                message: "WhoIs failed for 100.64.0.9: no such peer"
+                doc_url: https://twd.dev/errors/no_identity
+                trace_id: 7f3a…
+            hostTokenRequired:
+              value:
+                code: host_token_required
+                message: "Twd-Host-Token header required on the local-dev socket"
+                doc_url: https://twd.dev/errors/host_token_required
+                trace_id: 7f3a…
+    NotFound:
+      description: No such resource (or none the caller may see).
+      headers:
+        Twd-Error: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: not_found
+            message: "object agent-k3j5m7p9qa not found"
+            doc_url: https://twd.dev/errors/not_found
+            trace_id: 7f3a…
+    NotModified:
+      description: The `If-None-Match` validator still matches. No body.
+      headers:
+        ETag: { $ref: "#/components/headers/ETag" }
+    Conflict:
+      description: The request conflicts with the resource's current state.
+      headers:
+        Twd-Error: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          examples:
+            exists:
+              value:
+                code: exists
+                message: "tenant tn_tail7906d5 already exists"
+                doc_url: https://twd.dev/errors/exists
+                trace_id: 7f3a…
+            superseded:
+              value:
+                code: superseded
+                message: "dep_01j… was superseded by dep_01k…; undeploy the latest deployment"
+                doc_url: https://twd.dev/errors/superseded
+                trace_id: 7f3a…
+    LeaseLost:
+      description: The caller does not hold the namespace lease at this epoch.
+      headers:
+        Twd-Error: { schema: { type: string, const: lease_lost } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: lease_lost
+            message: "the caller does not hold the namespace lease at this epoch (want 4, have 3)"
+            doc_url: https://twd.dev/errors/lease_lost
+            trace_id: 7f3a…
+    Gone:
+      description: The object was killed. The body is the typed error plus the kill record; it stays until purged.
+      headers:
+        Twd-Error: { schema: { type: string, const: killed } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/TombstoneError" }
+          example:
+            code: killed
+            message: "agent-k3j5m7p9qa was killed (cascade from agent-root1234ab)"
+            doc_url: https://twd.dev/errors/killed
+            trace_id: 7f3a…
+            tombstone:
+              objectID: agent-k3j5m7p9qa
+              tenantID: tn_tail7906d5
+              workload: agent
+              namespace: SubAgent
+              objectName: researcher-1
+              killedAt: 1762633200000
+              reason: operator kill
+              by: ross@example.com
+              cascade: true
+              root: agent-root1234ab
+              deviceDeleted: true
+    PreconditionFailed:
+      description: "`If-Match` did not match the current `ETag`."
+      headers:
+        Twd-Error: { schema: { type: string, const: precondition_failed } }
+        ETag: { $ref: "#/components/headers/ETag" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: precondition_failed
+            message: "If-Match \"3f9a…\" does not match the current ETag \"8c21…\""
+            doc_url: https://twd.dev/errors/precondition_failed
+            trace_id: 7f3a…
+
+  schemas:
+    # ------------------------------------------------------------ errors
+    Error:
+      type: object
+      description: |
+        The DX.md error catalog shape. `code` is stable and machine-readable;
+        `missing` names what is absent (grant, cap, field, quota); `snippet`
+        is policy HuJSON to paste when a grant is missing; `doc_url` is
+        `https://twd.dev/errors/<code>`; `trace_id` correlates with audit.
+      required: [code, message, doc_url, trace_id]
+      properties:
+        code: { $ref: "#/components/schemas/ErrorCode" }
+        message: { type: string }
+        missing:
+          type: object
+          additionalProperties: true
+          description: What is missing. Shape depends on `code` (e.g. `{src, dst, cap, field}` for `delegation_invalid`).
+        snippet:
+          type: string
+          description: Policy HuJSON to add (a grant or tagOwners entry).
+        doc_url: { type: string, format: uri }
+        trace_id: { type: string }
+    ErrorCode:
+      type: string
+      description: |
+        The catalog. Status in parentheses.
+
+        | code | status | when |
+        |---|---|---|
+        | `bad_request` | 400 | malformed body, parameter or filter |
+        | `bad_cursor` | 400 | `cursor` does not decode |
+        | `bad_bundle` | 400 | bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` |
+        | `immutable_field` | 400 | PATCH touches a field the caller may not change |
+        | `no_identity` | 401 | WhoIs failed for the connection |
+        | `host_token_required` | 401 | local-dev socket without `Twd-Host-Token` |
+        | `host_token_invalid` | 403 | local-dev socket, wrong token |
+        | `not_admin` | 403 | tailnet caller without `twd.dev/cap/admin` (`snippet` given) |
+        | `forbidden` | 403 | role ok, but outside the caller's records / namespaces |
+        | `host_not_registered` | 403 | `tag:twd-host` node that never did `PUT /v1/hosts/{id}` |
+        | `host_identity_mismatch` | 403 | host ID bound to another node |
+        | `delegation_invalid` | 403 | child tag not owned by the parent's, parent unknown (404) or dead (410) |
+        | `delegation_exceeds_parent` | 403 | spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) |
+        | `not_found` | 404 | — |
+        | `unknown_tenant` | 404 | — |
+        | `unknown_namespace` | 404 | `(workload, class)` not declared |
+        | `exists` | 409 | create of an existing ID |
+        | `lease_lost` | 409 | epoch/holder fence failed |
+        | `lease_held` | 409 | another host holds the lease |
+        | `already_joined` | 409 | credential for an object that has a node |
+        | `identity_conflict` | 409 | object ID collision across identities |
+        | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
+        | `not_ready` | 409 | certificate requested before `ready` |
+        | `superseded` | 409 | undeploy of a non-latest deployment |
+        | `tenant_has_live_objects` | 409 | tenant delete without `force` |
+        | `host_holds_leases` | 409 | host delete without `drain` |
+        | `killed` | 410 | tombstone (`TombstoneError`) |
+        | `precondition_failed` | 412 | `If-Match` mismatch |
+        | `object_quota_exceeded` | 429 | tenant `maxObjects` |
+        | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+        | `bootstrap_failed` | 502 | control plane refused the mint |
+        | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
+        | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
+        | `no_host` | 503 | no live host for the deployment |
+        | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
+        | `internal` | 500 | — |
+      enum:
+        - bad_request
+        - bad_cursor
+        - bad_bundle
+        - immutable_field
+        - no_identity
+        - host_token_required
+        - host_token_invalid
+        - not_admin
+        - forbidden
+        - host_not_registered
+        - host_identity_mismatch
+        - delegation_invalid
+        - delegation_exceeds_parent
+        - not_found
+        - unknown_tenant
+        - unknown_namespace
+        - exists
+        - lease_lost
+        - lease_held
+        - already_joined
+        - identity_conflict
+        - namespace_ambiguous
+        - not_ready
+        - superseded
+        - tenant_has_live_objects
+        - host_holds_leases
+        - killed
+        - precondition_failed
+        - object_quota_exceeded
+        - spawn_budget_exceeded
+        - bootstrap_failed
+        - host_token_unconfigured
+        - identity_pending
+        - no_host
+        - policy_unavailable
+        - internal
+    TombstoneError:
+      description: "`410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`)."
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            tombstone: { $ref: "#/components/schemas/Tombstone" }
+    Tombstone:
+      type: object
+      description: The kill record of an object. Kept until the tenant's terminal objects are purged.
+      required: [objectID, tenantID, workload, namespace, objectName, killedAt, by, cascade, root, deviceDeleted]
+      properties:
+        objectID: { type: string }
+        tenantID: { type: string }
+        workload: { type: string }
+        namespace: { type: string }
+        objectName: { type: string }
+        killedAt: { type: integer, format: int64, description: unix ms }
+        reason: { type: string }
+        by: { type: string, description: The actor (see Conventions). }
+        cascade: { type: boolean, description: True when this object died as part of a cascade. }
+        root: { type: string, description: The object the kill was issued on. }
+        deviceDeleted: { type: boolean, description: Tier 2 done (false while the delete is still scheduled). }
+        deviceDeleteAt: { type: integer, format: int64, description: unix ms when the scheduled device delete runs; absent once done. }
+
+    # ---------------------------------------------------------- pagination
+    Page:
+      type: object
+      description: |
+        The generic page envelope (`Page<T>`); every concrete `*Page` schema
+        below is this shape with a typed `items`. `nextCursor` is `null` on
+        the last page.
+      required: [items, nextCursor]
+      properties:
+        items: { type: array, items: {} }
+        nextCursor:
+          type: [string, "null"]
+          description: Pass as `?cursor=` for the next page; `null` when there is none.
+    TenantPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/Tenant" } }
+    HostPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/Host" } }
+    AssignmentPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/Assignment" } }
+    DeploymentPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/Deployment" } }
+    ObjectPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/Object" } }
+    AuditPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          required: [chains, verified]
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/AuditRecord" } }
+            chains:
+              type: array
+              description: Verification status of every chain that contributed to this page.
+              items: { $ref: "#/components/schemas/ChainStatus" }
+            verified: { type: boolean, description: "AND over `chains[].ok`." }
+
+    # ------------------------------------------------------------- tenants
+    MintMode:
+      type: string
+      description: "`wif`: keyless, mints through the trust credential (default). `apikey`: a Tailscale API key file (tests, homelab). `static`: fakemgmt only (testcontrol accepts any key)."
+      enum: [wif, apikey, static]
+    Tier:
+      type: string
+      enum: [process, microvm]
+    Tenant:
+      type: object
+      required: [tenantID, tailnet, mintMode, registrationsPerMinute, maxObjects, createdAt, updatedAt]
+      properties:
+        tenantID: { type: string, examples: [tn_tail7906d5] }
+        tailnet: { type: string, description: MagicDNS suffix of the customer tailnet., examples: [tail7906d5.ts.net] }
+        controlURL: { type: string, format: uri, description: "Non-default control plane (testcontrol, headscale)." }
+        mintMode: { $ref: "#/components/schemas/MintMode" }
+        apiKeyFile:
+          type: string
+          description: "`apikey` mode: absolute path, read at use; the key is never stored or returned."
+        wifClientID: { type: string, description: Public client ID of the mint trust credential (`auth_keys`). }
+        wifLifecycleClientID: { type: string, description: "Public client ID of the lifecycle credential (`devices:core`, `policy_file:read`)." }
+        wif: { $ref: "#/components/schemas/WIFInfo" }
+        registrationsPerMinute: { type: integer, minimum: 1, default: 200 }
+        maxObjects: { type: integer, minimum: 1, default: 1000 }
+        pool:
+          type: string
+          description: Host pool the tenant's deployments are placed on (hosts with a matching `pool`; empty = any host).
+        tier: { $ref: "#/components/schemas/Tier" }
+        oboPublicKey: { type: string, description: base64 Ed25519 key that verifies this tenant's node certificates; hostd pins it. }
+        createdAt: { type: integer, format: int64 }
+        updatedAt: { type: integer, format: int64 }
+    WIFInfo:
+      type: object
+      description: Present in wif mode.
+      required: [issuer, mintSubject, lifecycleSubject]
+      properties:
+        issuer: { type: string, format: uri, examples: ["https://twd-mgmt.tail7906d5.ts.net/t/tn_tail7906d5"] }
+        mintSubject: { type: string, examples: ["twd:tenant:tn_tail7906d5:mint"] }
+        lifecycleSubject: { type: string, examples: ["twd:tenant:tn_tail7906d5:lifecycle"] }
+    TenantCreate:
+      type: object
+      required: [tailnet, mintMode]
+      properties:
+        tenantID: { type: string, description: Optional; generated (`tn_…`) when absent. }
+        tailnet: { type: string }
+        controlURL: { type: string, format: uri }
+        mintMode: { $ref: "#/components/schemas/MintMode" }
+        apiKeyFile: { type: string }
+        wifClientID: { type: string }
+        wifLifecycleClientID: { type: string }
+        registrationsPerMinute: { type: integer, minimum: 1 }
+        maxObjects: { type: integer, minimum: 1 }
+        pool: { type: string }
+        tier: { $ref: "#/components/schemas/Tier" }
+      additionalProperties: false
+    TenantPatch:
+      type: object
+      description: JSON Merge Patch over the updatable fields. `null` clears an optional field.
+      properties:
+        mintMode: { $ref: "#/components/schemas/MintMode" }
+        apiKeyFile: { type: [string, "null"] }
+        wifClientID: { type: [string, "null"] }
+        wifLifecycleClientID: { type: [string, "null"] }
+        registrationsPerMinute: { type: integer, minimum: 1 }
+        maxObjects: { type: integer, minimum: 1 }
+        pool: { type: [string, "null"] }
+        tier: { $ref: "#/components/schemas/Tier" }
+      additionalProperties: false
+    TenantDeleteResult:
+      type: object
+      required: [tenantID, killed]
+      properties:
+        tenantID: { type: string }
+        killed: { type: array, items: { type: string } }
+        purged: { type: array, items: { type: string } }
+        deploymentsStopped: { type: array, items: { type: string } }
+        devicesDeleting: { type: array, items: { type: string } }
+    PurgeResult:
+      type: object
+      required: [purged]
+      properties:
+        purged: { type: array, items: { type: string }, description: Object IDs forgotten. }
+    WIFCheckResult:
+      type: object
+      required: [mintMode, mint, lifecycle, policyRead, issuer]
+      properties:
+        mintMode: { $ref: "#/components/schemas/MintMode" }
+        mint: { type: boolean, description: The mint credential's token exchange succeeded (its `auth_keys` scope is only proven by the first real mint). }
+        mintError: { type: string }
+        lifecycle:
+          type: string
+          enum: [ok, absent, error]
+          description: "`absent`: no lifecycle client ID (kill tier 2, reaper device deletes, spawn checks and preflight are off)."
+        lifecycleError: { type: string }
+        policyRead: { type: boolean, description: "The lifecycle credential read the policy (`policy_file:read`)." }
+        policyReadError: { type: string }
+        issuer: { type: string, format: uri }
+
+    # --------------------------------------------------------------- hosts
+    HostStatusEnum:
+      type: string
+      description: "`pending`: created by `twd host add`, never registered. `live`: heartbeated within 10 s. `stale`: registered, no recent heartbeat. `draining`: being deleted."
+      enum: [pending, live, stale, draining]
+    HostPush:
+      type: object
+      description: |
+        Where mgmt pushes kills and assignment changes. Over the tailnet,
+        `port` names hostd's push listener on **its own tsnet node** (the
+        WhoIs node; mgmt never pushes anywhere else). `url` is accepted only
+        on the local-dev socket and only as `unix:///…`.
+      properties:
+        port: { type: integer, minimum: 1, maximum: 65535 }
+        url: { type: string, description: "`unix:///path/hostd.sock`; local-dev only." }
+    Host:
+      type: object
+      required: [hostID, status, capacityNodes, tiers, liveNodes, lastSeen, createdAt, updatedAt]
+      properties:
+        hostID: { type: string }
+        status: { $ref: "#/components/schemas/HostStatusEnum" }
+        capacityNodes: { type: integer }
+        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+        pool: { type: string }
+        nodeID: { type: string, description: "Stable node ID of the host's `tag:twd-host` tsnet node (bound at registration)." }
+        dnsName: { type: string, description: "`twd-host-<hostID>.<tailnet>`." }
+        auditPubKey: { type: string, description: base64 ed25519; verifies `hostSig`. }
+        push: { $ref: "#/components/schemas/HostPush" }
+        liveNodes: { type: integer }
+        leases: { type: array, items: { $ref: "#/components/schemas/Lease" }, description: Namespace leases the host currently holds. }
+        lastSeen: { type: integer, format: int64, description: unix ms of the last heartbeat }
+        createdAt: { type: integer, format: int64 }
+        updatedAt: { type: integer, format: int64 }
+    HostCreate:
+      type: object
+      required: [hostID]
+      properties:
+        hostID: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$" }
+        tenantID:
+          type: string
+          description: "The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own)."
+        pool: { type: string }
+        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+      additionalProperties: false
+    HostJoin:
+      type: object
+      description: A single-use join key for a host's `tag:twd-host` node. Never logged.
+      required: [host, authKey, expiresAt, tags, hostname]
+      properties:
+        host: { $ref: "#/components/schemas/Host" }
+        authKey: { type: string, format: password }
+        expiresAt: { type: integer, format: int64, description: unix ms }
+        tags: { type: array, items: { type: string } }
+        hostname: { type: string, description: "`twd-host-<hostID>`" }
+        controlURL: { type: string, format: uri }
+        tailnet: { type: string }
+      x-twd-secret: true
+    HostRegistration:
+      type: object
+      required: [capacityNodes, tiers]
+      properties:
+        capacityNodes: { type: integer, minimum: 0 }
+        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" }, minItems: 1 }
+        pool: { type: string }
+        auditPubKey: { type: string }
+        push: { $ref: "#/components/schemas/HostPush" }
+      additionalProperties: false
+    Lease:
+      type: object
+      required: [namespace, epoch]
+      properties:
+        namespace: { type: string, description: "Lease name `<tenantID>/<workload>` (a workload or DO class name is also accepted on input)." }
+        epoch: { type: integer, format: int64 }
+        expiresAt: { type: integer, format: int64 }
+    DeploymentReport:
+      type: object
+      required: [deploymentID, status]
+      properties:
+        deploymentID: { type: string }
+        status: { $ref: "#/components/schemas/DeploymentStatus" }
+        error: { type: string }
+    HostStatus:
+      type: object
+      description: The heartbeat body.
+      required: [liveNodes, leases]
+      properties:
+        liveNodes: { type: integer, minimum: 0 }
+        leases: { type: array, items: { $ref: "#/components/schemas/Lease" } }
+        deployments: { type: array, items: { $ref: "#/components/schemas/DeploymentReport" } }
+      additionalProperties: false
+    HostStatusResponse:
+      type: object
+      required: [revoke, revokeObjects]
+      properties:
+        revoke: { type: array, items: { type: string }, description: Lease entries that are no longer held. }
+        revokeObjects: { type: array, items: { type: string }, description: Object IDs killed in the last 10 min in namespaces this host holds; kill idempotently. }
+        assignmentsChanged: { type: boolean, description: A hint to re-list assignments (set when a push could not be delivered). }
+    HostDeleteResult:
+      type: object
+      required: [hostID, killed, leasesReleased]
+      properties:
+        hostID: { type: string }
+        killed: { type: array, items: { type: string } }
+        leasesReleased: { type: array, items: { type: string } }
+        devicesLeft: { type: array, items: { type: string }, description: Devices mgmt could not delete (no operator credential); delete them in the console. }
+
+    # --------------------------------------------------------- deployments
+    DeploymentStatus:
+      type: string
+      enum: [assigned, starting, active, draining, stopped, failed, superseded]
+    ClassConfig:
+      type: object
+      description: One DO namespace from `twd.jsonc` `tailnet.objects`.
+      required: [class, tags]
+      properties:
+        class: { type: string }
+        tags: { type: array, items: { type: string } }
+        agent: { type: boolean }
+        ttl: { type: string, description: "`10m`-style duration or seconds." }
+    Endpoint:
+      type: object
+      description: The workload entry node (`_workload` object).
+      required: [node, magicDNS, status]
+      properties:
+        objectID: { type: string }
+        node: { type: string, description: hostname }
+        magicDNS: { type: string }
+        status: { $ref: "#/components/schemas/ObjectStatus" }
+    Deployment:
+      type: object
+      required: [deploymentID, tenantID, workload, host, epoch, status, namespaces, endpoint, createdAt]
+      properties:
+        deploymentID: { type: string, examples: [dp_3f9a1c2b7d8e4f50] }
+        tenantID: { type: string }
+        workload: { type: string }
+        host: { type: string }
+        epoch: { type: integer, format: int64 }
+        status: { $ref: "#/components/schemas/DeploymentStatus" }
+        error: { type: string }
+        tier: { $ref: "#/components/schemas/Tier" }
+        namespaces: { type: array, items: { $ref: "#/components/schemas/ClassConfig" } }
+        workloadTags: { type: array, items: { type: string } }
+        maxLive: { type: integer }
+        maxDepth: { type: integer }
+        endpoint: { $ref: "#/components/schemas/Endpoint" }
+        deployedBy: { type: string, description: The actor who deployed (see Conventions). }
+        createdAt: { type: integer, format: int64 }
+        updatedAt: { type: integer, format: int64 }
+    DeploymentCreate:
+      type: object
+      required: [tenantID, workload, bundle]
+      properties:
+        tenantID: { type: string }
+        workload: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$" }
+        bundle: { type: string, contentEncoding: base64, description: tar (optionally gzipped) of the built worker + `twd.jsonc` + `wrangler.jsonc`. }
+        host: { type: string, description: Pin a host. }
+        namespaces:
+          type: array
+          description: Override the classes read from `twd.jsonc` (tests).
+          items: { $ref: "#/components/schemas/ClassConfig" }
+      additionalProperties: false
+    Assignment:
+      type: object
+      description: What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
+      required: [deploymentID, tenantID, workload, bundleURL, namespaces, epoch, lease, tailnet, createdAt]
+      properties:
+        deploymentID: { type: string }
+        tenantID: { type: string }
+        workload: { type: string }
+        bundleURL: { type: string, format: uri-reference }
+        namespaces: { type: array, items: { $ref: "#/components/schemas/ClassConfig" } }
+        workloadTags: { type: array, items: { type: string } }
+        epoch: { type: integer, format: int64 }
+        lease: { type: string }
+        tailnet: { type: string }
+        controlURL: { type: string, format: uri }
+        tier: { $ref: "#/components/schemas/Tier" }
+        maxLive: { type: integer }
+        maxDepth: { type: integer }
+        createdAt: { type: integer, format: int64 }
+    PreflightMissing:
+      type: object
+      required: [src, dst, snippet]
+      properties:
+        src: { type: string }
+        dst: { type: string }
+        snippet: { type: string, description: The grant to add (HuJSON). }
+    PreflightResult:
+      type: object
+      required: [ok, missing, missingTagOwners]
+      properties:
+        ok: { type: boolean }
+        srcTags: { type: array, items: { type: string }, description: The tags checked (workload + object tags from the bundle). }
+        missing: { type: array, items: { $ref: "#/components/schemas/PreflightMissing" } }
+        missingTagOwners: { type: array, items: { type: string } }
+        tagOwnersSnippet: { type: string }
+        unchecked: { type: array, items: { type: string }, description: "`tailnet.connects` entries that are names, not tags." }
+
+    # ------------------------------------------------------------- objects
+    ObjectStatus:
+      type: string
+      description: "`pending` → `minted` → `ready`; terminal: `killed` (tombstone, `410`), `failed`."
+      enum: [pending, minted, ready, killed, failed]
+    ObjectRef:
+      type: object
+      required: [objectID]
+      properties:
+        objectID: { type: string }
+    Caps:
+      type: object
+      description: "`{capName: value | [values]}`; see `caps ⊆ parent` semantics in `CreateObject`."
+      additionalProperties: true
+    Object:
+      type: object
+      required: [objectID, tenantID, workload, namespace, objectName, hostname, deploymentID, lease, tags, root, depth, ephemeral, status, lineage, createdAt, updatedAt]
+      properties:
+        objectID: { type: string, examples: [agent-k3j5m7p9qa] }
+        tenantID: { type: string }
+        workload: { type: string }
+        namespace: { type: string, description: "DO class name, or `_workload`." }
+        objectName: { type: string }
+        hostname: { type: string, description: The node hostname (hostd may prepend its `-hostname-prefix`). }
+        deploymentID: { type: string }
+        lease: { type: string }
+        host: { type: string, description: The lease holder when known. }
+        tags: { type: array, items: { type: string } }
+        caps: { $ref: "#/components/schemas/Caps" }
+        parent: { type: string, description: Parent object ID (spawn). }
+        root: { type: string, description: Root of the spawn tree (itself for a root). }
+        depth: { type: integer }
+        lineage: { type: array, items: { type: string }, description: Object IDs from the root down to this object (inclusive). }
+        children: { type: array, items: { type: string } }
+        ttl: { type: integer, format: int64, description: seconds }
+        ephemeral: { type: boolean }
+        status: { $ref: "#/components/schemas/ObjectStatus" }
+        nodeID: { type: string }
+        stableNodeID: { type: string }
+        magicDNS: { type: string }
+        cert: { type: string, description: "The node certificate `<b64url payload>.<b64url sig>` once ready." }
+        actingFor: { type: string, description: "The human principal at the head of the chain, when known." }
+        killReason: { type: string }
+        tombstone: { $ref: "#/components/schemas/Tombstone" }
+        createdAt: { type: integer, format: int64 }
+        updatedAt: { type: integer, format: int64 }
+    ObjectCreate:
+      type: object
+      required: [tenantID, namespace, objectName]
+      properties:
+        tenantID: { type: string }
+        workload: { type: string, description: Always sent by hostd; see resolution rules in `CreateObject`. }
+        namespace: { type: string, description: "DO class name, or `_workload`." }
+        objectName: { type: string }
+        parent: { $ref: "#/components/schemas/ObjectRef" }
+        caps: { $ref: "#/components/schemas/Caps" }
+        ttl:
+          description: "`10m`-style duration or seconds. Defaults to the class `ttl`."
+          oneOf:
+            - { type: string }
+            - { type: integer, minimum: 1 }
+        hostname: { type: string, description: The hostname hostd proposes; mgmt answers with the one to use. }
+        actingFor: { type: string, description: The principal this object acts for (feeds audit). }
+        traceID: { type: string }
+      additionalProperties: false
+    ObjectPatch:
+      type: object
+      description: JSON Merge Patch. Hosts send the `ready` group; admins send `ttl`.
+      properties:
+        status: { type: string, enum: [ready] }
+        nodeID: { type: string }
+        stableNodeID: { type: string }
+        magicDNS: { type: string }
+        epoch: { type: integer, format: int64, minimum: 1, description: Fences the ready commit. }
+        ttl:
+          type: [integer, "null"]
+          format: int64
+          minimum: 1
+          description: Admin. Seconds; `null` clears.
+      additionalProperties: false
+    KillResult:
+      type: object
+      required: [killed, devicesDeleted]
+      properties:
+        killed: { type: array, items: { type: string } }
+        pushed: { type: array, items: { type: string }, description: Objects whose host acknowledged the tier-1 push. }
+        pushMs: { type: number }
+        devicesDeleted: { type: array, items: { type: string } }
+        devicesDeleting: { type: array, items: { type: string }, description: Device deletes scheduled (`-device-delete-delay`). }
+        errors: { type: object, additionalProperties: { type: string } }
+
+    # --------------------------------------------------------- credentials
+    Credential:
+      type: object
+      description: A single-use auth key. Never logged; `String()` redacts it in Go.
+      required: [authKey, expiresAt, tags, hostname, ephemeral]
+      properties:
+        authKey: { type: string, format: password, description: "`tskey-auth-…`, single use." }
+        expiresAt: { type: integer, format: int64, description: unix ms }
+        tags: { type: array, items: { type: string } }
+        hostname: { type: string }
+        ephemeral: { type: boolean }
+        controlURL: { type: string, format: uri }
+        reminted: { type: boolean, description: True when `reason=rejoin_rejected` deleted the old device and re-minted. }
+      x-twd-secret: true
+    NodeCertificatePayload:
+      type: object
+      description: "`internal/nodecert.Payload`; signed with the tenant's OBO root key (Ed25519)."
+      required: [v, tenant, objectID, stableNodeID, tags, root, iat, exp]
+      properties:
+        v: { type: integer, const: 1 }
+        tenant: { type: string }
+        objectID: { type: string }
+        stableNodeID: { type: string }
+        tags: { type: array, items: { type: string } }
+        lim: { $ref: "#/components/schemas/Caps" }
+        parent: { type: string }
+        root: { type: string }
+        iat: { type: integer, format: int64, description: unix seconds }
+        exp: { type: integer, format: int64, description: unix seconds (24 h after iat) }
+    NodeCertificate:
+      type: object
+      required: [tenantID, objectID, stableNodeID, status, cert, payload, oboPublicKey]
+      properties:
+        tenantID: { type: string }
+        objectID: { type: string }
+        stableNodeID: { type: string }
+        status: { $ref: "#/components/schemas/ObjectStatus" }
+        cert: { type: string, description: "`<b64url payload>.<b64url sig>`" }
+        payload: { $ref: "#/components/schemas/NodeCertificatePayload" }
+        oboPublicKey: { type: string, description: base64 Ed25519 }
+
+    # --------------------------------------------------------------- audit
+    AuditKind:
+      type: string
+      description: |
+        Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
+        `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+        `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
+        `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
+        `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
+        `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+      enum:
+        - allow
+        - deny
+        - egress
+        - spawn
+        - kill
+        - principal
+        - tenant_note
+        - tenant_create
+        - tenant_update
+        - tenant_delete
+        - host_register
+        - host_delete
+        - deploy
+        - undeploy
+        - create
+        - mint
+        - remint
+        - ready
+        - device_delete
+        - purge
+        - volume_key
+        - reap
+        - preflight
+        - host_add
+        - credential
+        - obo_root
+        - object_update
+    AuditSource:
+      type: string
+      description: "`mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content)."
+      enum: [mgmt, host, tenant]
+    AuditRecord:
+      type: object
+      description: |
+        One hash-chained record. Hash input is the record without `hash` and
+        `hostSig`, keys sorted at every level, no whitespace, numbers as
+        written, no HTML escaping. `seq` and `chain` are assigned by mgmt.
+      required: [ts, kind, prevHash, hash]
+      properties:
+        seq: { type: integer, format: int64, readOnly: true }
+        chain: { type: string, readOnly: true, description: "`mgmt` or `host:<hostID>`." }
+        ts: { type: string, format: date-time }
+        tenantID: { type: string }
+        objectID: { type: string }
+        kind: { $ref: "#/components/schemas/AuditKind" }
+        source: { $ref: "#/components/schemas/AuditSource" }
+        dst: { type: string }
+        grant: { type: string }
+        code: { type: string }
+        traceID: { type: string }
+        actingFor: { type: string }
+        detail:
+          description: Structured detail (mgmt records) or free text (host `tenant_note`s).
+          oneOf:
+            - { type: object, additionalProperties: true }
+            - { type: string }
+        prevHash: { type: string, description: "`\"\"` for the first record of a chain." }
+        hash: { type: string, pattern: "^[0-9a-f]{64}$" }
+        hostSig: { type: string, description: base64 ed25519 over utf8(hash); host chains only. }
+    AuditBatch:
+      type: object
+      required: [records]
+      properties:
+        records: { type: array, items: { $ref: "#/components/schemas/AuditRecord" }, minItems: 1, maxItems: 1000 }
+    ChainStatus:
+      type: object
+      required: [chain, ok, records]
+      properties:
+        chain: { type: string }
+        ok: { type: boolean }
+        records: { type: integer }
+        brokenAt: { type: integer, format: int64, description: seq of the first bad record }
+        error: { type: string }
+    AuditAppendResult:
+      type: object
+      required: [accepted, chain]
+      properties:
+        accepted: { type: integer }
+        chain: { $ref: "#/components/schemas/ChainStatus" }
+    AuditVerification:
+      type: object
+      required: [ok, chains, verifiedAt]
+      properties:
+        ok: { type: boolean }
+        chains: { type: array, items: { $ref: "#/components/schemas/ChainStatus" } }
+        verifiedAt: { type: integer, format: int64 }
+
+    # ------------------------------------------------------------- volumes
+    VolumeKeyGrant:
+      type: object
+      description: A fenced release of a volume's data key. Never logged.
+      required: [volumeID, tenantID, workload, epoch, key]
+      properties:
+        volumeID: { type: string }
+        tenantID: { type: string }
+        workload: { type: string }
+        epoch: { type: integer, format: int64 }
+        key: { type: string, contentEncoding: base64, format: password, description: 32 bytes. }
+        grantedAt: { type: integer, format: int64 }
+      x-twd-secret: true
+
+    # --------------------------------------------------------- operational
+    Health:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean, const: true }
+    Transport:
+      type: string
+      description: "`tsnet` in normal operation; `local-dev` when the unix socket is serving."
+      enum: [tsnet, local-dev]
+    Status:
+      type: object
+      required: [ok, transport, pendingDeviceDeletes, hosts, tenants, objects]
+      properties:
+        ok: { type: boolean }
+        transport: { $ref: "#/components/schemas/Transport" }
+        listeners: { type: array, items: { type: string }, description: "e.g. `tsnet:80`, `tsnet:443`, `funnel:443`, `unix:~/.twd/run/mgmt.sock`." }
+        pendingDeviceDeletes: { type: integer }
+        hosts: { type: object, required: [total, live], properties: { total: { type: integer }, live: { type: integer } } }
+        tenants: { type: integer }
+        objects: { type: object, additionalProperties: { type: integer }, description: Count per `ObjectStatus`. }
+        version: { type: string }
+    SelfInfo:
+      type: object
+      required: [https]
+      properties:
+        dnsName: { type: string, description: "`twd-mgmt.<tailnet>`" }
+        tailnet: { type: string }
+        https: { type: boolean }
+        issuer: { type: string, format: uri }
+        transport: { $ref: "#/components/schemas/Transport" }
+    WhoAmI:
+      type: object
+      required: [kind, admin, actor, mgmt]
+      properties:
+        kind: { type: string, enum: [user, node, host, local] }
+        login: { type: string }
+        nodeID: { type: string }
+        tags: { type: array, items: { type: string } }
+        hostID: { type: string }
+        admin: { type: boolean }
+        actor: { type: string }
+        mgmt: { $ref: "#/components/schemas/SelfInfo" }
+    DeviceDeleteRun:
+      type: object
+      required: [deleted]
+      properties:
+        deleted: { type: array, items: { type: string }, description: Object IDs whose devices were deleted. }
+        errors: { type: object, additionalProperties: { type: string } }
+
+    # ---------------------------------------------------------------- oidc
+    OIDCConfiguration:
+      type: object
+      required: [issuer, jwks_uri, response_types_supported, subject_types_supported, id_token_signing_alg_values_supported]
+      properties:
+        issuer: { type: string, format: uri }
+        jwks_uri: { type: string, format: uri }
+        response_types_supported: { type: array, items: { type: string } }
+        subject_types_supported: { type: array, items: { type: string } }
+        id_token_signing_alg_values_supported: { type: array, items: { type: string } }
+        claims_supported: { type: array, items: { type: string } }
+      additionalProperties: true
+    JWKS:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items: { type: object, additionalProperties: true }

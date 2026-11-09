@@ -1,6 +1,7 @@
-// Package fakemgmt is an in-memory twd-mgmt implementing the mgmt ⇄ hostd
-// contract (docs/contracts/mgmt-api.md v0 + v0.1) for hostd tests and the
-// e2e-real suite. It is not production code: no persistence, no peer-cred
+// Package fakemgmt is an in-memory twd-mgmt implementing the subset of the
+// mgmt /v1 contract (api/openapi.yaml) that hostd uses, for hostd tests
+// and the e2e-real suite. Tests wrap it with the spec validator
+// (mgmt/api/v1.Validator), so its shapes must match the spec. It is not production code: no persistence, no peer-cred
 // checks, one host per deployment.
 //
 // Mint modes per tenant:
@@ -109,6 +110,7 @@ type tenant struct {
 
 type host struct {
 	mgmtapi.RegisterRequest
+	created     time.Time
 	lastSeen    time.Time
 	liveNodes   int
 	leases      []mgmtapi.Lease
@@ -158,26 +160,30 @@ func New(cfg Config) *Server {
 		leases: map[string]*lease{}, objects: map[string]*object{}, byName: map[string]string{},
 		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}, oboKey: priv, certDenied: map[string]bool{}}
 	m := s.mux
-	m.HandleFunc("GET /v0/certs/{nodeID}", s.nodeCert)
-	m.HandleFunc("POST /v0/tenants", s.createTenant)
-	m.HandleFunc("GET /v0/tenants", s.listTenants)
-	m.HandleFunc("GET /v0/tenants/{id}", s.getTenant)
-	m.HandleFunc("POST /v0/hosts/register", s.register)
-	m.HandleFunc("POST /v0/hosts/{id}/heartbeat", s.heartbeat)
-	m.HandleFunc("GET /v0/hosts/{id}/assignments", s.assignments)
-	m.HandleFunc("POST /v0/deployments", s.deploy)
-	m.HandleFunc("GET /v0/deployments/{id}", s.getDeployment)
-	m.HandleFunc("GET /v0/deployments/{id}/bundle", s.getBundle)
-	m.HandleFunc("POST /v0/objects", s.createObject)
-	m.HandleFunc("GET /v0/objects", s.listObjects)
-	m.HandleFunc("GET /v0/objects/{id}", s.getObject)
-	m.HandleFunc("GET /v0/objects/{id}/credential", s.credential)
-	m.HandleFunc("POST /v0/objects/{id}/ready", s.ready)
-	m.HandleFunc("GET /v0/volumes/key", s.volumeKey)
-	m.HandleFunc("POST /v0/objects/{id}/remint", s.remint)
-	m.HandleFunc("POST /v0/objects/{id}/kill", s.kill)
-	m.HandleFunc("POST /v0/audit", s.postAudit)
-	m.HandleFunc("GET /v0/audit", s.getAudit)
+	m.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) })
+	m.HandleFunc("GET /v1/certificates/{nodeID}", s.nodeCert)
+	m.HandleFunc("POST /v1/tenants", s.createTenant)
+	m.HandleFunc("GET /v1/tenants", s.listTenants)
+	m.HandleFunc("GET /v1/tenants/{id}", s.getTenant)
+	m.HandleFunc("PUT /v1/hosts/{id}", s.register)
+	m.HandleFunc("PUT /v1/hosts/{id}/status", s.heartbeat)
+	m.HandleFunc("GET /v1/hosts/{id}/assignments", s.assignments)
+	m.HandleFunc("POST /v1/deployments", s.deploy)
+	m.HandleFunc("GET /v1/deployments", s.listDeployments)
+	m.HandleFunc("GET /v1/deployments/{id}", s.getDeployment)
+	m.HandleFunc("GET /v1/deployments/{id}/bundle", s.getBundle)
+	m.HandleFunc("POST /v1/objects", s.createObject)
+	m.HandleFunc("GET /v1/objects", s.listObjects)
+	m.HandleFunc("GET /v1/objects/{id}", s.getObject)
+	m.HandleFunc("POST /v1/objects/{id}/credentials", s.credential)
+	m.HandleFunc("PATCH /v1/objects/{id}", s.ready)
+	m.HandleFunc("POST /v1/volumes/{id}/keys", s.volumeKey)
+	m.HandleFunc("DELETE /v1/objects/{id}", s.kill)
+	m.HandleFunc("POST /v1/audit", s.postAudit)
+	m.HandleFunc("GET /v1/audit", s.getAudit)
+	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeErr(w, 404, mgmtapi.CodeNotFound, r.Method+" "+r.URL.Path+" is not a /v1 route")
+	})
 	return s
 }
 
@@ -196,6 +202,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(v)
 }
+
+// page is the /v1 list envelope (fakemgmt never pages: one page, no cursor).
+func page[T any](items []T) mgmtapi.Page[T] {
+	if items == nil {
+		items = []T{}
+	}
+	return mgmtapi.Page[T]{Items: items}
+}
+
+func ms(t time.Time) int64 { return t.UnixMilli() }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	w.Header().Set("Twd-Error", code)
@@ -235,7 +251,7 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 		tn.api = &tsapi.Client{Tailnet: t.Tailnet, APIKey: key, BaseURL: s.cfg.APIBaseURL}
 		tn.minter = tsapi.MintSource(tn.api, s.log)
 	default:
-		writeErr(w, 400, "plan_feature_missing", "mintMode "+t.MintMode+" is not supported by fakemgmt")
+		writeErr(w, 400, "bad_request", "mintMode "+t.MintMode+" is not supported by fakemgmt")
 		return
 	}
 	if tn.RegistrationsPerMinute == 0 {
@@ -246,10 +262,13 @@ func (s *Server) createTenant(w http.ResponseWriter, r *http.Request) {
 	}
 	tn.bucket = newBucket(tn.RegistrationsPerMinute)
 	tn.TenantID = newID("tn")
+	tn.CreatedAt, tn.UpdatedAt = ms(time.Now()), ms(time.Now())
 	s.mu.Lock()
 	s.tenants[tn.TenantID] = tn
+	pub := s.public(tn)
 	s.mu.Unlock()
-	writeJSON(w, 200, map[string]string{"tenantID": tn.TenantID})
+	w.Header().Set("Location", "/v1/tenants/"+tn.TenantID)
+	writeJSON(w, 201, pub)
 }
 
 func (s *Server) public(t *tenant) mgmtapi.Tenant {
@@ -266,7 +285,8 @@ func (s *Server) listTenants(w http.ResponseWriter, r *http.Request) {
 		out = append(out, s.public(t))
 	}
 	s.mu.Unlock()
-	writeJSON(w, 200, out)
+	sort.Slice(out, func(i, j int) bool { return out[i].TenantID < out[j].TenantID })
+	writeJSON(w, 200, page(out))
 }
 
 func (s *Server) getTenant(w http.ResponseWriter, r *http.Request) {
@@ -282,21 +302,48 @@ func (s *Server) getTenant(w http.ResponseWriter, r *http.Request) {
 
 // ---- hosts ----
 
+// hostView is the /v1 Host resource.
+func (s *Server) hostView(h *host) map[string]any {
+	st := "live"
+	if time.Since(h.lastSeen) > 10*time.Second {
+		st = "stale"
+	}
+	v := map[string]any{"hostID": h.HostID, "status": st, "capacityNodes": h.CapacityNodes, "tiers": h.Tiers,
+		"liveNodes": h.liveNodes, "lastSeen": ms(h.lastSeen), "createdAt": ms(h.created), "updatedAt": ms(h.lastSeen)}
+	if h.AuditPubKey != "" {
+		v["auditPubKey"] = h.AuditPubKey
+	}
+	return v
+}
+
 func (s *Server) register(w http.ResponseWriter, r *http.Request) {
-	var req mgmtapi.RegisterRequest
-	if err := decode(r, &req); err != nil || req.HostID == "" {
-		writeErr(w, 400, "bad_request", "hostID required")
+	var req struct {
+		mgmtapi.RegisterRequest
+		Push *struct {
+			Port int    `json:"port"`
+			URL  string `json:"url"`
+		} `json:"push"`
+	}
+	if err := decode(r, &req); err != nil {
+		writeErr(w, 400, "bad_request", err.Error())
 		return
+	}
+	req.HostID = r.PathValue("id")
+	if req.Push != nil {
+		req.PushURL, req.PushPort = req.Push.URL, req.Push.Port
 	}
 	s.mu.Lock()
 	h := s.hosts[req.HostID]
+	status := 200
 	if h == nil {
-		h = &host{deployments: map[string]mgmtapi.DeploymentStatus{}}
+		h = &host{deployments: map[string]mgmtapi.DeploymentStatus{}, created: time.Now()}
 		s.hosts[req.HostID] = h
+		status = 201
 	}
-	h.RegisterRequest, h.lastSeen = req, time.Now()
+	h.RegisterRequest, h.lastSeen = req.RegisterRequest, time.Now()
+	v := s.hostView(h)
 	s.mu.Unlock()
-	writeJSON(w, 200, mgmtapi.OK{OK: true})
+	writeJSON(w, status, v)
 }
 
 func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
@@ -320,8 +367,8 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 			dep.Status, dep.Error = d.Status, d.Error
 		}
 	}
-	resp := mgmtapi.HeartbeatResponse{OK: true, Revoke: []string{}, Kill: h.kills}
-	h.kills = nil
+	resp := mgmtapi.HeartbeatResponse{Revoke: []string{}, RevokeObjects: []string{}}
+	h.kills = nil // kills reach hosts through revokeObjects below (and pushes)
 	held := map[string]bool{}
 	for _, l := range req.Leases {
 		cur := s.leases[l.Namespace]
@@ -348,12 +395,12 @@ func (s *Server) assignments(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out = append(out, mgmtapi.Assignment{DeploymentID: d.DeploymentID, TenantID: d.tenantID, Workload: d.workload,
-			BundleURL: "/v0/deployments/" + d.DeploymentID + "/bundle", Namespaces: d.namespaces, Epoch: d.epoch,
+			BundleURL: "/v1/deployments/" + d.DeploymentID + "/bundle", Namespaces: d.namespaces, Epoch: d.epoch,
 			WorkloadTags: d.wlTags, Lease: mgmtapi.LeaseName(d.tenantID, d.workload),
-			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL})
+			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created)})
 	}
 	s.mu.Unlock()
-	writeJSON(w, 200, out)
+	writeJSON(w, 200, page(out))
 }
 
 func (s *Server) sortedDeployments() []*deployment {
@@ -428,7 +475,11 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 	s.leases[wlKey] = &lease{hostID, epoch}
 	for _, c := range app.ClassNames() {
 		cl := app.Classes[c]
-		nss = append(nss, mgmtapi.NamespaceSpec{Class: c, Tags: cl.Tags, Agent: cl.Agent})
+		tags := cl.Tags
+		if tags == nil {
+			tags = []string{}
+		}
+		nss = append(nss, mgmtapi.NamespaceSpec{Class: c, Tags: tags, Agent: cl.Agent})
 	}
 	for _, d := range s.deployments {
 		if d.tenantID == req.TenantID && d.workload == req.Workload {
@@ -438,18 +489,65 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 	d := &deployment{tenantID: req.TenantID, workload: req.Workload, bundle: req.Bundle, namespaces: nss,
 		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now()}
 	d.DeploymentID, d.Host, d.Status = newID("dp"), hostID, "assigned"
-	d.Endpoint = mgmtapi.Endpoint{Node: req.Workload}
 	s.deployments[d.DeploymentID] = d
 	push := s.hosts[hostID].PushURL
 	if s.cfg.NoPush {
 		push = ""
 	}
-	resp := d.DeployResponse
+	resp := s.deploymentView(d)
 	s.mu.Unlock()
 	if push != "" {
-		go s.push(push, "/v0/push/assignments", map[string]any{})
+		go s.push(push, "/v1/push/assignments", map[string]any{})
 	}
-	writeJSON(w, 200, resp)
+	w.Header().Set("Location", "/v1/deployments/"+d.DeploymentID)
+	writeJSON(w, 202, resp)
+}
+
+// deploymentView is the /v1 Deployment resource (s.mu held).
+func (s *Server) deploymentView(d *deployment) mgmtapi.DeployResponse {
+	resp := d.DeployResponse
+	resp.TenantID, resp.Workload, resp.Epoch, resp.CreatedAt = d.tenantID, d.workload, d.epoch, ms(d.created)
+	resp.Namespaces = d.namespaces
+	if resp.Namespaces == nil {
+		resp.Namespaces = []mgmtapi.NamespaceSpec{}
+	}
+	if d.superseded {
+		resp.Status = "superseded"
+	}
+	tailnet := ""
+	if t := s.tenants[d.tenantID]; t != nil {
+		tailnet = t.Tailnet
+	}
+	resp.Endpoint = mgmtapi.Endpoint{Node: d.workload + "-" + d.Host, MagicDNS: d.workload + "-" + d.Host + "." + tailnet, Status: "pending"}
+	if id, ok := s.byName[objKey(d.tenantID, d.workload, mgmtapi.WorkloadNamespace, d.workload)]; ok {
+		if o := s.objects[id]; o != nil {
+			resp.Endpoint.ObjectID, resp.Endpoint.Status = o.ObjectID, o.Status
+			if o.MagicDNS != "" {
+				resp.Endpoint.Node, resp.Endpoint.MagicDNS = strings.Split(o.MagicDNS, ".")[0], o.MagicDNS
+			}
+		}
+	}
+	return resp
+}
+
+func (s *Server) listDeployments(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	s.mu.Lock()
+	out := []mgmtapi.DeployResponse{}
+	for _, d := range s.sortedDeployments() {
+		if tn := q.Get("tenant"); tn != "" && d.tenantID != tn {
+			continue
+		}
+		if wl := q.Get("workload"); wl != "" && d.workload != wl {
+			continue
+		}
+		if q.Get("latest") == "true" && d.superseded {
+			continue
+		}
+		out = append(out, s.deploymentView(d))
+	}
+	s.mu.Unlock()
+	writeJSON(w, 200, page(out))
 }
 
 func (s *Server) getDeployment(w http.ResponseWriter, r *http.Request) {
@@ -460,16 +558,7 @@ func (s *Server) getDeployment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, mgmtapi.CodeNotFound, "no such deployment")
 		return
 	}
-	resp := d.DeployResponse
-	if d.superseded {
-		resp.Status = "superseded"
-	}
-	if id, ok := s.byName[objKey(d.tenantID, d.workload, mgmtapi.WorkloadNamespace, d.workload)]; ok {
-		if o := s.objects[id]; o != nil && o.MagicDNS != "" {
-			resp.Endpoint = mgmtapi.Endpoint{Node: strings.Split(o.MagicDNS, ".")[0], MagicDNS: o.MagicDNS}
-		}
-	}
-	writeJSON(w, 200, resp)
+	writeJSON(w, 200, s.deploymentView(d))
 }
 
 func (s *Server) getBundle(w http.ResponseWriter, r *http.Request) {
@@ -515,10 +604,10 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 	if id, ok := s.byName[k]; ok && workload != "" {
 		o := s.objects[id]
 		if o.Status == "killed" {
-			writeErr(w, 410, mgmtapi.CodeKilled, "object "+o.ObjectID+" was killed")
+			s.writeGone(w, o)
 			return
 		}
-		writeJSON(w, 200, mgmtapi.CreateObjectResponse{ObjectID: o.ObjectID, Status: o.Status, Tags: o.Tags, Hostname: req.Hostname})
+		writeJSON(w, 200, s.view(o))
 		return
 	}
 	l := s.leases[mgmtapi.LeaseName(req.TenantID, workload)]
@@ -533,12 +622,23 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if live >= t.MaxObjects {
-		writeErr(w, 429, "spawn_budget_exceeded", fmt.Sprintf("tenant has %d live objects (maxObjects %d)", live, t.MaxObjects))
+		writeErr(w, 429, "object_quota_exceeded", fmt.Sprintf("tenant has %d live objects (maxObjects %d)", live, t.MaxObjects))
 		return
 	}
 	tags := s.namespaceTags(req.TenantID, workload, req.Namespace)
+	now := time.Now()
+	hn := req.Hostname
+	if hn == "" {
+		hn = newID("o")
+	}
 	o := &object{Object: mgmtapi.Object{ObjectID: newID("o"), TenantID: req.TenantID, Workload: workload, Namespace: req.Namespace,
-		ObjectName: req.ObjectName, Status: "pending", Tags: tags, Host: l.host}, created: time.Now(), workload: workload}
+		ObjectName: req.ObjectName, Hostname: hn, Lease: mgmtapi.LeaseName(req.TenantID, workload), Status: "pending", Tags: tags, Host: l.host,
+		CreatedAt: ms(now), UpdatedAt: ms(now)}, created: now, workload: workload}
+	for _, d := range s.deployments {
+		if d.tenantID == req.TenantID && d.workload == workload && !d.superseded {
+			o.DeploymentID = d.DeploymentID
+		}
+	}
 	if len(req.Caps) > 0 && string(req.Caps) != "null" {
 		if err := json.Unmarshal(req.Caps, &o.caps); err != nil {
 			writeErr(w, 400, "bad_request", "caps must be a JSON object")
@@ -570,17 +670,52 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 		}
 		if pc := s.effectiveCaps(p); o.caps != nil && pc != nil {
 			if bad := subset(o.caps, pc, ""); bad != "" {
-				writeErr(w, 403, "delegation_exceeds_parent", "spawn caps exceed the parent's: "+bad)
+				writeErr(w, 403, "delegation_invalid", "spawn caps exceed the parent's: "+bad)
 				return
 			}
 		} else if pc := s.effectiveCaps(p); pc != nil {
 			o.caps = pc // inherit
 		}
 		o.Parent, o.Lineage = p.ObjectID, lineage
+		o.Ephemeral = req.TTL != ""
 	}
 	s.objects[o.ObjectID] = o
 	s.byName[k] = o.ObjectID
-	writeJSON(w, 200, mgmtapi.CreateObjectResponse{ObjectID: o.ObjectID, Status: o.Status, Tags: o.Tags, Hostname: req.Hostname})
+	w.Header().Set("Location", "/v1/objects/"+o.ObjectID)
+	writeJSON(w, 202, s.view(o))
+}
+
+// view is the /v1 Object resource: lineage is root → self (the internal
+// Lineage holds the ancestors only).
+func (s *Server) view(o *object) mgmtapi.Object {
+	out := o.Object
+	out.Lineage = append(append([]string{}, o.Lineage...), o.ObjectID)
+	out.Root = out.Lineage[0]
+	out.Depth = len(o.Lineage)
+	if out.Tags == nil {
+		out.Tags = []string{}
+	}
+	for _, x := range s.objects {
+		if x.Parent == o.ObjectID {
+			out.Children = append(out.Children, x.ObjectID)
+		}
+	}
+	sort.Strings(out.Children)
+	return out
+}
+
+// writeGone is the 410 tombstone (s.mu held).
+func (s *Server) writeGone(w http.ResponseWriter, o *object) {
+	root := o.ObjectID
+	if len(o.Lineage) > 0 {
+		root = o.Lineage[0]
+	}
+	w.Header().Set("Twd-Error", mgmtapi.CodeKilled)
+	writeJSON(w, 410, map[string]any{"code": mgmtapi.CodeKilled, "message": "object " + o.ObjectID + " was killed", "trace_id": newID(""),
+		"doc_url": netd.DocBase + mgmtapi.CodeKilled,
+		"tombstone": map[string]any{"objectID": o.ObjectID, "tenantID": o.TenantID, "workload": o.workload, "namespace": o.Namespace,
+			"objectName": o.ObjectName, "killedAt": ms(o.killedAt), "reason": o.KillReason, "by": "mgmt", "cascade": false, "root": root,
+			"deviceDeleted": o.NodeID != ""}})
 }
 
 // workloadOf finds the (live) deployment declaring namespace: a DO class,
@@ -698,42 +833,51 @@ func (s *Server) namespaceTags(tenantID, workload, ns string) []string {
 	return tags
 }
 
-func (s *Server) lineage(o *object) mgmtapi.Object {
-	out := o.Object
-	return out
-}
-
 func (s *Server) listObjects(w http.ResponseWriter, r *http.Request) {
-	tn, ns := r.URL.Query().Get("tenant"), r.URL.Query().Get("namespace")
+	q := r.URL.Query()
+	tn, ns, wl := q.Get("tenant"), q.Get("namespace"), q.Get("workload")
 	s.mu.Lock()
 	out := []mgmtapi.Object{}
 	for _, o := range s.objects {
-		if (tn == "" || o.TenantID == tn) && (ns == "" || o.Namespace == ns) {
-			out = append(out, s.lineage(o))
+		if (tn == "" || o.TenantID == tn) && (ns == "" || o.Namespace == ns) && (wl == "" || o.workload == wl) {
+			out = append(out, s.view(o))
 		}
 	}
 	s.mu.Unlock()
-	sort.Slice(out, func(i, j int) bool { return out[i].ObjectID < out[j].ObjectID })
-	writeJSON(w, 200, out)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt != out[j].CreatedAt {
+			return out[i].CreatedAt < out[j].CreatedAt
+		}
+		return out[i].ObjectID < out[j].ObjectID
+	})
+	writeJSON(w, 200, page(out))
 }
 
 func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	o := s.objects[r.PathValue("id")]
-	s.mu.Unlock()
 	if o == nil {
 		writeErr(w, 404, mgmtapi.CodeNotFound, "no such object")
 		return
 	}
-	writeJSON(w, 200, s.lineage(o))
+	if o.Status == "killed" {
+		s.writeGone(w, o)
+		return
+	}
+	writeJSON(w, 200, s.view(o))
 }
 
 // volumeKey releases a workload's DO volume key to the lease holder at
 // the lease's epoch (mgmt.VolumeKey's contract).
 func (s *Server) volumeKey(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	epoch, _ := strconv.ParseInt(q.Get("epoch"), 10, 64)
-	name := mgmtapi.LeaseName(q.Get("tenant"), q.Get("workload"))
+	epoch, _ := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
+	tenantID, workload, ok := strings.Cut(r.PathValue("id"), ":")
+	if !ok {
+		writeErr(w, 400, "bad_request", "volume ID must be <tenantID>:<workload>")
+		return
+	}
+	name := mgmtapi.LeaseName(tenantID, workload)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.VolumeKeyCalls++
@@ -752,8 +896,9 @@ func (s *Server) volumeKey(w http.ResponseWriter, r *http.Request) {
 		rand.Read(k)
 		s.volKeys[name] = k
 	}
-	w.Header().Set("content-type", "application/json")
-	json.NewEncoder(w).Encode(mgmtapi.VolumeKey{Key: k})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 201, map[string]any{"volumeID": r.PathValue("id"), "tenantID": tenantID, "workload": workload, "epoch": epoch,
+		"key": k, "grantedAt": ms(time.Now())})
 }
 
 // VolumeKeyOf returns the volume key fakemgmt holds for (tenant, workload)
@@ -767,6 +912,7 @@ func (s *Server) VolumeKeyOf(tenantID, workload string) []byte {
 func (s *Server) credential(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	epoch, _ := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
+	remint := r.URL.Query().Get("reason") == "rejoin_rejected"
 	s.mu.Lock()
 	o := s.objects[id]
 	if o == nil {
@@ -775,9 +921,16 @@ func (s *Server) credential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if o.Status == "killed" {
+		s.writeGone(w, o)
 		s.mu.Unlock()
-		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
 		return
+	}
+	if remint {
+		// The host's rejoin was rejected by control: back to pending, same
+		// hostname, a fresh key below.
+		delete(s.nodeIDs, o.NodeID)
+		o.Status, o.NodeID, o.StableNodeID, o.MagicDNS = "pending", "", "", ""
+		s.remints++
 	}
 	s.credentialCalls++
 	if s.leaseLostCredentials > 0 {
@@ -798,29 +951,42 @@ func (s *Server) credential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	t := s.tenants[o.TenantID]
-	tags := o.Tags
+	tags, hostname := o.Tags, o.Hostname
 	s.mu.Unlock()
 	if err := t.bucket.wait(r.Context()); err != nil {
+		w.Header().Set("Retry-After", "1")
 		writeErr(w, 503, mgmtapi.CodeIdentityPending, "registration throttle: "+err.Error())
 		return
 	}
+	cred := mgmtapi.Credential{ExpiresAt: ms(time.Now().Add(5 * time.Minute)), Tags: tags, Hostname: hostname,
+		Ephemeral: !s.cfg.NonEphemeral, ControlURL: t.ControlURL, Reminted: remint}
+	if cred.Tags == nil {
+		cred.Tags = []string{}
+	}
 	switch t.MintMode {
 	case "static":
-		writeJSON(w, 200, map[string]string{"authKey": s.cfg.StaticKey})
+		cred.AuthKey = s.cfg.StaticKey
 	case "apikey":
 		k, err := t.minter.AuthKey(r.Context(), netd.KeyRequest{ObjectID: id, Tags: tags, Ephemeral: !s.cfg.NonEphemeral})
 		if err != nil {
 			writeErr(w, 502, "bootstrap_failed", "mint: "+err.Error())
 			return
 		}
-		writeJSON(w, 200, map[string]string{"authKey": k})
+		cred.AuthKey = k
 	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 201, cred)
 }
 
+// ready is PATCH /v1/objects/{id} {"status":"ready", …} (the host's
+// merge patch; the admin's {ttl} is not modelled by the fake).
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	var req mgmtapi.ReadyRequest
-	if err := decode(r, &req); err != nil {
-		writeErr(w, 400, "bad_request", err.Error())
+	var req struct {
+		Status string `json:"status"`
+		mgmtapi.ReadyRequest
+	}
+	if err := decode(r, &req); err != nil || req.Status != "ready" {
+		writeErr(w, 400, "bad_request", "fakemgmt: the patch must be {status: ready, nodeID, stableNodeID, magicDNS, epoch}")
 		return
 	}
 	s.mu.Lock()
@@ -831,53 +997,36 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if o.Status == "killed" {
-		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
+		s.writeGone(w, o)
 		return
 	}
-	o.Status, o.NodeID, o.MagicDNS = "ready", req.StableNodeID, req.MagicDNS
+	o.Status, o.NodeID, o.StableNodeID, o.MagicDNS, o.UpdatedAt = "ready", req.StableNodeID, req.StableNodeID, req.MagicDNS, ms(time.Now())
 	if req.StableNodeID != "" {
 		s.nodeIDs[req.StableNodeID] = o.ObjectID
 	}
-	writeJSON(w, 200, mgmtapi.OK{OK: true})
+	writeJSON(w, 200, s.view(o))
 }
 
-// remint: the host's rejoin was rejected by control; back to pending so the
-// next credential call mints again (same hostname).
-func (s *Server) remint(w http.ResponseWriter, r *http.Request) {
-	var req mgmtapi.RemintRequest
-	if err := decode(r, &req); err != nil {
-		writeErr(w, 400, "bad_request", err.Error())
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	o := s.objects[r.PathValue("id")]
-	if o == nil {
-		writeErr(w, 404, mgmtapi.CodeNotFound, "no such object")
-		return
-	}
-	if o.Status == "killed" {
-		writeErr(w, 410, mgmtapi.CodeKilled, "object was killed")
-		return
-	}
-	delete(s.nodeIDs, o.NodeID)
-	o.Status, o.NodeID, o.MagicDNS = "pending", "", ""
-	s.remints++
-	writeJSON(w, 200, mgmtapi.OK{OK: true})
-}
-
+// kill is DELETE /v1/objects/{id}?cascade=&reason= (202 KillResult).
 func (s *Server) kill(w http.ResponseWriter, r *http.Request) {
-	var req mgmtapi.KillRequest
-	if err := decode(r, &req); err != nil {
-		writeErr(w, 400, "bad_request", err.Error())
+	q := r.URL.Query()
+	s.mu.Lock()
+	o := s.objects[r.PathValue("id")]
+	if o != nil && o.Status == "killed" {
+		s.writeGone(w, o)
+		s.mu.Unlock()
 		return
 	}
-	killed, err := s.Kill(r.Context(), r.PathValue("id"), req.Cascade, req.Reason)
+	s.mu.Unlock()
+	killed, err := s.Kill(r.Context(), r.PathValue("id"), q.Get("cascade") == "true", q.Get("reason"))
 	if err != nil {
 		writeErr(w, 404, mgmtapi.CodeNotFound, err.Error())
 		return
 	}
-	writeJSON(w, 200, mgmtapi.KillResponse{Killed: killed})
+	if killed == nil {
+		killed = []string{}
+	}
+	writeJSON(w, 202, mgmtapi.KillResponse{Killed: killed, DevicesDeleted: []string{}})
 }
 
 // Kill marks an object (and with cascade, its descendants) killed, pushes
@@ -911,7 +1060,7 @@ func (s *Server) Kill(ctx context.Context, id string, cascade bool, reason strin
 		if t.Status == "killed" {
 			continue
 		}
-		t.Status, t.killedAt = "killed", time.Now()
+		t.Status, t.killedAt, t.KillReason, t.UpdatedAt = "killed", time.Now(), reason, ms(time.Now())
 		killed = append(killed, t.ObjectID)
 		ko := mgmtapi.KillOrder{ObjectID: t.ObjectID, Reason: reason}
 		if h := s.hosts[t.Host]; h != nil {
@@ -924,7 +1073,7 @@ func (s *Server) Kill(ctx context.Context, id string, cascade bool, reason strin
 			dels = append(dels, del{tn, t.NodeID})
 		}
 		rec := mgmtapi.AuditRecord{TS: time.Now().UTC().Format(time.RFC3339Nano), ObjectID: t.ObjectID, Kind: "kill",
-			Detail: reason, TraceID: newID("")}
+			Detail: mgmtapi.Note(reason), TraceID: newID(""), Source: "mgmt"}
 		s.appendAudit("mgmt", rec)
 	}
 	s.mu.Unlock()
@@ -935,7 +1084,7 @@ func (s *Server) Kill(ctx context.Context, id string, cascade bool, reason strin
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				s.push(u, "/v0/push/kill", ko)
+				s.push(u, "/v1/push/kill", ko)
 			}()
 		}
 	}
@@ -977,15 +1126,17 @@ func (s *Server) postAudit(w http.ResponseWriter, r *http.Request) {
 	host := "host:" + r.Header.Get("Twd-Host-ID")
 	s.mu.Lock()
 	s.audit[host] = append(s.audit[host], b.Records...)
+	n := len(s.audit[host])
+	ok, _ := mgmtapi.VerifyChain(s.audit[host])
 	s.mu.Unlock()
-	writeJSON(w, 200, mgmtapi.OK{OK: true})
+	writeJSON(w, 201, map[string]any{"accepted": len(b.Records), "chain": mgmtapi.ChainStatus{Chain: host, OK: ok, Records: n}})
 }
 
 func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	resp := mgmtapi.AuditResponse{Records: []mgmtapi.AuditRecord{}, Verified: true}
+	resp := mgmtapi.AuditResponse{Items: []mgmtapi.AuditRecord{}, Chains: []mgmtapi.ChainStatus{}, Verified: true}
 	chains := make([]string, 0, len(s.audit))
 	for c := range s.audit {
 		chains = append(chains, c)
@@ -994,13 +1145,17 @@ func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 	for _, c := range chains {
 		recs := s.audit[c]
 		ok, probs := mgmtapi.VerifyChain(recs)
+		st := mgmtapi.ChainStatus{Chain: c, OK: ok, Records: len(recs)}
 		if !ok {
 			resp.Verified = false
-			for _, p := range probs {
-				resp.Problems = append(resp.Problems, c+": "+p)
-			}
+			st.Error = strings.Join(probs, "; ")
 		}
-		for _, rec := range recs {
+		resp.Chains = append(resp.Chains, st)
+		for i, rec := range recs {
+			rec.Chain, rec.Seq = c, int64(i+1)
+			if rec.Source == "" {
+				rec.Source = "host"
+			}
 			if obj := q.Get("object"); obj != "" && rec.ObjectID != obj {
 				o := s.objects[rec.ObjectID]
 				if o == nil || !contains(o.Lineage, obj) {
@@ -1013,10 +1168,10 @@ func (s *Server) getAudit(w http.ResponseWriter, r *http.Request) {
 			if tr := q.Get("trace"); tr != "" && rec.TraceID != tr {
 				continue
 			}
-			resp.Records = append(resp.Records, rec)
+			resp.Items = append(resp.Items, rec)
 		}
 	}
-	sort.SliceStable(resp.Records, func(i, j int) bool { return resp.Records[i].TS < resp.Records[j].TS })
+	sort.SliceStable(resp.Items, func(i, j int) bool { return resp.Items[i].TS < resp.Items[j].TS })
 	writeJSON(w, 200, resp)
 }
 

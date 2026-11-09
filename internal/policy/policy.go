@@ -105,8 +105,10 @@ func normalize(v any) any {
 	return out
 }
 
-// Missing returns the part of s that the policy doesn't already contain
-// (a tag already in tagOwners counts as present, whatever its owners).
+// Missing returns the part of s that the policy doesn't already contain.
+// For a tag already in tagOwners, the returned owners are only the ones the
+// policy lacks (they are appended by Merge; existing owners are never
+// removed or reordered).
 func Missing(policy []byte, s Snippet) (Snippet, error) {
 	std, err := hujson.Standardize(append([]byte(nil), policy...))
 	if err != nil {
@@ -118,8 +120,19 @@ func Missing(policy []byte, s Snippet) (Snippet, error) {
 	}
 	out := Snippet{TagOwners: map[string][]string{}}
 	for t, owners := range s.TagOwners {
-		if _, ok := d.TagOwners[t]; !ok {
+		have, ok := d.TagOwners[t]
+		if !ok {
 			out.TagOwners[t] = owners
+			continue
+		}
+		var add []string
+		for _, o := range owners {
+			if !slices.Contains(have, o) && !slices.Contains(add, o) {
+				add = append(add, o)
+			}
+		}
+		if len(add) > 0 {
+			out.TagOwners[t] = add
 		}
 	}
 	out.Grants = missingEntries(d.Grants, s.Grants)
@@ -283,7 +296,14 @@ func MergeWith(policy []byte, s Snippet, o Options) ([]byte, error) {
 			}
 			sort.Strings(tags)
 			for _, t := range tags {
-				ops = append(ops, map[string]any{"op": "add", "path": "/tagOwners/" + ptrEscape(t), "value": miss.TagOwners[t]})
+				if v.Find("/tagOwners/"+ptrEscape(t)) == nil {
+					ops = append(ops, map[string]any{"op": "add", "path": "/tagOwners/" + ptrEscape(t), "value": miss.TagOwners[t]})
+					continue
+				}
+				// An existing tag: append the missing owners, one by one.
+				for _, o := range miss.TagOwners[t] {
+					ops = append(ops, map[string]any{"op": "add", "path": "/tagOwners/" + ptrEscape(t) + "/-", "value": o})
+				}
 			}
 		}
 	}
@@ -348,9 +368,23 @@ func VerifyAdditive(before, after []byte, added Snippet) error {
 	bt, _ := b["tagOwners"].(map[string]any)
 	at, _ := a["tagOwners"].(map[string]any)
 	for t, bo := range bt {
-		if ao, ok := at[t]; !ok {
+		ao, ok := at[t]
+		if !ok {
 			diff = append(diff, "- tagOwners."+t+" (removed)")
-		} else if !reflect.DeepEqual(normalize(bo), normalize(ao)) {
+			continue
+		}
+		if reflect.DeepEqual(normalize(bo), normalize(ao)) {
+			continue
+		}
+		// Allowed change: the snippet's owners appended after the existing ones.
+		bl, _ := bo.([]any)
+		al, _ := ao.([]any)
+		want := make([]any, 0, len(bl)+len(added.TagOwners[t]))
+		want = append(want, bl...)
+		for _, o := range added.TagOwners[t] {
+			want = append(want, o)
+		}
+		if !reflect.DeepEqual(normalize(want), normalize(al)) {
 			diff = append(diff, "~ tagOwners."+t+" (modified: "+compactJSON(bo)+" → "+compactJSON(ao)+")")
 		}
 	}
@@ -485,4 +519,23 @@ func ApplyWith(ctx context.Context, api API, s Snippet, o Options) (ApplyResult,
 	}
 	res.Changed, res.NewETag = true, ne
 	return res, nil
+}
+
+// InfraSnippet is the policy every twd deployment needs for its own nodes
+// (normal operation is tsnet only): tag:twd owns twd's tags; mgmt's node is
+// tag:twd-mgmt and each host's node tag:twd-host (owned by tag:twd so the
+// trust credential can mint host join keys); hosts call mgmt's API on
+// :80/:443 and mgmt pushes kills to the hosts' nodes on pushPort.
+func InfraSnippet(pushPort int) Snippet {
+	return Snippet{
+		TagOwners: map[string][]string{
+			"tag:twd":      {"autogroup:admin"},
+			"tag:twd-mgmt": {"autogroup:admin"},
+			"tag:twd-host": {"autogroup:admin", "tag:twd"},
+		},
+		Grants: []map[string]any{
+			{"src": []string{"tag:twd-host"}, "dst": []string{"tag:twd-mgmt"}, "ip": []string{"tcp:443", "tcp:80"}},
+			{"src": []string{"tag:twd-mgmt"}, "dst": []string{"tag:twd-host"}, "ip": []string{fmt.Sprintf("tcp:%d", pushPort)}},
+		},
+	}
 }

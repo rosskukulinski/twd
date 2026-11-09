@@ -16,6 +16,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/internal/procsb"
+	v1 "github.com/rosskukulinski/twd/mgmt/api/v1"
 	"github.com/rosskukulinski/twd/netd"
 	"github.com/rosskukulinski/twd/netd/nettest"
 )
@@ -85,7 +86,13 @@ func Start(t testing.TB, o Options) *Env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: fm}
+	// Every request and response between hostd and the fake is checked
+	// against api/openapi.yaml: a shape drift on either side fails the test.
+	val, err := v1.NewValidator()
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: val.Middleware(func(err error) { t.Errorf("mgmt /v1 spec violation: %v", err) })(fm)}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Close() })
 	cli, _ := mgmtapi.NewClient("unix://" + sock)
@@ -93,7 +100,7 @@ func Start(t testing.TB, o Options) *Env {
 	var tr struct {
 		TenantID string `json:"tenantID"`
 	}
-	if err := cli.Do(ctx, "POST", "/v0/tenants", o.Tenant, &tr); err != nil {
+	if err := cli.Do(ctx, "POST", "/v1/tenants", tenantCreate(o.Tenant), &tr); err != nil {
 		t.Fatal(err)
 	}
 	hc, _ := mgmtapi.NewClient("unix://" + sock)
@@ -116,6 +123,23 @@ func Start(t testing.TB, o Options) *Env {
 	return &Env{T: t, FM: fm, Mgmt: cli, Host: h, TenantID: tr.TenantID, Dir: dir}
 }
 
+// tenantCreate is the spec's TenantCreate body (no read-only fields).
+func tenantCreate(t mgmtapi.Tenant) map[string]any {
+	m := map[string]any{"tailnet": t.Tailnet, "mintMode": t.MintMode}
+	for k, v := range map[string]string{"controlURL": t.ControlURL, "apiKeyFile": t.APIKeyFile, "wifClientID": t.WIFClientID, "tier": t.Tier, "tenantID": t.TenantID} {
+		if v != "" {
+			m[k] = v
+		}
+	}
+	if t.RegistrationsPerMinute > 0 {
+		m["registrationsPerMinute"] = t.RegistrationsPerMinute
+	}
+	if t.MaxObjects > 0 {
+		m["maxObjects"] = t.MaxObjects
+	}
+	return m
+}
+
 // AddTenant creates another tenant in fakemgmt and returns an Env view of
 // it (same mgmt and host; Deploy/WaitActive/WaitObject act for it).
 func (e *Env) AddTenant(t mgmtapi.Tenant) *Env {
@@ -123,7 +147,7 @@ func (e *Env) AddTenant(t mgmtapi.Tenant) *Env {
 	var tr struct {
 		TenantID string `json:"tenantID"`
 	}
-	if err := e.Mgmt.Do(context.Background(), "POST", "/v0/tenants", t, &tr); err != nil {
+	if err := e.Mgmt.Do(context.Background(), "POST", "/v1/tenants", tenantCreate(t), &tr); err != nil {
 		e.T.Fatal(err)
 	}
 	c := *e
@@ -139,11 +163,25 @@ func (e *Env) Deploy(appDir, workload string, vars map[string]string) string {
 		e.T.Fatal(err)
 	}
 	var resp mgmtapi.DeployResponse
-	if err := e.Mgmt.Do(context.Background(), "POST", "/v0/deployments",
+	if err := e.Mgmt.Do(context.Background(), "POST", "/v1/deployments",
 		mgmtapi.DeployRequest{TenantID: e.TenantID, Workload: workload, Bundle: MustTar(files)}, &resp); err != nil {
 		e.T.Fatal(err)
 	}
 	return resp.DeploymentID
+}
+
+// Audit fetches the audit page for an object ("" = everything).
+func (e *Env) Audit(objectID string) mgmtapi.AuditResponse {
+	e.T.Helper()
+	var resp mgmtapi.AuditResponse
+	path := "/v1/audit?limit=500"
+	if objectID != "" {
+		path += "&object=" + objectID
+	}
+	if err := e.Mgmt.Do(context.Background(), "GET", path, nil, &resp); err != nil {
+		e.T.Logf("audit: %v", err)
+	}
+	return resp
 }
 
 // DeployNode builds a runtime "node" app and deploys it as workload.
@@ -160,7 +198,7 @@ func (e *Env) DeployNode(appDir, workload string, vars map[string]string) string
 func (e *Env) DeployFiles(files map[string][]byte, workload string) string {
 	e.T.Helper()
 	var resp mgmtapi.DeployResponse
-	if err := e.Mgmt.Do(context.Background(), "POST", "/v0/deployments",
+	if err := e.Mgmt.Do(context.Background(), "POST", "/v1/deployments",
 		mgmtapi.DeployRequest{TenantID: e.TenantID, Workload: workload, Bundle: MustTar(files)}, &resp); err != nil {
 		e.T.Fatal(err)
 	}

@@ -16,12 +16,16 @@ type Store interface {
 	GetTenant(ctx context.Context, id string) (Tenant, error)
 	// UpdateTenant rewrites mint configuration and limits (not ID/tailnet).
 	UpdateTenant(ctx context.Context, t Tenant) error
-	ListTenants(ctx context.Context) ([]Tenant, error)
+	ListTenants(ctx context.Context, pg Page) ([]Tenant, error)
+	// DeleteTenant removes the tenant row (objects, deployments and leases
+	// of the tenant must already be gone or are removed with it).
+	DeleteTenant(ctx context.Context, id string) error
 
 	UpsertHost(ctx context.Context, h Host) error
 	GetHost(ctx context.Context, id string) (Host, error)
-	ListHosts(ctx context.Context) ([]Host, error)
+	ListHosts(ctx context.Context, pg Page) ([]Host, error)
 	TouchHost(ctx context.Context, id string, liveNodes int, now time.Time) error
+	DeleteHost(ctx context.Context, id string) error
 
 	CreateDeployment(ctx context.Context, d Deployment) error
 	GetDeployment(ctx context.Context, id string) (Deployment, error)
@@ -34,6 +38,11 @@ type Store interface {
 	FindClass(ctx context.Context, tenantID, workload, class string) (Deployment, ClassConfig, error)
 	// LatestDeployments returns the latest deployment of every workload of a tenant.
 	LatestDeployments(ctx context.Context, tenantID string) ([]Deployment, error)
+	// ListDeployments lists deployments (Latest: only the newest per
+	// (tenant, workload)) ordered by (created_at, id).
+	ListDeployments(ctx context.Context, f DeploymentFilter, pg Page) ([]Deployment, error)
+	// StopDeployment marks a deployment stopped (undeploy).
+	StopDeployment(ctx context.Context, id string, now time.Time) error
 
 	// Object identity is (tenant, workload, namespace = class, name).
 	CreateObject(ctx context.Context, o Object) error // ErrExists on (tenant, workload, namespace, name)
@@ -49,7 +58,7 @@ type Store interface {
 	// DeleteDeadObjects removes a tenant's killed and failed objects (twd
 	// down --purge), so their names and IDs can be used again. It returns
 	// the removed objects; audit records are untouched.
-	DeleteDeadObjects(ctx context.Context, tenantID string) ([]Object, error)
+	DeleteDeadObjects(ctx context.Context, tenantID string, statuses []string) ([]Object, error)
 
 	AcquireLease(ctx context.Context, name, holder string, ttl time.Duration, now time.Time) (Lease, error)
 	RenewLease(ctx context.Context, name, holder string, epoch int64, ttl time.Duration, now time.Time) (Lease, error)
@@ -61,6 +70,8 @@ type Store interface {
 	// stored as submitted (host chains) and verified on read.
 	AppendAudit(ctx context.Context, rec AuditRecord) (AuditRecord, error)
 	ListAudit(ctx context.Context, f AuditFilter) ([]AuditRecord, error)
+	// CountObjects counts objects per status (GET /v1/status).
+	CountObjects(ctx context.Context) (map[string]int, error)
 	AuditChains(ctx context.Context) ([]string, error)
 	AuditHead(ctx context.Context, chain string) (seq int64, hash string, err error)
 
@@ -89,6 +100,15 @@ type ObjectFilter struct {
 	StableNodeID string
 	Status       []string
 	HasParent    bool
+	Page         Page
+}
+
+// DeploymentFilter selects deployments; empty fields match everything.
+type DeploymentFilter struct {
+	TenantID string
+	Workload string
+	HostID   string
+	Latest   bool
 }
 
 // AuditFilter selects audit records; empty fields match everything.
@@ -98,5 +118,9 @@ type AuditFilter struct {
 	ActingFor string
 	TraceID   string
 	TenantID  string
-	Limit     int
+	Kinds     []string
+	Since     string // RFC 3339; records with ts >= Since
+	Until     string
+	Limit     int // deprecated: use Page.Limit
+	Page      Page
 }

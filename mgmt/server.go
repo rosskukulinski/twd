@@ -16,7 +16,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/tailscale/peercred"
 
@@ -84,14 +83,19 @@ func AdminGrantSnippet(src string) string {
 	return `{"src": ["` + src + `"], "dst": ["` + MgmtTag + `"], "ip": ["tcp:443", "tcp:80"], "app": {"` + AdminCap + `": [{}]}}`
 }
 
-// Server is the v0 HTTP API.
+// Server is the /v1 HTTP API (api/openapi.yaml; handlers in v1.go).
 type Server struct {
 	M *Mgmt
 	// Admins, if set, are tailnet logins admitted as admins even without
 	// AdminCap (an operator override; the cap is the normal path).
 	Admins []string
-	// Self describes mgmt's own tailnet node (GET /v0/whoami).
+	// Self describes mgmt's own tailnet node (GET /v1/whoami).
 	Self SelfInfo
+	// Listeners names what mgmt is serving on (GET /v1/status), e.g.
+	// "tsnet:80", "tsnet:443", "funnel:443", "unix:/path" (local-dev).
+	Listeners []string
+	// Version is reported by GET /v1/status.
+	Version string
 }
 
 // SelfInfo is mgmt's own identity, reported to callers so `twd link` can
@@ -101,7 +105,32 @@ type SelfInfo struct {
 	Tailnet string `json:"tailnet,omitempty"` // MagicDNS suffix
 	HTTPS   bool   `json:"https"`             // the API is served on :443 with the node's cert
 	Issuer  string `json:"issuer,omitempty"`  // WIF issuer base URL (Funnel)
+	// Transport is how this request reached mgmt: "tsnet" (normal
+	// operation) or "local-dev" (the unix socket behind --local-dev).
+	Transport string `json:"transport,omitempty"`
+	// NodeID is mgmt's own stable node ID (not serialised): a caller with
+	// this WhoIs identity is the operator console (loopback).
+	NodeID string `json:"-"`
+	// IP is mgmt's tailnet IPv4.
+	IP string `json:"ip,omitempty"`
 }
+
+// Loopback is <state>/mgmt/loopback.json (0600): how the twd CLI on the
+// host machine reaches mgmt through mgmt's own tsnet node (tsnet
+// Loopback: a SOCKS5 proxy on 127.0.0.1 with a per-start credential). The
+// connection then arrives from mgmt's own node, which WhoIs resolves to
+// the operator principal. No API runs on a unix socket in this mode.
+type Loopback struct {
+	Addr      string `json:"addr"`      // 127.0.0.1:port (SOCKS5 + HTTP proxy)
+	ProxyCred string `json:"proxyCred"` // SOCKS5 password (user "tsnet")
+	MgmtIP    string `json:"mgmtIP"`    // dial this through the proxy
+	DNSName   string `json:"dnsName,omitempty"`
+	HTTPS     bool   `json:"https"`
+	PID       int    `json:"pid"`
+}
+
+// String never prints the credential.
+func (Loopback) String() string { return "mgmt.Loopback{[REDACTED]}" }
 
 func decodeB64(s string) ([]byte, error) { return base64.StdEncoding.DecodeString(s) }
 
@@ -197,7 +226,7 @@ func hostOf(r *http.Request) string {
 	return r.URL.Query().Get("host")
 }
 
-// WhoAmI is GET /v0/whoami.
+// WhoAmI is GET /v1/whoami.
 type WhoAmI struct {
 	Kind   string   `json:"kind"`
 	Login  string   `json:"login,omitempty"`
@@ -207,302 +236,6 @@ type WhoAmI struct {
 	Admin  bool     `json:"admin"`
 	Actor  string   `json:"actor"`
 	Mgmt   SelfInfo `json:"mgmt"`
-}
-
-// Handler returns the API mux.
-func (s *Server) Handler() http.Handler {
-	m := s.M
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v0/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) })
-	// whoami answers every authenticated principal (hosts included): it
-	// tells a caller who mgmt thinks they are and where mgmt lives.
-	mux.HandleFunc("GET /v0/whoami", func(w http.ResponseWriter, r *http.Request) {
-		p := principalOf(r.Context())
-		if p.Kind == "" {
-			writeErr(w, r, errf(401, "no_identity", "unauthenticated"))
-			return
-		}
-		writeJSON(w, 200, WhoAmI{Kind: p.Kind, Login: p.Login, NodeID: p.NodeID, Tags: p.Tags, HostID: p.HostID,
-			Admin: s.allowed(p, roleAdmin), Actor: p.Actor(r), Mgmt: s.Self})
-	})
-
-	// Tenants.
-	mux.HandleFunc("POST /v0/tenants", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req TenantRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		t, err := m.CreateTenant(r.Context(), req)
-		if err != nil {
-			return nil, err
-		}
-		out := map[string]any{"tenantID": t.ID}
-		if info := m.IssuerInfo(t); info != nil && t.MintMode == MintWIF {
-			out["wif"] = info
-		}
-		return out, nil
-	}))
-	mux.HandleFunc("GET /v0/tenants", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		ts, err := m.store.ListTenants(r.Context())
-		if ts == nil {
-			ts = []Tenant{}
-		}
-		return ts, err
-	}))
-	mux.HandleFunc("GET /v0/tenants/{id}", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		t, err := m.store.GetTenant(r.Context(), r.PathValue("id"))
-		if err != nil {
-			return nil, err
-		}
-		pub, err := m.OBOPublicKey(r.Context(), t.ID)
-		if err != nil {
-			return nil, err
-		}
-		return struct {
-			Tenant
-			WIF           map[string]any `json:"wif,omitempty"`
-			MintQueue     int            `json:"mintQueue"`
-			EffectiveRate float64        `json:"effectiveRegistrationsPerMinute"`
-			// OBOPublicKey (RT-01) verifies this tenant's node certificates
-			// (GET /v0/certs/{stableNodeID}); hosts pin it per tenant.
-			OBOPublicKey string `json:"oboPublicKey"`
-		}{t, m.IssuerInfo(t), m.QueueDepth(t.ID), m.throttle(t).Rate(), pub}, nil
-	}))
-
-	mux.HandleFunc("PUT /v0/tenants/{id}/wif", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var u WIFUpdate
-		if err := readJSON(r, &u); err != nil {
-			return nil, err
-		}
-		t, err := m.UpdateTenantWIF(r.Context(), r.PathValue("id"), u)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"tenantID": t.ID, "mintMode": t.MintMode, "wif": m.IssuerInfo(t)}, nil
-	}))
-	mux.HandleFunc("POST /v0/tenants/{id}/wif-check", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.WIFCheck(r.Context(), r.PathValue("id"))
-	}))
-
-	// Node certificates (ADR-010, RT-01): the receiving host fetches the
-	// sender's certificate by its WhoIs stable node ID and narrows the
-	// sender's CapMap by cert.lim.
-	mux.HandleFunc("GET /v0/certs/{nodeID}", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		w.Header().Set("Cache-Control", "no-store")
-		return m.NodeCert(r.Context(), r.URL.Query().Get("tenant"), r.PathValue("nodeID"))
-	}))
-
-	// Hosts.
-	mux.HandleFunc("POST /v0/hosts/register", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req RegisterRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		p := principalOf(r.Context())
-		if p.Kind == "host" && p.HostID != "" && p.HostID != req.HostID {
-			return nil, errf(403, "host_identity_mismatch", "this node is registered as host %s", p.HostID)
-		}
-		if err := m.RegisterHost(r.Context(), req, p.NodeID); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, nil
-	}))
-	mux.HandleFunc("POST /v0/hosts/{id}/heartbeat", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req struct {
-			LiveNodes   int                `json:"liveNodes"`
-			Leases      []HeartbeatLease   `json:"leases"`
-			Deployments []DeploymentStatus `json:"deployments"`
-		}
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		return m.Heartbeat(r.Context(), r.PathValue("id"), req.LiveNodes, req.Leases, req.Deployments...)
-	}))
-	mux.HandleFunc("GET /v0/hosts/{id}/assignments", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.Assignments(r.Context(), r.PathValue("id"))
-	}))
-	mux.HandleFunc("GET /v0/hosts", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		hs, err := m.store.ListHosts(r.Context())
-		if hs == nil {
-			hs = []Host{}
-		}
-		return hs, err
-	}))
-
-	// Deployments.
-	mux.HandleFunc("POST /v0/deployments", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req DeployRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		req.By = principalOf(r.Context()).Actor(r)
-		return m.Deploy(r.Context(), req)
-	}))
-	mux.HandleFunc("GET /v0/deployments/{id}", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.GetDeployment(r.Context(), r.PathValue("id"))
-	}))
-	mux.HandleFunc("GET /v0/deployments", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		ds, err := m.store.LatestDeployments(r.Context(), r.URL.Query().Get("tenant"))
-		if err != nil {
-			return nil, err
-		}
-		out := []DeploymentView{}
-		for _, d := range ds {
-			if v, err := m.GetDeployment(r.Context(), d.ID); err == nil {
-				out = append(out, v)
-			}
-		}
-		return out, nil
-	}))
-	mux.HandleFunc("POST /v0/tenants/{id}/preflight", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req PreflightRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		return m.Preflight(r.Context(), r.PathValue("id"), req)
-	}))
-	mux.HandleFunc("GET /v0/status", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return map[string]any{"ok": true, "pendingDeviceDeletes": m.PendingDeletes()}, nil
-	}))
-	mux.HandleFunc("POST /v0/tenants/{id}/purge", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.Purge(r.Context(), r.PathValue("id"))
-	}))
-	mux.HandleFunc("POST /v0/flush", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		n := m.PendingDeletes()
-		m.FlushDeletes()
-		return map[string]any{"ok": true, "flushed": n}, nil
-	}))
-	mux.HandleFunc("GET /v0/deployments/{id}/bundle", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		d, err := m.store.GetDeployment(r.Context(), r.PathValue("id"))
-		if err != nil {
-			return nil, err
-		}
-		if p := principalOf(r.Context()); p.Kind == "host" && d.HostID != p.HostID {
-			return nil, errf(403, "forbidden", "deployment %s is not assigned to host %s", d.ID, p.HostID)
-		}
-		w.Header().Set("Content-Type", "application/x-tar")
-		w.Write(d.Bundle)
-		return nil, nil
-	}))
-
-	// Objects.
-	mux.HandleFunc("POST /v0/objects", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req CreateObjectRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		if req.TraceID == "" {
-			req.TraceID = r.Header.Get("Twd-Trace-ID")
-		}
-		return m.CreateObject(r.Context(), req)
-	}))
-	mux.HandleFunc("GET /v0/objects", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.ListObjects(r.Context(), r.URL.Query().Get("tenant"), r.URL.Query().Get("workload"), r.URL.Query().Get("namespace"))
-	}))
-	mux.HandleFunc("GET /v0/objects/{id}", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		return m.GetObject(r.Context(), r.PathValue("id"))
-	}))
-	mux.HandleFunc("GET /v0/objects/{id}/credential", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		epoch, err := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
-		if err != nil || epoch <= 0 {
-			return nil, errf(400, "bad_request", "epoch query parameter required")
-		}
-		wait := 10 * time.Second
-		if v := r.URL.Query().Get("wait"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 30 {
-				wait = time.Duration(n) * time.Second
-			}
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		return m.Credential(r.Context(), r.PathValue("id"), hostOf(r), epoch, wait)
-	}))
-	mux.HandleFunc("GET /v0/volumes/key", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		q := r.URL.Query()
-		epoch, err := strconv.ParseInt(q.Get("epoch"), 10, 64)
-		if err != nil || epoch <= 0 {
-			return nil, errf(400, "bad_request", "epoch query parameter required")
-		}
-		w.Header().Set("Cache-Control", "no-store")
-		key, err := m.VolumeKey(r.Context(), q.Get("tenant"), q.Get("workload"), hostOf(r), epoch)
-		if err != nil {
-			return nil, err
-		}
-		return VolumeKeyResponse{Key: key}, nil
-	}))
-	mux.HandleFunc("POST /v0/objects/{id}/ready", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req ReadyRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		return m.Ready(r.Context(), r.PathValue("id"), hostOf(r), req)
-	}))
-	mux.HandleFunc("POST /v0/objects/{id}/remint", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req RemintRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		return m.Remint(r.Context(), r.PathValue("id"), hostOf(r), req)
-	}))
-	mux.HandleFunc("POST /v0/objects/{id}/kill", s.h(roleHost|roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req KillRequest
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		p := principalOf(r.Context())
-		req.By = p.Actor(r)
-		if p.Kind == "host" {
-			// Hosts may only kill objects in namespaces they hold.
-			o, err := m.store.GetObject(r.Context(), r.PathValue("id"))
-			if err != nil {
-				return nil, err
-			}
-			if l, err := m.store.GetLease(r.Context(), o.Lease); err != nil || l.Holder != p.HostID {
-				return nil, errf(403, "forbidden", "host %s does not hold %s", p.HostID, o.Lease)
-			}
-		}
-		return m.Kill(r.Context(), r.PathValue("id"), req)
-	}))
-
-	// Audit.
-	mux.HandleFunc("POST /v0/audit", s.h(roleHost, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		var req struct {
-			Records []json.RawMessage `json:"records"`
-		}
-		if err := readJSON(r, &req); err != nil {
-			return nil, err
-		}
-		host := hostOf(r)
-		if host == "" {
-			return nil, errf(400, "bad_request", "audit records need a host (Twd-Host-ID header on the unix socket)")
-		}
-		n, st, err := m.IngestAudit(r.Context(), host, req.Records)
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": true, "accepted": n, "chain": st}, nil
-	}))
-	mux.HandleFunc("GET /v0/audit", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		q := r.URL.Query()
-		limit, _ := strconv.Atoi(q.Get("limit"))
-		recs, chains, err := m.QueryAudit(r.Context(), AuditFilter{ObjectID: q.Get("object"), ActingFor: q.Get("human"),
-			TraceID: q.Get("trace"), TenantID: q.Get("tenant"), Chain: q.Get("chain"), Limit: limit})
-		if err != nil {
-			return nil, err
-		}
-		ok := true
-		for _, c := range chains {
-			ok = ok && c.OK
-		}
-		return map[string]any{"records": recs, "chains": chains, "verified": ok}, nil
-	}))
-	mux.HandleFunc("GET /v0/audit/verify", s.h(roleAdmin, func(w http.ResponseWriter, r *http.Request) (any, error) {
-		chains, ok, err := m.VerifyAll(r.Context())
-		if err != nil {
-			return nil, err
-		}
-		return map[string]any{"ok": ok, "chains": chains}, nil
-	}))
-	return mux
 }
 
 // ---- listeners ----
@@ -655,16 +388,25 @@ func (s *Server) TailnetHandler(whois WhoIsFunc, h http.Handler) http.Handler {
 		}
 		p := Principal{NodeID: wi.NodeID, Tags: wi.Tags, Caps: wi.Caps}
 		switch {
+		case s.Self.NodeID != "" && wi.NodeID == s.Self.NodeID:
+			// mgmt's own node: the operator console on the host machine
+			// (the twd CLI dials through the node's loopback proxy, so the
+			// connection carries mgmt's identity). Local admin, like the
+			// local-dev socket, but over the tsnet listener.
+			p.Kind = "local"
+			p.Login = "operator"
 		case slices.Contains(wi.Tags, HostTag):
 			p.Kind = "host"
-			hosts, _ := s.M.store.ListHosts(r.Context())
+			hosts, _ := s.M.store.ListHosts(r.Context(), Page{})
 			for _, hst := range hosts {
 				if hst.NodeID == wi.NodeID {
 					p.HostID = hst.ID
 				}
 			}
-			if p.HostID == "" && r.URL.Path != "/v0/hosts/register" {
-				writeErr(w, r, errf(403, "host_not_registered", "node %s must POST /v0/hosts/register first", wi.NodeID))
+			registerOrProbe := (r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/hosts/") && strings.Count(r.URL.Path, "/") == 3) ||
+				(r.Method == http.MethodGet && (r.URL.Path == "/v1/healthz" || r.URL.Path == "/v1/whoami"))
+			if p.HostID == "" && !registerOrProbe {
+				writeErr(w, r, errf(403, "host_not_registered", "node %s (%s) has not registered; PUT /v1/hosts/{id} first", wi.NodeID, HostTag))
 				return
 			}
 		default:

@@ -225,7 +225,7 @@ func TestMgmtRealWIF(t *testing.T) {
 		t.Fatal(err)
 	}
 	hostID := "h-" + run
-	m.RegisterHost(ctx, mgmt.RegisterRequest{HostID: hostID, CapacityNodes: 4}, "")
+	m.RegisterHost(ctx, mgmt.RegisterRequest{HostID: hostID, CapacityNodes: 4}, "", "")
 	dep, err := m.Deploy(ctx, mgmt.DeployRequest{TenantID: tenantID, Workload: prefix, Namespaces: []mgmt.ClassConfig{{Class: prefix, Tags: []string{"tag:ttest"}}}})
 	if err != nil {
 		t.Fatal(err)

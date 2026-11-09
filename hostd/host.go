@@ -113,6 +113,13 @@ type Config struct {
 	// tests and demos turn it on so that objects can exercise each other's
 	// tailnet-facing authorization (e.g. e2e check (d), RT-01).
 	AllowSiblingEgress bool
+	// PushListener, when set, also serves the push API (mgmt → hostd:
+	// kills, assignment changes) on it: the host's own tsnet node in
+	// normal operation. PushPort is the port it listens on; it is sent
+	// to mgmt at registration so pushes go to the WhoIs node's address.
+	// The unix push socket (local-dev) is always served too.
+	PushListener net.Listener
+	PushPort     int
 }
 
 // Host is a running twd-hostd.
@@ -227,6 +234,9 @@ func (h *Host) Start(ctx context.Context) error {
 	ln = procsb.Guard(ln, nil)
 	h.pushSrv = &http.Server{Handler: h.pushAPI(), ReadHeaderTimeout: 10 * time.Second}
 	go h.pushSrv.Serve(ln)
+	if h.cfg.PushListener != nil {
+		go h.pushSrv.Serve(h.cfg.PushListener)
+	}
 	if err := h.register(ctx); err != nil {
 		h.pushSrv.Close()
 		return fmt.Errorf("hostd: register: %w", err)
@@ -244,9 +254,16 @@ func (h *Host) register(ctx context.Context) error {
 	if h.cfg.VM != nil {
 		tiers = append(tiers, "microvm")
 	}
-	return h.mgmt.Register(ctx, mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes,
-		Tiers: tiers, PushURL: "unix://" + h.pushSock,
-		AuditPubKey: base64.StdEncoding.EncodeToString(h.audit.key.Public().(ed25519.PublicKey))})
+	req := mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes, Tiers: tiers,
+		AuditPubKey: base64.StdEncoding.EncodeToString(h.audit.key.Public().(ed25519.PublicKey))}
+	if h.cfg.PushPort > 0 {
+		// tsnet transport: mgmt pushes to this host's node at PushPort.
+		req.PushPort = h.cfg.PushPort
+	} else {
+		// local-dev: the unix push socket.
+		req.PushURL = "unix://" + h.pushSock
+	}
+	return h.mgmt.Register(ctx, req)
 }
 
 // Close stops every workload and node (node state is kept for rejoin).
@@ -372,9 +389,6 @@ func (h *Host) heartbeat(ctx context.Context) error {
 	resp, err := h.mgmt.Heartbeat(ctx, h.cfg.HostID, req)
 	if err != nil {
 		return err
-	}
-	for _, k := range resp.Kill {
-		go h.killLocal(k.ObjectID, k.Reason)
 	}
 	for _, id := range resp.RevokeObjects {
 		go h.killLocal(id, "revoked by mgmt")

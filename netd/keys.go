@@ -15,7 +15,8 @@ type KeyRequest struct {
 	// (NeedsLogin: the device expired or was removed, which is what happens
 	// to an ephemeral node that is offline during a restart). The object
 	// needs a fresh key under the same hostname; mgmt-backed sources must
-	// move the object out of "ready" first (POST /v0/objects/{id}/remint).
+	// move the object out of "ready" first (POST /v1/objects/{id}/credentials
+	// ?reason=rejoin_rejected).
 	Remint bool
 }
 

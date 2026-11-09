@@ -1,3 +1,5 @@
+> **Note (M11):** this file describes the v0 era. The mgmt API is now `/v1`, specified in `api/openapi.yaml`; `mgmt-api.md` is **generated** from it (`make api`). The hostd-side facts below (audit hash input, push API, platform wrapper sockets) still hold; the `/v0` route names are historical and map to `/v1` per the spec's "Replaces …" notes.
+
 # Contract: twd-hostd additions (M3, backward compatible)
 
 These extend `mgmt-api.md` (v0 + the M2 "v0 clarifications"). All of them are optional: M2's twd-mgmt (origin/m2-mgmt b08b5e4) works with twd-hostd unmodified (`make test-m2mgmt`). The one exception is the workload entry node; see gap 1.

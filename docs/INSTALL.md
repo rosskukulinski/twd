@@ -215,7 +215,7 @@ twd deploy                               # bundles here (built-in esbuild), uplo
 twd ls · twd audit <object> · twd kill <object> --cascade
 ```
 
-`twd link` calls mgmt's `GET /v0/whoami` over your own Tailscale
+`twd link` calls mgmt's `GET /v1/whoami` over your own Tailscale
 connection. mgmt identifies the caller by **WhoIs** (your login, or your
 node's tags) and admits admins by the `twd.dev/cap/admin` capability; it
 stores only the endpoint in `~/.twd/link.json`. No key, no token, nothing
@@ -223,6 +223,34 @@ to rotate. If you are not an admin, `twd link` fails with `not_admin` and
 prints the grant to add. `twd ls` shows `by <login>` on each deployment
 and `twd audit` carries your login on the deploy record. Logs stay on the
 host (`twd logs` there). `twd link --unlink` forgets the endpoint.
+
+#### Transport: tsnet only
+
+Normal operation never uses a unix socket or a token. mgmt serves the
+`/v1` API (OpenAPI: `api/openapi.yaml`, rendered in
+`docs/contracts/mgmt-api.md`) on its own tailnet node `twd-mgmt`
+(`tag:twd-mgmt`), authenticated by WhoIs. twd-hostd runs its **own** node
+`twd-host-<hostID>` (`tag:twd-host`), joined once with a single-use key
+mgmt mints through the trust credential (or the API key), and talks to mgmt
+over the tailnet; mgmt pushes kills to that node (port 7474). The `twd` CLI
+on the host machine reaches mgmt through the node's loopback proxy
+(`~/.twd/mgmt/loopback.json`, 0600), so it is the operator by WhoIs; a
+developer machine uses `twd link` (its own Tailscale) or `twd link --tsnet`
+(no Tailscale installed: an ephemeral CLI node with an interactive login,
+state under `~/.twd/cli`). `twd doctor` has a `transport` row; `ok tsnet:`
+is the expected answer. The policy additions `twd up` prints include the
+host ⇄ mgmt grants (`tag:twd-host → tag:twd-mgmt tcp:80,443`,
+`tag:twd-mgmt → tag:twd-host tcp:7474`).
+
+Add a second machine as a host with `twd host add <host-id>`: mgmt records
+it (pending) and writes a single-use join key file; on the new machine run
+`twd-hostd join --host-id <id> --token-file <file> --control-url …`, then
+start `twd-hostd -host-id <id> -mgmt http://twd-mgmt.<tailnet> -tsnet-control-url …`.
+`twd host ls` / `twd host rm <id> [--drain]` manage hosts; `twd tenant set`
+(PATCH) and `twd tenant rm`, `twd undeploy <workload>` round out the CRUD.
+
+`twd up --local-dev` keeps the old unix socket + per-host token for
+`twd dev` and hermetic tests only; `twd doctor` flags it.
 
 ### Alternative: API-key mode
 

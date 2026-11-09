@@ -94,7 +94,7 @@ func doctorSandboxActive(s *state, sb, detail, warn string) (string, string, str
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	var hv hostd.StatusView
-	if err := s.hostd().Do(ctx2, "GET", "/v0/status", nil, &hv); err != nil {
+	if err := s.hostd().Do(ctx2, "GET", "/v1/status", nil, &hv); err != nil {
 		return "warn", detail + "; twd-hostd is not answering, so running workloads were not checked", "twd status"
 	}
 	n, on := 0, 0

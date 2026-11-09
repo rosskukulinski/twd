@@ -129,9 +129,9 @@ func descendants(objs []mgmt.Object, id string) []mgmt.Object {
 // create/spawn records carry actingFor).
 func (s *state) principal(ctx context.Context, root mgmt.Object) string {
 	var ar struct {
-		Records []mgmt.AuditRecord `json:"records"`
+		Records []mgmt.AuditRecord `json:"items"`
 	}
-	if s.mgmt().Do(ctx, "GET", "/v0/audit?object="+url.QueryEscape(root.ID), nil, &ar) == nil {
+	if s.mgmt().Do(ctx, "GET", "/v1/audit?limit=500&object="+url.QueryEscape(root.ID), nil, &ar) == nil {
 		for _, r := range ar.Records {
 			if (r.Kind == "create" || r.Kind == "spawn" || r.Kind == "principal") && r.ActingFor != "" {
 				return r.ActingFor
@@ -156,7 +156,8 @@ func chainString(principal string, lin []mgmt.Object) string {
 
 func cmdLs(args []string) error {
 	f := newFlags("ls")
-	all := f.Bool("all", false, "include killed objects")
+	all := f.Bool("all", false, "include killed objects, and fetch every page")
+	limit := f.Int("limit", 200, "at most this many objects (pages of ≤500 are followed up to it; --all lifts the cap)")
 	tenantF := tenantFlag(f)
 	if _, err := f.parse(args); err != nil {
 		return err
@@ -174,11 +175,15 @@ func cmdLs(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	var deps []mgmt.DeploymentView
-	if err := s.mgmt().Do(ctx, "GET", "/v0/deployments?tenant="+url.QueryEscape(tn.TenantID), nil, &deps); err != nil {
+	deps, err := listAll[mgmt.DeploymentView](ctx, s.mgmt(), "/v1/deployments?latest=true&tenant="+url.QueryEscape(tn.TenantID), 0)
+	if err != nil {
 		return err
 	}
-	objs, err := s.objectsOf(ctx, tn.TenantID)
+	max := *limit
+	if *all {
+		max = 0
+	}
+	objs, err := s.objectsOfN(ctx, tn.TenantID, max)
 	if err != nil {
 		return err
 	}
@@ -272,7 +277,11 @@ func cmdKill(args []string) error {
 	}
 	ks := time.Now()
 	var kr mgmt.KillResult
-	if err := s.mgmt().DoHeaders(ctx, "POST", "/v0/objects/"+o.ID+"/kill", map[string]any{"cascade": *cascade, "reason": r},
+	q := url.Values{"reason": {r}}
+	if *cascade {
+		q.Set("cascade", "true")
+	}
+	if err := s.mgmt().DoHeaders(ctx, "DELETE", "/v1/objects/"+o.ID+"?"+q.Encode(), nil,
 		&kr, map[string]string{"Twd-Actor": actor()}); err != nil {
 		return err
 	}
@@ -464,29 +473,44 @@ func cmdAudit(args []string) error {
 	seen := map[string]bool{}
 	var recs []mgmt.AuditRecord
 	query := func(q string) error {
-		var ar struct {
-			Records  []mgmt.AuditRecord `json:"records"`
-			Chains   []mgmt.ChainStatus `json:"chains"`
-			Verified bool               `json:"verified"`
-		}
-		// Always scoped to the tenant: one tenant's audit never shows another's.
-		if err := s.mgmt().Do(ctx, "GET", "/v0/audit?tenant="+url.QueryEscape(tn.TenantID)+"&"+q, nil, &ar); err != nil {
-			return err
-		}
-		res.Verified = res.Verified && ar.Verified
-		for _, c := range ar.Chains {
-			if !slices.ContainsFunc(res.Chains, func(x mgmt.ChainStatus) bool { return x.Chain == c.Chain }) {
-				res.Chains = append(res.Chains, c)
+		// Always scoped to the tenant: one tenant's audit never shows
+		// another's. Every page is followed.
+		cursor := ""
+		for {
+			var ar struct {
+				Records    []mgmt.AuditRecord `json:"items"`
+				NextCursor *string            `json:"nextCursor"`
+				Chains     []mgmt.ChainStatus `json:"chains"`
+				Verified   bool               `json:"verified"`
 			}
-		}
-		for _, r := range ar.Records {
-			k := fmt.Sprintf("%s/%d", r.Chain, r.Seq)
-			if !seen[k] {
-				seen[k] = true
-				recs = append(recs, r)
+			u := "/v1/audit?limit=500&tenant=" + url.QueryEscape(tn.TenantID)
+			if q != "" {
+				u += "&" + q
 			}
+			if cursor != "" {
+				u += "&cursor=" + url.QueryEscape(cursor)
+			}
+			if err := s.mgmt().Do(ctx, "GET", u, nil, &ar); err != nil {
+				return err
+			}
+			res.Verified = res.Verified && ar.Verified
+			for _, c := range ar.Chains {
+				if !slices.ContainsFunc(res.Chains, func(x mgmt.ChainStatus) bool { return x.Chain == c.Chain }) {
+					res.Chains = append(res.Chains, c)
+				}
+			}
+			for _, r := range ar.Records {
+				k := fmt.Sprintf("%s/%d", r.Chain, r.Seq)
+				if !seen[k] {
+					seen[k] = true
+					recs = append(recs, r)
+				}
+			}
+			if ar.NextCursor == nil || *ar.NextCursor == "" {
+				return nil
+			}
+			cursor = *ar.NextCursor
 		}
-		return nil
 	}
 	switch {
 	case len(pos) == 1:
@@ -506,7 +530,7 @@ func cmdAudit(args []string) error {
 			return err
 		}
 	case *all:
-		if err := query("all=1"); err != nil {
+		if err := query(""); err != nil {
 			return err
 		}
 	default:
@@ -596,7 +620,7 @@ func cmdLogs(args []string) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		var hv hostd.StatusView
-		if err := s.hostd().Do(ctx, "GET", "/v0/status", nil, &hv); err != nil {
+		if err := s.hostd().Do(ctx, "GET", "/v1/status", nil, &hv); err != nil {
 			return fail("host_unavailable", "twd-hostd is not answering", err.Error()).withFix("twd status")
 		}
 		tn, err := s.tenant(*tenantF)
@@ -652,4 +676,64 @@ func cmdLogs(args []string) error {
 			time.Sleep(300 * time.Millisecond)
 		}
 	}
+}
+
+// ---- undeploy ----
+
+// cmdUndeploy is `twd undeploy <workload> [--tenant …] [--reason …]`:
+// DELETE /v1/deployments/{id} of the workload's latest deployment: its
+// objects are killed (cascade), the lease released, the deployment stopped.
+func cmdUndeploy(args []string) error {
+	f := newFlags("undeploy")
+	reason := f.String("reason", "", "why (recorded in audit)")
+	tenantF := tenantFlag(f)
+	pos, err := f.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return fail("bad_request", "twd undeploy needs one workload", "usage: twd "+usageOf("undeploy"))
+	}
+	s, err := openState(*f.stateDir)
+	if err != nil {
+		return err
+	}
+	if err := s.requireUp(); err != nil {
+		return err
+	}
+	tn, err := s.tenant(*tenantF)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	deps, err := listAll[mgmt.DeploymentView](ctx, s.mgmt(), "/v1/deployments?latest=true&tenant="+url.QueryEscape(tn.TenantID)+"&workload="+url.QueryEscape(pos[0]), 0)
+	if err != nil {
+		return err
+	}
+	if len(deps) == 0 {
+		return fail("unknown_workload", "no deployment of "+pos[0]+" for tenant "+tn.Tailnet).withFix("twd ls")
+	}
+	d := deps[len(deps)-1]
+	if d.Status == "stopped" {
+		return fail("already_stopped", pos[0]+" is already undeployed ("+d.DeploymentID+")")
+	}
+	q := url.Values{}
+	if *reason != "" {
+		q.Set("reason", *reason)
+	}
+	u := "/v1/deployments/" + d.DeploymentID
+	if len(q) > 0 {
+		u += "?" + q.Encode()
+	}
+	t0 := time.Now()
+	var kr mgmt.KillResult
+	if err := s.mgmt().DoHeaders(ctx, "DELETE", u, nil, &kr, map[string]string{"Twd-Actor": actor()}); err != nil {
+		return err
+	}
+	res := map[string]any{"workload": pos[0], "deploymentID": d.DeploymentID, "result": kr, "timingsMs": map[string]float64{"total": ms(time.Since(t0))}}
+	emit(f, res, func() {
+		fmt.Printf("✓ undeployed %s (%s) · %d objects killed · lease released\n", pos[0], d.DeploymentID, len(kr.Killed))
+	})
+	return nil
 }

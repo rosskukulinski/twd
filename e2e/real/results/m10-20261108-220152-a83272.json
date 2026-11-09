@@ -1,0 +1,32 @@
+{
+  "run": "m10-a83272",
+  "tailnet": "tail7906d5.ts.net",
+  "date": "2026-11-08T22:01:52-08:00",
+  "checks": {
+    "no_api_key_in_twd_state": "PASS twd.json: {MintMode:wif APIKeyFile: MgmtDNSName:ttest-m10-a83272-mgmt.tail7906d5.ts.net MgmtNodeID:nsFX1d551B11CNTRL IssuerURL:https://ttest-m10-a83272-mgmt.tail7906d5.ts.net Tailnet:tail7906d5.ts.net HTTPS:true}",
+    "stack_running_before_credential": "FAIL mgmt up, host \"\", transport \"tsnet (loopback through mgmt's node)\" while waiting for the trust credential",
+    "up_waits_for_trust_credential": "PASS err=exit status 1 stderr=\n› trust    twd mints its nodes' auth keys WITHOUT an API key: Tailscale trusts mgmt's OIDC issuer (served over\n           Funnel from this machine) for one pinned subject. Create the trust credential(s) once, in the admin console:\n\n  1. Open  https://login.tailscale.com/admin/settings/trust-credentials   (tailnet tail7906d5.ts.net)\n     › Trust credentials › Add trust credential   (the console has no pre-fill for custom issuers yet; paste these)\n  2. Mint credential (required):\n       Issuer:    https://ttest-m10-a83272-mgmt.tail7906d5.ts.net/t/tn_tail7906d5\n       Subject:   twd:tenant:tn_tail7906d5:mint\n       Scopes:    auth_keys                   Tags: tag:twd\n       Audience:  leave the default (api.tailscale.com/\u003cclient ID\u003e)\n  3. Lifecycle credential (recommended; enables kill tier 2 = device delete, the reaper, spawn checks and deploy preflight):\n       Issuer:    https://ttest-m10-a83272-mgmt.tail7906d5.ts.net/t/tn_tail7906d5\n       Subject:   twd:tenant:tn_tail7906d5:lifecycle\n       Scopes:    devices:core, policy_file:read     Tags: tag:twd\n  4. Copy each credential's client ID (it is public; twd stores only that) and paste it below.\n     Non-interactive: twd up --wif-client-id \u003cmint ID\u003e [--wif-lifecycle-client-id \u003clifecycle ID\u003e]\n\n› host     twd-hostd waits for its join key: it is minted through the trust credential once the IDs are given\n{\"error\":{\"code\":\"wif_credential_required\",\"message\":\"keyless mode needs the trust credential's client ID (see the steps above)\",\"detail\":[\"twd-mgmt and twd-hostd keep running; the tenant is created when the ID is given\"],\"fix\":[\"twd up --wif-client-id \\u003cmint ID\\u003e [--wif-lifecycle-client-id \\u003clifecycle ID\\u003e]\"]}}\n stdout="
+  },
+  "numbers": {
+    "up_step1_ms": 3454
+  },
+  "notes": [
+    "policy changed (validated, If-Match \"31f97e0d8f0d1e605ff8f72b50133fea8bc382dd7ef1d0cbd4adc19253536ecd\"): added \"grants\": [\n  {\"dst\":[\"tag:twd-host\"],\"ip\":[\"tcp:7474\"],\"src\":[\"tag:twd-mgmt\"]},\n],\n (previous copy: /Users/ross/.config/tailnet-agents-design/tailnet1_acl.pre-m10-a83272.hujson)"
+  ],
+  "cleanup": {
+    "devices_deleted_by_cleanup": 1,
+    "devices_left": 0,
+    "devices_tracked": 1,
+    "errors": null,
+    "trust_credentials_deleted": 0,
+    "twd_devices_left_after_down": 0,
+    "twd_devices_tracked": 0,
+    "twd_keys_valid_after_down": 0,
+    "untracked_run_devices": null
+  },
+  "nodeIDs": null,
+  "infraNodeIDs": null,
+  "keyIDs": [
+    "kFQ7XJcW2o11CNTRL"
+  ]
+}

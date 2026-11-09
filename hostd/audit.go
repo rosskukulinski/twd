@@ -9,7 +9,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 )
 
-// auditLog is this host's hash-chained audit log (contract POST /v0/audit):
+// auditLog is this host's hash-chained audit log (contract POST /v1/audit):
 // each record carries prevHash/hash (mgmtapi.ChainHash) and hostSig
 // (ed25519 with the host's audit key, registered as auditPubKey). Pending records are flushed to mgmt
 // with every heartbeat; on failure they stay queued (bounded).

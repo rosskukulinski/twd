@@ -149,7 +149,7 @@ func promptClientIDs(in io.Reader, out io.Writer) (mintID, lifeID string) {
 func wifOnboard(ctx context.Context, s *state, tid, tailnet, mintID, lifeID string, interactive bool, out io.Writer) (*wifResult, error) {
 	res := &wifResult{Plan: planFor(s.Cfg.IssuerURL, tid), ClientID: mintID, Lifecycle: lifeID}
 	var existing mgmt.Tenant
-	have := s.mgmt().Do(ctx, "GET", "/v0/tenants/"+tid, nil, &existing) == nil
+	have := s.mgmt().Do(ctx, "GET", "/v1/tenants/"+tid, nil, &existing) == nil
 	if have && existing.MintMode == mgmt.MintWIF && existing.WIFClientID != "" && mintID == "" {
 		// Already set up; just verify.
 		res.ClientID, res.Lifecycle = existing.WIFClientID, existing.WIFLifecycleClientID
@@ -182,7 +182,11 @@ func wifOnboard(ctx context.Context, s *state, tid, tailnet, mintID, lifeID stri
 		res.IssuerMS = ms(issuerMS)
 		fmt.Fprintf(out, "✓ issuer   public via Funnel in %.1fs · %s\n", issuerMS.Seconds(), res.Plan.Issuer)
 		if have {
-			if err := s.mgmt().Do(ctx, "PUT", "/v0/tenants/"+tid+"/wif", mgmt.WIFUpdate{WIFClientID: res.ClientID, WIFLifecycleClientID: res.Lifecycle}, nil); err != nil {
+			patch := map[string]any{"mintMode": "wif", "wifClientID": res.ClientID, "wifLifecycleClientID": res.Lifecycle}
+			if res.Lifecycle == "" {
+				patch["wifLifecycleClientID"] = nil
+			}
+			if err := s.mgmt().DoHeaders(ctx, "PATCH", "/v1/tenants/"+tid, patch, nil, map[string]string{"Content-Type": "application/merge-patch+json"}); err != nil {
 				return res, err
 			}
 			res.Updated = true
@@ -190,14 +194,14 @@ func wifOnboard(ctx context.Context, s *state, tid, tailnet, mintID, lifeID stri
 			var tr struct {
 				TenantID string `json:"tenantID"`
 			}
-			if err := s.mgmt().Do(ctx, "POST", "/v0/tenants", map[string]any{"tenantID": tid, "tailnet": tailnet, "controlURL": s.Cfg.ControlURL,
+			if err := s.mgmt().Do(ctx, "POST", "/v1/tenants", map[string]any{"tenantID": tid, "tailnet": tailnet, "controlURL": s.Cfg.ControlURL,
 				"mintMode": "wif", "wifClientID": res.ClientID, "wifLifecycleClientID": res.Lifecycle}, &tr); err != nil {
 				return res, err
 			}
 			res.Created = true
 		}
 	}
-	if err := s.mgmt().Do(ctx, "POST", "/v0/tenants/"+tid+"/wif-check", nil, &res.Check); err != nil {
+	if err := s.mgmt().Do(ctx, "POST", "/v1/tenants/"+tid+"/wif-check", nil, &res.Check); err != nil {
 		return res, err
 	}
 	if !res.Check.Mint {
