@@ -50,9 +50,12 @@ func TestMergeKeepsExisting(t *testing.T) {
 	if err != nil || !miss.Empty() {
 		t.Fatalf("second merge still missing %+v (%v)", miss, err)
 	}
-	// Existing owners untouched.
-	if strings.Contains(s, `"tag:twd-marker"`) {
-		t.Fatalf("existing tagOwners entry overwritten:\n%s", s)
+	// An existing tag gains the snippet's missing owner; its own stay.
+	if !strings.Contains(s, `"tag:twd-marker"`) {
+		t.Fatalf("missing owner not appended to the existing tagOwners entry:\n%s", s)
+	}
+	if !strings.Contains(s, `"autogroup:admin"`) {
+		t.Fatalf("existing owners lost:\n%s", s)
 	}
 }
 
