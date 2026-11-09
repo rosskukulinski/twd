@@ -48,9 +48,9 @@ func TestRT02_AppAuditCannotForgeAuthorization(t *testing.T) {
 		t.Fatalf("RT-02: tenant controlled platform fields: %+v", forged)
 	}
 	// 3. What it claimed is kept, visibly as a claim.
-	if !strings.Contains(forged.Detail, `"claimedKind":"allow"`) || !strings.Contains(forged.Detail, `"parentHint":"trace-of-victim"`) ||
-		!strings.Contains(forged.Detail, "ceo@victim.example") {
-		t.Fatalf("RT-02: the note lost the tenant's claims (needed for forensics): %s", forged.Detail)
+	if !strings.Contains(string(forged.Detail), `"claimedKind":"allow"`) || !strings.Contains(string(forged.Detail), `"parentHint":"trace-of-victim"`) ||
+		!strings.Contains(string(forged.Detail), "ceo@victim.example") {
+		t.Fatalf("RT-02: the note lost the tenant's claims (needed for forensics): %s", string(forged.Detail))
 	}
 
 	// 4. mgmt's ingest contract: a "tenant" source may carry only a

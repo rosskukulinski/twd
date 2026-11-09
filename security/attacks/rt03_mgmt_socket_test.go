@@ -12,7 +12,7 @@ package attacks
 // (Twd-Host-Token) that mgmt minted into a 0600 file under hostd's state
 // dir (twd-mgmt -host-token-file; rotated on `twd up`). A bare same-uid
 // connection is accepted at the TCP level and then refused by every
-// endpoint, admin and host alike, including /v0/healthz. This test serves
+// endpoint, admin and host alike, including /v1/healthz. This test serves
 // the real local wrapper on the real listener and drives it as a tenant
 // process would.
 
@@ -60,7 +60,7 @@ func TestRT03_MgmtSocketRejectsBareSameUid(t *testing.T) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	}}}
 	call := func(hdr map[string]string) (int, string, string) {
-		req, _ := http.NewRequest("GET", "http://twd-mgmt/v0/tenants", nil)
+		req, _ := http.NewRequest("GET", "http://twd-mgmt/v1/tenants", nil)
 		for k, v := range hdr {
 			req.Header.Set(k, v)
 		}
@@ -109,7 +109,7 @@ func TestRT03_MgmtSocketRejectsBareSameUid(t *testing.T) {
 	hc2 := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", sock2)
 	}}}
-	req, _ := http.NewRequest("GET", "http://twd-mgmt/v0/tenants", nil)
+	req, _ := http.NewRequest("GET", "http://twd-mgmt/v1/tenants", nil)
 	res, err := hc2.Do(req)
 	if err != nil {
 		t.Fatal(err)

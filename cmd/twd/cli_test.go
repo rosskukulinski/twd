@@ -254,7 +254,7 @@ func TestCLILink(t *testing.T) {
 		Admin                  bool
 		Tenants                []struct{ TenantID, MintMode string }
 	}
-	d := dev.MustJSON(&lk, "link", ep, "--tsnet-dir", filepath.Join(work, "dev-node"), "--tsnet-hostname", "ttest-dev", "--control-url", ctl.URL, "--tsnet-authkey-file", authFile)
+	d := dev.MustJSON(&lk, "link", ep, "--tsnet", "--tsnet-dir", filepath.Join(work, "dev-node"), "--tsnet-hostname", "ttest-dev", "--control-url", ctl.URL, "--tsnet-authkey-file", authFile)
 	if !lk.Admin || lk.Endpoint != ep || len(lk.Tenants) != 1 || lk.Tenants[0].MintMode != "apikey" || lk.Actor == "" {
 		t.Fatalf("twd link: %+v", lk)
 	}
