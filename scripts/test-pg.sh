@@ -19,7 +19,7 @@ export TWD_TEST_POSTGRES_DSN="postgres://postgres:twdtest@127.0.0.1:$port/postgr
 # -p 1 / no t.Parallel: the tests share one database.
 GOTOOLCHAIN=local go test -race -count=1 -run 'Lease|Audit|Store|Migrat' -v ./mgmt/ >/tmp/twd-test-pg.log 2>&1
 st=$?
-TWD_TEST_API_POSTGRES=1 GOTOOLCHAIN=local go test -race -count=1 -run 'API|Kill|WIF|Tailnet' -v ./mgmt/ >>/tmp/twd-test-pg.log 2>&1
+TWD_TEST_API_POSTGRES=1 GOTOOLCHAIN=local go test -race -count=1 -run 'API|Kill|WIF|Tailnet|V1' -v ./mgmt/ >>/tmp/twd-test-pg.log 2>&1
 st2=$?
 [ "$st" -eq 0 ] && st=$st2
 grep -E '^(---|    ---|ok|FAIL|panic)' /tmp/twd-test-pg.log

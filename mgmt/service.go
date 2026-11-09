@@ -755,6 +755,9 @@ type CreateObjectResponse struct {
 	Status   string   `json:"status"`
 	Tags     []string `json:"tags"`
 	Hostname string   `json:"hostname"`
+	// Created is true for a fresh object (the API answers 202), false when
+	// an existing live object was returned (200).
+	Created bool `json:"-"`
 }
 
 var b32 = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
@@ -905,7 +908,7 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	}
 	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ID, Kind: kind, TraceID: r.TraceID, ActingFor: r.ActingFor}, detail)
 	m.enqueue(t.ID, o.ID)
-	return CreateObjectResponse{ObjectID: o.ID, Status: StatusPending, Tags: o.Tags, Hostname: o.Hostname}, nil
+	return CreateObjectResponse{ObjectID: o.ID, Status: StatusPending, Tags: o.Tags, Hostname: o.Hostname, Created: true}, nil
 }
 
 // findWorkloadClass finds the latest deployment of the workload named name

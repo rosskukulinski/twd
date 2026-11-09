@@ -873,13 +873,17 @@ func (a *v1api) CreateObject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, r, err)
 		return
 	}
-	v := a.objectView(r, o, nil)
-	if resp.Status == StatusPending && o.CreatedAt == o.UpdatedAt && time.Since(time.UnixMilli(o.CreatedAt)) < 5*time.Second {
+	if resp.Created {
+		// Accepted: the mint is queued. The body is the resource as created
+		// (the mint worker may already have moved it on; poll Location).
+		if o.Status == StatusMinted {
+			o.Status = StatusPending
+		}
 		location(w, "/v1/objects/"+o.ID)
-		writeJSON(w, 202, v)
+		writeJSON(w, 202, a.objectView(r, o, nil))
 		return
 	}
-	writeResource(w, r, 200, v)
+	writeResource(w, r, 200, a.objectView(r, o, nil))
 }
 
 func (a *v1api) ListObjects(w http.ResponseWriter, r *http.Request, params v1.ListObjectsParams) {
