@@ -255,6 +255,28 @@ func TestE2EOAuth(t *testing.T) {
 
 	// 4. twd link from a developer node (tag:ttest, admin cap) over https,
 	// then a second developer state over plain http.
+	// mgmt fetches its node's HTTPS certificate in the background at start
+	// (a new name's first certificate takes 30–100 s; with no Funnel nothing
+	// else requests it). Wait for it, then link over https.
+	// If ACME fails (Let's Encrypt via Tailscale; seen transiently), the
+	// product falls back to plain HTTP on :80, and so must the link.
+	cw := time.Now()
+	certReady := false
+	for time.Since(cw) < 4*time.Minute && !certReady {
+		lb, _ := os.ReadFile(filepath.Join(state, "logs", "mgmt.log"))
+		certReady = strings.Contains(string(lb), "HTTPS certificate ready")
+		if strings.Count(string(lb), "HTTPS certificate prefetch failed") >= 4 {
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	res.Numbers["cert_wait_after_scenario_ms"] = float64(time.Since(cw).Milliseconds())
+	if certReady {
+		res.Pass("https_cert_prefetched", fmt.Sprintf("mgmt's certificate ready %v after the scenario", time.Since(cw).Round(time.Second)))
+	} else {
+		res.Notes = append(res.Notes, "mgmt's HTTPS certificate was NOT issued (ACME error in mgmt.log): link_https must fall back to http")
+	}
+	wantScheme := map[bool]string{true: "https", false: "http"}[certReady]
 	dev := &cliflow.Env{T: t, BinDir: bin, StateDir: filepath.Join(work, "dev-state"), WorkDir: work, Res: res}
 	cliKey := keyTo("cli", []string{cliflow.TestTag})
 	type link struct {
@@ -267,8 +289,8 @@ func TestE2EOAuth(t *testing.T) {
 		"--control-url", prodControl, "--tsnet-authkey-file", cliKey, "--tsnet-tags", cliflow.TestTag)
 	res.Numbers["link_https_ms"] = float64(d.Milliseconds())
 	tracker.Track(lk.NodeID, "cli-node")
-	check("link_https", lk.Admin && lk.Scheme == "https" && lk.Endpoint == "https://"+cfg.MgmtDNSName && len(lk.Tenants) == 1 && lk.Tenants[0].MintMode == "oauth",
-		fmt.Sprintf("%+v in %v (no scheme given: https first)", lk, d.Round(time.Millisecond)))
+	check("link_no_scheme_https_first", lk.Admin && lk.Scheme == wantScheme && lk.Endpoint == wantScheme+"://"+cfg.MgmtDNSName && len(lk.Tenants) == 1 && lk.Tenants[0].MintMode == "oauth",
+		fmt.Sprintf("%+v in %v (no scheme given: https first, http if no certificate)", lk, d.Round(time.Millisecond)))
 	dev2 := &cliflow.Env{T: t, BinDir: bin, StateDir: filepath.Join(work, "dev2-state"), WorkDir: work, Res: res}
 	cli2Key := keyTo("cli2", []string{cliflow.TestTag})
 	var lk2 link
@@ -319,6 +341,7 @@ func TestE2EOAuth(t *testing.T) {
 	res.Numbers["remote_kill_cli_ms"] = float64(d.Milliseconds())
 	check("remote_kill", len(kr.Result.Killed) == 1 && len(kr.Result.DevicesDeleted)+len(kr.Result.DevicesDeleting) == 1 && len(kr.Result.Warnings) == 0,
 		fmt.Sprintf("killed %v, device delete %v/%v, warnings %v in %v", kr.Result.Killed, kr.Result.DevicesDeleted, kr.Result.DevicesDeleting, kr.Result.Warnings, d.Round(time.Millisecond)))
+	killedID := kr.Result.Killed[0]
 	var aud struct {
 		Verified bool
 		Records  []struct {
@@ -335,11 +358,23 @@ func TestE2EOAuth(t *testing.T) {
 			mints++
 		case r.Kind == "deploy" && r.ActingFor == lk.Actor:
 			deployBy = true
-		case r.Kind == "kill" && r.ObjectID == dep.Endpoint.Node:
+		case r.Kind == "kill" && r.ObjectID == killedID:
 			killed = true
 		}
 	}
-	check("remote_audit", aud.Verified && mints >= 3 && deployBy && killed, fmt.Sprintf("verified=%v mints=%d deployBy=%v kill=%v", aud.Verified, mints, deployBy, killed))
+	dev.MustJSON(&aud, "audit", killedID)
+	for _, r := range aud.Records {
+		if r.Kind == "kill" && r.ObjectID == killedID {
+			killed = true
+		}
+	}
+	var kills []string
+	for _, r := range aud.Records {
+		if r.Kind == "kill" || r.ObjectID == killedID {
+			kills = append(kills, r.Kind+":"+r.ObjectID)
+		}
+	}
+	check("remote_audit", aud.Verified && mints >= 3 && deployBy && killed, fmt.Sprintf("verified=%v mints=%d deployBy=%v kill=%v (object %s; records %v)", aud.Verified, mints, deployBy, killed, killedID, kills))
 
 	// 6. Down (purge: ephemeral) and leftovers (in Cleanup).
 	e.TrackObjectNodes()

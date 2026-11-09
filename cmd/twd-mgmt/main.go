@@ -288,8 +288,35 @@ func run() error {
 			}
 			api.Listeners = append(api.Listeners, "tsnet:443")
 			servers = append(servers, serve("tsnet-tls", tln, th))
+			// Fetch the node's certificate now, in the background: a new
+			// node name's first certificate takes 30–100 s, and without
+			// Funnel (oauth mode) nothing else would request it before the
+			// first `twd link`, whose TLS handshake would time out.
+			go func() {
+				lc, err := ts.LocalClient()
+				if err != nil || self.DNSName == "" {
+					return
+				}
+				st := time.Now()
+				for attempt := 1; ; attempt++ {
+					cctx, ccancel := context.WithTimeout(context.Background(), 3*time.Minute)
+					_, _, err := lc.CertPair(cctx, self.DNSName)
+					ccancel()
+					if err == nil {
+						log.Info("HTTPS certificate ready", "name", self.DNSName, "ms", time.Since(st).Milliseconds(), "attempts", attempt)
+						return
+					}
+					// ACME orders fail transiently (seen: CreateOrder 404); a
+					// TLS handshake retries on its own later, this only warms.
+					log.Warn("HTTPS certificate prefetch failed (twd link falls back to http on :80 meanwhile)", "name", self.DNSName, "attempt", attempt, "err", err)
+					if attempt == 4 {
+						return
+					}
+					time.Sleep(time.Duration(attempt) * 20 * time.Second)
+				}
+			}()
 		} else if *tsTLS {
-			log.Warn("HTTPS is not enabled on this tailnet: the API is served on :80 only (twd link needs https)")
+			log.Warn("HTTPS is not enabled on this tailnet: the API is served on :80 only; `twd link` uses plain HTTP (WireGuard-encrypted, WhoIs-authenticated)")
 		}
 		if *funnel {
 			if issuer == nil {
