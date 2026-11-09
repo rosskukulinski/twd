@@ -26,6 +26,7 @@ const (
 	AuditKindDeploy       AuditKind = "deploy"
 	AuditKindDeviceDelete AuditKind = "device_delete"
 	AuditKindEgress       AuditKind = "egress"
+	AuditKindHostAdd      AuditKind = "host_add"
 	AuditKindHostDelete   AuditKind = "host_delete"
 	AuditKindHostRegister AuditKind = "host_register"
 	AuditKindKill         AuditKind = "kill"
@@ -59,6 +60,8 @@ func (e AuditKind) Valid() bool {
 	case AuditKindDeviceDelete:
 		return true
 	case AuditKindEgress:
+		return true
+	case AuditKindHostAdd:
 		return true
 	case AuditKindHostDelete:
 		return true
@@ -543,7 +546,7 @@ type AuditBatch struct {
 // `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-// `preflight` (optional; dryRun deploys).
+// `preflight` (optional; dryRun deploys), `host_add`.
 type AuditKind string
 
 // AuditPage defines model for AuditPage.
@@ -581,7 +584,7 @@ type AuditRecord struct {
 	// `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-	// `preflight` (optional; dryRun deploys).
+	// `preflight` (optional; dryRun deploys), `host_add`.
 	Kind     AuditKind `json:"kind"`
 	ObjectID *string   `json:"objectID,omitempty"`
 
@@ -652,7 +655,7 @@ type Deployment struct {
 	// DeployedBy The actor who deployed (see Conventions).
 	DeployedBy *string `json:"deployedBy,omitempty"`
 
-	// DeploymentID Examples: dep_01j8z…
+	// DeploymentID Examples: dp_3f9a1c2b7d8e4f50
 	DeploymentID string `json:"deploymentID"`
 
 	// Endpoint The workload entry node (`_workload` object).
@@ -861,6 +864,16 @@ type Host struct {
 	UpdatedAt int64          `json:"updatedAt"`
 }
 
+// HostCreate defines model for HostCreate.
+type HostCreate struct {
+	HostID string  `json:"hostID"`
+	Pool   *string `json:"pool,omitempty"`
+
+	// TenantID The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own).
+	TenantID *string `json:"tenantID,omitempty"`
+	Tiers    *[]Tier `json:"tiers,omitempty"`
+}
+
 // HostDeleteResult defines model for HostDeleteResult.
 type HostDeleteResult struct {
 	// DevicesLeft Devices mgmt could not delete (no operator credential); delete them in the console.
@@ -868,6 +881,21 @@ type HostDeleteResult struct {
 	HostID         string    `json:"hostID"`
 	Killed         []string  `json:"killed"`
 	LeasesReleased []string  `json:"leasesReleased"`
+}
+
+// HostJoin A single-use join key for a host's `tag:twd-host` node. Never logged.
+type HostJoin struct {
+	AuthKey    string  `json:"authKey"`
+	ControlURL *string `json:"controlURL,omitempty"`
+
+	// ExpiresAt unix ms
+	ExpiresAt int64 `json:"expiresAt"`
+	Host      Host  `json:"host"`
+
+	// Hostname `twd-host-<hostID>`
+	Hostname string   `json:"hostname"`
+	Tags     []string `json:"tags"`
+	Tailnet  *string  `json:"tailnet,omitempty"`
 }
 
 // HostPage defines model for HostPage.
@@ -1736,6 +1764,9 @@ type AppendAuditJSONRequestBody = AuditBatch
 // CreateDeploymentJSONRequestBody defines body for CreateDeployment for application/json ContentType.
 type CreateDeploymentJSONRequestBody = DeploymentCreate
 
+// CreateHostJSONRequestBody defines body for CreateHost for application/json ContentType.
+type CreateHostJSONRequestBody = HostCreate
+
 // RegisterHostJSONRequestBody defines body for RegisterHost for application/json ContentType.
 type RegisterHostJSONRequestBody = HostRegistration
 
@@ -2219,6 +2250,40 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /v1/hosts (the `ListHosts` operationId).
 	ListHosts(ctx context.Context, params *ListHostsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CreateHostWithBody Add a host and mint its single-use join key
+	//
+	// `twd host add`: creates the host record (status `pending`) and mints a
+	// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+	// through the operator tenant's trust credential (wif) or API key
+	// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+	// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+	// node to the record. Calling it again for a host that has not bound a
+	// node yet mints a fresh key (`200`); a bound host is `409 exists`
+	// (delete it first). The key is never logged. Audited
+	// (`kind: host_add`).
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+	CreateHostWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CreateHost Add a host and mint its single-use join key
+	//
+	// `twd host add`: creates the host record (status `pending`) and mints a
+	// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+	// through the operator tenant's trust credential (wif) or API key
+	// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+	// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+	// node to the record. Calling it again for a host that has not bound a
+	// node yet mints a fresh key (`200`); a bound host is `409 exists`
+	// (delete it first). The key is never logged. Audited
+	// (`kind: host_add`).
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+	CreateHost(ctx context.Context, body CreateHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// DeleteHost Drain and remove a host
 	//
@@ -2969,6 +3034,60 @@ func (c *Client) GetHealthz(ctx context.Context, reqEditors ...RequestEditorFn) 
 // Corresponds with GET /v1/hosts (the `ListHosts` operationId).
 func (c *Client) ListHosts(ctx context.Context, params *ListHostsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewListHostsRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CreateHostWithBody Add a host and mint its single-use join key
+//
+// `twd host add`: creates the host record (status `pending`) and mints a
+// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+// through the operator tenant's trust credential (wif) or API key
+// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+// node to the record. Calling it again for a host that has not bound a
+// node yet mints a fresh key (`200`); a bound host is `409 exists`
+// (delete it first). The key is never logged. Audited
+// (`kind: host_add`).
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+func (c *Client) CreateHostWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateHostRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CreateHost Add a host and mint its single-use join key
+//
+// `twd host add`: creates the host record (status `pending`) and mints a
+// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+// through the operator tenant's trust credential (wif) or API key
+// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+// node to the record. Calling it again for a host that has not bound a
+// node yet mints a fresh key (`200`); a bound host is `409 exists`
+// (delete it first). The key is never logged. Audited
+// (`kind: host_add`).
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+func (c *Client) CreateHost(ctx context.Context, body CreateHostJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateHostRequest(c.Server, body)
 	if err != nil {
 		return nil, err
 	}
@@ -4554,6 +4673,46 @@ func NewListHostsRequest(server string, params *ListHostsParams) (*http.Request,
 	return req, nil
 }
 
+// NewCreateHostRequest calls the generic CreateHost builder with application/json body
+func NewCreateHostRequest(server string, body CreateHostJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCreateHostRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCreateHostRequestWithBody constructs an http.Request for the CreateHost method, with any body, and a specified content type
+func NewCreateHostRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/hosts")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
 // NewDeleteHostRequest constructs an http.Request for the DeleteHost method
 func NewDeleteHostRequest(server string, id HostID, params *DeleteHostParams) (*http.Request, error) {
 	var err error
@@ -6115,6 +6274,40 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with GET /v1/hosts (the `ListHosts` operationId).
 	ListHostsWithResponse(ctx context.Context, params *ListHostsParams, reqEditors ...RequestEditorFn) (*ListHostsResponse, error)
+
+	// CreateHostWithBodyWithResponse Add a host and mint its single-use join key
+	//
+	// `twd host add`: creates the host record (status `pending`) and mints a
+	// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+	// through the operator tenant's trust credential (wif) or API key
+	// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+	// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+	// node to the record. Calling it again for a host that has not bound a
+	// node yet mints a fresh key (`200`); a bound host is `409 exists`
+	// (delete it first). The key is never logged. Audited
+	// (`kind: host_add`).
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+	CreateHostWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateHostResponse, error)
+
+	// CreateHostWithResponse Add a host and mint its single-use join key
+	//
+	// `twd host add`: creates the host record (status `pending`) and mints a
+	// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+	// through the operator tenant's trust credential (wif) or API key
+	// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+	// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+	// node to the record. Calling it again for a host that has not bound a
+	// node yet mints a fresh key (`200`); a bound host is `409 exists`
+	// (delete it first). The key is never logged. Audited
+	// (`kind: host_add`).
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+	CreateHostWithResponse(ctx context.Context, body CreateHostJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateHostResponse, error)
 
 	// DeleteHostWithResponse Drain and remove a host
 	//
@@ -7802,6 +7995,139 @@ func (r ListHostsResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r ListHostsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// CreateHostResponse200Headers the declared response headers of an HTTP 200 response for CreateHost
+type CreateHostResponse200Headers struct {
+	CacheControl *string
+}
+
+// CreateHostResponse201Headers the declared response headers of an HTTP 201 response for CreateHost
+type CreateHostResponse201Headers struct {
+	CacheControl *string
+	Location     *string
+}
+
+// CreateHostResponse400Headers the declared response headers of an HTTP 400 response for CreateHost
+type CreateHostResponse400Headers struct {
+	TwdError *string
+}
+
+// CreateHostResponse403Headers the declared response headers of an HTTP 403 response for CreateHost
+type CreateHostResponse403Headers struct {
+	TwdError *string
+}
+
+// CreateHostResponse409Headers the declared response headers of an HTTP 409 response for CreateHost
+type CreateHostResponse409Headers struct {
+	TwdError *string
+}
+
+// CreateHostResponseDefaultHeaders the declared response headers of an HTTP default response for CreateHost
+type CreateHostResponseDefaultHeaders struct {
+	TwdError *string
+}
+
+type CreateHostResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *HostJoin
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *HostJoin
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *Forbidden
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *Error
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *Conflict
+	// JSON502 the response for an HTTP 502 `application/json` response
+	JSON502 *Error
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *CreateHostResponse200Headers
+	// Headers201 the parsed response headers for an HTTP 201 response
+	Headers201 *CreateHostResponse201Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *CreateHostResponse400Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *CreateHostResponse403Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *CreateHostResponse409Headers
+	// HeadersDefault the parsed response headers for an HTTP default response
+	HeadersDefault *CreateHostResponseDefaultHeaders
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CreateHostResponse) GetJSON200() *HostJoin {
+	return r.JSON200
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r CreateHostResponse) GetJSON201() *HostJoin {
+	return r.JSON201
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r CreateHostResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r CreateHostResponse) GetJSON403() *Forbidden {
+	return r.JSON403
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r CreateHostResponse) GetJSON404() *Error {
+	return r.JSON404
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r CreateHostResponse) GetJSON409() *Conflict {
+	return r.JSON409
+}
+
+// GetJSON502 returns the response for an HTTP 502 `application/json` response
+func (r CreateHostResponse) GetJSON502() *Error {
+	return r.JSON502
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r CreateHostResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r CreateHostResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CreateHostResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CreateHostResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CreateHostResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -10416,6 +10742,52 @@ func (c *ClientWithResponses) ListHostsWithResponse(ctx context.Context, params 
 	return ParseListHostsResponse(rsp)
 }
 
+// CreateHostWithBodyWithResponse Add a host and mint its single-use join key
+//
+// `twd host add`: creates the host record (status `pending`) and mints a
+// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+// through the operator tenant's trust credential (wif) or API key
+// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+// node to the record. Calling it again for a host that has not bound a
+// node yet mints a fresh key (`200`); a bound host is `409 exists`
+// (delete it first). The key is never logged. Audited
+// (`kind: host_add`).
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+func (c *ClientWithResponses) CreateHostWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateHostResponse, error) {
+	rsp, err := c.CreateHostWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateHostResponse(rsp)
+}
+
+// CreateHostWithResponse Add a host and mint its single-use join key
+//
+// `twd host add`: creates the host record (status `pending`) and mints a
+// **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+// through the operator tenant's trust credential (wif) or API key
+// (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+// with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+// node to the record. Calling it again for a host that has not bound a
+// node yet mints a fresh key (`200`); a bound host is `409 exists`
+// (delete it first). The key is never logged. Audited
+// (`kind: host_add`).
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/hosts (the `CreateHost` operationId).
+func (c *ClientWithResponses) CreateHostWithResponse(ctx context.Context, body CreateHostJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateHostResponse, error) {
+	rsp, err := c.CreateHost(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateHostResponse(rsp)
+}
+
 // DeleteHostWithResponse Drain and remove a host
 //
 // `409 host_holds_leases` while the host holds any namespace lease,
@@ -12225,6 +12597,151 @@ func ParseListHostsResponse(rsp *http.Response) (*ListHostsResponse, error) {
 		response.Headers403 = &headers
 	case true:
 		var headers ListHostsResponseDefaultHeaders
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.HeadersDefault = &headers
+	}
+
+	return response, nil
+}
+
+// ParseCreateHostResponse parses an HTTP response from a CreateHostWithResponse call
+func ParseCreateHostResponse(rsp *http.Response) (*CreateHostResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CreateHostResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest HostJoin
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest HostJoin
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest Conflict
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 502:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON502 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers CreateHostResponse200Headers
+		if values := rsp.Header.Values("Cache-Control"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Cache-Control", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.CacheControl = &value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 201:
+		var headers CreateHostResponse201Headers
+		if values := rsp.Header.Values("Cache-Control"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Cache-Control", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.CacheControl = &value
+		}
+		if values := rsp.Header.Values("Location"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Location", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: "uri-reference"}); err != nil {
+				return nil, err
+			}
+			headers.Location = &value
+		}
+		response.Headers201 = &headers
+	case rsp.StatusCode == 400:
+		var headers CreateHostResponse400Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 403:
+		var headers CreateHostResponse403Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 409:
+		var headers CreateHostResponse409Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers409 = &headers
+	case true:
+		var headers CreateHostResponseDefaultHeaders
 		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {

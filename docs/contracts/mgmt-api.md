@@ -111,6 +111,7 @@ hostd's API, not this document's.
 | `POST` | `/v1/device-delete-runs` | admin | yes | `CreateDeviceDeleteRun` | Run the scheduled device deletes now |
 | `GET` | `/v1/healthz` | any | no | `GetHealthz` | Liveness |
 | `GET` | `/v1/hosts` | admin | no | `ListHosts` | List hosts |
+| `POST` | `/v1/hosts` | admin | yes | `CreateHost` | Add a host and mint its single-use join key |
 | `GET` | `/v1/hosts/{id}` | admin\|host | no | `GetHost` | Read a host |
 | `PUT` | `/v1/hosts/{id}` | host | yes | `RegisterHost` | Register or re-register a host (idempotent) |
 | `DELETE` | `/v1/hosts/{id}` | admin | yes | `DeleteHost` | Drain and remove a host |
@@ -180,7 +181,7 @@ Includes `oboPublicKey` (hostd pins it) and, in wif mode, `wif` (issuer and subj
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes | Tenant ID (`tn_…`). |
+| `id` | path | string | yes | Tenant ID (`tn_…` when generated; one safe path element). |
 | `If-None-Match` | header | string | no | Answer `304` when the `ETag` still matches. |
 
 | Status | Body | Description |
@@ -202,7 +203,7 @@ Switching to `wif` or changing a WIF client ID drops cached tokens.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes | Tenant ID (`tn_…`). |
+| `id` | path | string | yes | Tenant ID (`tn_…` when generated; one safe path element). |
 | `If-Match` | header | string | no | Only apply if the resource's current `ETag` matches; otherwise `412 precondition_failed`. |
 
 **Request** `application/json` or `application/merge-patch+json`: `TenantPatch`
@@ -229,7 +230,7 @@ volume keys) are removed last.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes | Tenant ID (`tn_…`). |
+| `id` | path | string | yes | Tenant ID (`tn_…` when generated; one safe path element). |
 | `If-Match` | header | string | no | Only apply if the resource's current `ETag` matches; otherwise `412 precondition_failed`. |
 | `force` | query | boolean | no | Cascade-kill live objects and purge before deleting. |
 
@@ -256,7 +257,7 @@ Replaces `POST /v0/tenants/{id}/purge`.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes | Tenant ID (`tn_…`). |
+| `id` | path | string | yes | Tenant ID (`tn_…` when generated; one safe path element). |
 | `state` | query | array of string: `killed` \| `failed` | no | Terminal states to purge. Repeatable. Any other value is `400 bad_request`. |
 
 | Status | Body | Description |
@@ -278,7 +279,7 @@ control plane; it creates nothing. `400 bad_request` for non-wif tenants.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes | Tenant ID (`tn_…`). |
+| `id` | path | string | yes | Tenant ID (`tn_…` when generated; one safe path element). |
 
 | Status | Body | Description |
 |---|---|---|
@@ -307,6 +308,33 @@ twd-hostd instances. A host writes its own record; admins read.
 | 200 | `HostPage` | One page of hosts, ordered by `(createdAt, hostID)`. |
 | 400 | `Error` | Malformed request, body, filter or cursor. |
 | 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+### `POST /v1/hosts` — Add a host and mint its single-use join key
+
+`CreateHost` · role **admin** · audited: yes
+
+`twd host add`: creates the host record (status `pending`) and mints a
+**single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+through the operator tenant's trust credential (wif) or API key
+(apikey). `twd-hostd join --token <key>` joins the operator tailnet
+with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+node to the record. Calling it again for a host that has not bound a
+node yet mints a fresh key (`200`); a bound host is `409 exists`
+(delete it first). The key is never logged. Audited
+(`kind: host_add`).
+
+**Request** `application/json`: `HostCreate`
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | `HostJoin` | The pending host exists; a fresh join key. |
+| 201 | `HostJoin` | Created; the join key. |
+| 400 | `Error` | Malformed request, body, filter or cursor. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| 404 | `Error` | Unknown operator tenant. |
+| 409 | `Error` | The request conflicts with the resource's current state. |
+| 502 | `Error` | The control plane refused the mint (`bootstrap_failed`). |
 | default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
 
 ### `GET /v1/hosts/{id}` — Read a host
@@ -496,7 +524,7 @@ the CLI then prints `preflight skipped` and deploys.
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes |  |
+| `id` | path | string | yes | Deployment ID (`dp_…`). |
 | `If-None-Match` | header | string | no | Answer `304` when the `ETag` still matches. |
 
 | Status | Body | Description |
@@ -520,7 +548,7 @@ undeployed (`409 superseded` otherwise).
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes |  |
+| `id` | path | string | yes | Deployment ID (`dp_…`). |
 | `If-Match` | header | string | no | Only apply if the resource's current `ETag` matches; otherwise `412 precondition_failed`. |
 | `reason` | query | string | no |  |
 
@@ -541,7 +569,7 @@ Hosts fetch the bundle named by `Assignment.bundleURL`. Only the lease holder (o
 
 | Parameter | In | Type | Required | Description |
 |---|---|---|---|---|
-| `id` | path | string | yes |  |
+| `id` | path | string | yes | Deployment ID (`dp_…`). |
 
 | Status | Body | Description |
 |---|---|---|
@@ -1062,9 +1090,9 @@ Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
 `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-`preflight` (optional; dryRun deploys).
+`preflight` (optional; dryRun deploys), `host_add`.
 
-Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`
+Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`
 
 #### `AuditPage`
 
@@ -1092,7 +1120,7 @@ written, no HTML escaping. `seq` and `chain` are assigned by mgmt.
 | `grant` | string | no |  |
 | `hash` | string | yes |  |
 | `hostSig` | string | no | base64 ed25519 over utf8(hash); host chains only. |
-| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys). |
+| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`. |
 | `objectID` | string | no |  |
 | `prevHash` | string | yes | `""` for the first record of a chain. |
 | `seq` | integer (int64) | no | (read-only) |
@@ -1308,6 +1336,15 @@ Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity
 | `tiers` | array of `Tier` | yes |  |
 | `updatedAt` | integer (int64) | yes |  |
 
+#### `HostCreate`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `hostID` | string | yes |  |
+| `pool` | string | no |  |
+| `tenantID` | string | no | The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own). |
+| `tiers` | array of `Tier` | no |  |
+
 #### `HostDeleteResult`
 
 | Field | Type | Required | Description |
@@ -1316,6 +1353,20 @@ Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity
 | `hostID` | string | yes |  |
 | `killed` | array of string | yes |  |
 | `leasesReleased` | array of string | yes |  |
+
+#### `HostJoin`
+
+A single-use join key for a host's `tag:twd-host` node. Never logged.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `authKey` | string (password) | yes |  |
+| `controlURL` | string (uri) | no |  |
+| `expiresAt` | integer (int64) | yes | unix ms |
+| `host` | `Host` | yes |  |
+| `hostname` | string | yes | `twd-host-<hostID>` |
+| `tags` | array of string | yes |  |
+| `tailnet` | string | no |  |
 
 #### `HostPage`
 

@@ -360,6 +360,60 @@ paths:
 
   # ------------------------------------------------------------------ hosts
   /v1/hosts:
+    post:
+      tags: [hosts, credentials]
+      operationId: CreateHost
+      summary: Add a host and mint its single-use join key
+      description: |
+        `twd host add`: creates the host record (status `pending`) and mints a
+        **single-use, pre-authorized auth key for `tag:twd-host`** (10 min)
+        through the operator tenant's trust credential (wif) or API key
+        (apikey). `twd-hostd join --token <key>` joins the operator tailnet
+        with it as `twd-host-<hostID>`, then `PUT /v1/hosts/{id}` binds that
+        node to the record. Calling it again for a host that has not bound a
+        node yet mints a fresh key (`200`); a bound host is `409 exists`
+        (delete it first). The key is never logged. Audited
+        (`kind: host_add`).
+      x-twd-role: admin
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HostCreate" }
+            example: { hostID: h-mbp, tenantID: tn_tail7906d5 }
+      responses:
+        "201":
+          description: Created; the join key.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostJoin" }
+        "200":
+          description: The pending host exists; a fresh join key.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HostJoin" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: Unknown operator tenant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "502":
+          description: The control plane refused the mint (`bootstrap_failed`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        default: { $ref: "#/components/responses/Error" }
     get:
       tags: [hosts]
       operationId: ListHosts
@@ -1518,8 +1572,8 @@ components:
       name: id
       in: path
       required: true
-      description: Tenant ID (`tn_…`).
-      schema: { type: string, pattern: "^tn_[a-z0-9]{1,16}$" }
+      description: Tenant ID (`tn_…` when generated; one safe path element).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
     tenantPath:
       name: tenant
       in: path
@@ -1535,19 +1589,20 @@ components:
       name: id
       in: path
       required: true
-      schema: { type: string, pattern: "^dep_[a-z0-9]{1,24}$" }
+      description: Deployment ID (`dp_…`).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
     objectID:
       name: id
       in: path
       required: true
       description: Object ID (`<class-slug>-<b32(hmac)[:10]>`, also the node hostname).
-      schema: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$" }
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
     volumeID:
       name: id
       in: path
       required: true
       description: "Volume ID `<tenantID>:<workload>` (one volume per workload; `:` is a legal path character)."
-      schema: { type: string, pattern: "^tn_[a-z0-9]{1,16}:[a-z0-9][a-z0-9-]{0,62}$" }
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[a-z0-9][a-z0-9-]{0,62}$" }
       example: "tn_tail7906d5:agent"
 
   headers:
@@ -2046,6 +2101,30 @@ components:
         lastSeen: { type: integer, format: int64, description: unix ms of the last heartbeat }
         createdAt: { type: integer, format: int64 }
         updatedAt: { type: integer, format: int64 }
+    HostCreate:
+      type: object
+      required: [hostID]
+      properties:
+        hostID: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$" }
+        tenantID:
+          type: string
+          description: "The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own)."
+        pool: { type: string }
+        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+      additionalProperties: false
+    HostJoin:
+      type: object
+      description: A single-use join key for a host's `tag:twd-host` node. Never logged.
+      required: [host, authKey, expiresAt, tags, hostname]
+      properties:
+        host: { $ref: "#/components/schemas/Host" }
+        authKey: { type: string, format: password }
+        expiresAt: { type: integer, format: int64, description: unix ms }
+        tags: { type: array, items: { type: string } }
+        hostname: { type: string, description: "`twd-host-<hostID>`" }
+        controlURL: { type: string, format: uri }
+        tailnet: { type: string }
+      x-twd-secret: true
     HostRegistration:
       type: object
       required: [capacityNodes, tiers]
@@ -2121,7 +2200,7 @@ components:
       type: object
       required: [deploymentID, tenantID, workload, host, epoch, status, namespaces, endpoint, createdAt]
       properties:
-        deploymentID: { type: string, examples: [dep_01j8z…] }
+        deploymentID: { type: string, examples: [dp_3f9a1c2b7d8e4f50] }
         tenantID: { type: string }
         workload: { type: string }
         host: { type: string }
@@ -2328,7 +2407,7 @@ components:
         `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
         `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
         `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-        `preflight` (optional; dryRun deploys).
+        `preflight` (optional; dryRun deploys), `host_add`.
       enum:
         - allow
         - deny
@@ -2353,6 +2432,7 @@ components:
         - volume_key
         - reap
         - preflight
+        - host_add
     AuditSource:
       type: string
       description: "`mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content)."

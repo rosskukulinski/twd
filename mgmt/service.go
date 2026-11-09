@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -51,6 +52,14 @@ type Config struct {
 	DeviceDeleteDelay time.Duration
 	// PushTimeout bounds one mgmt → hostd push (default 2 s).
 	PushTimeout time.Duration
+	// TailnetDial dials hosts' tsnet nodes for pushes (tsnet.Server.Dial);
+	// nil uses the plain network (tests).
+	TailnetDial func(ctx context.Context, network, addr string) (net.Conn, error)
+	// OperatorTailnet is mgmt's own tailnet (MagicDNS suffix): the tenant
+	// whose tailnet this is mints host join keys (POST /v1/hosts).
+	OperatorTailnet string
+	// OperatorControlURL is passed to hosts with their join key.
+	OperatorControlURL string
 }
 
 // Mgmt is twd-mgmt's core: tenants, deployments, objects, the mint broker
@@ -360,27 +369,58 @@ type RegisterRequest struct {
 	CapacityNodes int      `json:"capacityNodes"`
 	Tiers         []string `json:"tiers"`
 	AuditPubKey   string   `json:"auditPubKey,omitempty"`
-	// PushURL (hostd-additions) is where mgmt pushes kills and assignment
-	// changes. Only unix:// sockets are accepted.
-	PushURL string `json:"pushURL,omitempty"`
+	Pool          string   `json:"pool,omitempty"`
+	// PushURL is where mgmt pushes kills and assignment changes on the
+	// local-dev socket (unix:///… only). Over the tailnet hosts give
+	// PushPort instead: mgmt pushes to the WhoIs node's address.
+	PushURL  string `json:"pushURL,omitempty"`
+	PushPort int    `json:"pushPort,omitempty"`
 }
 
-func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID string) error {
+// RegisterHost binds the host record to the calling node (nodeID, nodeAddr
+// are the WhoIs identity and tailnet IP of a tsnet host; "" on the
+// local-dev socket). It returns true when the record is new.
+func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, nodeAddr string) (Host, bool, error) {
 	if r.HostID == "" {
-		return errf(400, "bad_request", "hostID required")
+		return Host{}, false, errf(400, "bad_request", "hostID required")
 	}
-	if old, err := m.store.GetHost(ctx, r.HostID); err == nil && old.NodeID != "" && nodeID != "" && old.NodeID != nodeID {
-		return errf(403, "host_identity_mismatch", "host %s is registered to another node", r.HostID)
+	old, err := m.store.GetHost(ctx, r.HostID)
+	created := errors.Is(err, ErrNotFound)
+	if err == nil && old.NodeID != "" && nodeID != "" && old.NodeID != nodeID {
+		return Host{}, false, errf(403, "host_identity_mismatch", "host %s is registered to another node", r.HostID)
 	}
 	m.mu.Lock()
-	if strings.HasPrefix(r.PushURL, "unix:///") {
+	switch {
+	case strings.HasPrefix(r.PushURL, "unix:///") && nodeID == "":
 		m.pushURLs[r.HostID] = r.PushURL
-	} else {
+	case r.PushPort > 0 && nodeAddr != "":
+		m.pushURLs[r.HostID] = "http://" + net.JoinHostPort(nodeAddr, strconv.Itoa(r.PushPort))
+	default:
 		delete(m.pushURLs, r.HostID)
 	}
 	m.mu.Unlock()
-	return m.store.UpsertHost(ctx, Host{ID: r.HostID, CapacityNodes: r.CapacityNodes, Tiers: r.Tiers, NodeID: nodeID,
-		AuditPubKey: r.AuditPubKey, LastSeen: m.now().UnixMilli()})
+	now := m.now().UnixMilli()
+	h := Host{ID: r.HostID, CapacityNodes: r.CapacityNodes, Tiers: r.Tiers, NodeID: nodeID, AuditPubKey: r.AuditPubKey,
+		Pool: r.Pool, PushPort: r.PushPort, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt}
+	if h.CreatedAt == 0 {
+		h.CreatedAt = now
+	}
+	if h.Pool == "" {
+		h.Pool = old.Pool
+	}
+	if err := m.store.UpsertHost(ctx, h); err != nil {
+		return Host{}, false, err
+	}
+	m.audit(ctx, AuditRecord{Kind: "host_register", ActingFor: "host:" + r.HostID}, map[string]any{"host": r.HostID, "node": nodeID,
+		"tiers": r.Tiers, "capacity": r.CapacityNodes, "push": m.pushTarget(r.HostID) != "", "new": created})
+	return h, created, nil
+}
+
+// pushTarget returns the host's push URL ("" if none).
+func (m *Mgmt) pushTarget(hostID string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pushURLs[hostID]
 }
 
 // HeartbeatLease is one lease a host believes it holds.
@@ -550,7 +590,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	resp.Endpoint.MagicDNS = resp.Endpoint.Node + "." + t.Tailnet
 	m.setDepStatus(d.ID, DeploymentStatus{Status: "assigned"})
 	// Tell the host now instead of at its next heartbeat.
-	go m.push(host, "/v0/push/assignments", map[string]any{})
+	go m.push(host, "/v1/push/assignments", map[string]any{})
 	return resp, nil
 }
 
@@ -600,20 +640,7 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 	}
 	v.DeploymentID, v.TenantID, v.Workload, v.Host, v.Epoch, v.Namespaces, v.CreatedAt = d.ID, d.TenantID, d.Workload, d.HostID, d.Epoch, d.Namespaces, d.CreatedAt
 	v.DeployedBy = d.DeployedBy
-	m.mu.Lock()
-	st, ok := m.depStatus[id]
-	m.mu.Unlock()
-	v.Status, v.Error = "unknown", ""
-	if ok {
-		v.Status, v.Error = st.Status, st.Error
-	}
-	if ds, err := m.store.LatestDeployments(ctx, d.TenantID); err == nil {
-		for _, a := range ds {
-			if a.Workload == d.Workload && a.ID != d.ID {
-				v.Status = "superseded"
-			}
-		}
-	}
+	v.Status, v.Error = m.deploymentStatus(ctx, d)
 	if o, err := m.store.GetObjectByName(ctx, d.TenantID, d.Workload, WorkloadNamespace, d.Workload); err == nil {
 		v.Endpoint.ObjectID, v.Endpoint.MagicDNS, v.Endpoint.Status = o.ID, o.MagicDNS, o.Status
 		v.Endpoint.Node, _, _ = strings.Cut(o.MagicDNS, ".")
@@ -625,13 +652,13 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 // live lease holder; otherwise the live host with the most free capacity.
 func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want string) (string, error) {
 	now := m.now()
-	hosts, err := m.store.ListHosts(ctx)
+	hosts, err := m.store.ListHosts(ctx, Page{})
 	if err != nil {
 		return "", err
 	}
 	live := map[string]Host{}
 	for _, h := range hosts {
-		if h.Live(now) {
+		if h.Live(now) && (t.Pool == "" || h.Pool == t.Pool) {
 			live[h.ID] = h
 		}
 	}
@@ -685,7 +712,7 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 	for _, d := range ds {
 		t, _ := m.store.GetTenant(ctx, d.TenantID)
 		a := Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
-			BundleURL: "/v0/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
+			BundleURL: "/v1/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
 			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}}
 		for _, c := range d.Namespaces {
 			if c.Class == WorkloadNamespace {
@@ -847,7 +874,7 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	}
 	o := Object{ID: id, TenantID: t.ID, Workload: workload, Namespace: r.Namespace, Name: r.ObjectName, Hostname: id, DeploymentID: dep.ID,
 		Lease: LeaseName(t.ID, dep.Workload), Tags: class.Tags, Caps: r.Caps, RootID: id, TTLSeconds: int64(ttl / time.Second),
-		Status: StatusPending, CreatedAt: m.now().UnixMilli(), UpdatedAt: m.now().UnixMilli()}
+		Status: StatusPending, ActingFor: r.ActingFor, CreatedAt: m.now().UnixMilli(), UpdatedAt: m.now().UnixMilli()}
 	kind := "create"
 	if parent != nil {
 		kind = "spawn"
@@ -1389,6 +1416,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		prev := o.Status
 		killed, err := m.store.UpdateObject(ctx, o.ID, nil, func(x *Object) error {
 			x.Status, x.KillReason, x.UpdatedAt = StatusKilled, r.Reason, now.UnixMilli()
+			x.KilledAt, x.KilledBy, x.KillCascade, x.KillRoot = now.UnixMilli(), r.By, x.ID != id, id
 			return nil
 		})
 		if err != nil {
@@ -1413,7 +1441,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if err := m.push(host, "/v0/push/kill", map[string]any{"objectID": oid, "reason": r.Reason}); err == nil {
+				if err := m.push(host, "/v1/push/kill", map[string]any{"objectID": oid, "reason": r.Reason}); err == nil {
 					pmu.Lock()
 					res.Pushed = append(res.Pushed, oid)
 					pmu.Unlock()
@@ -1466,14 +1494,24 @@ func (m *Mgmt) push(hostID, path string, body any) error {
 	if u == "" {
 		return errors.New("host has no push URL")
 	}
-	sock := strings.TrimPrefix(u, "unix://")
-	hc := &http.Client{Timeout: m.cfg.PushTimeout, Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+	base := "http://hostd"
+	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	if sock, ok := strings.CutPrefix(u, "unix://"); ok {
+		dial = func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
-		}}}
+		}
+	} else {
+		// A tsnet host: dial its node through mgmt's own node.
+		base = u
+		dial = m.cfg.TailnetDial
+		if dial == nil {
+			dial = (&net.Dialer{}).DialContext
+		}
+	}
+	hc := &http.Client{Timeout: m.cfg.PushTimeout, Transport: &http.Transport{DialContext: dial}}
 	defer hc.CloseIdleConnections()
 	b, _ := json.Marshal(body)
-	resp, err := hc.Post("http://hostd"+path, "application/json", bytes.NewReader(b))
+	resp, err := hc.Post(base+path, "application/json", bytes.NewReader(b))
 	if err != nil {
 		m.log.Debug("push failed", "host", hostID, "path", path, "err", err)
 		return err
@@ -1488,6 +1526,7 @@ func (m *Mgmt) push(hostID, path string, body any) error {
 type pendingDelete struct {
 	o     Object
 	timer *time.Timer
+	at    int64 // unix ms when the delete runs
 }
 
 func (m *Mgmt) scheduleDelete(o Object) {
@@ -1496,7 +1535,7 @@ func (m *Mgmt) scheduleDelete(o Object) {
 	if _, ok := m.pending[o.ID]; ok {
 		return
 	}
-	pd := &pendingDelete{o: o}
+	pd := &pendingDelete{o: o, at: m.now().Add(m.cfg.DeviceDeleteDelay).UnixMilli()}
 	pd.timer = time.AfterFunc(m.cfg.DeviceDeleteDelay, func() { m.runDelete(o.ID) })
 	m.pending[o.ID] = pd
 }
@@ -1542,7 +1581,7 @@ type PurgeResult struct {
 // was refused: the killed workload-node object (same name, same ID) made
 // CreateObject answer 410 and the deployment's endpoint read "killed".
 // Live objects are never touched; every removal is audited as "purge".
-func (m *Mgmt) Purge(ctx context.Context, tenantID string) (PurgeResult, error) {
+func (m *Mgmt) Purge(ctx context.Context, tenantID string, statuses ...string) (PurgeResult, error) {
 	res := PurgeResult{Purged: []string{}}
 	if _, err := m.store.GetTenant(ctx, tenantID); err != nil {
 		return res, err
@@ -1551,7 +1590,7 @@ func (m *Mgmt) Purge(ctx context.Context, tenantID string) (PurgeResult, error) 
 	l := m.tenantLock(tenantID)
 	l.Lock()
 	defer l.Unlock()
-	dead, err := m.store.DeleteDeadObjects(ctx, tenantID)
+	dead, err := m.store.DeleteDeadObjects(ctx, tenantID, statuses)
 	if err != nil {
 		return res, err
 	}
@@ -1826,6 +1865,7 @@ type PreflightMissing struct {
 // PreflightResult is the preflight verdict.
 type PreflightResult struct {
 	OK               bool               `json:"ok"`
+	SrcTags          []string           `json:"srcTags,omitempty"`
 	Missing          []PreflightMissing `json:"missing"`
 	MissingTagOwners []string           `json:"missingTagOwners"`
 	TagOwnersSnippet string             `json:"tagOwnersSnippet,omitempty"`

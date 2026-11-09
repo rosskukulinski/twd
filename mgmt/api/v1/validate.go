@@ -143,3 +143,27 @@ func (r *recorder) Write(p []byte) (int, error) {
 	r.body = append(r.body, p...)
 	return r.ResponseWriter.Write(p)
 }
+
+// OperationRoles maps "METHOD /path" (the spec's path template, which is
+// also the Go 1.22 mux pattern) to the operation's x-twd-role. Public
+// operations (empty security) map to "public".
+func OperationRoles() (map[string]string, error) {
+	doc, err := Spec()
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for path, item := range doc.Paths.Map() {
+		for method, op := range item.Operations() {
+			role := ""
+			if v, ok := op.Extensions["x-twd-role"]; ok {
+				role, _ = v.(string)
+			}
+			if op.Security != nil && len(*op.Security) == 0 {
+				role = "public"
+			}
+			out[method+" "+path] = role
+		}
+	}
+	return out, nil
+}

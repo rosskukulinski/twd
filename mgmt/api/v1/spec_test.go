@@ -141,7 +141,7 @@ func TestValidatorRejectsAndAccepts(t *testing.T) {
 		{"GET", "/v1/tenants?limit=50", "", false},
 		{"GET", "/v1/tenants?limit=0", "", true},      // below minimum
 		{"GET", "/v1/tenants?limit=501", "", true},    // above maximum
-		{"GET", "/v1/tenants/not-a-tenant", "", true}, // pattern
+		{"GET", "/v1/tenants/not%20a%20tenant", "", true}, // pattern
 		{"GET", "/v1/tenants/tn_abc123", "", false},
 		{"POST", "/v1/objects/agent-k3j5m7p9qa/credentials", "", true}, // epoch required
 		{"POST", "/v1/objects/agent-k3j5m7p9qa/credentials?epoch=3", "", false},

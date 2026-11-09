@@ -180,7 +180,49 @@ func (s *SQLStore) migrate(ctx context.Context) error {
 	if err := s.copyLegacyObjects(ctx, legacy); err != nil {
 		return err
 	}
-	return s.addColumns(ctx)
+	if err := s.addColumns(ctx); err != nil {
+		return err
+	}
+	return s.addIndexes(ctx)
+}
+
+// addIndexes creates the cursor-pagination indexes (/v1 lists are ordered
+// by (created_at, id); audit by (ts, chain, seq)). Idempotent on both
+// dialects; hosts.created_at is backfilled from last_seen for rows that
+// predate the column.
+func (s *SQLStore) addIndexes(ctx context.Context) error {
+	for _, ddl := range []string{
+		"UPDATE hosts SET created_at=last_seen WHERE created_at=0",
+		"CREATE INDEX IF NOT EXISTS tenants_created ON tenants (created_at, id)",
+		"CREATE INDEX IF NOT EXISTS hosts_created ON hosts (created_at, id)",
+		"CREATE INDEX IF NOT EXISTS deployments_created ON deployments (created_at, id)",
+		"CREATE INDEX IF NOT EXISTS objects_created ON objects (created_at, id)",
+		"CREATE INDEX IF NOT EXISTS objects_tenant_created ON objects (tenant_id, created_at, id)",
+		"CREATE INDEX IF NOT EXISTS audit_ts ON audit (ts, chain, seq)",
+		"CREATE INDEX IF NOT EXISTS audit_tenant ON audit (tenant_id, ts)",
+		"CREATE INDEX IF NOT EXISTS audit_acting_for ON audit (acting_for)",
+	} {
+		if _, err := s.db.ExecContext(ctx, ddl); err != nil {
+			return fmt.Errorf("%w: %s", err, ddl)
+		}
+	}
+	return nil
+}
+
+// afterKey is the keyset condition for a page: rows strictly after
+// (created_at, id). cols names the two columns (possibly prefixed).
+func afterKey(pg Page, created, id string) (string, []any) {
+	if pg.After == nil {
+		return "", nil
+	}
+	return "(" + created + " > ? OR (" + created + " = ? AND " + id + " > ?))", []any{pg.After.Created, pg.After.Created, pg.After.ID}
+}
+
+func limitClause(pg Page) string {
+	if pg.Limit > 0 {
+		return fmt.Sprintf(" LIMIT %d", pg.Limit)
+	}
+	return ""
 }
 
 // addColumns adds columns introduced after a store was created (additive
@@ -189,6 +231,22 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 	for _, c := range []struct{ table, col, ddl string }{
 		{"objects", "cert", "ALTER TABLE objects ADD COLUMN cert TEXT NOT NULL DEFAULT ''"},                       // RT-01 node certificates
 		{"deployments", "deployed_by", "ALTER TABLE deployments ADD COLUMN deployed_by TEXT NOT NULL DEFAULT ''"}, // M10: WhoIs login / local actor
+		// M11 (/v1): tenant pool/tier/updated_at; host pool, push port,
+		// created/updated; deployment stopped_at (undeploy); the object
+		// kill record (tombstone) and acting_for.
+		{"tenants", "pool", "ALTER TABLE tenants ADD COLUMN pool TEXT NOT NULL DEFAULT ''"},
+		{"tenants", "tier", "ALTER TABLE tenants ADD COLUMN tier TEXT NOT NULL DEFAULT ''"},
+		{"tenants", "updated_at", "ALTER TABLE tenants ADD COLUMN updated_at BIGINT NOT NULL DEFAULT 0"},
+		{"hosts", "pool", "ALTER TABLE hosts ADD COLUMN pool TEXT NOT NULL DEFAULT ''"},
+		{"hosts", "push_port", "ALTER TABLE hosts ADD COLUMN push_port BIGINT NOT NULL DEFAULT 0"},
+		{"hosts", "created_at", "ALTER TABLE hosts ADD COLUMN created_at BIGINT NOT NULL DEFAULT 0"},
+		{"hosts", "updated_at", "ALTER TABLE hosts ADD COLUMN updated_at BIGINT NOT NULL DEFAULT 0"},
+		{"deployments", "stopped_at", "ALTER TABLE deployments ADD COLUMN stopped_at BIGINT NOT NULL DEFAULT 0"},
+		{"objects", "killed_at", "ALTER TABLE objects ADD COLUMN killed_at BIGINT NOT NULL DEFAULT 0"},
+		{"objects", "killed_by", "ALTER TABLE objects ADD COLUMN killed_by TEXT NOT NULL DEFAULT ''"},
+		{"objects", "kill_cascade", "ALTER TABLE objects ADD COLUMN kill_cascade BIGINT NOT NULL DEFAULT 0"},
+		{"objects", "kill_root", "ALTER TABLE objects ADD COLUMN kill_root TEXT NOT NULL DEFAULT ''"},
+		{"objects", "acting_for", "ALTER TABLE objects ADD COLUMN acting_for TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {
@@ -300,13 +358,16 @@ func jsonStr(v any) string {
 
 // ---- tenants ----
 
-const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at"
+const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at"
 
 func scanTenant(sc interface{ Scan(...any) error }) (Tenant, error) {
 	var t Tenant
 	var rpm, mo int64
-	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt)
+	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt)
 	t.RegistrationsPerMinute, t.MaxObjects = int(rpm), int(mo)
+	if t.UpdatedAt == 0 {
+		t.UpdatedAt = t.CreatedAt
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -314,9 +375,12 @@ func scanTenant(sc interface{ Scan(...any) error }) (Tenant, error) {
 }
 
 func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?)"),
+	if t.UpdatedAt == 0 {
+		t.UpdatedAt = t.CreatedAt
+	}
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"),
 		t.ID, t.Tailnet, t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID,
-		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt)
+		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -326,8 +390,8 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 // UpdateTenant rewrites a tenant's mint configuration (mode, key file,
 // WIF client IDs) and limits; ID, tailnet and createdAt are immutable.
 func (s *SQLStore) UpdateTenant(ctx context.Context, t Tenant) error {
-	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=? WHERE id=?"),
-		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.ID)
+	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=? WHERE id=?"),
+		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.ID)
 	if err != nil {
 		return err
 	}
@@ -341,8 +405,31 @@ func (s *SQLStore) GetTenant(ctx context.Context, id string) (Tenant, error) {
 	return scanTenant(s.db.QueryRowContext(ctx, s.q("SELECT "+tenantCols+" FROM tenants WHERE id=?"), id))
 }
 
-func (s *SQLStore) ListTenants(ctx context.Context) ([]Tenant, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+tenantCols+" FROM tenants ORDER BY created_at, id")
+func (s *SQLStore) DeleteTenant(ctx context.Context, id string) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		for _, q := range []string{"DELETE FROM objects WHERE tenant_id=?", "DELETE FROM deployments WHERE tenant_id=?",
+			"DELETE FROM leases WHERE name LIKE ? || '/%'"} {
+			if _, err := tx.ExecContext(ctx, s.q(q), id); err != nil {
+				return err
+			}
+		}
+		res, err := tx.ExecContext(ctx, s.q("DELETE FROM tenants WHERE id=?"), id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
+}
+
+func (s *SQLStore) ListTenants(ctx context.Context, pg Page) ([]Tenant, error) {
+	q, args := "SELECT "+tenantCols+" FROM tenants", []any{}
+	if cond, a := afterKey(pg, "created_at", "id"); cond != "" {
+		q, args = q+" WHERE "+cond, a
+	}
+	rows, err := s.db.QueryContext(ctx, s.q(q+" ORDER BY created_at, id"+limitClause(pg)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -360,26 +447,37 @@ func (s *SQLStore) ListTenants(ctx context.Context) ([]Tenant, error) {
 
 // ---- hosts ----
 
-const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen"
+const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at"
 
 func scanHost(sc interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var capacity, live int64
 	var tiers string
-	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen)
+	var port int64
+	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return h, ErrNotFound
 	}
-	h.CapacityNodes, h.LiveNodes = int(capacity), int(live)
+	h.CapacityNodes, h.LiveNodes, h.PushPort = int(capacity), int(live), int(port)
+	if h.UpdatedAt == 0 {
+		h.UpdatedAt = h.LastSeen
+	}
 	json.Unmarshal([]byte(tiers), &h.Tiers)
 	return h, err
 }
 
 func (s *SQLStore) UpsertHost(ctx context.Context, h Host) error {
-	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?)
+	if h.UpdatedAt == 0 {
+		h.UpdatedAt = h.LastSeen
+	}
+	if h.CreatedAt == 0 {
+		h.CreatedAt = h.UpdatedAt
+	}
+	// created_at is kept from the first insert (the page key must be stable).
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET capacity=excluded.capacity, tiers=excluded.tiers, node_id=excluded.node_id,
-		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen`),
-		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen)
+		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen, pool=excluded.pool, push_port=excluded.push_port, updated_at=excluded.updated_at`),
+		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt)
 	return err
 }
 
@@ -387,8 +485,23 @@ func (s *SQLStore) GetHost(ctx context.Context, id string) (Host, error) {
 	return scanHost(s.db.QueryRowContext(ctx, s.q("SELECT "+hostCols+" FROM hosts WHERE id=?"), id))
 }
 
-func (s *SQLStore) ListHosts(ctx context.Context) ([]Host, error) {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+hostCols+" FROM hosts ORDER BY id")
+func (s *SQLStore) DeleteHost(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, s.q("DELETE FROM hosts WHERE id=?"), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLStore) ListHosts(ctx context.Context, pg Page) ([]Host, error) {
+	q, args := "SELECT "+hostCols+" FROM hosts", []any{}
+	if cond, a := afterKey(pg, "created_at", "id"); cond != "" {
+		q, args = q+" WHERE "+cond, a
+	}
+	rows, err := s.db.QueryContext(ctx, s.q(q+" ORDER BY created_at, id"+limitClause(pg)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -417,13 +530,13 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var ns string
 	var ml, md int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy)
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -433,8 +546,8 @@ func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 }
 
 func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?)"),
-		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.Bundle)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"),
+		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, d.Bundle)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -505,6 +618,58 @@ func (s *SQLStore) LatestDeployments(ctx context.Context, tenantID string) ([]De
 	return s.latestDeployments(ctx, "AND d.tenant_id=?", tenantID)
 }
 
+func (s *SQLStore) StopDeployment(ctx context.Context, id string, now time.Time) error {
+	res, err := s.db.ExecContext(ctx, s.q("UPDATE deployments SET stopped_at=? WHERE id=?"), now.UnixMilli(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLStore) ListDeployments(ctx context.Context, f DeploymentFilter, pg Page) ([]Deployment, error) {
+	var where []string
+	var args []any
+	add := func(cond string, v any) { where = append(where, cond); args = append(args, v) }
+	if f.TenantID != "" {
+		add("d.tenant_id=?", f.TenantID)
+	}
+	if f.Workload != "" {
+		add("d.workload=?", f.Workload)
+	}
+	if f.HostID != "" {
+		add("d.host_id=?", f.HostID)
+	}
+	if f.Latest {
+		where = append(where, `NOT EXISTS (SELECT 1 FROM deployments n WHERE n.tenant_id=d.tenant_id AND n.workload=d.workload
+		  AND (n.created_at > d.created_at OR (n.created_at = d.created_at AND n.id > d.id)))`)
+	}
+	if cond, a := afterKey(pg, "d.created_at", "d.id"); cond != "" {
+		where = append(where, cond)
+		args = append(args, a...)
+	}
+	q := "SELECT " + prefixCols("d.", deployCols) + " FROM deployments d"
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	rows, err := s.db.QueryContext(ctx, s.q(q+" ORDER BY d.created_at, d.id"+limitClause(pg)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Deployment
+	for rows.Next() {
+		d, err := scanDeployment(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLStore) FindClass(ctx context.Context, tenantID, workload, class string) (Deployment, ClassConfig, error) {
 	ds, err := s.latestDeployments(ctx, "AND d.tenant_id=?", tenantID)
 	if err != nil {
@@ -541,19 +706,19 @@ func (s *SQLStore) FindClass(ctx context.Context, tenantID, workload, class stri
 // objectColsV1 are the columns of the M7 schema; cert (RT-01) was added later
 // and is filled by addColumns on older stores.
 const objectColsV1 = "id, tenant_id, workload, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
-const objectCols = objectColsV1 + ", cert"
+const objectCols = objectColsV1 + ", cert, killed_at, killed_by, kill_cascade, kill_root, acting_for"
 
 func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var o Object
 	var tags, caps string
-	var depth, eph int64
+	var depth, eph, casc int64
 	err := sc.Scan(&o.ID, &o.TenantID, &o.Workload, &o.Namespace, &o.Name, &o.Hostname, &o.DeploymentID, &o.Lease, &tags, &caps,
 		&o.ParentID, &o.RootID, &depth, &o.TTLSeconds, &eph, &o.Status, &o.NodeID, &o.StableNodeID, &o.MagicDNS,
-		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert)
+		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert, &o.KilledAt, &o.KilledBy, &casc, &o.KillRoot, &o.ActingFor)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
-	o.Depth, o.Ephemeral = int(depth), eph != 0
+	o.Depth, o.Ephemeral, o.KillCascade = int(depth), eph != 0, casc != 0
 	json.Unmarshal([]byte(tags), &o.Tags)
 	if caps != "" {
 		o.Caps = json.RawMessage(caps)
@@ -566,13 +731,17 @@ func objectArgs(o Object) []any {
 	if o.Ephemeral {
 		eph = 1
 	}
+	casc := 0
+	if o.KillCascade {
+		casc = 1
+	}
 	return []any{o.ID, o.TenantID, o.Workload, o.Namespace, o.Name, o.Hostname, o.DeploymentID, o.Lease, jsonStr(o.Tags), string(o.Caps),
 		o.ParentID, o.RootID, o.Depth, o.TTLSeconds, eph, o.Status, o.NodeID, o.StableNodeID, o.MagicDNS,
-		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert}
+		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert, o.KilledAt, o.KilledBy, casc, o.KillRoot, o.ActingFor}
 }
 
 func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -583,13 +752,24 @@ func (s *SQLStore) GetObject(ctx context.Context, id string) (Object, error) {
 	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE id=?"), id))
 }
 
-func (s *SQLStore) DeleteDeadObjects(ctx context.Context, tenantID string) ([]Object, error) {
+func (s *SQLStore) DeleteDeadObjects(ctx context.Context, tenantID string, statuses []string) ([]Object, error) {
+	if len(statuses) == 0 {
+		statuses = []string{StatusKilled, StatusFailed}
+	}
+	ph := strings.TrimSuffix(strings.Repeat("?,", len(statuses)), ",")
+	args := []any{tenantID}
+	for _, st := range statuses {
+		if st != StatusKilled && st != StatusFailed {
+			return nil, fmt.Errorf("purge: %q is not a terminal status", st)
+		}
+		args = append(args, st)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE tenant_id=? AND status IN (?,?)"), tenantID, StatusKilled, StatusFailed)
+	rows, err := tx.QueryContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE tenant_id=? AND status IN ("+ph+")"), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -613,7 +793,7 @@ func (s *SQLStore) DeleteDeadObjects(ctx context.Context, tenantID string) ([]Ob
 			return nil, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, s.q("DELETE FROM objects WHERE tenant_id=? AND status IN (?,?)"), tenantID, StatusKilled, StatusFailed); err != nil {
+	if _, err := tx.ExecContext(ctx, s.q("DELETE FROM objects WHERE tenant_id=? AND status IN ("+ph+")"), args...); err != nil {
 		return nil, err
 	}
 	return dead, tx.Commit()
@@ -655,11 +835,15 @@ func (s *SQLStore) ListObjects(ctx context.Context, f ObjectFilter) ([]Object, e
 			args = append(args, st)
 		}
 	}
+	if cond, a := afterKey(f.Page, "created_at", "id"); cond != "" {
+		where = append(where, cond)
+		args = append(args, a...)
+	}
 	q := "SELECT " + objectCols + " FROM objects"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	rows, err := s.db.QueryContext(ctx, s.q(q+" ORDER BY created_at, id"), args...)
+	rows, err := s.db.QueryContext(ctx, s.q(q+" ORDER BY created_at, id"+limitClause(f.Page)), args...)
 	if err != nil {
 		return nil, err
 	}
@@ -722,6 +906,24 @@ func (s *SQLStore) UpdateObject(ctx context.Context, id string, fence *Fence, fn
 		return err
 	})
 	return out, err
+}
+
+func (s *SQLStore) CountObjects(ctx context.Context) (map[string]int, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT status, COUNT(*) FROM objects GROUP BY status")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var st string
+		var n int64
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[st] = int(n)
+	}
+	return out, rows.Err()
 }
 
 func (s *SQLStore) CountLive(ctx context.Context, tenantID, rootID string) (int, error) {
@@ -847,13 +1049,36 @@ func (s *SQLStore) ListAudit(ctx context.Context, f AuditFilter) ([]AuditRecord,
 	if f.TenantID != "" {
 		add("tenant_id=?", f.TenantID)
 	}
+	if len(f.Kinds) > 0 {
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(f.Kinds)), ",")
+		where = append(where, "kind IN ("+ph+")")
+		for _, k := range f.Kinds {
+			args = append(args, k)
+		}
+	}
+	if f.Since != "" {
+		add("ts>=?", f.Since)
+	}
+	if f.Until != "" {
+		add("ts<=?", f.Until)
+	}
+	// Order: a single chain is read in chain order (verification needs it);
+	// cross-chain queries are ordered by (ts, chain, seq), the page key.
+	order := " ORDER BY ts, chain, seq"
+	if f.Chain != "" && f.Page.After == nil {
+		order = " ORDER BY chain, seq"
+	}
+	if k := f.Page.After; k != nil {
+		where = append(where, "(ts > ? OR (ts = ? AND chain > ?) OR (ts = ? AND chain = ? AND seq > ?))")
+		args = append(args, k.TS, k.TS, k.Chain, k.TS, k.Chain, k.Seq)
+	}
 	q := "SELECT chain, seq, ts, tenant_id, object_id, kind, trace_id, acting_for, prev_hash, hash, host_sig, raw FROM audit"
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY chain, seq"
-	if f.Limit > 0 {
-		q += fmt.Sprintf(" LIMIT %d", f.Limit)
+	q += order
+	if lim := max(f.Limit, f.Page.Limit); lim > 0 {
+		q += fmt.Sprintf(" LIMIT %d", lim)
 	}
 	rows, err := s.db.QueryContext(ctx, s.q(q), args...)
 	if err != nil {
