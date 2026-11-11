@@ -56,7 +56,9 @@ FIX_MODE: fix
 | S4 | — | **3/3 clean seeds** (PG blackhole 30 s, one replica) | `TestMM_S4_PostgresPartitionOneReplica` |
 | S5 | — | **3/3 clean seeds** (PG restart mid-load; failures confined to the declared outage) | `TestMM_S5_PostgresRestart` |
 | S6 | — | **3/3 clean seeds** after the harness got load-balancer semantics (iter30); was failing I8 at 1.3–2.2% | `TestMM_S6_SlowPostgresOneReplica` |
-| S1, S7–S11 | — | 0/3 seeds each | |
+| S1 | — | **3/3 clean seeds** (rolling SIGTERM restarts under load) | `TestMM_S1_RollingRestart` |
+| S7 | — | **clean**: S7a 3/3 seeds (all replicas killed and cold-started at once, twice, under load); S7b passes (3 concurrent `OpenStore` migrating a pre-M7 Postgres store: once, 50/50 rows intact) | `TestMM_S7a_SimultaneousColdStart`, `TestStoreConcurrentLegacyMigration` (make test-pg) |
+| S8–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -1018,3 +1020,5 @@ retry on a different backend, plus passive and active health checks
 2026-11-11 iter29 | S5, S6 | seeds 1–3 each | S5 3/3 PASS (after outage windows), S6 3/3 invariants PASS with throughput finding | I8 | results/*-S5-*, *-S6-* (locks.txt) | new: PG lock sampler; H17 (lease-row contention), H18 (500 vs 503 during store outage)
 2026-11-11 iter29 CORRECTION | S6 | seeds 2, 3 | seed 2 PASS (0.85%), seed 3 FAIL I8 (1.5%) | I8 | results/*-S6-seed{2,3} | the previous entry's '3/3' was written before reading seed 3's result
 2026-11-11 iter30 | S6 diagnosis | seeds 1–3 + A/B | 3/3 PASS after harness LB semantics; mgmt: session limits, FOR SHARE fence, 503 store_unavailable (H18) | I8 | results/*-S6-* (attempts traces) | A/B: S6 passes without the mgmt changes too; recorded as defense in depth
+2026-11-11 iter31 PLAN | S1 (rolling SIGTERM restarts), S7a (simultaneous kill+cold start ×2 under load), S7b (3 concurrent OpenStore on a pre-M7 Postgres store) | seeds 1–3 | pass if all invariants hold / migration once, rows intact | I3 I5 I6 I7 I8 I9 I11, migration
+2026-11-11 iter31 | S1, S7a, S7b | seeds 1–3 | 7/7 PASS | — | results/*-S1-*, *-S7a-*; make test-pg | no product changes

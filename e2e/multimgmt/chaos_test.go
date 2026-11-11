@@ -625,3 +625,56 @@ func (c *cluster) ejected(i int) bool {
 	defer ejections.Unlock()
 	return time.Now().Before(ejections.until[c][i])
 }
+
+// S1: rolling graceful restart (SIGTERM, then start) of every replica in
+// turn, repeatedly, under steady load.
+func TestMM_S1_RollingRestart(t *testing.T) {
+	runScenario(t, "S1", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		for ctx.Err() == nil {
+			for i := range 3 {
+				if ctx.Err() != nil {
+					return
+				}
+				c.stop(i, syscall.SIGTERM)
+				c.start(i)
+				c.waitReady(i, 15*time.Second)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Duration(3+g.intn(5)) * time.Second):
+				}
+			}
+		}
+	})
+}
+
+// S7a: every replica SIGKILLed and restarted at the same moment, twice,
+// under load: simultaneous cold starts over a populated store with pending
+// work. Requests in the gap fail; the gap is declared an outage.
+func TestMM_S7a_SimultaneousColdStart(t *testing.T) {
+	runScenario(t, "S7a", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		for k := 0; k < 2 && ctx.Err() == nil; k++ {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(15+g.intn(10)) * time.Second):
+			}
+			start := time.Now()
+			var wg sync.WaitGroup
+			for i := range 3 {
+				wg.Add(1)
+				go func() { defer wg.Done(); c.stop(i, syscall.SIGKILL) }()
+			}
+			wg.Wait()
+			for i := range 3 {
+				c.start(i)
+			}
+			for i := range 3 {
+				if _, err := c.waitReady(i, 15*time.Second); err != nil {
+					t.Errorf("cold start %d: %v", k, err)
+				}
+			}
+			h.outage(start.Add(-time.Second), time.Now().Add(2*time.Second))
+		}
+	})
+}

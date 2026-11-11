@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -244,6 +246,66 @@ func TestAPIIdentityScope(t *testing.T) {
 	for _, r := range ar.Records {
 		if r.TenantID != tb.TenantID {
 			t.Fatalf("tenant B audit has %+v", r)
+		}
+	}
+}
+
+// TestStoreConcurrentLegacyMigration (mm-loop S7b): three replicas opening a
+// pre-M7 Postgres store at the same moment migrate it exactly once; every
+// row survives with its workload; nobody errors. Postgres only (make
+// test-pg); each OpenStore has its own pool, like separate processes.
+func TestStoreConcurrentLegacyMigration(t *testing.T) {
+	dsn := os.Getenv("TWD_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("TWD_TEST_POSTGRES_DSN not set")
+	}
+	ctx := context.Background()
+	db, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.Exec("DROP SCHEMA public CASCADE")
+	db.Exec("CREATE SCHEMA public")
+	legacy := strings.Replace(strings.Replace(schemaCommon, "workload TEXT NOT NULL DEFAULT '', namespace", "namespace", 1),
+		"UNIQUE (tenant_id, workload, namespace, name)", "UNIQUE (tenant_id, namespace, name)", 1)
+	for _, stmt := range splitSQL(strings.Replace(legacy, "%s", "BYTEA", 1)) {
+		if _, err := db.Exec(stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Exec(`INSERT INTO deployments (id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at) VALUES ('d1','tn','support','h','[]',0,0,1,1)`)
+	for i := range 50 {
+		if _, err := db.Exec(`INSERT INTO objects (id, tenant_id, namespace, name, hostname, deployment_id, lease, tags, root_id, depth, status, created_at, updated_at)
+			VALUES ($1, 'tn', 'SupportAgent', $2, $1, 'd1', 'tn/support', '[]', $1, 0, 'ready', 1, 1)`, fmt.Sprintf("o%02d", i), fmt.Sprintf("n%02d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	errs := make([]error, 3)
+	stores := make([]*SQLStore, 3)
+	var wg sync.WaitGroup
+	gate := make(chan struct{})
+	for i := range 3 {
+		wg.Add(1)
+		go func() { defer wg.Done(); <-gate; stores[i], errs[i] = OpenStore(ctx, dsn) }()
+	}
+	close(gate)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("replica %d: concurrent migration failed: %v", i, err)
+		}
+		defer stores[i].Close()
+	}
+	var n, withWorkload int
+	db.QueryRow("SELECT COUNT(*), COUNT(*) FILTER (WHERE workload='support') FROM objects").Scan(&n, &withWorkload)
+	if n != 50 || withWorkload != 50 {
+		t.Fatalf("after the concurrent migration: %d objects, %d with workload 'support'; want 50/50", n, withWorkload)
+	}
+	// And every replica works on the migrated store.
+	for i, s := range stores {
+		if o, err := s.GetObjectByName(ctx, "tn", "support", "SupportAgent", "n07"); err != nil || o.ID != "o07" {
+			t.Fatalf("replica %d read: %+v %v", i, o, err)
 		}
 	}
 }
