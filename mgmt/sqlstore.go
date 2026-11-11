@@ -101,6 +101,22 @@ func (s *SQLStore) ClockOffset() (time.Duration, time.Time) {
 	return 0, time.Now()
 }
 
+func (s *SQLStore) ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error) {
+	r, err := s.db.ExecContext(ctx, s.q(`UPDATE objects SET mint_claim=?, mint_claimed_at=?
+		WHERE id=? AND status=? AND key_id='' AND (mint_claim='' OR mint_claim=? OR mint_claimed_at<?)`),
+		claimer, now.UnixMilli(), id, StatusPending, claimer, staleBefore.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+
+func (s *SQLStore) ReleaseMint(ctx context.Context, id, claimer string) error {
+	_, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET mint_claim='', mint_claimed_at=0 WHERE id=? AND mint_claim=?"), id, claimer)
+	return err
+}
+
 // ClockSource reports "postgres" while the store follows the server clock,
 // else "local".
 func (s *SQLStore) ClockSource() string {
@@ -298,6 +314,9 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// M12: oauth mint mode (client ID + credential file path; never the secret).
 		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
 		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F3 (H02): one replica mints each object.
+		{"objects", "mint_claim", "ALTER TABLE objects ADD COLUMN mint_claim TEXT NOT NULL DEFAULT ''"},
+		{"objects", "mint_claimed_at", "ALTER TABLE objects ADD COLUMN mint_claimed_at BIGINT NOT NULL DEFAULT 0"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {

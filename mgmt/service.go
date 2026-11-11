@@ -76,6 +76,8 @@ type Mgmt struct {
 	mu        sync.Mutex
 	throttles map[string]*Throttle
 	queues    map[string]chan string
+	queued    map[string]bool // object IDs in this replica's mint queues (dedupe for the pending sweep)
+	replicaID string          // this process's identity for mint claims
 	waiters   map[string]chan struct{}
 	spawnMu   map[string]*sync.Mutex // per tenant: serialises budget checks
 	depStatus map[string]DeploymentStatus
@@ -117,7 +119,7 @@ func New(cfg Config) (*Mgmt, error) {
 		cfg.MintRetries = 5
 	}
 	m := &Mgmt{cfg: cfg, store: cfg.Store, custody: cfg.Custody, broker: cfg.Broker, clock: cfg.Clock, log: cfg.Log,
-		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, waiters: map[string]chan struct{}{},
+		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, queued: map[string]bool{}, replicaID: newID("rp_"), waiters: map[string]chan struct{}{},
 		spawnMu: map[string]*sync.Mutex{}, depStatus: map[string]DeploymentStatus{}, pushURLs: map[string]string{},
 		pending: map[string]*pendingDelete{}, noDeviceScope: map[string]bool{}, deviceKept: map[string]bool{}}
 	if cfg.PushTimeout == 0 {
@@ -154,12 +156,8 @@ func LoadOrCreateSecret(path string) ([]byte, error) {
 
 // Start re-queues pending objects and runs the reaper until Close.
 func (m *Mgmt) Start() error {
-	pending, err := m.store.ListObjects(m.ctx, ObjectFilter{Status: []string{StatusPending}})
-	if err != nil {
+	if err := m.sweepPending(m.ctx); err != nil {
 		return err
-	}
-	for _, o := range pending {
-		m.enqueue(o.TenantID, o.ID)
 	}
 	m.clockOK = true
 	m.checkClock()
@@ -172,6 +170,9 @@ func (m *Mgmt) Start() error {
 				return
 			case <-m.clock.After(m.cfg.ReapInterval):
 				m.checkClock()
+				if err := m.sweepPending(m.ctx); err != nil {
+					m.log.Warn("pending sweep", "err", err)
+				}
 				if n, err := m.Reap(m.ctx); err != nil {
 					m.log.Warn("reaper", "err", err)
 				} else if n > 0 {
@@ -1039,8 +1040,28 @@ func (m *Mgmt) throttle(t Tenant) *Throttle {
 	return th
 }
 
+// sweepPending enqueues every pending object this replica isn't already
+// holding in a queue. It runs at Start and every reaper tick, so an object
+// whose mint claim was held by a replica that died is picked up again once
+// the claim goes stale (mint claims make concurrent sweeps safe: H02).
+func (m *Mgmt) sweepPending(ctx context.Context) error {
+	pending, err := m.store.ListObjects(ctx, ObjectFilter{Status: []string{StatusPending}})
+	if err != nil {
+		return err
+	}
+	for _, o := range pending {
+		m.enqueue(o.TenantID, o.ID)
+	}
+	return nil
+}
+
 func (m *Mgmt) enqueue(tenantID, objectID string) {
 	m.mu.Lock()
+	if m.queued[objectID] {
+		m.mu.Unlock()
+		return
+	}
+	m.queued[objectID] = true
 	q := m.queues[tenantID]
 	if q == nil {
 		q = make(chan string, 100_000)
@@ -1052,6 +1073,9 @@ func (m *Mgmt) enqueue(tenantID, objectID string) {
 	select {
 	case q <- objectID:
 	default:
+		m.mu.Lock()
+		delete(m.queued, objectID)
+		m.mu.Unlock()
 		m.log.Error("mint queue full", "tenant", tenantID)
 	}
 }
@@ -1072,6 +1096,9 @@ func (m *Mgmt) mintWorker(tenantID string, q chan string) {
 			return
 		case id = <-q:
 		}
+		m.mu.Lock()
+		delete(m.queued, id)
+		m.mu.Unlock()
 		for attempt := 1; ; attempt++ {
 			t, err := m.store.GetTenant(m.ctx, tenantID)
 			if err != nil {
@@ -1116,7 +1143,33 @@ func (m *Mgmt) mintWorker(tenantID string, q chan string) {
 	}
 }
 
-func custodyName(o Object) string { return "twd/" + o.TenantID + "/" + o.ID + "/authkey" }
+// custodyName is where an object's auth key lives: one entry per minted key
+// (…/authkey/<keyID>), so two replicas minting the same object can never
+// overwrite or delete each other's entry (H02). Objects minted before keyed
+// names keep the legacy name (…/authkey) until they join or are killed.
+func custodyName(o Object) string { return custodyKeyName(o, o.KeyID) }
+
+func custodyKeyName(o Object, keyID string) string {
+	if keyID == "" {
+		return legacyCustodyName(o)
+	}
+	return legacyCustodyName(o) + "/" + keyID
+}
+
+func legacyCustodyName(o Object) string { return "twd/" + o.TenantID + "/" + o.ID + "/authkey" }
+
+// deleteCustody removes the object's current key entry and any legacy one.
+func (m *Mgmt) deleteCustody(ctx context.Context, o Object) {
+	if o.KeyID != "" {
+		m.custody.Delete(ctx, custodyName(o))
+	}
+	m.custody.Delete(ctx, legacyCustodyName(o))
+}
+
+// MintClaimTTL is how long a replica's claim on minting an object stays
+// valid without being refreshed (each attempt refreshes it). It must exceed
+// one CreateKey + custody Put; after it, another replica may take over.
+const MintClaimTTL = 60 * time.Second
 
 // mintOne mints one single-use, preauthorized, ≤5-min key tagged with the
 // object's tags, and puts it in custody. The key is never logged.
@@ -1125,6 +1178,18 @@ func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string) error {
 	if err != nil || o.Status != StatusPending {
 		return nil // gone, killed or already minted
 	}
+	// Claim the mint (H02): only one replica calls CreateKey for an object.
+	now := m.now()
+	if ok, err := m.store.ClaimMint(ctx, id, m.replicaID, now, now.Add(-MintClaimTTL)); err != nil {
+		return err
+	} else if !ok {
+		return nil // another replica holds a fresh claim (or it is no longer pending)
+	}
+	// The claim covers this attempt only: released on every exit, so a
+	// replica backing off (429/5xx) or dying between attempts never blocks
+	// the others. Correctness does not rest on the TTL: keyed custody and
+	// the KeyID check below make a late duplicate undo only its own key.
+	defer m.store.ReleaseMint(context.WithoutCancel(ctx), id, m.replicaID)
 	api, err := m.broker.API(ctx, t, purposeMint)
 	if err != nil {
 		return err
@@ -1134,23 +1199,26 @@ func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string) error {
 	if err != nil {
 		return err
 	}
-	if err := m.custody.Put(ctx, custodyName(o), []byte(k.Secret)); err != nil {
+	own := custodyKeyName(o, k.ID)
+	if err := m.custody.Put(ctx, own, []byte(k.Secret)); err != nil {
 		api.DeleteKey(ctx, k.ID)
 		return err
 	}
 	exp := m.now().Add(KeyExpiry - 15*time.Second).UnixMilli() // released only with ≥15 s of life left
 	killed := false
 	_, err = m.store.UpdateObject(ctx, id, nil, func(o *Object) error {
-		if o.Status != StatusPending {
-			killed = true
+		if o.Status != StatusPending || o.KeyID != "" {
+			killed = true // killed meanwhile, or (claim expired mid-mint) minted by someone else
 			return nil
 		}
 		o.Status, o.KeyID, o.KeyExpires, o.UpdatedAt = StatusMinted, k.ID, exp, m.now().UnixMilli()
 		return nil
 	})
 	if err != nil || killed {
+		// Undo only what this attempt created: its key and its own custody
+		// entry. Never the object's (another replica's) credential.
 		api.DeleteKey(ctx, k.ID)
-		m.custody.Delete(ctx, custodyName(o))
+		m.custody.Delete(ctx, own)
 		return err
 	}
 	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: id, Kind: "mint"}, map[string]any{"keyID": k.ID, "tags": o.Tags,
@@ -1233,6 +1301,9 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 				return Credential{}, err
 			}
 			secret, err := m.custody.Get(ctx, custodyName(o))
+			if err != nil && o.KeyID != "" {
+				secret, err = m.custody.Get(ctx, legacyCustodyName(o)) // minted before keyed custody names
+			}
 			if err != nil {
 				return Credential{}, fmt.Errorf("custody: %w", err)
 			}
@@ -1286,7 +1357,7 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 	if err != nil {
 		return o, err
 	}
-	m.custody.Delete(ctx, custodyName(o))
+	m.deleteCustody(ctx, o)
 	if wasKilled {
 		// Killed while joining: the device that just appeared must go too.
 		o.NodeID, o.StableNodeID = r.NodeID, r.StableNodeID
@@ -1513,7 +1584,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 	}
 	for _, k := range done {
 		o, killed, prev := k.o, k.o, k.prev
-		m.custody.Delete(ctx, custodyName(o))
+		m.deleteCustody(ctx, o)
 		if prev != StatusReady {
 			m.revokeKey(ctx, killed)
 		}

@@ -14,7 +14,7 @@ FIX_MODE: fix
 |---|---|---|---|---|
 | F1 | Postgres/SQLite clock for lease acquire/renew/expiry, host `last_seen`/liveness, expiry windows; `Store.Now` hook for tests | H10 | `TestMM_H10_LeaseClockSkew` (0–20 s, both directions) | **DONE**: fails before (same 10/15 s thresholds), passes after; `make test-go`, `make test-pg`, `make lint` green |
 | F2 | Skew metric in `/v1/status`; not-ready above 2 s | H10 | new `TestMM_F2_SkewGate` | **DONE** (reports, doesn't refuse; see F2 note) |
-| F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | next |
+| F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | **DONE**: before 14–23/40 broken (iter2), after 0/40 and 40 keys for 40 objects, 3/3 runs; + `TestStoreMintClaim` (SQLite + Postgres), `TestCustodyNamesPerKey` |
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | extend `TestMM_H10` with a partitioned-holder case | queued |
 | F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
 
@@ -24,7 +24,7 @@ FIX_MODE: fix
 |---|---|---|---|
 | Harness | P0 | slice 1 built (PG container, fake TS API, fake setec, N real replicas, unix-socket client, pg_locks probe). + slice 2: tenant/host/deploy setup, fake host heartbeat, fakeTS hold switch and per-object key counts. TODO: PG fault proxy, front proxy, fake hosts, workload gen, PG sampler, oracle | `e2e/multimgmt/harness_test.go` |
 | H01 | P0 | **REFUTED** (3/3 runs) — latent fragility noted | `TestMM_H01_StartupAdvisoryLock` |
-| H02 | P0 | **CONFIRMED** (4/4 runs), and worse than hypothesised: every double-minted object loses its credential | `TestMM_H02_DoubleMint` |
+| H02 | P0 | **FIXED by F3** (was: every double-minted object lost its credential) | `TestMM_H02_DoubleMint` |
 | H03 | P1 | open | |
 | H04 | P1 | open | |
 | H05 | P2 | open | |
@@ -290,6 +290,32 @@ Those deserve a warning, not an outage. So F2 does the following:
 The spec came first (`StatusClock` in `api/openapi.yaml`), then
 `make api`. The regression test is `TestMM_F2_SkewGate` (in `make test`).
 
+### F3: one mint per object (fixes H02)
+
+1. **Mint claims.** New `objects.mint_claim` / `mint_claimed_at` columns.
+   `ClaimMint` is a conditional UPDATE: it succeeds iff the object is
+   pending with no key, and is unclaimed, claimed by this replica, or
+   claimed more than 60 s ago (`MintClaimTTL`). Each replica gets a
+   per-process ID (`rp_…`).
+   - The claim covers **one attempt** and is released on every exit (a
+     `defer`). The first version held it through 503 backoff: a SIGKILLed
+     replica then blocked all 40 objects for the full 60 s (runs took
+     66 s instead of 12 s). Releasing per attempt fixed that, and runs are
+     back to 12–13 s.
+2. **Custody named per key** (`…/authkey/<keyID>`). `Credential` falls back
+   to the legacy `…/authkey` name for objects minted before the upgrade.
+   Ready and kill delete both names.
+3. **The losing path undoes only its own work:** its key and its own
+   custody entry. It also bails if the row already has a `KeyID` (in case a
+   claim expired mid-attempt). So correctness doesn't depend on the TTL;
+   the TTL only prevents wasted registrations.
+4. **Pending sweep.** Each replica sweeps pending objects at `Start` and on
+   every reaper tick (deduplicated per replica via `m.queued`), so an
+   object whose claimer died is retried once its claim goes stale.
+
+Mint delay after a claimer crashes mid-attempt: at most `MintClaimTTL`
+(60 s) plus one reaper interval.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -321,3 +347,4 @@ The spec came first (`StatusClock` in `api/openapi.yaml`), then
 2026-11-11 | LOOP STOPPED | — | I1 violated (H10) → stop rule | — | — | needs a decision: accept skew as out of scope (and resume), or fix H10 first. Open: H03–H09, H11–H14; harness slices 3+; scenarios S1–S11 not started
 2026-11-11 iter4 | F1 | n/a | FIXED | — | in-process + make test-go/test-pg/lint | H10 test fails before (10/15 s), passes after; H01 e2e still green with the dbClock
 2026-11-11 iter5 | F2 | n/a | DONE | — | make test-go/test-pg green; lint/api-check re-run after commit | status reports clock; warns at >2 s or a 30 s-stale sample
+2026-11-11 iter6 | F3 | n/a ×6 | FIXED | — | results/*-H02 | first 3 runs correct but 66 s (claim held through backoff); after per-attempt release 3/3 correct in 12–13 s; make test-go/test-pg/lint green

@@ -52,6 +52,12 @@ type Store interface {
 	// UpdateObject is a read-modify-write in one transaction. With a non-nil
 	// fence, the lease must still be held at fence.Epoch (else ErrLeaseLost).
 	UpdateObject(ctx context.Context, id string, fence *Fence, fn func(*Object) error) (Object, error)
+	// ClaimMint takes (or refreshes) claimer's claim on minting a pending
+	// object. It succeeds iff the object is pending without a key and is
+	// unclaimed, claimed by claimer, or claimed before staleBefore (H02).
+	ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error)
+	// ReleaseMint drops claimer's claim (no-op if someone else holds it).
+	ReleaseMint(ctx context.Context, id, claimer string) error
 	// CountLive counts live objects of a tenant, or (rootID != "") the live
 	// descendants of rootID.
 	CountLive(ctx context.Context, tenantID, rootID string) (int, error)
