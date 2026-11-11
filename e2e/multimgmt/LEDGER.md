@@ -5,8 +5,8 @@ FIX_MODE: fix
 
 > **Resumed 2026-11-11 in fix mode** (Ross approved): clock skew is in
 > scope. Fixes run before open hypotheses. Self-fencing (fix queue F4)
-> waits on ADR-028, Proposed in
-> `tailnet-agents-design/DECISIONS.md`.
+> was redefined by Ross on 2026-11-11 (ADR-028 §3, now Accepted) as
+> guarded moves; self-fencing is deferred until state can move.
 
 ## Fix queue (fix mode: these come before open hypotheses, in order)
 
@@ -18,7 +18,7 @@ FIX_MODE: fix
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | `TestMM_F5_LeaseHeldExplains` | **DONE** |
 | F6 | Replica registry (`replicas` table: stable per-state-dir ID, custody fingerprint, last_seen by the store clock). A replica refuses to start if file custody would be shared with another live replica, or if live replicas' custody fingerprints differ; the same check runs each reaper tick (status not ok, warning) | H11 | `TestMM_H11_FileCustodyPerReplica` becomes "second replica refuses with a clear error"; unit test for the registry; a single replica restarting within 30 s of a SIGKILL must still start | queued |
 | F7 | Registration throttle state in the store (`tenant_throttle`), shared by every replica and timed by the store clock | H03 | `TestMM_H03_ThrottlePerReplica` (before: 45 in a 10 s window; after: 16 = the limit, 2/2); `TestStoreSharedThrottle` (SQLite + Postgres) | **DONE** |
-| F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
+| F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
 
