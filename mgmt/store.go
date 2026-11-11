@@ -56,6 +56,9 @@ type Store interface {
 	// object. It succeeds iff the object is pending without a key and is
 	// unclaimed, claimed by claimer, or claimed before staleBefore (H02).
 	ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error)
+	// SetDeploymentStatus records the host-reported status of a deployment
+	// so every replica reports it (F13, H08).
+	SetDeploymentStatus(ctx context.Context, id, status, errText string) error
 	// Durable device deletes (F10, H07): SetDeviceDelete records when a
 	// killed object's device is due for deletion (unix ms); ClaimDeviceDelete
 	// takes a due one (at most one replica wins); DueDeviceDeletes lists them.

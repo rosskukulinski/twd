@@ -187,7 +187,6 @@ func (m *Mgmt) DeleteTenant(ctx context.Context, id string, force bool, by strin
 				m.store.ReleaseLease(ctx, l.Name, l.Holder, l.Epoch)
 			}
 			m.mu.Lock()
-			delete(m.depStatus, d.ID)
 			m.mu.Unlock()
 		}
 	}
@@ -585,9 +584,7 @@ func (m *Mgmt) deploymentStatus(ctx context.Context, d Deployment) (string, stri
 	if d.StoppedAt != 0 {
 		return "stopped", ""
 	}
-	m.mu.Lock()
-	st := m.depStatus[d.ID]
-	m.mu.Unlock()
+	st := DeploymentStatus{Status: d.HostStatus, Error: d.HostError} // from the store: the same on every replica (H08)
 	if ds, err := m.store.LatestDeployments(ctx, d.TenantID); err == nil {
 		for _, l := range ds {
 			if l.Workload == d.Workload && l.ID != d.ID {

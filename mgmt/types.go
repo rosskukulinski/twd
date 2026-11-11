@@ -119,6 +119,10 @@ type Deployment struct {
 	// instances (BundleStateful), so its host stops serving it when it loses
 	// mgmt (ADR-028 §3). Stateless workloads keep serving.
 	Fence bool `json:"fence"`
+	// HostStatus/HostError: what the host (or mgmt, for assigned, draining
+	// and stopped) last reported; shared by every replica (F13, H08).
+	HostStatus string `json:"-"`
+	HostError  string `json:"-"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per

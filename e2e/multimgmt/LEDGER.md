@@ -24,6 +24,8 @@ FIX_MODE: fix
 | F11 | Store-arbitrated shared secrets: OBO root keys (and the WIF issuer signing key) are chosen once per tenant/issuer through a DB row (`INSERT … ON CONFLICT DO NOTHING` names the winning key ID); custody holds each candidate under a per-key name, losers delete theirs; readers follow the row. Issuer key moves from the state dir into custody | H13 | `TestMM_H13_OBORootKeyDiverges` (b): before 12/40 diverged, after 0/40 (5 runs); `TestMM_F11_OBORootChosenOnce` (40 two-replica races + legacy adoption, -race) | **DONE for OBO root keys**; the WIF issuer key is still per state dir (F11b, queued) |
 | F11b | WIF issuer signing key: load or create through custody + `secret_choice` ("issuer") instead of `<state-dir>/issuer.key`, migrating an existing file key as the first offer | H13 | `TestMM_F11b_SharedIssuer` (4 concurrent first starts serve one JWKS; restart reloads it; an existing issuer.key is kept and shared). No e2e (needs Funnel and WIF) | **DONE** |
 | F12 | (a) `CreateObject`: a UNIQUE violation on insert means another replica just created it; re-read by name and return that object (the same response as the idempotent path). (b) Share `id.secret` through custody + `secret_choice` (like F11b), adopting the first replica's existing file, so object IDs and hostnames don't depend on which replica created them | H14 | `TestMM_H14_ConcurrentSameNameCreate` (before 10/10 names broken; after 0/10 ×5 alone and after H13); `TestMM_F12_SharedIDSecret`, `_ExistingFileAdopted`, `_IdentityConflictStillRefused` | **DONE** |
+| F13 | Host-reported deployment status stored in `deployments.host_status/host_error`; written with `UPDATE … WHERE` the value differs (no per-replica cache: another replica may have written since) | H08 | `TestMM_H08` (r1 said `assigned`, now `active`, 2/2), `TestMM_F13_DeploymentStatusShared` (alternating replicas) | **DONE** |
+| F14 | Spawn budget enforced inside the insert transaction: lock the root object row (`FOR UPDATE`; SQLite's immediate transaction serialises), count live descendants, insert or refuse `spawn_budget_exceeded` | H04 | `TestMM_H04_SpawnBudgetRace` 0 failures in ≥ 30 runs; store test with concurrent inserts | queued |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -34,11 +36,11 @@ FIX_MODE: fix
 | H01 | P0 | **REFUTED** (3/3 runs) — latent fragility noted | `TestMM_H01_StartupAdvisoryLock` |
 | H02 | P0 | **FIXED by F3** (was: every double-minted object lost its credential) | `TestMM_H02_DoubleMint` |
 | H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
-| H04 | P1 | **not reproduced yet** (exactly 5/5 live in 6 runs at 0/2/5/20 ms PG delay); the race exists in code (per-replica `tenantLock`; `CountLive` then insert, no re-check); something narrows the window, cause not found | `TestMM_H04_SpawnBudgetRace` |
+| H04 | P1 | **CONFIRMED** (intermittent: 3/20 runs, each 6 live descendants with maxLive 5; standalone 2/15, after H03 1/5) | `TestMM_H04_SpawnBudgetRace` (writes report.txt) |
 | H05 | P2 | open | |
 | H06 | P1 | **FIXED by F8**. Was CONFIRMED (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
 | H07 | P1 | **FIXED by F10**. Was CONFIRMED: with a device-delete delay, SIGKILL of the killing replica inside the window left the device forever (control deleted) | `TestMM_H07_DeviceDeleteLostOnCrash`, `TestStoreDeviceDelete` |
-| H08 | P2 | open | |
+| H08 | P2 | **FIXED by F13**. Was CONFIRMED: after the host reported `active` to r0, r1 said `assigned` | `TestMM_H08_DeploymentStatusPerReplica`, `TestMM_F13_DeploymentStatusShared` |
 | H09 | P2 | open | |
 | H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
 | H11 | P0 | **FIXED by F6** (was: with `-custody file`, 6/12 credential releases failed on each replica) | `TestMM_H11_FileCustodyPerReplica` |
@@ -716,6 +718,35 @@ hostnames no longer depend on which replica created them.
 **After.** The full multi-replica e2e suite (H01–H14) passes, as do
 `make test-go` and `make test-pg`.
 
+### F13: deployment status is shared (fixes H08)
+
+- **Before:** host-reported status lived in each replica's memory. After
+  the host reported `active` to r0, r1 said `assigned`, so `twd deploy`
+  (which waits for `active`) could wait on the wrong replica behind a
+  load-balanced mgmt.
+- **Now:** `deployments.host_status/host_error`, written by `setDepStatus`
+  with a single `UPDATE … WHERE (host_status<>? OR host_error<>?)`. Repeat
+  heartbeats cost a lookup, not a write, and `deploymentStatus` reads the
+  row. The `depStatus` map is gone.
+- **My first version** skipped the write when this replica's cache already
+  held the same value. That's wrong when the host alternates replicas:
+  active via A, failed via B, active via A again would leave the store at
+  `failed`. Replaced with the SQL comparison;
+  `TestMM_F13_DeploymentStatusShared` covers that sequence.
+
+### H04: CONFIRMED (intermittent). The spawn budget is exceeded by one.
+
+The race the code suggested finally showed up. In the full suite
+`TestMM_H04` failed once; I couldn't diagnose it at first because the test
+only logged to stdout. It now writes `report.txt`. Targeted reruns:
+- **standalone:** 2 of 15 runs failed;
+- **after H03:** 1 of 5 failed;
+- every failure was **6 live descendants with `maxLive` 5**, one too many.
+
+**Cause.** `checkSpawn` runs `CountLive`, and the insert follows later.
+Only the per-replica `tenantLock` sits in between, so two replicas can
+both see 4 and both insert. **Fix: F14.**
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -770,3 +801,6 @@ hostnames no longer depend on which replica created them.
 2026-11-11 iter20 PLAN | H14 | n/a | confirm if concurrent same-name creates through 3 replicas give any non-2xx or differing object IDs; refute if all 2xx with one ID for 10 names × 2 runs | idempotency, I8
 2026-11-11 iter20 | H14 | n/a ×2 | CONFIRMED | idempotency | results/*-H14 | 10/10 names: 202 + 2×409 exists; queued F12
 2026-11-11 iter21 | F12 | n/a ×many | FIXED | — | full e2e suite + make test-go/test-pg green | two regressions found by existing e2e (H11 refusal, H13+H14 ordering) and fixed before commit
+2026-11-11 iter22 PLAN | H08 | n/a | confirm if r1 reports a different deployment status than r0 after the host reports active to r0 only | I10
+2026-11-11 iter22 | H08 → F13 | n/a | CONFIRMED then FIXED | I10 | results/*-H08 | first fix version had a stale-cache flaw (fixed before commit)
+2026-11-11 iter22 | H04 | 20 runs | CONFIRMED (3/20) | I5 | results/*-H04 (report.txt) | appeared in the full-suite run after F13; not related to F13 (the race predates it)

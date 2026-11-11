@@ -87,8 +87,7 @@ type Mgmt struct {
 	liveReplicas int
 	waiters      map[string]chan struct{}
 	spawnMu      map[string]*sync.Mutex // per tenant: serialises budget checks
-	depStatus    map[string]DeploymentStatus
-	pushURLs     map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
+	pushURLs     map[string]string      // hostID → unix:// push socket (in memory; hosts re-register)
 	pending      map[string]*pendingDelete
 	// noDeviceScope: tenants whose credential got a 403 on a device delete
 	// (an OAuth client without devices:core); kills then warn up front.
@@ -127,7 +126,7 @@ func New(cfg Config) (*Mgmt, error) {
 	}
 	m := &Mgmt{cfg: cfg, store: cfg.Store, custody: cfg.Custody, broker: cfg.Broker, clock: cfg.Clock, log: cfg.Log,
 		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, queued: map[string]bool{}, replicaID: cfg.ReplicaID, waiters: map[string]chan struct{}{},
-		spawnMu: map[string]*sync.Mutex{}, depStatus: map[string]DeploymentStatus{}, pushURLs: map[string]string{},
+		spawnMu: map[string]*sync.Mutex{}, pushURLs: map[string]string{},
 		pending: map[string]*pendingDelete{}, noDeviceScope: map[string]bool{}, deviceKept: map[string]bool{}}
 	if cfg.PushTimeout == 0 {
 		m.cfg.PushTimeout = 2 * time.Second
@@ -690,11 +689,17 @@ type DeploymentStatus struct {
 	Error        string `json:"error,omitempty"`
 }
 
+// setDepStatus records a deployment's status in the store, shared by every
+// replica (H08). The UPDATE only writes when the stored value differs, so the
+// heartbeats that repeat it every few seconds cost a lookup, not a write. A
+// per-replica cache can't decide that: another replica may have written a
+// different status since.
 func (m *Mgmt) setDepStatus(id string, st DeploymentStatus) {
-	st.DeploymentID = id
-	m.mu.Lock()
-	m.depStatus[id] = st
-	m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.store.SetDeploymentStatus(ctx, id, st.Status, st.Error); err != nil {
+		m.log.Warn("deployment status", "deployment", id, "err", err)
+	}
 }
 
 // DeploymentView is GET /v0/deployments/{id}.

@@ -233,3 +233,51 @@ func TestMM_F12_IdentityConflictStillRefused(t *testing.T) {
 		t.Fatalf("a different identity holding the ID must be refused with identity_conflict, got %v", err)
 	}
 }
+
+// TestMM_F13_DeploymentStatusShared (H08): the host-reported status is
+// stored, so every replica reports the latest one, including after the host
+// alternated between replicas (a per-replica cache must not skip the write).
+func TestMM_F13_DeploymentStatusShared(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, _ := OpenStore(ctx, filepath.Join(dir, "m.db"))
+	defer st.Close()
+	cust, _ := OpenFileCustody(filepath.Join(dir, "c"))
+	mk := func() *Mgmt {
+		m, err := New(Config{Store: st, Custody: cust, Broker: &Broker{}, IDSecret: []byte("0123456789abcdef"), ReapInterval: time.Hour})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(m.Close)
+		return m
+	}
+	a, b := mk(), mk()
+	kf := filepath.Join(dir, "api.env")
+	os.WriteFile(kf, []byte("TS_API_KEY=x\n"), 0o600)
+	tn, _ := a.CreateTenant(ctx, TenantRequest{Tailnet: "t.ts.net", MintMode: "apikey", APIKeyFile: kf})
+	a.RegisterHost(ctx, RegisterRequest{HostID: "h1", CapacityNodes: 10, Tiers: []string{"process"}}, "", "")
+	d, err := a.Deploy(ctx, DeployRequest{TenantID: tn.ID, Workload: "w",
+		Bundle: makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := func(m *Mgmt, status string) {
+		m.Heartbeat(ctx, "h1", 1, nil, DeploymentStatus{DeploymentID: d.DeploymentID, Status: status})
+	}
+	want := func(status string) {
+		t.Helper()
+		for i, m := range []*Mgmt{a, b} {
+			v, err := m.GetDeployment(ctx, d.DeploymentID)
+			if err != nil || v.Status != status {
+				t.Fatalf("replica %d: status %q (%v), want %q", i, v.Status, err, status)
+			}
+		}
+	}
+	want("assigned")
+	report(a, "active")
+	want("active")
+	report(b, "failed")
+	want("failed")
+	report(a, "active") // a last wrote "active" itself; it must still write
+	want("active")
+}

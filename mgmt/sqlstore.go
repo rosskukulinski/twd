@@ -141,6 +141,12 @@ func (s *SQLStore) UpdateThrottle(ctx context.Context, tenantID string, fn func(
 	return tx.Commit()
 }
 
+func (s *SQLStore) SetDeploymentStatus(ctx context.Context, id, status, errText string) error {
+	_, err := s.db.ExecContext(ctx, s.q("UPDATE deployments SET host_status=?, host_error=? WHERE id=? AND (host_status<>? OR host_error<>?)"),
+		status, errText, id, status, errText)
+	return err
+}
+
 func (s *SQLStore) SetDeviceDelete(ctx context.Context, id string, due int64) error {
 	_, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=?"), due, id)
 	return err
@@ -430,6 +436,9 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// M12: oauth mint mode (client ID + credential file path; never the secret).
 		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
 		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F13 (H08): the host-reported deployment status, shared by replicas.
+		{"deployments", "host_status", "ALTER TABLE deployments ADD COLUMN host_status TEXT NOT NULL DEFAULT ''"},
+		{"deployments", "host_error", "ALTER TABLE deployments ADD COLUMN host_error TEXT NOT NULL DEFAULT ''"},
 		// mm-loop F10 (H07): durable device deletes (0 none, >0 due unix ms, -1 claimed/done).
 		{"objects", "device_delete_at", "ALTER TABLE objects ADD COLUMN device_delete_at BIGINT NOT NULL DEFAULT 0"},
 		// mm-loop F9 (ADR-028 §3): hosts self-fence only stateful workloads.
@@ -724,13 +733,13 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence, host_status, host_error"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var ns string
 	var ml, md, fence int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence)
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError)
 	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
@@ -745,8 +754,9 @@ func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
 	if d.Fence {
 		fence = 1
 	}
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"),
-		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence, d.Bundle)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence,
+		d.HostStatus, d.HostError, d.Bundle)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -758,7 +768,7 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	var d Deployment
 	var ns string
 	var ml, md, fence int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.Bundle)
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &d.Bundle)
 	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound

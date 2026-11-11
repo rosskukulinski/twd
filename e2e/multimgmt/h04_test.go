@@ -71,7 +71,9 @@ func TestMM_H04_SpawnBudgetRace(t *testing.T) {
 	wg.Wait()
 	var live int
 	db.QueryRow("SELECT COUNT(*) FROM objects WHERE root_id=$1 AND id<>$1 AND status NOT IN ('killed','failed')", root.ObjectID).Scan(&live)
-	t.Logf("pg delay %v; responses: %v; live descendants of root = %d (maxLive %d)", pgDelay(), codes, live, maxLive)
+	summary := fmt.Sprintf("pg delay %v; responses: %v; live descendants of root = %d (maxLive %d)", pgDelay(), codes, live, maxLive)
+	t.Log(summary)
+	os.WriteFile(r.dir+"/report.txt", []byte(summary+"\n"), 0o600) // diagnosable after the fact
 	if live > maxLive {
 		t.Errorf("I5 violated: root has %d live descendants, maxLive is %d (%d concurrent spawns over %d replicas)", live, maxLive, spawns, replicas)
 	}
