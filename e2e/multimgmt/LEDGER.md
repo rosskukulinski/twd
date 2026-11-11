@@ -23,6 +23,7 @@ FIX_MODE: fix
 | F10 | Durable device deletes: `objects.device_delete_at` (due ms / -1 claimed), claimed by one replica, swept by every replica's reaper, retried in 30 s on failure | H07 | `TestMM_H07_DeviceDeleteLostOnCrash` (before: device left; after: deleted by the surviving replica, 2/2); `TestStoreDeviceDelete` (SQLite + Postgres) | **DONE** |
 | F11 | Store-arbitrated shared secrets: OBO root keys (and the WIF issuer signing key) are chosen once per tenant/issuer through a DB row (`INSERT … ON CONFLICT DO NOTHING` names the winning key ID); custody holds each candidate under a per-key name, losers delete theirs; readers follow the row. Issuer key moves from the state dir into custody | H13 | `TestMM_H13_OBORootKeyDiverges` (b): before 12/40 diverged, after 0/40 (5 runs); `TestMM_F11_OBORootChosenOnce` (40 two-replica races + legacy adoption, -race) | **DONE for OBO root keys**; the WIF issuer key is still per state dir (F11b, queued) |
 | F11b | WIF issuer signing key: load or create through custody + `secret_choice` ("issuer") instead of `<state-dir>/issuer.key`, migrating an existing file key as the first offer | H13 | `TestMM_F11b_SharedIssuer` (4 concurrent first starts serve one JWKS; restart reloads it; an existing issuer.key is kept and shared). No e2e (needs Funnel and WIF) | **DONE** |
+| F12 | (a) `CreateObject`: a UNIQUE violation on insert means another replica just created it; re-read by name and return that object (the same response as the idempotent path). (b) Share `id.secret` through custody + `secret_choice` (like F11b), adopting the first replica's existing file, so object IDs and hostnames don't depend on which replica created them | H14 | `TestMM_H14_ConcurrentSameNameCreate` (all 2xx, one ID); unit test for the shared ID secret | queued |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -43,7 +44,7 @@ FIX_MODE: fix
 | H11 | P0 | **FIXED by F6** (was: with `-custody file`, 6/12 credential releases failed on each replica) | `TestMM_H11_FileCustodyPerReplica` |
 | H12 | P1 | open | |
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
-| H14 | P2 | open | |
+| H14 | P2 | **CONFIRMED** (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | open (pre-existing, single replica too) | |
 | S1–S11 | — | 0/3 seeds each | |
 
@@ -664,6 +665,26 @@ The test is `TestMM_F11b_SharedIssuer` (unit, `-race`). An end-to-end WIF
 check needs Funnel on a real tailnet: run `make e2e-keyless` before
 release.
 
+### H14: CONFIRMED (P2). Concurrent same-name creates aren't idempotent across replicas.
+
+**Repro.** `TestMM_H14_ConcurrentSameNameCreate`: 3 replicas, the same
+`(namespace, objectName)` posted through all 3 at once, 10 names, 2 runs.
+
+**Result.** Every name got one `202` and two `409 exists` (the UNIQUE
+constraint maps to `ErrExists`; not a 500 as I'd guessed). A single
+replica returns the existing object for a repeated create, because
+`tenantLock` serialises lookup and insert. Across replicas, the lookups all
+miss and only one insert wins.
+
+**When it matters.** It needs creates for one object spread over replicas
+at once: a host behind a load-balanced mgmt (`svc:twd-mgmt`) retrying, or
+two callers touching a new DO together. There's no split brain, because
+the constraint holds.
+
+**Separately: `id.secret` is per state dir.** The same name created
+through different replicas (e.g. after a purge) gets a different ID and
+hostname. Fix in F12(b).
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -715,3 +736,5 @@ release.
 2026-11-11 iter17 | H13 | n/a ×5 | CONFIRMED | identity consistency | results/*-H13 | (b) 5/8, 0/8, 3/8, 3/8, 1/8; (a) 0/40. Issuer key by code inspection only
 2026-11-11 iter18 | F11 | n/a ×5 | FIXED (OBO) | — | results/*-H13; make test-go/test-pg green | (b) 0/8 ×5; issuer key split out as F11b
 2026-11-11 iter19 | F11b | n/a | DONE | — | unit (-race); make test-go/test-pg green | e2e WIF not run (needs Funnel)
+2026-11-11 iter20 PLAN | H14 | n/a | confirm if concurrent same-name creates through 3 replicas give any non-2xx or differing object IDs; refute if all 2xx with one ID for 10 names × 2 runs | idempotency, I8
+2026-11-11 iter20 | H14 | n/a ×2 | CONFIRMED | idempotency | results/*-H14 | 10/10 names: 202 + 2×409 exists; queued F12
