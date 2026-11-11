@@ -1,16 +1,22 @@
 # multi-mgmt loop ledger
 
-> **Stopped 2026-11-11 after iteration 3 by the I1 rule** (H10: lease and
-> liveness use each replica's clock; a healthy holder is displaced at
-> ≥12–15 s of skew).
->
-> **Confirmed so far:** H02 (P0; a double mint destroys the credential) and
-> H10. **Refuted:** H01.
->
-> **To resume:** decide whether clock skew is in scope, then
-> `/loop Follow e2e/multimgmt/LOOP.md`.
 
-FIX_MODE: propose
+FIX_MODE: fix
+
+> **Resumed 2026-11-11 in fix mode** (Ross approved): clock skew is in
+> scope. Fixes run before open hypotheses. Self-fencing (fix queue F4)
+> waits on ADR-028, Proposed in
+> `tailnet-agents-design/DECISIONS.md`.
+
+## Fix queue (fix mode: these come before open hypotheses, in order)
+
+| ID | Fix | For | Regression test (must fail before, pass after) | Status |
+|---|---|---|---|---|
+| F1 | Postgres/SQLite clock for lease acquire/renew/expiry, host `last_seen`/liveness, expiry windows; `Store.Now` hook for tests | H10 | `TestMM_H10_LeaseClockSkew` (0–20 s, both directions) | **DONE**: fails before (same 10/15 s thresholds), passes after; `make test-go`, `make test-pg`, `make lint` green |
+| F2 | Skew metric in `/v1/status`; not-ready above 2 s | H10 | new `TestMM_F2_SkewGate` | queued |
+| F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | queued |
+| F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | extend `TestMM_H10` with a partitioned-holder case | queued |
+| F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
 
 ## Status
 
@@ -26,7 +32,7 @@ FIX_MODE: propose
 | H07 | P1 | open | |
 | H08 | P2 | open | |
 | H09 | P2 | open | |
-| H10 | P0 | **CONFIRMED** (SQLite + Postgres): deploys refused at ≥10 s skew; healthy holder displaced at ≥12–15 s. **Loop stopped (I1 rule)** | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
+| H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
 | H11 | P0 | open | |
 | H12 | P1 | open | |
 | H13 | P1 | open | |
@@ -238,6 +244,28 @@ Nothing detects or refuses skew today.
    holder". It should fall back to the lease holder, or say "the current
    host looks dead to this replica".
 
+### F1: Postgres server time is the shared clock (fixes H10)
+
+- **`mgmt/storeclock.go`:** `dbClock` samples Postgres `clock_timestamp()`
+  at open and every 5 s. Between samples it extrapolates with the local
+  **monotonic** clock (no round trip per call, immune to wall-clock steps),
+  and it keeps extrapolating when a sample fails. SQLite uses the local
+  clock, since there's only one replica.
+- **`SQLStore`:** gains `Now()`, `ClockOffset()` (for F2) and `SetClock()`
+  (tests). `Mgmt.now()` uses the store clock whenever the store provides
+  one. That covers every lease, liveness, key-window, revocation and TTL
+  decision (~31 call sites) with one change.
+- **Still on the local clock** (not ownership decisions): the throttle
+  token bucket, the policy cache max age, the JWT issuer `iat`/`exp`, and
+  local timers (`After`).
+- **Tests:**
+  - `TestMM_H10_LeaseClockSkew`: the store clock is true time and the
+    replica clocks are skewed. It passes from 0 to 20 s in both directions,
+    and fails with `Mgmt.now()` reverted.
+  - `TestDBClockExtrapolates` (in `make test`).
+  - `TestStoreClockPostgres` / `TestStoreClockSQLite` (in `make test-pg`):
+    `Mgmt.now()` follows the server even with the replica clock 1 h off.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -267,3 +295,4 @@ Nothing detects or refuses skew today.
 2026-11-11T16:4xZ | H10 | n/a | CONFIRMED | I1, I8 | in-process (SQLite) | sweep 0–20 s: refused ≥10 s, displaced ≥15 s, ahead and behind. First run aborted at 10 s (a test bug: deploy errors were fatal); fixed to record outcomes
 2026-11-11T16:4xZ | H10 | n/a | CONFIRMED | I1, I8 | in-process (Postgres twd-mm-pg) | refused ≥10 s; displaced ≥12 s ahead / ≥15 s behind (sub-cases share host rows: approximate)
 2026-11-11 | LOOP STOPPED | — | I1 violated (H10) → stop rule | — | — | needs a decision: accept skew as out of scope (and resume), or fix H10 first. Open: H03–H09, H11–H14; harness slices 3+; scenarios S1–S11 not started
+2026-11-11 iter4 | F1 | n/a | FIXED | — | in-process + make test-go/test-pg/lint | H10 test fails before (10/15 s), passes after; H01 e2e still green with the dbClock

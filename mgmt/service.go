@@ -186,7 +186,16 @@ func (m *Mgmt) Close() {
 	m.wg.Wait()
 }
 
-func (m *Mgmt) now() time.Time { return m.clock.Now() }
+// now is the shared time source: the store's clock when the store provides
+// one (Postgres server time; ADR-028 §1), else the configured clock. Every
+// lease, liveness and expiry decision goes through it, so replicas whose
+// wall clocks disagree still agree on who holds what.
+func (m *Mgmt) now() time.Time {
+	if sc, ok := m.store.(StoreClock); ok {
+		return sc.Now()
+	}
+	return m.clock.Now()
+}
 
 func newID(prefix string) string {
 	b := make([]byte, 8)

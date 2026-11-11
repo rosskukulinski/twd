@@ -37,14 +37,17 @@ State lives in `e2e/multimgmt/LEDGER.md`. Read it first, every iteration.
 1. **Read LEDGER.md.** Pick exactly one item, in this order:
    a. Harness not built, or the last run was HARNESS-BROKEN → work on the
       harness (see "Harness").
-   b. An open hypothesis (H-*), highest priority first → design the smallest
+   b. In `fix` mode: the first queued or in-progress item in the ledger's
+      "Fix queue" that isn't blocked. Implement it, prove the regression test
+      goes from failing to passing, and run `make test` and `make test-pg`.
+   c. An open hypothesis (H-*), highest priority first → design the smallest
       experiment that confirms or refutes it. Prefer a Go test that runs two
       `mgmt.Mgmt` instances in-process on the same Postgres store (fast,
       deterministic). Fall back to real processes when the bug needs a real
       crash, a real connection pool, or real timing.
-   c. A scenario (S-*) without 3 consecutive clean seeds → run it with the
+   d. A scenario (S-*) without 3 consecutive clean seeds → run it with the
       next seed.
-   d. Everything green → soak: random scenario mix, new seed, 10 min.
+   e. Everything green → soak: random scenario mix, new seed, 10 min.
 2. **Write the plan in the ledger before running:** item, seed, what result
    would confirm or refute it, and which invariants you'll check.
 3. **Run it.** Put artifacts in `e2e/multimgmt/results/<UTC-stamp>-<item>-<seed>/`:
@@ -64,8 +67,9 @@ State lives in `e2e/multimgmt/LEDGER.md`. Read it first, every iteration.
    on `mm-loop` with a message naming the item and verdict.
 7. **Stop the loop and notify the user (PushNotification)** if any of these
    happen:
-   - I1 or I2 is violated (split brain or fencing failure). These are
-     design-level problems, so don't keep going.
+   - I1 or I2 is violated (split brain or fencing failure) by a **new** finding.
+     These are design-level problems, so don't keep going. H10 is already known
+     and accepted as in scope, so don't stop for it again.
    - The harness is HARNESS-BROKEN 3 iterations in a row.
    - Every hypothesis is resolved and every scenario has 3 clean seeds, plus
      2 clean soaks. Write a final summary at the top of LEDGER.md.

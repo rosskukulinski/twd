@@ -57,6 +57,9 @@ func newH10World(t *testing.T, skewB time.Duration) *h10World {
 		t.Fatal(err)
 	}
 	base := &baseTime{now: time.Now()}
+	// The store's clock is true (base) time, as a database server's would be;
+	// each replica's own clock (Config.Clock) is skewed.
+	st.SetClock(skewClock{base, 0})
 	secret := []byte("0123456789abcdef0123456789abcdef")
 	mk := func(skew time.Duration) *Mgmt {
 		m, err := New(Config{Store: st, Custody: cust, Broker: &Broker{BaseURL: "http://127.0.0.1:1"}, IDSecret: secret,

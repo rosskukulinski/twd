@@ -23,8 +23,10 @@ const (
 
 // SQLStore implements Store on SQLite or Postgres with one set of queries.
 type SQLStore struct {
-	db *sql.DB
-	d  dialect
+	db    *sql.DB
+	d     dialect
+	clock TimeSource // the shared time source (ADR-028 §1)
+	dbc   *dbClock   // Postgres: follows the server clock; nil for SQLite
 }
 
 var _ Store = (*SQLStore)(nil)
@@ -61,10 +63,47 @@ func OpenStore(ctx context.Context, dsn string) (*SQLStore, error) {
 		s.db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	s.clock = localClock{}
+	if s.d == dialectPostgres {
+		s.dbc = newDBClock(func(ctx context.Context) (time.Time, error) {
+			var us int64
+			err := s.db.QueryRowContext(ctx, "SELECT (extract(epoch from clock_timestamp())*1000000)::bigint").Scan(&us)
+			return time.UnixMicro(us), err
+		})
+		if err := s.dbc.sync(ctx); err != nil {
+			s.db.Close()
+			return nil, fmt.Errorf("store clock: %w", err)
+		}
+		go s.dbc.run()
+		s.clock = s.dbc
+	}
 	return s, nil
 }
 
-func (s *SQLStore) Close() error { return s.db.Close() }
+func (s *SQLStore) Close() error {
+	if s.dbc != nil {
+		s.dbc.close()
+		s.dbc = nil
+	}
+	return s.db.Close()
+}
+
+// Now is the shared clock: the Postgres server clock, or the local clock for
+// SQLite (single replica). See TimeSource.
+func (s *SQLStore) Now() time.Time { return s.clock.Now() }
+
+// ClockOffset reports the store clock minus this replica's wall clock at the
+// last sync (Postgres), or 0 (SQLite / an overridden clock).
+func (s *SQLStore) ClockOffset() (time.Duration, time.Time) {
+	if s.dbc != nil && s.clock == TimeSource(s.dbc) {
+		return s.dbc.ClockOffset()
+	}
+	return 0, time.Now()
+}
+
+// SetClock overrides the shared clock (tests: simulated time shared by
+// several Mgmt replicas on this store).
+func (s *SQLStore) SetClock(c TimeSource) { s.clock = c }
 
 // q rewrites ? placeholders to $n for Postgres.
 func (s *SQLStore) q(query string) string {
