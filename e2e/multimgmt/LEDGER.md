@@ -13,8 +13,8 @@ FIX_MODE: fix
 | ID | Fix | For | Regression test (must fail before, pass after) | Status |
 |---|---|---|---|---|
 | F1 | Postgres/SQLite clock for lease acquire/renew/expiry, host `last_seen`/liveness, expiry windows; `Store.Now` hook for tests | H10 | `TestMM_H10_LeaseClockSkew` (0–20 s, both directions) | **DONE**: fails before (same 10/15 s thresholds), passes after; `make test-go`, `make test-pg`, `make lint` green |
-| F2 | Skew metric in `/v1/status`; not-ready above 2 s | H10 | new `TestMM_F2_SkewGate` | queued |
-| F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | queued |
+| F2 | Skew metric in `/v1/status`; not-ready above 2 s | H10 | new `TestMM_F2_SkewGate` | **DONE** (reports, doesn't refuse; see F2 note) |
+| F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | next |
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | extend `TestMM_H10` with a partitioned-holder case | queued |
 | F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
 
@@ -266,6 +266,30 @@ Nothing detects or refuses skew today.
   - `TestStoreClockPostgres` / `TestStoreClockSQLite` (in `make test-pg`):
     `Mgmt.now()` follows the server even with the replica clock 1 h off.
 
+### F2: skew is reported in `/v1/status` (warns, doesn't refuse)
+
+**A deliberate change from ADR-028 §2's "not-ready".** After F1, the
+replica's wall clock no longer drives any lease, liveness or expiry
+decision. Refusing traffic on skew would cost availability and buy no
+correctness.
+
+What remains on the local clock:
+- the WIF issuer JWT `iat`/`exp`, where skew can make Tailscale reject
+  token exchanges;
+- the throttle;
+- the policy cache.
+
+Those deserve a warning, not an outage. So F2 does the following:
+- `GET /v1/status` gains `clock {source, ok, offsetMs, syncAgeMs, message}`;
+- the top-level `ok` becomes `clock.ok`;
+- `ok` is false beyond `MaxClockOffset` = 2 s, or when the last sample is
+  older than `MaxClockSyncAge` = 30 s;
+- `checkClock` logs a warning once per change between ok and not ok (at
+  `Start` and every reaper tick).
+
+The spec came first (`StatusClock` in `api/openapi.yaml`), then
+`make api`. The regression test is `TestMM_F2_SkewGate` (in `make test`).
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -296,3 +320,4 @@ Nothing detects or refuses skew today.
 2026-11-11T16:4xZ | H10 | n/a | CONFIRMED | I1, I8 | in-process (Postgres twd-mm-pg) | refused ≥10 s; displaced ≥12 s ahead / ≥15 s behind (sub-cases share host rows: approximate)
 2026-11-11 | LOOP STOPPED | — | I1 violated (H10) → stop rule | — | — | needs a decision: accept skew as out of scope (and resume), or fix H10 first. Open: H03–H09, H11–H14; harness slices 3+; scenarios S1–S11 not started
 2026-11-11 iter4 | F1 | n/a | FIXED | — | in-process + make test-go/test-pg/lint | H10 test fails before (10/15 s), passes after; H01 e2e still green with the dbClock
+2026-11-11 iter5 | F2 | n/a | DONE | — | make test-go/test-pg green; lint/api-check re-run after commit | status reports clock; warns at >2 s or a 30 s-stale sample

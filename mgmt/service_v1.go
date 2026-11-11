@@ -543,6 +543,7 @@ type StatusCounts struct {
 	Tenants          int
 	Objects          map[string]int
 	PendingDeletes   int
+	Clock            ClockStatus
 }
 
 // Status gathers counters.
@@ -568,6 +569,7 @@ func (m *Mgmt) Status(ctx context.Context) (StatusCounts, error) {
 		return st, err
 	}
 	st.PendingDeletes = m.PendingDeletes()
+	st.Clock = m.clockStatus()
 	return st, nil
 }
 

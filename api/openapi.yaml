@@ -2564,6 +2564,21 @@ components:
         tenants: { type: integer }
         objects: { type: object, additionalProperties: { type: integer }, description: Count per `ObjectStatus`. }
         version: { type: string }
+        clock: { $ref: "#/components/schemas/StatusClock" }
+    StatusClock:
+      type: object
+      description: >-
+        The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock.
+        `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the
+        store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall
+        clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+      required: [source, ok, offsetMs, syncAgeMs]
+      properties:
+        source: { type: string, enum: [postgres, local], description: "`postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica." }
+        ok: { type: boolean }
+        offsetMs: { type: integer, description: Store clock minus this replica's wall clock at the last sample. }
+        syncAgeMs: { type: integer, description: Milliseconds since the last successful sample (0 for `local`). }
+        message: { type: string }
     SelfInfo:
       type: object
       required: [https]

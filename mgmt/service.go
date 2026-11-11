@@ -86,6 +86,7 @@ type Mgmt struct {
 	noDeviceScope map[string]bool
 	deviceKept    map[string]bool               // killed objects whose device delete was refused (403)
 	oboKeys       map[string]ed25519.PrivateKey // tenant → OBO root key (loaded from custody)
+	clockOK       bool                          // last checkClock result (logs on change)
 	volMu         sync.Mutex                    // VolumeKey create-if-absent
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -160,6 +161,8 @@ func (m *Mgmt) Start() error {
 	for _, o := range pending {
 		m.enqueue(o.TenantID, o.ID)
 	}
+	m.clockOK = true
+	m.checkClock()
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -168,6 +171,7 @@ func (m *Mgmt) Start() error {
 			case <-m.ctx.Done():
 				return
 			case <-m.clock.After(m.cfg.ReapInterval):
+				m.checkClock()
 				if n, err := m.Reap(m.ctx); err != nil {
 					m.log.Warn("reaper", "err", err)
 				} else if n > 0 {

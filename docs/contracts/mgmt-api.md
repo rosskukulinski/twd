@@ -1639,6 +1639,7 @@ the last page.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `clock` | `StatusClock` | no | The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock. `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave. |
 | `hosts` | object | yes |  |
 | `listeners` | array of string | no | e.g. `tsnet:80`, `tsnet:443`, `funnel:443`, `unix:~/.twd/run/mgmt.sock`. |
 | `objects` | object | yes | Count per `ObjectStatus`. |
@@ -1647,6 +1648,18 @@ the last page.
 | `tenants` | integer | yes |  |
 | `transport` | `Transport` | yes | `tsnet` in normal operation; `local-dev` when the unix socket is serving. |
 | `version` | string | no |  |
+
+#### `StatusClock`
+
+The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock. `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `message` | string | no |  |
+| `offsetMs` | integer | yes | Store clock minus this replica's wall clock at the last sample. |
+| `ok` | boolean | yes |  |
+| `source` | string: `postgres` \| `local` | yes | `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica. |
+| `syncAgeMs` | integer | yes | Milliseconds since the last successful sample (0 for `local`). |
 
 #### `Tenant`
 

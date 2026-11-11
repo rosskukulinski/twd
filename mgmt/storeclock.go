@@ -2,6 +2,7 @@ package mgmt
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -22,6 +23,9 @@ type StoreClock interface {
 	// last sync (0 when the store clock is the local clock), and when that
 	// sync happened (zero time = never synced).
 	ClockOffset() (time.Duration, time.Time)
+	// ClockSource is "postgres" (the server clock) or "local" (this
+	// machine's clock: SQLite, one replica; or a test override).
+	ClockSource() string
 }
 
 // dbClock follows the Postgres server clock. It samples clock_timestamp()
@@ -105,3 +109,61 @@ func (c *dbClock) ClockOffset() (time.Duration, time.Time) {
 type localClock struct{}
 
 func (localClock) Now() time.Time { return time.Now() }
+
+// Skew thresholds for GET /v1/status (ADR-028 §2): beyond these the replica
+// reports ok=false and logs a warning. Ownership decisions use the store
+// clock regardless, so nothing is refused.
+const (
+	MaxClockOffset  = 2 * time.Second
+	MaxClockSyncAge = 30 * time.Second
+)
+
+// ClockStatus is the "clock" object of GET /v1/status.
+type ClockStatus struct {
+	Source    string `json:"source"`
+	OK        bool   `json:"ok"`
+	OffsetMs  int64  `json:"offsetMs"`
+	SyncAgeMs int64  `json:"syncAgeMs"`
+	Message   string `json:"message,omitempty"`
+}
+
+// clockStatus reports how this replica's wall clock relates to the shared
+// store clock.
+func (m *Mgmt) clockStatus() ClockStatus {
+	sc, ok := m.store.(StoreClock)
+	if !ok {
+		return ClockStatus{Source: "local", OK: true}
+	}
+	if sc.ClockSource() != "postgres" {
+		return ClockStatus{Source: "local", OK: true}
+	}
+	off, at := sc.ClockOffset()
+	cs := ClockStatus{Source: "postgres", OK: true, OffsetMs: off.Milliseconds()}
+	if at.IsZero() {
+		cs.OK, cs.Message = false, "store clock never sampled"
+		return cs
+	}
+	cs.SyncAgeMs = time.Since(at).Milliseconds()
+	switch {
+	case off.Abs() > MaxClockOffset:
+		cs.OK, cs.Message = false, fmt.Sprintf("this replica's wall clock is %v from the store clock (limit %v): fix NTP on this machine", (-off).Round(time.Millisecond), MaxClockOffset)
+	case time.Since(at) > MaxClockSyncAge:
+		cs.OK, cs.Message = false, fmt.Sprintf("store clock last sampled %v ago (limit %v): is the store reachable?", time.Since(at).Round(time.Second), MaxClockSyncAge)
+	}
+	return cs
+}
+
+// checkClock logs once per change between ok and not ok.
+func (m *Mgmt) checkClock() {
+	cs := m.clockStatus()
+	m.mu.Lock()
+	changed := cs.OK != m.clockOK
+	m.clockOK = cs.OK
+	m.mu.Unlock()
+	switch {
+	case changed && !cs.OK:
+		m.log.Warn("clock skew", "offsetMs", cs.OffsetMs, "syncAgeMs", cs.SyncAgeMs, "message", cs.Message)
+	case changed:
+		m.log.Info("clock ok", "offsetMs", cs.OffsetMs)
+	}
+}

@@ -101,6 +101,15 @@ func (s *SQLStore) ClockOffset() (time.Duration, time.Time) {
 	return 0, time.Now()
 }
 
+// ClockSource reports "postgres" while the store follows the server clock,
+// else "local".
+func (s *SQLStore) ClockSource() string {
+	if s.dbc != nil && s.clock == TimeSource(s.dbc) {
+		return "postgres"
+	}
+	return "local"
+}
+
 // SetClock overrides the shared clock (tests: simulated time shared by
 // several Mgmt replicas on this store).
 func (s *SQLStore) SetClock(c TimeSource) { s.clock = c }

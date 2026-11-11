@@ -98,3 +98,62 @@ type skewedReal struct{ d time.Duration }
 
 func (s skewedReal) Now() time.Time                         { return time.Now().Add(s.d) }
 func (s skewedReal) After(d time.Duration) <-chan time.Time { return time.After(d) }
+
+// fakeClockStore wraps a store with a controllable store-clock report.
+type fakeClockStore struct {
+	*SQLStore
+	off    time.Duration
+	synced time.Time
+}
+
+func (f *fakeClockStore) ClockOffset() (time.Duration, time.Time) { return f.off, f.synced }
+func (f *fakeClockStore) ClockSource() string                     { return "postgres" }
+
+// TestMM_F2_SkewGate: GET /v1/status reports the replica's offset from the
+// store clock and turns ok=false beyond MaxClockOffset or a stale sample
+// (ADR-028 §2). It warns; it does not refuse.
+func TestMM_F2_SkewGate(t *testing.T) {
+	sq, err := OpenStore(context.Background(), filepath.Join(t.TempDir(), "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sq.Close()
+	st := &fakeClockStore{SQLStore: sq, synced: time.Now()}
+	cust, _ := OpenFileCustody(filepath.Join(t.TempDir(), "c"))
+	m, err := New(Config{Store: st, Custody: cust, Broker: &Broker{}, IDSecret: []byte("0123456789abcdef"), ReapInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	for _, tc := range []struct {
+		name   string
+		off    time.Duration
+		synced time.Time
+		ok     bool
+	}{
+		{"in sync", 40 * time.Millisecond, time.Now(), true},
+		{"replica 1.9 s behind", 1900 * time.Millisecond, time.Now(), true},
+		{"replica 3 s behind", 3 * time.Second, time.Now(), false},
+		{"replica 3 s ahead", -3 * time.Second, time.Now(), false},
+		{"stale sample", 0, time.Now().Add(-45 * time.Second), false},
+		{"never sampled", 0, time.Time{}, false},
+	} {
+		st.off, st.synced = tc.off, tc.synced
+		s, err := m.Status(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.Clock.OK != tc.ok || s.Clock.Source != "postgres" || s.Clock.OffsetMs != tc.off.Milliseconds() {
+			t.Errorf("%s: clock = %+v, want ok=%v", tc.name, s.Clock, tc.ok)
+		}
+		if !tc.ok && s.Clock.Message == "" {
+			t.Errorf("%s: a not-ok clock needs a message", tc.name)
+		}
+	}
+	// SQLite (no server clock): always local and ok.
+	m2, _ := New(Config{Store: sq, Custody: cust, Broker: &Broker{}, IDSecret: []byte("0123456789abcdef"), ReapInterval: time.Hour})
+	defer m2.Close()
+	if s, _ := m2.Status(context.Background()); s.Clock.Source != "local" || !s.Clock.OK {
+		t.Errorf("sqlite: clock = %+v, want local ok", s.Clock)
+	}
+}
