@@ -112,6 +112,35 @@ func (s *SQLStore) ClaimMint(ctx context.Context, id, claimer string, now, stale
 	return n == 1, err
 }
 
+// UpdateThrottle applies fn to the tenant's shared throttle state in one
+// transaction (Postgres: row locked FOR UPDATE; SQLite: the immediate
+// transaction holds the write lock). A missing row reaches fn as the zero
+// state (Last == 0), which the throttle initialises to a full bucket.
+func (s *SQLStore) UpdateThrottle(ctx context.Context, tenantID string, fn func(*ThrottleState)) error {
+	if _, err := s.db.ExecContext(ctx, s.q(`INSERT INTO tenant_throttle (tenant_id, tokens, rate, last, pause_till, failures)
+		VALUES (?, 0, 0, 0, 0, 0) ON CONFLICT (tenant_id) DO NOTHING`), tenantID); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var st ThrottleState
+	var failures int64
+	if err := tx.QueryRowContext(ctx, s.q("SELECT tokens, rate, last, pause_till, failures FROM tenant_throttle WHERE tenant_id=?"+s.forUpdate()),
+		tenantID).Scan(&st.Tokens, &st.Rate, &st.Last, &st.PauseTill, &failures); err != nil {
+		return err
+	}
+	st.Failures = int(failures)
+	fn(&st)
+	if _, err := tx.ExecContext(ctx, s.q("UPDATE tenant_throttle SET tokens=?, rate=?, last=?, pause_till=?, failures=? WHERE tenant_id=?"),
+		st.Tokens, st.Rate, st.Last, st.PauseTill, int64(st.Failures), tenantID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *SQLStore) UpsertReplica(ctx context.Context, r Replica) error {
 	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO replicas (id, custody, started_at, last_seen) VALUES (?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET custody=excluded.custody, started_at=excluded.started_at, last_seen=excluded.last_seen`),
@@ -217,6 +246,9 @@ CREATE INDEX IF NOT EXISTS audit_trace ON audit (trace_id);
 CREATE TABLE IF NOT EXISTS audit_heads (chain TEXT PRIMARY KEY, seq BIGINT NOT NULL, hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS revocations (
   host_id TEXT NOT NULL, object_id TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (host_id, object_id));
+CREATE TABLE IF NOT EXISTS tenant_throttle (
+  tenant_id TEXT PRIMARY KEY, tokens REAL NOT NULL, rate REAL NOT NULL, last BIGINT NOT NULL,
+  pause_till BIGINT NOT NULL, failures BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS replicas (
   id TEXT PRIMARY KEY, custody TEXT NOT NULL, started_at BIGINT NOT NULL, last_seen BIGINT NOT NULL);
 `

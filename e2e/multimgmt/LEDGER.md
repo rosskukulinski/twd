@@ -17,6 +17,7 @@ FIX_MODE: fix
 | F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | **DONE**: before 14–23/40 broken (iter2), after 0/40 and 40 keys for 40 objects, 3/3 runs; + `TestStoreMintClaim` (SQLite + Postgres), `TestCustodyNamesPerKey` |
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | `TestMM_F5_LeaseHeldExplains` | **DONE** |
 | F6 | Replica registry (`replicas` table: stable per-state-dir ID, custody fingerprint, last_seen by the store clock). A replica refuses to start if file custody would be shared with another live replica, or if live replicas' custody fingerprints differ; the same check runs each reaper tick (status not ok, warning) | H11 | `TestMM_H11_FileCustodyPerReplica` becomes "second replica refuses with a clear error"; unit test for the registry; a single replica restarting within 30 s of a SIGKILL must still start | queued |
+| F7 | Registration throttle state in the store (`tenant_throttle`), shared by every replica and timed by the store clock | H03 | `TestMM_H03_ThrottlePerReplica` (before: 45 in a 10 s window; after: 16 = the limit, 2/2); `TestStoreSharedThrottle` (SQLite + Postgres) | **DONE** |
 | F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
 
 ## Status
@@ -26,7 +27,7 @@ FIX_MODE: fix
 | Harness | P0 | slice 1 built (PG container, fake TS API, fake setec, N real replicas, unix-socket client, pg_locks probe). + slice 2: tenant/host/deploy setup, fake host heartbeat, fakeTS hold switch and per-object key counts. TODO: PG fault proxy, front proxy, fake hosts, workload gen, PG sampler, oracle | `e2e/multimgmt/harness_test.go` |
 | H01 | P0 | **REFUTED** (3/3 runs) — latent fragility noted | `TestMM_H01_StartupAdvisoryLock` |
 | H02 | P0 | **FIXED by F3** (was: every double-minted object lost its credential) | `TestMM_H02_DoubleMint` |
-| H03 | P1 | open | |
+| H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
 | H04 | P1 | open | |
 | H05 | P2 | open | |
 | H06 | P1 | open | |
@@ -38,6 +39,7 @@ FIX_MODE: fix
 | H12 | P1 | open | |
 | H13 | P1 | open | |
 | H14 | P2 | open | |
+| H15 | P2 | open (pre-existing, single replica too) | |
 | S1–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
@@ -398,6 +400,46 @@ works.
 split the field. The spec loader caught it in the `mgmt` tests, and I
 quoted it.
 
+### H03: CONFIRMED, then FIXED by F7. The registration throttle was per replica.
+
+**Repro.** `TestMM_H03_ThrottlePerReplica`: 3 replicas, a tenant limited to
+60/min (burst 6, then 1/s), and 45 objects created at once across the
+replicas.
+
+**Before.** 45 keys in about 9 s (5/s): all 45 inside one 10 s window,
+against a limit of 16. That's three independent buckets (3×6 burst plus
+3×1/s). Same result in 2 of 2 runs.
+
+**F7.**
+- The throttle state (tokens, AIMD rate, pause, failures) is a
+  `ThrottleState` held in a `tenant_throttle` row.
+- `UpdateThrottle` reads, applies and writes it in one transaction:
+  `FOR UPDATE` on Postgres; SQLite's immediate transaction holds the
+  write lock.
+- The bucket logic is unchanged, and the in-memory path remains for
+  stores without shared state.
+- Shared throttles are timed by the store clock (`storeTimedClock`).
+- If the store can't be read, `Reserve` fails closed (waits 1 s).
+
+**After.** 45 keys in 45–48 s, with at most 16 in any 10 s window (the
+limit exactly), in 2 of 2 runs. `TestStoreSharedThrottle` (SQLite and
+Postgres) checks three things:
+- 40 concurrent reservations from two replicas on a frozen clock get
+  exactly one burst (6);
+- a backoff on one replica pauses the other and halves the shared rate;
+- a success on one is seen by the other.
+
+**Side effect.** `TestMM_H02` now takes about 18 s instead of 9–13 s,
+because a 503 backoff now pauses the whole tenant, not one replica. That's
+correct for ADR-017.
+
+- **H15 (P2, found while reading, not multi-replica-specific):**
+  `Throttle.SetLimit` is never called, so `PATCH /v1/tenants/{id}` with a
+  new `registrationsPerMinute` doesn't reach a throttle that already
+  exists (until a restart). With F7 the limit isn't stored in the shared
+  row, so each replica clamps to its own idea of the limit. Fix: call
+  `SetLimit` on tenant update. Check that it's really missing.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -434,3 +476,5 @@ quoted it.
 2026-11-11 iter8 PLAN | H11 | n/a | confirm if, with -custody file, any credential fetch fails on the replica that didn't mint; refute if all 12×2 succeed | I3, I8
 2026-11-11 iter8 | H11 | n/a ×2 | CONFIRMED | I3, I8 | results/*-H11 | exactly half of credential releases fail on each replica (404 custody: not found)
 2026-11-11 iter9 | F6 | n/a ×2 | FIXED | — | results/*-H11, H01, H02 | second file-custody replica refuses with a clear message; crash restart 105 ms; setec replicas unaffected; make test-go/test-pg green
+2026-11-11 iter10 PLAN | H03 | n/a | confirm if keys created in any 10 s window exceed burst+rate×10 s (16) by >10% with 3 replicas; refute if ≤ 17.6 | I4
+2026-11-11 iter10 | H03 → F7 | n/a ×2 + ×2 | CONFIRMED then FIXED | I4 | results/*-H03 | before: 45 keys in 9 s (window max 45, limit 16); after: 45 in 45–48 s, window max 16; make test-go/test-pg green

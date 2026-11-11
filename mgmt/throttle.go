@@ -19,25 +19,41 @@ type realClock struct{}
 func (realClock) Now() time.Time                         { return time.Now() }
 func (realClock) After(d time.Duration) <-chan time.Time { return time.After(d) }
 
+// ThrottleState is a token bucket's mutable state. With a shared store it is
+// one row per tenant that every mgmt replica reads and writes atomically
+// (mm-loop F7, H03), so the tenant's registration rate holds across replicas.
+type ThrottleState struct {
+	Tokens    float64 // available tokens
+	Rate      float64 // effective tokens/minute (AIMD, ≤ the limit)
+	Last      int64   // unix ms of the last refill (0 = new bucket)
+	PauseTill int64   // unix ms: no tokens before this (after a 429/5xx)
+	Failures  int     // consecutive backoffs (exponential delay)
+}
+
+// ThrottleBackend applies fn to a tenant's shared throttle state atomically
+// (read, fn, write in one transaction).
+type ThrottleBackend func(ctx context.Context, fn func(*ThrottleState)) error
+
 // Throttle is a per-tenant registration token bucket (RFC §4.9, ADR-017):
 // `perMinute` tokens per minute, burst = max(1, perMinute/10). On a 429/5xx
 // from the coordination server, Backoff halves the effective rate (down to
 // 1/min) and pauses minting until the server's Retry-After (or a jittered
 // exponential delay) passes; every success adds back 1/min of rate (AIMD).
+//
+// Without a backend the state is in memory (one replica). With one, the
+// state is shared by every replica of the store, so N replicas together mint
+// at most the tenant's rate.
 type Throttle struct {
-	mu        sync.Mutex
-	clock     Clock
-	limit     float64 // configured tokens/minute
-	rate      float64 // effective tokens/minute (≤ limit)
-	burst     float64
-	tokens    float64
-	last      time.Time
-	pauseTill time.Time
-	failures  int
-	jitter    func() float64 // [0,1)
+	mu      sync.Mutex
+	clock   Clock
+	limit   float64 // configured tokens/minute
+	burst   float64
+	st      ThrottleState   // in-memory state (no backend)
+	backend ThrottleBackend // shared state, or nil
+	jitter  func() float64  // [0,1)
 }
 
-// NewThrottle returns a full bucket.
+// NewThrottle returns a full in-memory bucket.
 func NewThrottle(perMinute int, clock Clock) *Throttle {
 	if perMinute <= 0 {
 		perMinute = DefaultRegistrationsPerMinute
@@ -45,40 +61,88 @@ func NewThrottle(perMinute int, clock Clock) *Throttle {
 	if clock == nil {
 		clock = realClock{}
 	}
-	b := float64(perMinute) / 10
-	if b < 1 {
-		b = 1
-	}
-	return &Throttle{clock: clock, limit: float64(perMinute), rate: float64(perMinute), burst: b, tokens: b,
-		last: clock.Now(), jitter: rand.Float64}
+	t := &Throttle{clock: clock, limit: float64(perMinute), burst: max(1, float64(perMinute)/10), jitter: rand.Float64}
+	t.st = ThrottleState{Tokens: t.burst, Rate: t.limit, Last: clock.Now().UnixMilli()}
+	return t
 }
 
-func (t *Throttle) refill(now time.Time) {
-	if el := now.Sub(t.last); el > 0 {
-		t.tokens += el.Minutes() * t.rate
-		if t.tokens > t.burst {
-			t.tokens = t.burst
+// NewSharedThrottle returns a bucket whose state lives in backend.
+func NewSharedThrottle(perMinute int, clock Clock, backend ThrottleBackend) *Throttle {
+	t := NewThrottle(perMinute, clock)
+	t.backend = backend
+	return t
+}
+
+func (t *Throttle) cfg() (limit, burst float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.limit, t.burst
+}
+
+// sharedRetry is how long Reserve asks callers to wait when the shared
+// state can't be read or written (fail closed: no token without the store).
+const sharedRetry = time.Second
+
+// apply runs fn on the bucket state: in memory, or atomically in the backend.
+func (t *Throttle) apply(fn func(s *ThrottleState)) error {
+	t.mu.Lock()
+	limit, burst, backend := t.limit, t.burst, t.backend
+	t.mu.Unlock()
+	init := func(s *ThrottleState, now time.Time) {
+		if s.Last == 0 { // a new shared bucket starts full
+			*s = ThrottleState{Tokens: burst, Rate: limit, Last: now.UnixMilli()}
 		}
+		s.Rate = min(s.Rate, limit)
+		if s.Rate <= 0 {
+			s.Rate = limit
+		}
+		s.Tokens = min(s.Tokens, burst)
 	}
-	t.last = now
+	if backend == nil {
+		t.mu.Lock()
+		defer t.mu.Unlock()
+		init(&t.st, t.clock.Now())
+		fn(&t.st)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return backend(ctx, func(s *ThrottleState) {
+		init(s, t.clock.Now())
+		fn(s)
+	})
+}
+
+func refill(s *ThrottleState, now time.Time, burst float64) {
+	if el := now.Sub(time.UnixMilli(s.Last)); el > 0 {
+		s.Tokens = min(burst, s.Tokens+el.Minutes()*s.Rate)
+	}
+	s.Last = now.UnixMilli()
 }
 
 // Reserve takes a token if one is available and returns 0, or returns how
 // long to wait before trying again.
 func (t *Throttle) Reserve() time.Duration {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	now := t.clock.Now()
-	if now.Before(t.pauseTill) {
-		return t.pauseTill.Sub(now)
+	var wait time.Duration
+	_, burst := t.cfg()
+	err := t.apply(func(s *ThrottleState) {
+		now := t.clock.Now()
+		if pt := time.UnixMilli(s.PauseTill); now.Before(pt) {
+			wait = pt.Sub(now)
+			return
+		}
+		refill(s, now, burst)
+		if s.Tokens >= 1 {
+			s.Tokens--
+			wait = 0
+			return
+		}
+		wait = time.Duration((1 - s.Tokens) / s.Rate * float64(time.Minute))
+	})
+	if err != nil {
+		return sharedRetry
 	}
-	t.refill(now)
-	if t.tokens >= 1 {
-		t.tokens--
-		return 0
-	}
-	need := (1 - t.tokens) / t.rate // minutes
-	return time.Duration(need * float64(time.Minute))
+	return wait
 }
 
 // Wait blocks until a token is available or ctx is done.
@@ -99,43 +163,48 @@ func (t *Throttle) Wait(ctx context.Context) error {
 // Backoff records a rate-limit / server error. retryAfter (0 if absent)
 // is the server's hint.
 func (t *Throttle) Backoff(retryAfter time.Duration) time.Duration {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.failures++
-	t.rate /= 2
-	if t.rate < 1 {
-		t.rate = 1
+	var d time.Duration
+	err := t.apply(func(s *ThrottleState) {
+		s.Failures++
+		s.Rate = max(1, s.Rate/2)
+		d = retryAfter
+		if d <= 0 {
+			exp := min(time.Second<<min(s.Failures-1, 6), time.Minute) // 1s, 2s, … 60s
+			d = exp/2 + time.Duration(t.jitter()*float64(exp/2))
+		}
+		s.PauseTill = t.clock.Now().Add(d).UnixMilli()
+		s.Tokens = 0
+	})
+	if err != nil && d == 0 {
+		d = sharedRetry
 	}
-	d := retryAfter
-	if d <= 0 {
-		exp := min(time.Second<<min(t.failures-1, 6), time.Minute) // 1s, 2s, … 60s
-		d = exp/2 + time.Duration(t.jitter()*float64(exp/2))
-	}
-	t.pauseTill = t.clock.Now().Add(d)
-	t.tokens = 0
 	return d
 }
 
 // Success records a successful registration (additive increase).
 func (t *Throttle) Success() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.failures = 0
-	t.rate = min(t.limit, t.rate+1)
+	limit, _ := t.cfg()
+	t.apply(func(s *ThrottleState) {
+		s.Failures = 0
+		s.Rate = min(limit, s.Rate+1)
+	})
 }
 
 // Rate returns the effective tokens/minute.
 func (t *Throttle) Rate() float64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.rate
+	var r float64
+	if err := t.apply(func(s *ThrottleState) { r = s.Rate }); err != nil {
+		limit, _ := t.cfg()
+		return limit
+	}
+	return r
 }
 
 // SetLimit changes the configured rate (tenant update).
 func (t *Throttle) SetLimit(perMinute int) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.limit = float64(perMinute)
-	t.rate = min(t.rate, t.limit)
 	t.burst = max(1, t.limit/10)
+	t.mu.Unlock()
+	t.apply(func(*ThrottleState) {}) // init clamps rate and tokens to the new limit
 }

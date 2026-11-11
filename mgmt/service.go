@@ -1083,11 +1083,31 @@ func (m *Mgmt) throttle(t Tenant) *Throttle {
 	defer m.mu.Unlock()
 	th := m.throttles[t.ID]
 	if th == nil {
-		th = NewThrottle(t.RegistrationsPerMinute, m.clock)
+		if ts, ok := m.store.(throttleStore); ok {
+			// Shared across replicas, timed by the store clock (F7, H03).
+			id := t.ID
+			th = NewSharedThrottle(t.RegistrationsPerMinute, storeTimedClock{m}, func(ctx context.Context, fn func(*ThrottleState)) error {
+				return ts.UpdateThrottle(ctx, id, fn)
+			})
+		} else {
+			th = NewThrottle(t.RegistrationsPerMinute, m.clock)
+		}
 		m.throttles[t.ID] = th
 	}
 	return th
 }
+
+// throttleStore is implemented by stores that can hold shared throttle state.
+type throttleStore interface {
+	UpdateThrottle(ctx context.Context, tenantID string, fn func(*ThrottleState)) error
+}
+
+// storeTimedClock reads time from the shared store clock (m.now) and waits
+// with the replica's timers.
+type storeTimedClock struct{ m *Mgmt }
+
+func (c storeTimedClock) Now() time.Time                         { return c.m.now() }
+func (c storeTimedClock) After(d time.Duration) <-chan time.Time { return c.m.clock.After(d) }
 
 // sweepPending enqueues every pending object this replica isn't already
 // holding in a queue. It runs at Start and every reaper tick, so an object
