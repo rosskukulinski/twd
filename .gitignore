@@ -11,3 +11,4 @@ guest/out/
 /twd-mgmt
 /twd-hostd
 /twd-netd
+e2e/*/results/

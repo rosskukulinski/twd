@@ -35,12 +35,23 @@ import (
 
 const prodControl = "https://controlplane.tailscale.com"
 
-// The two test tailnets. Ross's personal tailnet is never touched.
+// The two test tailnets. Tailnets listed in TWD_E2E_FORBIDDEN_TAILNETS
+// (comma-separated substrings, e.g. your personal tailnet) are never touched.
 var (
 	allowedA  = map[string]bool{"tail7906d5.ts.net": true}
 	allowedB  = map[string]bool{"tail2c3a48.ts.net": true}
-	forbidden = []string{"stonecat-wage.ts.net", "kukulinski.com"}
+	forbidden = forbiddenTailnets()
 )
+
+func forbiddenTailnets() []string {
+	var out []string
+	for _, f := range strings.Split(os.Getenv("TWD_E2E_FORBIDDEN_TAILNETS"), ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
 
 type side struct {
 	key, keyFile, tailnet string
@@ -202,7 +213,7 @@ func TestE2EMulti(t *testing.T) {
 	tailnetB = joined
 	for _, f := range forbidden {
 		if strings.Contains(tailnetB, f) {
-			t.Fatalf("tailnet-2 resolved to %s: refusing (personal tailnet)", tailnetB)
+			t.Fatalf("tailnet-2 resolved to %s: refusing (in TWD_E2E_FORBIDDEN_TAILNETS)", tailnetB)
 		}
 	}
 	if !allowedB[tailnetB] || tailnetB == tailnetA {
