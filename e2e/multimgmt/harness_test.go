@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -160,6 +161,15 @@ func (f *fakeTS) liveKeyCounts() map[string]int {
 
 const fakeAPIToken = "fake-api-token"
 
+// fakePolicy lets SupportAgent objects spawn LookupAgent children.
+const fakePolicy = `{
+  "tagOwners": {
+    "tag:twd": ["autogroup:admin"],
+    "tag:twd-agent-support": ["tag:twd"],
+    "tag:twd-agent-support-sub": ["tag:twd", "tag:twd-agent-support"],
+  },
+}`
+
 func newFakeTS(t *testing.T) *fakeTS {
 	f := &fakeTS{keysByObject: map[string][]string{}, liveKeys: map[string]string{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
@@ -199,6 +209,9 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == "DELETE" && strings.HasPrefix(r.URL.Path, "/api/v2/device/"):
 		f.deletedDevs = append(f.deletedDevs, strings.TrimPrefix(r.URL.Path, "/api/v2/device/"))
 		w.WriteHeader(200)
+	case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/acl"):
+		w.Header().Set("ETag", `"p1"`)
+		w.Write([]byte(fakePolicy))
 	case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/devices"):
 		json.NewEncoder(w).Encode(map[string]any{"devices": []any{}})
 	default:
@@ -284,9 +297,14 @@ type cluster struct {
 	token     string
 	replicas  []*replica
 	extraArgs []string
+	jsonc     string // twd.jsonc for setupTenant ("" = twdJSONC)
 }
 
+// proxy returns replica i's Postgres fault proxy.
+func (c *cluster) proxy(i int) *pgProxy { return c.replicas[i].pg }
+
 type replica struct {
+	pg     *pgProxy // this replica's path to Postgres (fault injection)
 	i      int
 	dir    string
 	sock   string
@@ -310,7 +328,9 @@ func newCluster(t *testing.T, r *run, n int) *cluster {
 	for i := 0; i < n; i++ {
 		// unix socket paths are limited to ~104 bytes on macOS: keep them short.
 		sock := filepath.Join(os.TempDir(), fmt.Sprintf("twd-mm-%d-%d.sock", os.Getpid(), i))
-		c.replicas = append(c.replicas, &replica{i: i, dir: filepath.Join(r.dir, fmt.Sprintf("r%d", i)), sock: sock})
+		u, _ := url.Parse(c.dsn)
+		c.replicas = append(c.replicas, &replica{i: i, dir: filepath.Join(r.dir, fmt.Sprintf("r%d", i)), sock: sock,
+			pg: newPGProxy(t, u.Host)})
 	}
 	t.Cleanup(func() {
 		for _, rp := range c.replicas {
@@ -333,7 +353,7 @@ func (c *cluster) start(i int) {
 	}
 	fmt.Fprintf(lf, "=== start %s\n", time.Now().UTC().Format(time.RFC3339Nano))
 	args := append([]string{"-local-dev", "-socket", rp.sock, "-host-token-file", c.tokenFile, "-state-dir", rp.dir,
-		"-db", c.dsn, "-custody", "setec", "-setec-url", c.setec.URL, "-tsapi-url", c.ts.srv.URL, "-reap-interval", "2s",
+		"-db", viaProxy(c.t, c.dsn, rp.pg.addr()), "-custody", "setec", "-setec-url", c.setec.URL, "-tsapi-url", c.ts.srv.URL, "-reap-interval", "2s",
 		"-no-loopback"}, c.extraArgs...)
 	cmd := exec.Command(mgmtBinary(c.t), args...)
 	cmd.Stdout, cmd.Stderr = lf, lf
@@ -535,7 +555,11 @@ func (c *cluster) setupTenant(i int, rpm int) setup {
 	var dep struct {
 		Epoch int64
 	}
-	bundle := makeBundle(map[string]string{"twd.jsonc": twdJSONC, "dist/index.js": "export default {}"})
+	jsonc := twdJSONC
+	if c.jsonc != "" {
+		jsonc = c.jsonc
+	}
+	bundle := makeBundle(map[string]string{"twd.jsonc": jsonc, "dist/index.js": "export default {}"})
 	c.must(i, "", "POST", "/v1/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "w", "bundle": bundle}, &dep)
 	return setup{tenantID: tn.TenantID, workload: "w", epoch: dep.Epoch}
 }
