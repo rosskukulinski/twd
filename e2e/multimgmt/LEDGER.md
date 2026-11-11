@@ -1,5 +1,54 @@
 # multi-mgmt loop ledger
 
+> ## FINAL (2026-11-11): loop complete. The stop condition is met.
+> Every hypothesis is resolved, every scenario (S1–S11) has 3 clean seeds,
+> and 2 clean 10-minute mixed-fault soaks have passed (seeds 101, 103).
+> Branch `mm-loop` is **local only, not pushed** (the repo is public).
+>
+> **Bugs found and fixed (all with regression tests):**
+> - **Ownership correctness:**
+>   - F1/H10: the store is the clock for leases and liveness;
+>   - F3/H02: a double mint destroyed credentials;
+>   - F4: guarded moves;
+>   - F9: stateful-only fencing, 30 s fence / 45 s lease (ADR-028);
+>   - F14/H04 and F17/H16: spawn budget and quota checked in the insert
+>     transaction;
+>   - F15/H09: one winner per kill.
+> - **Shared state across replicas:**
+>   - F6/H11: replica registry; file custody refused;
+>   - F7/H03: a shared throttle;
+>   - F8/H06: persisted push targets;
+>   - F11/H13: OBO root and issuer keys chosen once;
+>   - F12/H14: idempotent creates and a shared ID secret;
+>   - F13/H08: deployment status in the store;
+>   - F15/H15: throttle follows tenant limit changes.
+> - **Durability and availability:**
+>   - F10/H07, F20/H21, F21/H23: device deletes are durable, claimed as
+>     leases, and recorded atomically with the kill;
+>   - F16/H05: credential waits see other replicas' mints;
+>   - F18: no wasted throttle tokens;
+>   - F19/H19: bounded Postgres pool;
+>   - H20: no 404 masking of store errors;
+>   - H18: `503 store_unavailable`;
+>   - Postgres session limits.
+>
+> **Still open:**
+> 1. **H22, needs a decision:** a store blip can drop an audit record (the
+>    state change commits, the separate append fails). Recommended: (b) a
+>    durable audit outbox written in the same transaction.
+> 2. **H12:** no `svc:twd-mgmt` VIP yet. Hosts point at one replica. The
+>    VIP must retry on another backend and eject slow or stalled ones
+>    (from S3/S6).
+> 3. **S11 used fake hosts.** hostd's fencing (F9) is unit-tested only;
+>    run a hostd e2e once the VIP exists.
+> 4. **H17's effect isn't isolated:** S6 passes on the harness's
+>    load-balancer behavior alone. The mgmt-side lock limits are defense
+>    in depth.
+> 5. **ADR-028** (Accepted, with §3 re-decided) is **uncommitted** in
+>    `tailnet-agents-design`.
+> 6. Real-tailnet suites (`e2e-keyless` for the shared issuer key, etc.)
+>    and CI aren't run or wired up yet.
+
 
 FIX_MODE: fix
 
@@ -68,7 +117,7 @@ FIX_MODE: fix
 | S5 (re-verified) | — | 3/3 again after H20 (store errors now 503 inside the declared outage; 0.05–0.09% outside) | |
 | S10 | — | **3/3 clean seeds** (kill storm: overlapping cascade kills of the same trees through every replica every 3 s; KillOnce 0, I6 ok) | `TestMM_S10_KillStorm` |
 | S11 | — | **3/3 clean runs** (failover protocol across replicas with **fake hosts**: takeover_unconfirmed → lease_held → forced takeover to h2 at epoch+1 at 47 s, audited → h1 revoked and fenced (lease_lost via every replica) → h2 joins at the new epoch). A real twd-hostd is not used | `TestMM_S11_HostFailover` |
-| Soaks | — | seed 102 **PASS**. Seed 101 failed I6 twice (F20, then F21); seed 103 crashed the **harness** (thread exhaustion from a per-call HTTP transport leak). Re-running 101 + 103 after F21 and the harness fix | `TestMM_Soak` |
+| Soaks | — | **2/2 clean after F21** (seed 101: 309,741 ops; seed 103: 245,726 ops), plus seed 102 before F21. Before: 101 failed I6 twice (→ F20, F21), and 103 crashed the harness (fixed) | `TestMM_Soak` |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -1171,3 +1220,4 @@ Recommendation: (b).
 2026-11-11 iter33 PLAN | Soak ×2 (mixed faults every 10–25 s, 10 min, seeds 101 and 102) | 101, 102 | pass if every invariant holds in both | all
 2026-11-11 iter33 | soaks 101, 102 | 2 | 101 FAIL I6 → F20 (H21); 102 PASS | I6 | results/*-SOAK-* | H22 (dropped audit record during a store blip) recorded, needs a decision
 2026-11-11 iter33 | soak re-runs | 101, 103 | 101 FAIL I6 → F21 (H23); 103 harness crash (HTTP transport leak) → fixed | I6 | /tmp/mm-soak-*.log | the first re-run silently didn't run (grep hid it)
+2026-11-11 iter33 | soaks 101, 103 (after F21 + harness fix) | 2 | 2/2 PASS | all | /tmp/mm-soak-*.log, results/*-SOAK-* | the earlier re-runs never ran (my background `cd` didn't carry: `go -C` now). LOOP COMPLETE
