@@ -77,3 +77,40 @@ func TestCustodyNamesPerKey(t *testing.T) {
 		t.Fatalf("keyed names must differ per key: %q vs %q", a, b)
 	}
 }
+
+// TestStoreDeviceDelete (mm-loop F10, H07): a killed object's device delete
+// is durable; only one claimer runs it, not before it is due, and a retry
+// makes it due again.
+func TestStoreDeviceDelete(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		if err := s.CreateObject(ctx, Object{ID: "dd1", TenantID: "tn", Workload: "w", Namespace: "A", Name: "dd1", Hostname: "dd1",
+			Status: StatusKilled}); err != nil {
+			t.Fatal(err)
+		}
+		const t0 = int64(1_800_000_000_000)
+		if ids, _ := s.DueDeviceDeletes(ctx, t0); len(ids) != 0 {
+			t.Fatalf("nothing scheduled yet, got %v", ids)
+		}
+		s.SetDeviceDelete(ctx, "dd1", t0+8000)
+		if ok, _ := s.ClaimDeviceDelete(ctx, "dd1", t0); ok {
+			t.Fatal("claimed before it was due")
+		}
+		if ids, _ := s.DueDeviceDeletes(ctx, t0+8000); len(ids) != 1 {
+			t.Fatalf("due at t0+8s: %v", ids)
+		}
+		if ok, _ := s.ClaimDeviceDelete(ctx, "dd1", t0+9000); !ok {
+			t.Fatal("first claimer after due must win")
+		}
+		if ok, _ := s.ClaimDeviceDelete(ctx, "dd1", t0+9000); ok {
+			t.Fatal("second claimer must lose")
+		}
+		if ids, _ := s.DueDeviceDeletes(ctx, t0+99000); len(ids) != 0 {
+			t.Fatalf("claimed delete must not be due again: %v", ids)
+		}
+		s.SetDeviceDelete(ctx, "dd1", t0+39000) // failed: retry later
+		if ok, _ := s.ClaimDeviceDelete(ctx, "dd1", t0+39000); !ok {
+			t.Fatal("a rescheduled delete must be claimable when due")
+		}
+	})
+}

@@ -20,6 +20,7 @@ FIX_MODE: fix
 | F7 | Registration throttle state in the store (`tenant_throttle`), shared by every replica and timed by the store clock | H03 | `TestMM_H03_ThrottlePerReplica` (before: 45 in a 10 s window; after: 16 = the limit, 2/2); `TestStoreSharedThrottle` (SQLite + Postgres) | **DONE** |
 | F8 | Persist each host's push target in the `hosts` row at registration, so any replica can push kills and assignments; keep the in-memory map as a cache | H06 | `TestMM_H06_KillPushAcrossReplicas` (before: via r1 heartbeat after ~1.5 s; after: pushed in 13–15 ms, 2/2), `TestMM_F8_PushTargetShared` | **DONE** |
 | F9 | ADR-028 §3 (Ross, second interview): mgmt marks each deployment `fence` (= `BundleStateful`) and sends it in assignments; hostd's heartbeat-loss fencing undeploys only workloads with `fence` (a missing field means fence: safe against an older mgmt). `FenceAfter` 9 → 30 s, `NamespaceLeaseTTL` 15 → 45 s, with a startup check that fence < lease − margin. Fix the stale comment | correction (iter13) | `TestMM_F9_FenceStatefulOnly`, `TestFenceBelowLease` (hostd), `TestMM_F9_AssignmentFence` (mgmt) | **DONE** (fence selection unit-tested; undeploy and redeploy on reconnect not exercised end to end, since that needs workerd: scenario S4) |
+| F10 | Durable device deletes: `objects.device_delete_at` (due ms / -1 claimed), claimed by one replica, swept by every replica's reaper, retried in 30 s on failure | H07 | `TestMM_H07_DeviceDeleteLostOnCrash` (before: device left; after: deleted by the surviving replica, 2/2); `TestStoreDeviceDelete` (SQLite + Postgres) | **DONE** |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -33,7 +34,7 @@ FIX_MODE: fix
 | H04 | P1 | **not reproduced yet** (exactly 5/5 live in 6 runs at 0/2/5/20 ms PG delay); the race exists in code (per-replica `tenantLock`; `CountLive` then insert, no re-check); something narrows the window, cause not found | `TestMM_H04_SpawnBudgetRace` |
 | H05 | P2 | open | |
 | H06 | P1 | **FIXED by F8**. Was CONFIRMED (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
-| H07 | P1 | open | |
+| H07 | P1 | **FIXED by F10**. Was CONFIRMED: with a device-delete delay, SIGKILL of the killing replica inside the window left the device forever (control deleted) | `TestMM_H07_DeviceDeleteLostOnCrash`, `TestStoreDeviceDelete` |
 | H08 | P2 | open | |
 | H09 | P2 | open | |
 | H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
@@ -572,6 +573,36 @@ mgmt outage scenario, both future.
 (confirmed, or stateless) now waits up to 45 s instead of 15 s. Ross
 accepted this.
 
+### H07: CONFIRMED, then FIXED by F10. Device deletes lost on a crash.
+
+**Repro.** `TestMM_H07_DeviceDeleteLostOnCrash` with
+`-device-delete-delay 3s` (`twd up` uses 8 s):
+- **Control:** kill through r0 with r0 staying up. The device was deleted
+  after about 3 s.
+- **Crash:** kill through r0, then SIGKILL r0 0.5 s later. The device was
+  **never** deleted: not by r1 (whose reaper kept running), and not by r0
+  after its restart.
+
+The delete existed only as an in-memory `time.AfterFunc`. A failed delete
+wasn't retried either, which affects a single replica too.
+
+**F10.**
+- The kill writes `device_delete_at` (now + delay) before scheduling the
+  local timer, which is kept for promptness.
+- Each runner (the timer, `FlushDeletes` (forced), or any replica's reaper
+  sweep via `DueDeviceDeletes`) first `ClaimDeviceDelete`s, which sets it
+  to -1, so exactly one runs it.
+- A retryable failure makes it due again in `DeviceDeleteRetry` (30 s);
+  "unavailable" (no devices scope) doesn't retry.
+- 404 already counts as success in `tsapi`.
+- The inline (no-delay) delete inside `Kill` stays unaudited on its own,
+  because the kill record carries `deviceDeleted`. My first version added
+  a separate audit record, which `TestAPIEndToEnd` caught, so I kept the
+  existing audit contract.
+
+**After.** The crash case was deleted by r1's sweep in 2 of 2 runs.
+`TestStoreDeviceDelete` passes on SQLite and Postgres.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -617,3 +648,5 @@ accepted this.
 2026-11-11 iter13 | H06 | n/a ×2 | CONFIRMED | I6 | results/*-H06 | via r0: pushed in 12–15 ms; via r1: no push, heartbeat after ~1.5 s. While reading hostd's heartbeat found existing self-fencing (FenceAfter 9 s, all workloads): correction recorded, ADR-028 §3 to be re-decided
 2026-11-11 iter14 | F8 | n/a ×2 | FIXED | — | results/*-H06; make test-go/test-pg green | kill via r1 now pushed in 13–15 ms (was heartbeat, ~1.5 s)
 2026-11-11 iter15 | F9 | n/a | DONE | — | make test-go/test-pg green; e2e H01/H02/H06/H11 green | F4/F5 tests updated for the 45 s lease; my first edit left dead scaffolding (`_unusedFenceLoop`) and a duplicate import, both removed before commit
+2026-11-11 iter16 PLAN | H07 | n/a | confirm if, with -device-delete-delay 3s, a kill followed by SIGKILL of that replica within the delay leaves the device undeleted (control: deleted without the crash) | I6
+2026-11-11 iter16 | H07 → F10 | n/a ×3 | CONFIRMED then FIXED | I6 | results/*-H07 | crash case: device left (before), deleted by the surviving replica (after, 2/2); make test-go/test-pg green

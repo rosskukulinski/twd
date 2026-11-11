@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -188,6 +189,7 @@ func (m *Mgmt) Start() error {
 				if _, err := m.registerReplica(m.ctx); err != nil {
 					m.log.Warn("replica registry", "err", err)
 				}
+				m.sweepDeviceDeletes(m.ctx)
 				if err := m.sweepPending(m.ctx); err != nil {
 					m.log.Warn("pending sweep", "err", err)
 				}
@@ -1740,6 +1742,9 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		}
 		deleted, scheduled, unavailable := false, false, false
 		if killed.StableNodeID != "" || killed.NodeID != "" {
+			// Durable first (H07): any replica's sweep finishes this delete
+			// if this replica dies before it runs.
+			m.store.SetDeviceDelete(ctx, o.ID, m.now().Add(m.cfg.DeviceDeleteDelay).UnixMilli())
 			if m.cfg.DeviceDeleteDelay > 0 {
 				m.scheduleDelete(killed)
 				scheduled = true
@@ -1750,7 +1755,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 				if unavailable {
 					res.warnDeviceDelete(o.ID) // learned from an earlier 403; the scheduled delete still tries
 				}
-			} else if err := m.deleteDevice(ctx, killed); errors.Is(err, errDeviceDeleteUnavailable) {
+			} else if _, err := m.deleteDeviceClaimedAudit(ctx, killed, false, false); errors.Is(err, errDeviceDeleteUnavailable) {
 				unavailable = true
 				res.warnDeviceDelete(o.ID)
 			} else if err != nil {
@@ -1847,7 +1852,11 @@ func (m *Mgmt) scheduleDelete(o Object) {
 }
 
 // runDelete performs a scheduled device delete (once).
-func (m *Mgmt) runDelete(id string) {
+func (m *Mgmt) runDelete(id string) { m.runDeleteForce(id, false) }
+
+// runDeleteForce runs a scheduled delete now; force (FlushDeletes) runs it
+// even before it is due.
+func (m *Mgmt) runDeleteForce(id string, force bool) {
 	m.mu.Lock()
 	pd := m.pending[id]
 	delete(m.pending, id)
@@ -1858,17 +1867,72 @@ func (m *Mgmt) runDelete(id string) {
 	pd.timer.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	m.deleteDeviceClaimed(ctx, pd.o, force)
+}
+
+// DeviceDeleteRetry is how long a failed device delete waits before any
+// replica's sweep tries again.
+const DeviceDeleteRetry = 30 * time.Second
+
+// deleteDeviceClaimed claims the object's durable device delete (so exactly
+// one replica runs it), deletes the device, audits, and on a retryable
+// failure puts it back as due in DeviceDeleteRetry. ran is false when the
+// delete was not due or another replica claimed it.
+func (m *Mgmt) deleteDeviceClaimed(ctx context.Context, o Object, force bool) (ran bool, err error) {
+	return m.deleteDeviceClaimedAudit(ctx, o, force, true)
+}
+
+// deleteDeviceClaimedAudit is deleteDeviceClaimed; audit=false is the
+// inline delete inside Kill, whose kill record already says deviceDeleted.
+func (m *Mgmt) deleteDeviceClaimedAudit(ctx context.Context, o Object, force, audit bool) (ran bool, err error) {
+	now := m.now().UnixMilli()
+	if force {
+		now = math.MaxInt64
+	}
+	if ok, cerr := m.store.ClaimDeviceDelete(ctx, o.ID, now); cerr != nil || !ok {
+		return false, cerr
+	}
+	id := o.ID
 	st := time.Now()
-	err := m.deleteDevice(ctx, pd.o)
-	detail := map[string]any{"nodeID": pd.o.StableNodeID, "ms": time.Since(st).Milliseconds()}
+	err = m.deleteDevice(ctx, o)
+	if err != nil && !errors.Is(err, errDeviceDeleteUnavailable) {
+		m.store.SetDeviceDelete(context.WithoutCancel(ctx), id, m.now().Add(DeviceDeleteRetry).UnixMilli())
+	}
+	detail := map[string]any{"nodeID": o.StableNodeID, "ms": time.Since(st).Milliseconds()}
 	if errors.Is(err, errDeviceDeleteUnavailable) {
 		detail["error"], detail["code"], detail["fix"] = err.Error(), CodeDeviceDeleteUnavailable, DeviceScopeFix
-		m.log.Warn("device delete unavailable: the tenant's OAuth client has no devices:core scope", "object", id, "tenant", pd.o.TenantID)
+		m.log.Warn("device delete unavailable: the tenant's OAuth client has no devices:core scope", "object", id, "tenant", o.TenantID)
 	} else if err != nil {
 		detail["error"] = err.Error()
 		m.log.Warn("device delete failed", "object", id, "err", err)
 	}
-	m.audit(ctx, AuditRecord{TenantID: pd.o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
+	if audit {
+		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
+	}
+	return true, err
+}
+
+// sweepDeviceDeletes runs every due durable device delete: ones whose
+// replica died before its timer fired (H07) and failed ones being retried.
+func (m *Mgmt) sweepDeviceDeletes(ctx context.Context) {
+	ids, err := m.store.DueDeviceDeletes(ctx, m.now().UnixMilli())
+	if err != nil {
+		m.log.Warn("device delete sweep", "err", err)
+		return
+	}
+	for _, id := range ids {
+		m.mu.Lock()
+		_, local := m.pending[id]
+		m.mu.Unlock()
+		if local {
+			continue // this replica's own timer will run it
+		}
+		o, err := m.store.GetObject(ctx, id)
+		if err != nil {
+			continue
+		}
+		m.deleteDeviceClaimed(ctx, o, false)
+	}
 }
 
 // PendingDeletes is how many device deletes are scheduled.
@@ -1925,7 +1989,7 @@ func (m *Mgmt) FlushDeletes() {
 	var wg sync.WaitGroup
 	for _, id := range ids {
 		wg.Add(1)
-		go func() { defer wg.Done(); m.runDelete(id) }()
+		go func() { defer wg.Done(); m.runDeleteForce(id, true) }()
 	}
 	wg.Wait()
 }

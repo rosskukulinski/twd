@@ -141,6 +141,37 @@ func (s *SQLStore) UpdateThrottle(ctx context.Context, tenantID string, fn func(
 	return tx.Commit()
 }
 
+func (s *SQLStore) SetDeviceDelete(ctx context.Context, id string, due int64) error {
+	_, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=?"), due, id)
+	return err
+}
+
+func (s *SQLStore) ClaimDeviceDelete(ctx context.Context, id string, now int64) (bool, error) {
+	r, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=-1 WHERE id=? AND device_delete_at>0 AND device_delete_at<=?"), id, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+
+func (s *SQLStore) DueDeviceDeletes(ctx context.Context, now int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.q("SELECT id FROM objects WHERE device_delete_at>0 AND device_delete_at<=? ORDER BY device_delete_at"), now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLStore) UpsertReplica(ctx context.Context, r Replica) error {
 	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO replicas (id, custody, started_at, last_seen) VALUES (?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET custody=excluded.custody, started_at=excluded.started_at, last_seen=excluded.last_seen`),
@@ -372,6 +403,8 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// M12: oauth mint mode (client ID + credential file path; never the secret).
 		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
 		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F10 (H07): durable device deletes (0 none, >0 due unix ms, -1 claimed/done).
+		{"objects", "device_delete_at", "ALTER TABLE objects ADD COLUMN device_delete_at BIGINT NOT NULL DEFAULT 0"},
 		// mm-loop F9 (ADR-028 §3): hosts self-fence only stateful workloads.
 		// Existing rows default to 1 (fence), the safe value.
 		{"deployments", "fence", "ALTER TABLE deployments ADD COLUMN fence BIGINT NOT NULL DEFAULT 1"},

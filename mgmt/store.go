@@ -56,6 +56,12 @@ type Store interface {
 	// object. It succeeds iff the object is pending without a key and is
 	// unclaimed, claimed by claimer, or claimed before staleBefore (H02).
 	ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error)
+	// Durable device deletes (F10, H07): SetDeviceDelete records when a
+	// killed object's device is due for deletion (unix ms); ClaimDeviceDelete
+	// takes a due one (at most one replica wins); DueDeviceDeletes lists them.
+	SetDeviceDelete(ctx context.Context, id string, due int64) error
+	ClaimDeviceDelete(ctx context.Context, id string, now int64) (bool, error)
+	DueDeviceDeletes(ctx context.Context, now int64) ([]string, error)
 	// UpsertReplica records a mgmt replica (registry: F6/H11); ListReplicas
 	// returns every recorded replica, live or not.
 	UpsertReplica(ctx context.Context, r Replica) error
