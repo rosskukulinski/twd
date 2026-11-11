@@ -279,9 +279,9 @@ func (a *v1api) GetStatus(w http.ResponseWriter, r *http.Request) {
 	if listeners == nil {
 		listeners = []string{}
 	}
-	writeJSON(w, 200, map[string]any{"ok": st.Clock.OK, "transport": transport, "listeners": listeners,
+	writeJSON(w, 200, map[string]any{"ok": st.Clock.OK && st.Replicas.OK, "transport": transport, "listeners": listeners,
 		"pendingDeviceDeletes": st.PendingDeletes, "hosts": map[string]int{"total": st.Hosts, "live": st.LiveHosts},
-		"tenants": st.Tenants, "objects": st.Objects, "version": a.s.Version, "clock": st.Clock})
+		"tenants": st.Tenants, "objects": st.Objects, "version": a.s.Version, "clock": st.Clock, "replicas": st.Replicas})
 }
 
 func (a *v1api) CreateDeviceDeleteRun(w http.ResponseWriter, r *http.Request) {

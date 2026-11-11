@@ -4,72 +4,55 @@ package multimgmt
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// TestMM_H11_FileCustodyPerReplica probes H11: with the default
-// -custody file, each replica keeps minted auth keys in its own state dir,
-// so a credential minted by one replica can't be released by another.
-// Invariant I3/I8: any replica can release any minted object's credential.
+// TestMM_H11_FileCustodyPerReplica: with -custody file (the default) each
+// replica kept minted auth keys in its own state dir, so a credential minted
+// by one replica could not be released by another (H11: 6/12 failed on each
+// replica). Fixed by F6: a second replica sharing the store with file
+// custody refuses to start, with a message that says why and what to do,
+// while a single replica restarting right after a crash still starts.
 func TestMM_H11_FileCustodyPerReplica(t *testing.T) {
-	const n = 12
 	r := newRun(t, "H11")
 	c := newCluster(t, r, 2)
 	c.extraArgs = []string{"-custody", "file"} // the default; overrides the harness's setec (last flag wins)
-	db := c.db()
-	for i := range 2 {
-		c.start(i)
-		if _, err := c.waitReady(i, 10*time.Second); err != nil {
-			t.Fatal(err)
+	c.start(0)
+	if _, err := c.waitReady(0, 10*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	// A second file-custody replica on the same store: refused.
+	c.start(1)
+	select {
+	case <-c.replicas[1].exited:
+	case <-time.After(10 * time.Second):
+		t.Fatal("I3/I8: a second file-custody replica started and is serving; it must refuse (keys would be unreleasable across replicas)")
+	}
+	log, _ := os.ReadFile(filepath.Join(r.dir, "r1.log"))
+	for _, want := range []string{"refusing to start", "file custody", "-custody setec"} {
+		if !strings.Contains(string(log), want) {
+			t.Errorf("r1's refusal should mention %q; log:\n%s", want, log)
 		}
 	}
-	s := c.setupTenant(0, 1000)
-	stop := make(chan struct{})
-	defer close(stop)
-	c.heartbeat(s, stop)
-	for k := range n {
-		// Alternate the replica that serves the create (and enqueues the mint).
-		c.must(k%2, "h1", "POST", "/v1/objects", map[string]any{"tenantID": s.tenantID, "namespace": "SupportAgent",
-			"objectName": fmt.Sprintf("o%03d", k)}, nil)
+	c.replicas[1].cmd = nil // already exited
+	// r0 is unaffected.
+	if st, b, err := c.call(0, "GET", "/v1/status", nil); err != nil || st != 200 || !strings.Contains(string(b), `"ok":true`) {
+		t.Errorf("r0 status after the refused join: %d %v %s", st, err, b)
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		st, _ := objectStatuses(db)
-		left := 0
-		for _, v := range st {
-			if v == "pending" {
-				left++
-			}
-		}
-		if left == 0 && len(st) == n {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("%d still pending", left)
-		}
-		time.Sleep(200 * time.Millisecond)
+	// A crash and immediate restart of the single replica (its registry row
+	// is still live) must start: it has the same stable replica ID.
+	c.stop(0, syscall.SIGKILL)
+	c.start(0)
+	if d, err := c.waitReady(0, 10*time.Second); err != nil {
+		t.Fatalf("restart after SIGKILL: %v", err)
+	} else {
+		t.Logf("r0 restarted after SIGKILL in %v", d.Round(time.Millisecond))
 	}
-	st, _ := objectStatuses(db)
-	fail := [2]int{}
-	both := 0
-	for id := range st {
-		okOn := 0
-		for i := range 2 {
-			code, b, err := c.callAs(i, "h1", "POST", fmt.Sprintf("/v1/objects/%s/credentials?epoch=%d", id, s.epoch), nil)
-			if err != nil || code/100 != 2 {
-				fail[i]++
-				t.Logf("r%d %s: %d %.100s", i, id, code, b)
-			} else {
-				okOn++
-			}
-		}
-		if okOn == 0 {
-			both++
-		}
-	}
-	t.Logf("credential failures: r0 %d/%d, r1 %d/%d, on both %d", fail[0], n, fail[1], n, both)
-	if fail[0]+fail[1] > 0 {
-		t.Errorf("I3/I8 violated: with -custody file, %d credential releases failed because the key is in another replica's custody", fail[0]+fail[1])
-	}
+	st, b, _ := c.call(0, "GET", "/v1/status", nil)
+	t.Logf("r0 status: %d %s", st, fmt.Sprintf("%.400s", b))
 }

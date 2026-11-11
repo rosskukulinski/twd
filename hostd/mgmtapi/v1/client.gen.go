@@ -1312,7 +1312,10 @@ type Status struct {
 	Objects              map[string]int `json:"objects"`
 	Ok                   bool           `json:"ok"`
 	PendingDeviceDeletes int            `json:"pendingDeviceDeletes"`
-	Tenants              int            `json:"tenants"`
+
+	// Replicas The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it) when this replica conflicts with another live one: file custody shared between replicas, or replicas with different custody. A replica refuses to start in that state; a conflict that appears later (a replica started with an older version, or a registry row edited) is reported here and logged.
+	Replicas *StatusReplicas `json:"replicas,omitempty"`
+	Tenants  int             `json:"tenants"`
 
 	// Transport `tsnet` in normal operation; `local-dev` when the unix socket is serving.
 	Transport Transport `json:"transport"`
@@ -1336,6 +1339,17 @@ type StatusClock struct {
 
 // StatusClockSource `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica.
 type StatusClockSource string
+
+// StatusReplicas The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it) when this replica conflicts with another live one: file custody shared between replicas, or replicas with different custody. A replica refuses to start in that state; a conflict that appears later (a replica started with an older version, or a registry row edited) is reported here and logged.
+type StatusReplicas struct {
+	// ID This replica's stable ID (`<state-dir>/replica.id`).
+	ID string `json:"id"`
+
+	// Live Replicas seen within the last 30 s, this one included.
+	Live    int     `json:"live"`
+	Message *string `json:"message,omitempty"`
+	Ok      bool    `json:"ok"`
+}
 
 // Tenant defines model for Tenant.
 type Tenant struct {

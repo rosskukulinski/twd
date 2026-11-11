@@ -34,7 +34,7 @@ FIX_MODE: fix
 | H08 | P2 | open | |
 | H09 | P2 | open | |
 | H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
-| H11 | P0 | **CONFIRMED** (2/2 runs): with `-custody file`, each replica can release only the credentials it minted (6/12 fail on each) | `TestMM_H11_FileCustodyPerReplica` |
+| H11 | P0 | **FIXED by F6** (was: with `-custody file`, 6/12 credential releases failed on each replica) | `TestMM_H11_FileCustodyPerReplica` |
 | H12 | P1 | open | |
 | H13 | P1 | open | |
 | H14 | P2 | open | |
@@ -355,6 +355,49 @@ in each replica's own state dir:
 start. The stable replica ID matters because without it, a single replica
 restarting after a crash would see its own old row and refuse.
 
+### F6: replica registry (fixes H11 as a refusal)
+
+**Registry.** A new `replicas` table holds `(id, custody, started_at,
+last_seen)`. Each replica writes its row at `Start` and every reaper tick,
+using the store clock. A clean `Close` sets `last_seen = 0`. A replica
+counts as live if seen within `ReplicaLiveTTL` (30 s).
+
+**Stable IDs.** The replica ID lives in `<state-dir>/replica.id`
+(`Config.ReplicaID`). It's also the mint-claim owner, so a restarted
+replica can immediately reclaim its own claims.
+
+**`CustodyFingerprint`:**
+- `file:<host>:<dir>`;
+- `setec:<url>` (trailing `/` trimmed).
+
+**`Start` refuses** (and clears its own row) in three cases:
+- this replica uses file custody and another replica is live;
+- a live replica uses file custody;
+- live replicas' fingerprints differ.
+
+The message names the other replica and says to use
+`-custody setec -setec-url <same URL>`. A conflict that appears later is
+logged once and reported in `/v1/status` as
+`replicas {id, live, ok, message}`, and the top-level `ok` includes it
+(spec first, `StatusReplicas`).
+
+**Tests:**
+- `TestMM_F6_ReplicaRegistry` (unit): file+file refused; a crash-restart
+  with the same ID allowed; a clean shutdown frees the store; same setec
+  allowed; a different setec refused; file joining setec refused.
+- `TestMM_H11_FileCustodyPerReplica` (e2e) now asserts that r1 exits with
+  a clear refusal, r0 is unaffected, and r0 restarts 105 ms after SIGKILL.
+- `TestMM_H01` and `TestMM_H02` (setec) still pass.
+
+**Caveat.** The registry refreshes on the reaper tick. A
+`-reap-interval` of 30 s or more makes replicas look dead between ticks,
+so conflicts that appear later go undetected. The startup check still
+works.
+
+**My mistake:** a YAML flow-mapping comma in the new schema description
+split the field. The spec loader caught it in the `mgmt` tests, and I
+quoted it.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -390,3 +433,4 @@ restarting after a crash would see its own old row and refuse.
 2026-11-11 iter7 | F5 | n/a | DONE | — | make test-go/test-pg/lint green | first message referenced a nonexistent --host CLI flag; corrected
 2026-11-11 iter8 PLAN | H11 | n/a | confirm if, with -custody file, any credential fetch fails on the replica that didn't mint; refute if all 12×2 succeed | I3, I8
 2026-11-11 iter8 | H11 | n/a ×2 | CONFIRMED | I3, I8 | results/*-H11 | exactly half of credential releases fail on each replica (404 custody: not found)
+2026-11-11 iter9 | F6 | n/a ×2 | FIXED | — | results/*-H11, H01, H02 | second file-custody replica refuses with a clear message; crash restart 105 ms; setec replicas unaffected; make test-go/test-pg green

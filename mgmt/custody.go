@@ -27,6 +27,20 @@ type Custody interface {
 	Delete(ctx context.Context, name string) error        // absent is not an error
 }
 
+// CustodyFingerprint identifies where a custody keeps secrets, so replicas
+// can tell whether they share it (F6): "file:<host>:<dir>" (never shared
+// with another replica) or "setec:<url>".
+func CustodyFingerprint(c Custody) string {
+	switch c := c.(type) {
+	case *FileCustody:
+		h, _ := os.Hostname()
+		return "file:" + h + ":" + c.dir
+	case *SetecCustody:
+		return "setec:" + strings.TrimRight(c.BaseURL, "/")
+	}
+	return fmt.Sprintf("%T", c)
+}
+
 // FileCustody is the homelab store: one AES-256-GCM sealed file per secret
 // under dir, with the key in dir/custody.key (0600). The secret name is
 // bound as additional data, so a file can't be swapped for another name.

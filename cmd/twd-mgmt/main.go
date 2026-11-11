@@ -119,6 +119,10 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	replicaID, err := mgmt.LoadOrCreateReplicaID(filepath.Join(*stateDir, "replica.id"))
+	if err != nil {
+		return err
+	}
 
 	// Operator-tailnet node (optional).
 	var ts *tsnet.Server
@@ -176,7 +180,7 @@ func run() error {
 	}
 
 	mcfg := mgmt.Config{Store: store, Custody: custody, Broker: &mgmt.Broker{BaseURL: *tsapiURL, Issuer: issuer},
-		IDSecret: secret, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log,
+		IDSecret: secret, ReplicaID: replicaID, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log,
 		OperatorTailnet: self.Tailnet, OperatorControlURL: *tsControl}
 	if ts != nil {
 		mcfg.TailnetDial = ts.Dial // kill/assignment pushes to hosts' own nodes

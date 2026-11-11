@@ -1645,6 +1645,7 @@ the last page.
 | `objects` | object | yes | Count per `ObjectStatus`. |
 | `ok` | boolean | yes |  |
 | `pendingDeviceDeletes` | integer | yes |  |
+| `replicas` | `StatusReplicas` | no | The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it) when this replica conflicts with another live one: file custody shared between replicas, or replicas with different custody. A replica refuses to start in that state; a conflict that appears later (a replica started with an older version, or a registry row edited) is reported here and logged. |
 | `tenants` | integer | yes |  |
 | `transport` | `Transport` | yes | `tsnet` in normal operation; `local-dev` when the unix socket is serving. |
 | `version` | string | no |  |
@@ -1660,6 +1661,17 @@ The shared clock this replica uses for leases, host liveness and expiries (ADR-0
 | `ok` | boolean | yes |  |
 | `source` | string: `postgres` \| `local` | yes | `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica. |
 | `syncAgeMs` | integer | yes | Milliseconds since the last successful sample (0 for `local`). |
+
+#### `StatusReplicas`
+
+The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it) when this replica conflicts with another live one: file custody shared between replicas, or replicas with different custody. A replica refuses to start in that state; a conflict that appears later (a replica started with an older version, or a registry row edited) is reported here and logged.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `id` | string | yes | This replica's stable ID (`<state-dir>/replica.id`). |
+| `live` | integer | yes | Replicas seen within the last 30 s, this one included. |
+| `message` | string | no |  |
+| `ok` | boolean | yes |  |
 
 #### `Tenant`
 

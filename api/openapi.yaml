@@ -2565,6 +2565,20 @@ components:
         objects: { type: object, additionalProperties: { type: integer }, description: Count per `ObjectStatus`. }
         version: { type: string }
         clock: { $ref: "#/components/schemas/StatusClock" }
+        replicas: { $ref: "#/components/schemas/StatusReplicas" }
+    StatusReplicas:
+      type: object
+      description: >-
+        The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it)
+        when this replica conflicts with another live one: file custody shared between replicas, or replicas
+        with different custody. A replica refuses to start in that state; a conflict that appears later (a
+        replica started with an older version, or a registry row edited) is reported here and logged.
+      required: [id, live, ok]
+      properties:
+        id: { type: string, description: "This replica's stable ID (`<state-dir>/replica.id`)." }
+        live: { type: integer, description: "Replicas seen within the last 30 s, this one included." }
+        ok: { type: boolean }
+        message: { type: string }
     StatusClock:
       type: object
       description: >-

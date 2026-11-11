@@ -56,6 +56,10 @@ type Store interface {
 	// object. It succeeds iff the object is pending without a key and is
 	// unclaimed, claimed by claimer, or claimed before staleBefore (H02).
 	ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error)
+	// UpsertReplica records a mgmt replica (registry: F6/H11); ListReplicas
+	// returns every recorded replica, live or not.
+	UpsertReplica(ctx context.Context, r Replica) error
+	ListReplicas(ctx context.Context) ([]Replica, error)
 	// ReleaseMint drops claimer's claim (no-op if someone else holds it).
 	ReleaseMint(ctx context.Context, id, claimer string) error
 	// CountLive counts live objects of a tenant, or (rootID != "") the live

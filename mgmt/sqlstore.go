@@ -112,6 +112,30 @@ func (s *SQLStore) ClaimMint(ctx context.Context, id, claimer string, now, stale
 	return n == 1, err
 }
 
+func (s *SQLStore) UpsertReplica(ctx context.Context, r Replica) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO replicas (id, custody, started_at, last_seen) VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET custody=excluded.custody, started_at=excluded.started_at, last_seen=excluded.last_seen`),
+		r.ID, r.Custody, r.StartedAt, r.LastSeen)
+	return err
+}
+
+func (s *SQLStore) ListReplicas(ctx context.Context) ([]Replica, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, custody, started_at, last_seen FROM replicas ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Replica
+	for rows.Next() {
+		var r Replica
+		if err := rows.Scan(&r.ID, &r.Custody, &r.StartedAt, &r.LastSeen); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLStore) ReleaseMint(ctx context.Context, id, claimer string) error {
 	_, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET mint_claim='', mint_claimed_at=0 WHERE id=? AND mint_claim=?"), id, claimer)
 	return err
@@ -193,6 +217,8 @@ CREATE INDEX IF NOT EXISTS audit_trace ON audit (trace_id);
 CREATE TABLE IF NOT EXISTS audit_heads (chain TEXT PRIMARY KEY, seq BIGINT NOT NULL, hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS revocations (
   host_id TEXT NOT NULL, object_id TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (host_id, object_id));
+CREATE TABLE IF NOT EXISTS replicas (
+  id TEXT PRIMARY KEY, custody TEXT NOT NULL, started_at BIGINT NOT NULL, last_seen BIGINT NOT NULL);
 `
 
 // Append-only audit: UPDATE/DELETE on audit rows abort (defence in depth;

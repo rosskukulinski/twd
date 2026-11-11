@@ -544,6 +544,7 @@ type StatusCounts struct {
 	Objects          map[string]int
 	PendingDeletes   int
 	Clock            ClockStatus
+	Replicas         ReplicaStatus
 }
 
 // Status gathers counters.
@@ -570,6 +571,7 @@ func (m *Mgmt) Status(ctx context.Context) (StatusCounts, error) {
 	}
 	st.PendingDeletes = m.PendingDeletes()
 	st.Clock = m.clockStatus()
+	st.Replicas = m.replicaStatus()
 	return st, nil
 }
 

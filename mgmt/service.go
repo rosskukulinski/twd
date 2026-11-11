@@ -36,6 +36,9 @@ type Config struct {
 	PolicyMaxAge time.Duration
 	Clock        Clock
 	Log          *slog.Logger
+	// ReplicaID is this replica's stable identity (twd-mgmt keeps it in
+	// <state-dir>/replica.id). Empty: a fresh per-process ID (tests).
+	ReplicaID string
 	// IDSecret keys the object-name HMAC (RFC §4.3). Required.
 	IDSecret []byte
 	// ReapInterval (default 10s); RevocationWindow is how long a kill is
@@ -73,16 +76,19 @@ type Mgmt struct {
 	clock    Clock
 	log      *slog.Logger
 
-	mu        sync.Mutex
-	throttles map[string]*Throttle
-	queues    map[string]chan string
-	queued    map[string]bool // object IDs in this replica's mint queues (dedupe for the pending sweep)
-	replicaID string          // this process's identity for mint claims
-	waiters   map[string]chan struct{}
-	spawnMu   map[string]*sync.Mutex // per tenant: serialises budget checks
-	depStatus map[string]DeploymentStatus
-	pushURLs  map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
-	pending   map[string]*pendingDelete
+	mu           sync.Mutex
+	throttles    map[string]*Throttle
+	queues       map[string]chan string
+	queued       map[string]bool // object IDs in this replica's mint queues (dedupe for the pending sweep)
+	replicaID    string          // stable replica ID (Config.ReplicaID): mint claims, the replica registry
+	startedAt    int64
+	replicaMsg   string // replica-registry conflict ("" = ok)
+	liveReplicas int
+	waiters      map[string]chan struct{}
+	spawnMu      map[string]*sync.Mutex // per tenant: serialises budget checks
+	depStatus    map[string]DeploymentStatus
+	pushURLs     map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
+	pending      map[string]*pendingDelete
 	// noDeviceScope: tenants whose credential got a 403 on a device delete
 	// (an OAuth client without devices:core); kills then warn up front.
 	noDeviceScope map[string]bool
@@ -119,7 +125,7 @@ func New(cfg Config) (*Mgmt, error) {
 		cfg.MintRetries = 5
 	}
 	m := &Mgmt{cfg: cfg, store: cfg.Store, custody: cfg.Custody, broker: cfg.Broker, clock: cfg.Clock, log: cfg.Log,
-		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, queued: map[string]bool{}, replicaID: newID("rp_"), waiters: map[string]chan struct{}{},
+		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, queued: map[string]bool{}, replicaID: cfg.ReplicaID, waiters: map[string]chan struct{}{},
 		spawnMu: map[string]*sync.Mutex{}, depStatus: map[string]DeploymentStatus{}, pushURLs: map[string]string{},
 		pending: map[string]*pendingDelete{}, noDeviceScope: map[string]bool{}, deviceKept: map[string]bool{}}
 	if cfg.PushTimeout == 0 {
@@ -159,6 +165,15 @@ func (m *Mgmt) Start() error {
 	if err := m.sweepPending(m.ctx); err != nil {
 		return err
 	}
+	if m.replicaID == "" {
+		m.replicaID = newID("rp_")
+	}
+	if msg, err := m.registerReplica(m.ctx); err != nil {
+		return fmt.Errorf("replica registry: %w", err)
+	} else if msg != "" {
+		m.unregisterReplica(m.ctx)
+		return fmt.Errorf("refusing to start: %s", msg)
+	}
 	m.clockOK = true
 	m.checkClock()
 	m.wg.Add(1)
@@ -170,6 +185,9 @@ func (m *Mgmt) Start() error {
 				return
 			case <-m.clock.After(m.cfg.ReapInterval):
 				m.checkClock()
+				if _, err := m.registerReplica(m.ctx); err != nil {
+					m.log.Warn("replica registry", "err", err)
+				}
 				if err := m.sweepPending(m.ctx); err != nil {
 					m.log.Warn("pending sweep", "err", err)
 				}
@@ -187,6 +205,11 @@ func (m *Mgmt) Start() error {
 // Close stops the workers.
 func (m *Mgmt) Close() {
 	m.FlushDeletes() // never leave a killed object's device behind
+	if m.startedAt != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		m.unregisterReplica(ctx)
+		cancel()
+	}
 	m.cancel()
 	m.wg.Wait()
 }
