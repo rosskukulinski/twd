@@ -157,3 +157,41 @@ func TestStoreCreateChildBudget(t *testing.T) {
 		}
 	})
 }
+
+// TestStoreTenantQuota (mm-loop F17, H16): concurrent creates never exceed
+// the tenant's maxObjects, on SQLite and Postgres.
+func TestStoreTenantQuota(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		tid := "tnq-" + strings.ReplaceAll(t.Name(), "/", "-")
+		if err := s.CreateTenant(ctx, Tenant{ID: tid, Tailnet: tid + ".ts.net", MintMode: "apikey", MaxObjects: 7, CreatedAt: 1}); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		ok, full := 0, 0
+		for i := range 40 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				id := fmt.Sprintf("%s-o%02d", tid, i)
+				err := s.CreateObjectChecked(ctx, Object{ID: id, TenantID: tid, Workload: "w", Namespace: "A", Name: id, Hostname: id,
+					RootID: id, Status: StatusPending}, 7, 0)
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case err == nil:
+					ok++
+				case errors.Is(err, ErrQuota):
+					full++
+				default:
+					t.Errorf("object %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if ok != 7 || full != 33 {
+			t.Fatalf("inserted %d, refused %d; want exactly 7 inserted and 33 refused", ok, full)
+		}
+	})
+}

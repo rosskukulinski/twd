@@ -235,10 +235,13 @@ var (
 	// ErrSpawnBudget: the root already has its maximum of live descendants
 	// (checked in the insert transaction: mm-loop F14, H04).
 	ErrSpawnBudget = errors.New("spawn budget exceeded")
-	ErrLeaseHeld   = errors.New("lease held by another holder")
-	ErrLeaseLost   = errors.New("lease_lost")
-	ErrConflict    = errors.New("conflict")
-	ErrAmbiguous   = errors.New("ambiguous")
+	// ErrQuota: the tenant already has maxObjects live objects (checked in
+	// the insert transaction: mm-loop F17, H16).
+	ErrQuota     = errors.New("object quota exceeded")
+	ErrLeaseHeld = errors.New("lease held by another holder")
+	ErrLeaseLost = errors.New("lease_lost")
+	ErrConflict  = errors.New("conflict")
+	ErrAmbiguous = errors.New("ambiguous")
 )
 
 // asAPIError maps store errors to API errors.

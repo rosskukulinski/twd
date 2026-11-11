@@ -958,31 +958,60 @@ func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
 	return err
 }
 
-// CreateChild inserts a spawned object iff its root has fewer than maxLive
-// live descendants, deciding both in one transaction with the root row
-// locked (Postgres FOR UPDATE; SQLite's immediate transaction holds the write
-// lock), so concurrent spawns through different replicas can't overshoot
-// (H04). ErrSpawnBudget when full, ErrExists on a duplicate.
+// CreateChild inserts a spawned object iff its root stays within maxLive
+// live descendants (CreateObjectChecked without a tenant quota).
 func (s *SQLStore) CreateChild(ctx context.Context, o Object, maxLive int) error {
+	return s.CreateObjectChecked(ctx, o, 0, maxLive)
+}
+
+// CreateObjectChecked inserts o in one transaction with its limits, so
+// concurrent creates through different replicas can't overshoot them:
+// maxObjects > 0 locks the tenant row and refuses (ErrQuota) when the tenant
+// already has maxObjects live objects (H16); maxLive > 0 (a spawn) locks the
+// root row and refuses (ErrSpawnBudget) when the root already has maxLive
+// live descendants (H04). Locks are taken tenant first, then root. Postgres
+// uses FOR UPDATE; SQLite's immediate transaction holds the write lock.
+// ErrExists on a duplicate.
+func (s *SQLStore) CreateObjectChecked(ctx context.Context, o Object, maxObjects, maxLive int) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var root string
-	if err := tx.QueryRowContext(ctx, s.q("SELECT id FROM objects WHERE id=?"+s.forUpdate()), o.RootID).Scan(&root); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return ErrNotFound
-		}
-		return err
-	}
-	var n int64
 	live := "status NOT IN ('" + StatusKilled + "','" + StatusFailed + "')"
-	if err := tx.QueryRowContext(ctx, s.q("SELECT COUNT(*) FROM objects WHERE root_id=? AND id<>? AND "+live), o.RootID, o.RootID).Scan(&n); err != nil {
-		return err
+	lock := func(q string, arg string) error {
+		var x string
+		if err := tx.QueryRowContext(ctx, s.q(q+s.forUpdate()), arg).Scan(&x); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		return nil
 	}
-	if int(n)+1 > maxLive {
-		return ErrSpawnBudget
+	if maxObjects > 0 {
+		if err := lock("SELECT id FROM tenants WHERE id=?", o.TenantID); err != nil {
+			return err
+		}
+		var n int64
+		if err := tx.QueryRowContext(ctx, s.q("SELECT COUNT(*) FROM objects WHERE tenant_id=? AND "+live), o.TenantID).Scan(&n); err != nil {
+			return err
+		}
+		if int(n) >= maxObjects {
+			return ErrQuota
+		}
+	}
+	if maxLive > 0 {
+		if err := lock("SELECT id FROM objects WHERE id=?", o.RootID); err != nil {
+			return err
+		}
+		var n int64
+		if err := tx.QueryRowContext(ctx, s.q("SELECT COUNT(*) FROM objects WHERE root_id=? AND id<>? AND "+live), o.RootID, o.RootID).Scan(&n); err != nil {
+			return err
+		}
+		if int(n)+1 > maxLive {
+			return ErrSpawnBudget
+		}
 	}
 	if _, err := tx.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...); err != nil {
 		if isUnique(err) {

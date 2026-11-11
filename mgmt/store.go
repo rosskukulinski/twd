@@ -49,6 +49,10 @@ type Store interface {
 	// CreateChild inserts a spawned object only if its root stays within
 	// maxLive live descendants (atomic across replicas: F14, H04).
 	CreateChild(ctx context.Context, o Object, maxLive int) error
+	// CreateObjectChecked inserts o only within the tenant quota (maxObjects
+	// > 0) and, for a spawn, the root's budget (maxLive > 0), atomically
+	// across replicas (F14 H04, F17 H16).
+	CreateObjectChecked(ctx context.Context, o Object, maxObjects, maxLive int) error
 	GetObject(ctx context.Context, id string) (Object, error)
 	GetObjectByName(ctx context.Context, tenantID, workload, namespace, name string) (Object, error)
 	ListObjects(ctx context.Context, f ObjectFilter) ([]Object, error)

@@ -1064,15 +1064,19 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 		o.ParentID, o.RootID, o.Depth = p.ID, p.RootID, p.Depth+1
 		o.Ephemeral = ttl > 0
 	}
-	insert := func() error { return m.store.CreateObject(ctx, o) }
 	maxLive := dep.MaxLive
 	if maxLive <= 0 {
 		maxLive = DefaultMaxLive
 	}
+	spawnLimit := 0
 	if parent != nil {
-		insert = func() error { return m.store.CreateChild(ctx, o, maxLive) }
+		spawnLimit = maxLive
 	}
-	if err := insert(); errors.Is(err, ErrSpawnBudget) {
+	if err := m.store.CreateObjectChecked(ctx, o, t.MaxObjects, spawnLimit); errors.Is(err, ErrQuota) {
+		// The fast-path CountLive saw room, but concurrent creates (possibly
+		// through other replicas) filled the quota first (H16).
+		return resp, errf(429, "object_quota_exceeded", "tenant %s has reached its maxObjects (%d)", t.ID, t.MaxObjects)
+	} else if errors.Is(err, ErrSpawnBudget) {
 		// checkSpawn saw room, but a concurrent spawn (possibly through
 		// another replica) took the last slot (H04).
 		e := errf(429, "spawn_budget_exceeded", "root %s already has its maximum of live descendants (maxLive %d)", o.RootID, maxLive)

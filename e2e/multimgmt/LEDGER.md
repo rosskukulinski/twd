@@ -48,7 +48,7 @@ FIX_MODE: fix
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
-| H16 | P2 | open (from F14: tenant `MaxObjects` quota is check-then-insert across replicas; likely overshoot by a few under concurrent creates) | |
+| H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S1–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
@@ -801,6 +801,28 @@ worker re-reads the tenant on every attempt, so every replica follows a
   the object: **506 ms**. The cost is one `GetObject` per 250 ms per
   waiting request.
 
+### F17: the tenant quota is enforced in the insert transaction (fixes H16)
+
+- **Before.** `TestMM_H16_TenantQuotaRace` (3 replicas, quota 10, 9 used,
+  30 concurrent creates, 5 ms DB delay) ended with **12 live objects in 2
+  of 10 runs**: one extra per additional replica.
+- **`SQLStore.CreateObjectChecked(o, maxObjects, maxLive)`.** One
+  transaction:
+  - lock the tenant row and refuse with `ErrQuota` when the tenant is full;
+  - for spawns, lock the root row and refuse with `ErrSpawnBudget`;
+  - then insert.
+
+  Locks are always taken tenant first, then root. `CreateChild` (F14)
+  delegates to it with no quota.
+- **Wiring.** `CreateObject` uses it for every create. A late refusal is
+  `429 object_quota_exceeded`, the same code as the fast path.
+- **After.** H16 failed 0 of 20 and H04 0 of 10. `TestStoreTenantQuota`
+  (40 concurrent creates, quota 7) inserts exactly 7 on SQLite and
+  Postgres.
+- **Trade-off.** Creates within one tenant are now serialised across
+  replicas: one short transaction each. They were already serialised per
+  replica.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -861,3 +883,5 @@ worker re-reads the tenant on every attempt, so every replica follows a
 2026-11-11 iter23 | F14 | 30 runs | FIXED | — | make test-go/test-pg green | found and fixed flaky TestV1Pagination (async mint audits); queued H16
 2026-11-11 iter24 | H09, H15 → F15 | unit | CONFIRMED then FIXED | I6/I7, I4 | — | make test-go/test-pg green; e2e H02/H03 green
 2026-11-11 iter25 | H05 → F16 | unit | CONFIRMED then FIXED | I8 latency | — | 10.004 s → 506 ms; make test-go/test-pg green
+2026-11-11 iter26 PLAN | H16 | n/a | confirm if live objects exceed maxObjects (10) after 30 concurrent creates over 3 replicas (5 ms PG delay); refute if ≤10 in 10 runs | quota
+2026-11-11 iter26 | H16 → F17 | 10 + 20 runs | CONFIRMED (2/10) then FIXED (0/20) | quota | results/*-H16 (report.txt) | H04 still 0/10; make test-go/test-pg green
