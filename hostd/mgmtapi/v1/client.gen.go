@@ -423,6 +423,24 @@ func (e ObjectStatus) Valid() bool {
 	}
 }
 
+// Defines values for StatusClockSource.
+const (
+	StatusClockSourceLocal    StatusClockSource = "local"
+	StatusClockSourcePostgres StatusClockSource = "postgres"
+)
+
+// Valid indicates whether the value is a known member of the StatusClockSource enum.
+func (e StatusClockSource) Valid() bool {
+	switch e {
+	case StatusClockSourceLocal:
+		return true
+	case StatusClockSourcePostgres:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for Tier.
 const (
 	Microvm Tier = "microvm"
@@ -1280,6 +1298,8 @@ type SelfInfo struct {
 
 // Status defines model for Status.
 type Status struct {
+	// Clock The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock. `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+	Clock *StatusClock `json:"clock,omitempty"`
 	Hosts struct {
 		Live  int `json:"live"`
 		Total int `json:"total"`
@@ -1298,6 +1318,24 @@ type Status struct {
 	Transport Transport `json:"transport"`
 	Version   *string   `json:"version,omitempty"`
 }
+
+// StatusClock The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock. `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+type StatusClock struct {
+	Message *string `json:"message,omitempty"`
+
+	// OffsetMs Store clock minus this replica's wall clock at the last sample.
+	OffsetMs int  `json:"offsetMs"`
+	Ok       bool `json:"ok"`
+
+	// Source `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica.
+	Source StatusClockSource `json:"source"`
+
+	// SyncAgeMs Milliseconds since the last successful sample (0 for `local`).
+	SyncAgeMs int `json:"syncAgeMs"`
+}
+
+// StatusClockSource `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica.
+type StatusClockSource string
 
 // Tenant defines model for Tenant.
 type Tenant struct {
