@@ -25,7 +25,7 @@ FIX_MODE: fix
 | F11b | WIF issuer signing key: load or create through custody + `secret_choice` ("issuer") instead of `<state-dir>/issuer.key`, migrating an existing file key as the first offer | H13 | `TestMM_F11b_SharedIssuer` (4 concurrent first starts serve one JWKS; restart reloads it; an existing issuer.key is kept and shared). No e2e (needs Funnel and WIF) | **DONE** |
 | F12 | (a) `CreateObject`: a UNIQUE violation on insert means another replica just created it; re-read by name and return that object (the same response as the idempotent path). (b) Share `id.secret` through custody + `secret_choice` (like F11b), adopting the first replica's existing file, so object IDs and hostnames don't depend on which replica created them | H14 | `TestMM_H14_ConcurrentSameNameCreate` (before 10/10 names broken; after 0/10 ×5 alone and after H13); `TestMM_F12_SharedIDSecret`, `_ExistingFileAdopted`, `_IdentityConflictStillRefused` | **DONE** |
 | F13 | Host-reported deployment status stored in `deployments.host_status/host_error`; written with `UPDATE … WHERE` the value differs (no per-replica cache: another replica may have written since) | H08 | `TestMM_H08` (r1 said `assigned`, now `active`, 2/2), `TestMM_F13_DeploymentStatusShared` (alternating replicas) | **DONE** |
-| F14 | Spawn budget enforced inside the insert transaction: lock the root object row (`FOR UPDATE`; SQLite's immediate transaction serialises), count live descendants, insert or refuse `spawn_budget_exceeded` | H04 | `TestMM_H04_SpawnBudgetRace` 0 failures in ≥ 30 runs; store test with concurrent inserts | queued |
+| F14 | Spawn budget enforced inside the insert transaction: lock the root object row (`FOR UPDATE`; SQLite's immediate transaction serialises), count live descendants, insert or refuse `spawn_budget_exceeded` | H04 | `TestMM_H04_SpawnBudgetRace`: before 3/20 failed, after 0/30; `TestStoreCreateChildBudget` (40 concurrent, maxLive 5 → exactly 5; SQLite + Postgres) | **DONE** |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -36,7 +36,7 @@ FIX_MODE: fix
 | H01 | P0 | **REFUTED** (3/3 runs) — latent fragility noted | `TestMM_H01_StartupAdvisoryLock` |
 | H02 | P0 | **FIXED by F3** (was: every double-minted object lost its credential) | `TestMM_H02_DoubleMint` |
 | H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
-| H04 | P1 | **CONFIRMED** (intermittent: 3/20 runs, each 6 live descendants with maxLive 5; standalone 2/15, after H03 1/5) | `TestMM_H04_SpawnBudgetRace` (writes report.txt) |
+| H04 | P1 | **FIXED by F14**. Was CONFIRMED (intermittent: 3/20 runs, each 6 live descendants with maxLive 5; standalone 2/15, after H03 1/5) | `TestMM_H04_SpawnBudgetRace` (writes report.txt) |
 | H05 | P2 | open | |
 | H06 | P1 | **FIXED by F8**. Was CONFIRMED (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
 | H07 | P1 | **FIXED by F10**. Was CONFIRMED: with a device-delete delay, SIGKILL of the killing replica inside the window left the device forever (control deleted) | `TestMM_H07_DeviceDeleteLostOnCrash`, `TestStoreDeviceDelete` |
@@ -48,6 +48,7 @@ FIX_MODE: fix
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | open (pre-existing, single replica too) | |
+| H16 | P2 | open (from F14: tenant `MaxObjects` quota is check-then-insert across replicas; likely overshoot by a few under concurrent creates) | |
 | S1–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
@@ -747,6 +748,28 @@ only logged to stdout. It now writes `report.txt`. Targeted reruns:
 Only the per-replica `tenantLock` sits in between, so two replicas can
 both see 4 and both insert. **Fix: F14.**
 
+### F14: spawn budget enforced atomically (fixes H04)
+
+- `SQLStore.CreateChild(ctx, o, maxLive)` runs one transaction: lock the
+  root row (`FOR UPDATE`; SQLite's immediate transaction holds the write
+  lock), count live descendants, then insert or return `ErrSpawnBudget`.
+- `CreateObject` uses it for spawns. The earlier `checkSpawn` count stays
+  as a fast path with the friendly message; the transaction is the
+  authority. A late refusal is `429 spawn_budget_exceeded` and is audited
+  as `deny`, like the fast path.
+- **Tests.** e2e H04 failed 0 of 30 (before: 3 of 20).
+  `TestStoreCreateChildBudget` (40 concurrent spawns, `maxLive` 5) inserts
+  exactly 5 on SQLite and Postgres.
+- **Flaky test found along the way.** `TestV1Pagination` failed once in
+  `make test-pg` ("audit walked 12, unpaged 13"). It walks the audit log
+  while asynchronous `mint` records are still landing. That's a
+  pre-existing race, probably widened by the extra round trips from F3 and
+  F7. The test now waits for all 5 `mint` records before walking: 30 of 30
+  pass, and `make test-pg` passed 4 of 4.
+- **Not addressed, noted:** the tenant-wide `MaxObjects` quota
+  (`CountLive` then insert) has the same shape across replicas. A
+  per-tenant lock would serialise every create in a tenant. Tracked as H16.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -804,3 +827,4 @@ both see 4 and both insert. **Fix: F14.**
 2026-11-11 iter22 PLAN | H08 | n/a | confirm if r1 reports a different deployment status than r0 after the host reports active to r0 only | I10
 2026-11-11 iter22 | H08 → F13 | n/a | CONFIRMED then FIXED | I10 | results/*-H08 | first fix version had a stale-cache flaw (fixed before commit)
 2026-11-11 iter22 | H04 | 20 runs | CONFIRMED (3/20) | I5 | results/*-H04 (report.txt) | appeared in the full-suite run after F13; not related to F13 (the race predates it)
+2026-11-11 iter23 | F14 | 30 runs | FIXED | — | make test-go/test-pg green | found and fixed flaky TestV1Pagination (async mint audits); queued H16

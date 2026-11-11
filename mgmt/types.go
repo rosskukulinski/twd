@@ -230,12 +230,15 @@ func errf(status int, code, format string, a ...any) *Error {
 
 // Store errors.
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrExists    = errors.New("already exists")
-	ErrLeaseHeld = errors.New("lease held by another holder")
-	ErrLeaseLost = errors.New("lease_lost")
-	ErrConflict  = errors.New("conflict")
-	ErrAmbiguous = errors.New("ambiguous")
+	ErrNotFound = errors.New("not found")
+	ErrExists   = errors.New("already exists")
+	// ErrSpawnBudget: the root already has its maximum of live descendants
+	// (checked in the insert transaction: mm-loop F14, H04).
+	ErrSpawnBudget = errors.New("spawn budget exceeded")
+	ErrLeaseHeld   = errors.New("lease held by another holder")
+	ErrLeaseLost   = errors.New("lease_lost")
+	ErrConflict    = errors.New("conflict")
+	ErrAmbiguous   = errors.New("ambiguous")
 )
 
 // asAPIError maps store errors to API errors.

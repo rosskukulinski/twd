@@ -958,6 +958,41 @@ func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
 	return err
 }
 
+// CreateChild inserts a spawned object iff its root has fewer than maxLive
+// live descendants, deciding both in one transaction with the root row
+// locked (Postgres FOR UPDATE; SQLite's immediate transaction holds the write
+// lock), so concurrent spawns through different replicas can't overshoot
+// (H04). ErrSpawnBudget when full, ErrExists on a duplicate.
+func (s *SQLStore) CreateChild(ctx context.Context, o Object, maxLive int) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var root string
+	if err := tx.QueryRowContext(ctx, s.q("SELECT id FROM objects WHERE id=?"+s.forUpdate()), o.RootID).Scan(&root); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	var n int64
+	live := "status NOT IN ('" + StatusKilled + "','" + StatusFailed + "')"
+	if err := tx.QueryRowContext(ctx, s.q("SELECT COUNT(*) FROM objects WHERE root_id=? AND id<>? AND "+live), o.RootID, o.RootID).Scan(&n); err != nil {
+		return err
+	}
+	if int(n)+1 > maxLive {
+		return ErrSpawnBudget
+	}
+	if _, err := tx.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...); err != nil {
+		if isUnique(err) {
+			return ErrExists
+		}
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *SQLStore) GetObject(ctx context.Context, id string) (Object, error) {
 	return scanObject(s.db.QueryRowContext(ctx, s.q("SELECT "+objectCols+" FROM objects WHERE id=?"), id))
 }

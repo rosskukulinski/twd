@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	v1 "github.com/rosskukulinski/twd/mgmt/api/v1"
 )
@@ -110,6 +111,19 @@ func TestV1Pagination(t *testing.T) {
 	}
 	if len(all) != 5 {
 		t.Fatalf("objects walked: %d", len(all))
+	}
+	// Mints (and their audit records) are asynchronous: let them finish so
+	// the paged walk and the unpaged read see the same chain.
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		// mintOne audits after it marks the object minted: wait for the records.
+		mints, err := e.store.ListAudit(context.Background(), AuditFilter{TenantID: tn, Kinds: []string{"mint"}})
+		if err == nil && len(mints) == 5 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("mint audit records: %d of 5", len(mints))
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	var recs, allRecs []AuditRecord
 	path = "/v1/audit?tenant=" + tn + "&limit=3"

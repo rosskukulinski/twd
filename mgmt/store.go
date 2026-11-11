@@ -46,6 +46,9 @@ type Store interface {
 
 	// Object identity is (tenant, workload, namespace = class, name).
 	CreateObject(ctx context.Context, o Object) error // ErrExists on (tenant, workload, namespace, name)
+	// CreateChild inserts a spawned object only if its root stays within
+	// maxLive live descendants (atomic across replicas: F14, H04).
+	CreateChild(ctx context.Context, o Object, maxLive int) error
 	GetObject(ctx context.Context, id string) (Object, error)
 	GetObjectByName(ctx context.Context, tenantID, workload, namespace, name string) (Object, error)
 	ListObjects(ctx context.Context, f ObjectFilter) ([]Object, error)

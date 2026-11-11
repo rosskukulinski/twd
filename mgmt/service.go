@@ -1064,7 +1064,22 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 		o.ParentID, o.RootID, o.Depth = p.ID, p.RootID, p.Depth+1
 		o.Ephemeral = ttl > 0
 	}
-	if err := m.store.CreateObject(ctx, o); errors.Is(err, ErrExists) {
+	insert := func() error { return m.store.CreateObject(ctx, o) }
+	maxLive := dep.MaxLive
+	if maxLive <= 0 {
+		maxLive = DefaultMaxLive
+	}
+	if parent != nil {
+		insert = func() error { return m.store.CreateChild(ctx, o, maxLive) }
+	}
+	if err := insert(); errors.Is(err, ErrSpawnBudget) {
+		// checkSpawn saw room, but a concurrent spawn (possibly through
+		// another replica) took the last slot (H04).
+		e := errf(429, "spawn_budget_exceeded", "root %s already has its maximum of live descendants (maxLive %d)", o.RootID, maxLive)
+		m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ParentID, Kind: "deny", Code: e.Code, TraceID: r.TraceID,
+			ActingFor: r.ActingFor}, map[string]any{"spawn": r.Namespace + "/" + r.ObjectName, "message": e.Message})
+		return resp, e
+	} else if errors.Is(err, ErrExists) {
 		// Another replica created this name between our lookup and insert
 		// (tenantLock is per replica: H14). Answer as the idempotent path.
 		ex, gerr := m.store.GetObjectByName(ctx, t.ID, workload, r.Namespace, r.ObjectName)

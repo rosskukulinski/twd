@@ -2,6 +2,10 @@ package mgmt
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -111,6 +115,45 @@ func TestStoreDeviceDelete(t *testing.T) {
 		s.SetDeviceDelete(ctx, "dd1", t0+39000) // failed: retry later
 		if ok, _ := s.ClaimDeviceDelete(ctx, "dd1", t0+39000); !ok {
 			t.Fatal("a rescheduled delete must be claimable when due")
+		}
+	})
+}
+
+// TestStoreCreateChildBudget (mm-loop F14, H04): concurrent spawns under one
+// root never exceed maxLive, on SQLite and Postgres.
+func TestStoreCreateChildBudget(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		root := "root-" + strings.ReplaceAll(t.Name(), "/", "-")
+		if err := s.CreateObject(ctx, Object{ID: root, TenantID: "tn", Workload: "w", Namespace: "A", Name: root, Hostname: root,
+			RootID: root, Status: StatusReady}); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		ok, full := 0, 0
+		for i := range 40 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				id := fmt.Sprintf("%s-c%02d", root, i)
+				err := s.CreateChild(ctx, Object{ID: id, TenantID: "tn", Workload: "w", Namespace: "B", Name: id, Hostname: id,
+					RootID: root, ParentID: root, Depth: 1, Status: StatusPending}, 5)
+				mu.Lock()
+				defer mu.Unlock()
+				switch {
+				case err == nil:
+					ok++
+				case errors.Is(err, ErrSpawnBudget):
+					full++
+				default:
+					t.Errorf("child %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		if ok != 5 || full != 35 {
+			t.Fatalf("inserted %d, refused %d; want exactly 5 inserted and 35 refused", ok, full)
 		}
 	})
 }
