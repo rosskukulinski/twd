@@ -1207,6 +1207,17 @@ func (m *Mgmt) throttle(t Tenant) *Throttle {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	th := m.throttles[t.ID]
+	if th != nil {
+		// The tenant's limit may have changed (PATCH; any replica): the mint
+		// worker re-reads the tenant on every attempt (H15).
+		want := t.RegistrationsPerMinute
+		if want <= 0 {
+			want = DefaultRegistrationsPerMinute
+		}
+		if l, _ := th.cfg(); l != float64(want) {
+			th.SetLimit(want)
+		}
+	}
 	if th == nil {
 		if ts, ok := m.store.(throttleStore); ok {
 			// Shared across replicas, timed by the store clock (F7, H03).
@@ -1703,6 +1714,10 @@ func (r *KillResult) warnDeviceDelete(id string) {
 // revokeObjects is the fallback), deletes devices via the tenant API (tier
 // 2; deferred by DeviceDeleteDelay), revokes unused keys, wipes custody, and
 // records audit.
+// errAlreadyDead: the object was killed (or failed) between Kill's read and
+// its write, by another replica or the reaper.
+var errAlreadyDead = errors.New("already dead")
+
 func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, error) {
 	res := KillResult{Killed: []string{}, DevicesDeleted: []string{}, Errors: map[string]string{}}
 	root, err := m.store.GetObject(ctx, id)
@@ -1738,10 +1753,16 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		}
 		prev := o.Status
 		killed, err := m.store.UpdateObject(ctx, o.ID, nil, func(x *Object) error {
+			if !x.Live() {
+				return errAlreadyDead // another replica's kill or reaper won (H09)
+			}
 			x.Status, x.KillReason, x.UpdatedAt = StatusKilled, r.Reason, now.UnixMilli()
 			x.KilledAt, x.KilledBy, x.KillCascade, x.KillRoot = now.UnixMilli(), r.By, x.ID != id, id
 			return nil
 		})
+		if errors.Is(err, errAlreadyDead) {
+			continue // killed concurrently elsewhere: its tombstone and audit stand
+		}
 		if err != nil {
 			res.Errors[o.ID] = err.Error()
 			continue

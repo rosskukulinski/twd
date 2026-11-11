@@ -41,13 +41,13 @@ FIX_MODE: fix
 | H06 | P1 | **FIXED by F8**. Was CONFIRMED (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
 | H07 | P1 | **FIXED by F10**. Was CONFIRMED: with a device-delete delay, SIGKILL of the killing replica inside the window left the device forever (control deleted) | `TestMM_H07_DeviceDeleteLostOnCrash`, `TestStoreDeviceDelete` |
 | H08 | P2 | **FIXED by F13**. Was CONFIRMED: after the host reported `active` to r0, r1 said `assigned` | `TestMM_H08_DeploymentStatusPerReplica`, `TestMM_F13_DeploymentStatusShared` |
-| H09 | P2 | open | |
+| H09 | P2 | **CONFIRMED and FIXED** (F15): concurrent reapers double-killed 19/20 objects (two kill records, tombstone overwritten); now exactly one | `TestMM_H09_ConcurrentKillOnce` |
 | H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
 | H11 | P0 | **FIXED by F6** (was: with `-custody file`, 6/12 credential releases failed on each replica) | `TestMM_H11_FileCustodyPerReplica` |
 | H12 | P1 | open | |
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
-| H15 | P2 | open (pre-existing, single replica too) | |
+| H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
 | H16 | P2 | open (from F14: tenant `MaxObjects` quota is check-then-insert across replicas; likely overshoot by a few under concurrent creates) | |
 | S1–S11 | — | 0/3 seeds each | |
 
@@ -770,6 +770,25 @@ both see 4 and both insert. **Fix: F14.**
   (`CountLive` then insert) has the same shape across replicas. A
   per-tenant lock would serialise every create in a tenant. Tracked as H16.
 
+### F15: one winner per kill (H09); throttle follows the tenant's limit (H15)
+
+**H09.** `Kill` read the object, then updated it, without re-checking
+inside the write. Two replicas' reapers, or a reaper and an operator,
+could both "kill" the same object. In
+`TestMM_H09_ConcurrentKillOnce` (2 replicas, 4 concurrent `Reap` passes, 20
+TTL-expired objects), **19 of 20 got two `kill` audit records**, and the
+second write overwrote the tombstone (`KillReason`, `KilledBy`,
+`KillRoot`). The update function now returns `errAlreadyDead` when the row
+is no longer live; that object is skipped silently, and the first kill's
+tombstone and audit stand. After: 1 record per object.
+
+**H15** (pre-existing, single replica too). `m.throttle(t)` cached the
+throttle and never called `SetLimit`. In
+`TestMM_H15_ThrottleFollowsTenantLimit`, lowering the limit to 6/min left
+the throttle at 60/min. `throttle(t)` now applies a changed limit. The mint
+worker re-reads the tenant on every attempt, so every replica follows a
+`PATCH`.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -828,3 +847,4 @@ both see 4 and both insert. **Fix: F14.**
 2026-11-11 iter22 | H08 → F13 | n/a | CONFIRMED then FIXED | I10 | results/*-H08 | first fix version had a stale-cache flaw (fixed before commit)
 2026-11-11 iter22 | H04 | 20 runs | CONFIRMED (3/20) | I5 | results/*-H04 (report.txt) | appeared in the full-suite run after F13; not related to F13 (the race predates it)
 2026-11-11 iter23 | F14 | 30 runs | FIXED | — | make test-go/test-pg green | found and fixed flaky TestV1Pagination (async mint audits); queued H16
+2026-11-11 iter24 | H09, H15 → F15 | unit | CONFIRMED then FIXED | I6/I7, I4 | — | make test-go/test-pg green; e2e H02/H03 green
