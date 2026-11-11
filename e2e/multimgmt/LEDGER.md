@@ -6,8 +6,8 @@ FIX_MODE: propose
 
 | Item | Priority | Status | Evidence / test |
 |---|---|---|---|
-| Harness | P0 | not built | |
-| H01 | P0 | open | |
+| Harness | P0 | slice 1 built (PG container, fake TS API, fake setec, N real replicas, unix-socket client, pg_locks probe). TODO: PG fault proxy, front proxy, fake hosts, workload gen, PG sampler, oracle | `e2e/multimgmt/harness_test.go` |
+| H01 | P0 | **REFUTED** (3/3 runs) — latent fragility noted | `TestMM_H01_StartupAdvisoryLock` |
 | H02 | P0 | open | |
 | H03 | P1 | open | |
 | H04 | P1 | open | |
@@ -20,6 +20,7 @@ FIX_MODE: propose
 | H11 | P0 | open | |
 | H12 | P1 | open | |
 | H13 | P1 | open | |
+| H14 | P2 | open | |
 | S1–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
@@ -114,6 +115,40 @@ would go wrong, and which invariant it threatens.
   - **Probe:** create a tenant through A, then sign through B; verify across
     replicas.
 
+- **H14 (P2, I8/I10): each replica has its own `id.secret`.**
+  `cmd/twd-mgmt/main.go` loads `id.secret` from each replica's local state
+  dir. That key is the HMAC key for object IDs, which double as node
+  hostnames (`mgmt/service.go:781`).
+  - **Consequence 1:** an object's ID depends on which replica created it.
+  - **Consequence 2:** `tenantLock` is per replica too. Two replicas creating
+    the same (tenant, workload, ns, name) at once both miss
+    `GetObjectByName`, then both insert. One hits the
+    `UNIQUE (tenant_id, workload, namespace, name)` constraint, and that
+    likely surfaces as a 500 instead of the idempotent 200 with the
+    existing object. No split brain, because the constraint holds.
+  - **Fix:** share the secret (custody/setec), and map a unique violation
+    to "return the existing object".
+  - **Probe:** concurrent create of the same name through 2 replicas.
+
+## Notes
+
+- **H01, latent fragility:** `migrate` takes and releases the advisory lock
+  through the pool. It works only because `migrate` runs on one goroutine,
+  so `database/sql` hands back the same idle connection. Any future
+  concurrent query inside `migrate`, or a pool setting change, could break
+  it. Cheap hardening: pin a connection with `db.Conn(ctx)`. That's not a
+  bug today.
+- **Harness deviation:** the fake TS API and fake setec are small standalone
+  copies in `harness_test.go`, rather than `mgmt/mgmttest` promoted from
+  `mgmt`'s internal test files. That avoids touching `mgmt` tests in
+  propose mode.
+- **Baseline:** a 3-replica simultaneous cold start on an empty database
+  takes 407–410 ms to ready, and a restart into a live cluster about
+  105 ms (M5 Pro, OrbStack Postgres 17).
+
 ## Run log
 
 <!-- One line per run: UTC stamp | item | seed | verdict | invariants failed | artifact dir | note -->
+2026-11-11 iter1 PLAN | Harness slice 1 + H01 | seed n/a | confirm H01 if any replica start/restart exceeds 10 s or lock 7464 is held after all are ready; refute if 3-way cold start, SIGTERM/SIGKILL restarts and 10 rapid restarts are all < 10 s with the lock free | I8
+2026-11-11T16:32Z | H01 | n/a | HARNESS flaw | — | results/20261111T163257Z-H01 | binary built inside first start(): r1/r2 started 4.4 s late, so cold start wasn't simultaneous; fixed (build in newCluster)
+2026-11-11T16:3xZ | H01 | n/a ×3 | REFUTED | none | results/*-H01 (3 runs) | cold start 3-way 407–410 ms; SIGTERM/SIGKILL/10 rapid restarts ~105 ms each; lock 7464 free at every check
