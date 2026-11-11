@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -243,4 +244,92 @@ func VerifyJWT(token string, jwks []byte, now time.Time) (map[string]any, error)
 		return nil, errors.New("jwt: not yet valid")
 	}
 	return claims, nil
+}
+
+// secretChooser is the part of Store that arbitrates shared secrets.
+type secretChooser interface {
+	ChooseSecret(ctx context.Context, name, keyID string, now int64) (string, error)
+	SecretChoice(ctx context.Context, name string) (string, error)
+}
+
+func issuerChoiceName(baseURL string) string { return "issuer:" + strings.TrimRight(baseURL, "/") }
+func issuerKeyName(keyID string) string      { return "twd/mgmt/issuer/" + keyID }
+
+// LoadSharedIssuer returns the WIF issuer for baseURL with a signing key
+// every mgmt replica shares (mm-loop F11b, H13): the key lives in custody and
+// a secret_choice row names it. The first replica to start offers its
+// existing <state-dir>/issuer.key (keys Tailscale may already trust) or a new
+// key; later replicas, and losers of a concurrent start, use the chosen one.
+func LoadSharedIssuer(ctx context.Context, baseURL, keyPath string, st secretChooser, cust Custody) (*Issuer, error) {
+	if !strings.HasPrefix(baseURL, "https://") {
+		return nil, errors.New("issuer URL must be https")
+	}
+	name := issuerChoiceName(baseURL)
+	kid, err := st.SecretChoice(ctx, name)
+	if errors.Is(err, ErrNotFound) {
+		var key *ecdsa.PrivateKey
+		if b, rerr := os.ReadFile(keyPath); rerr == nil {
+			if st, _ := os.Stat(keyPath); st != nil && st.Mode().Perm()&0o077 != 0 {
+				return nil, fmt.Errorf("issuer key %s must be mode 0600", keyPath)
+			}
+			if key, err = parseIssuerKey(b); err != nil {
+				return nil, err
+			}
+		} else if errors.Is(rerr, os.ErrNotExist) {
+			if key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader); err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, rerr
+		}
+		pemKey, err := encodeIssuerKey(key)
+		if err != nil {
+			return nil, err
+		}
+		mine := newID("iss_")
+		if err := cust.Put(ctx, issuerKeyName(mine), pemKey); err != nil {
+			return nil, fmt.Errorf("custody: issuer key: %w", err)
+		}
+		if kid, err = st.ChooseSecret(ctx, name, mine, time.Now().UnixMilli()); err != nil {
+			return nil, err
+		}
+		if kid != mine {
+			cust.Delete(ctx, issuerKeyName(mine))
+		}
+	} else if err != nil {
+		return nil, err
+	}
+	b, err := cust.Get(ctx, issuerKeyName(kid))
+	if err != nil {
+		return nil, fmt.Errorf("custody: issuer key %s: %w", kid, err)
+	}
+	key, err := parseIssuerKey(b)
+	if err != nil {
+		return nil, err
+	}
+	return NewIssuer(baseURL, key), nil
+}
+
+func parseIssuerKey(b []byte) (*ecdsa.PrivateKey, error) {
+	blk, _ := pem.Decode(b)
+	if blk == nil {
+		return nil, errors.New("issuer key: no PEM block")
+	}
+	k, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	key, ok := k.(*ecdsa.PrivateKey)
+	if !ok || key.Curve != elliptic.P256() {
+		return nil, errors.New("issuer key: want a P-256 ECDSA key")
+	}
+	return key, nil
+}
+
+func encodeIssuerKey(key *ecdsa.PrivateKey) ([]byte, error) {
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 }

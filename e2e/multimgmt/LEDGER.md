@@ -22,7 +22,7 @@ FIX_MODE: fix
 | F9 | ADR-028 §3 (Ross, second interview): mgmt marks each deployment `fence` (= `BundleStateful`) and sends it in assignments; hostd's heartbeat-loss fencing undeploys only workloads with `fence` (a missing field means fence: safe against an older mgmt). `FenceAfter` 9 → 30 s, `NamespaceLeaseTTL` 15 → 45 s, with a startup check that fence < lease − margin. Fix the stale comment | correction (iter13) | `TestMM_F9_FenceStatefulOnly`, `TestFenceBelowLease` (hostd), `TestMM_F9_AssignmentFence` (mgmt) | **DONE** (fence selection unit-tested; undeploy and redeploy on reconnect not exercised end to end, since that needs workerd: scenario S4) |
 | F10 | Durable device deletes: `objects.device_delete_at` (due ms / -1 claimed), claimed by one replica, swept by every replica's reaper, retried in 30 s on failure | H07 | `TestMM_H07_DeviceDeleteLostOnCrash` (before: device left; after: deleted by the surviving replica, 2/2); `TestStoreDeviceDelete` (SQLite + Postgres) | **DONE** |
 | F11 | Store-arbitrated shared secrets: OBO root keys (and the WIF issuer signing key) are chosen once per tenant/issuer through a DB row (`INSERT … ON CONFLICT DO NOTHING` names the winning key ID); custody holds each candidate under a per-key name, losers delete theirs; readers follow the row. Issuer key moves from the state dir into custody | H13 | `TestMM_H13_OBORootKeyDiverges` (b): before 12/40 diverged, after 0/40 (5 runs); `TestMM_F11_OBORootChosenOnce` (40 two-replica races + legacy adoption, -race) | **DONE for OBO root keys**; the WIF issuer key is still per state dir (F11b, queued) |
-| F11b | WIF issuer signing key: load or create through custody + `secret_choice` ("issuer") instead of `<state-dir>/issuer.key`, migrating an existing file key as the first offer | H13 | unit test: two replicas serve the same JWKS; e2e not possible without Funnel | queued |
+| F11b | WIF issuer signing key: load or create through custody + `secret_choice` ("issuer") instead of `<state-dir>/issuer.key`, migrating an existing file key as the first offer | H13 | `TestMM_F11b_SharedIssuer` (4 concurrent first starts serve one JWKS; restart reloads it; an existing issuer.key is kept and shared). No e2e (needs Funnel and WIF) | **DONE** |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -42,7 +42,7 @@ FIX_MODE: fix
 | H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
 | H11 | P0 | **FIXED by F6** (was: with `-custody file`, 6/12 credential releases failed on each replica) | `TestMM_H11_FileCustodyPerReplica` |
 | H12 | P1 | open | |
-| H13 | P1 | **OBO part FIXED by F11**; issuer key open (F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
+| H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
 | H14 | P2 | open | |
 | H15 | P2 | open (pre-existing, single replica too) | |
 | S1–S11 | — | 0/3 seeds each | |
@@ -648,6 +648,22 @@ replica would serve, and sign with, a different key behind one issuer URL.
   code the row delete is a no-op and the prefix delete covers the legacy
   name, so the before and after numbers are comparable: **12/40 → 0/40**.
 
+### F11b: the WIF issuer key is shared through custody and `secret_choice`
+
+`twd-mgmt` now calls `LoadSharedIssuer(ctx, url, <state-dir>/issuer.key,
+store, custody)`:
+- **Choice row:** `issuer:<url>`.
+- **Candidate:** the replica's existing `issuer.key`, which keeps keys
+  Tailscale may already trust, or a new P-256 key. It's stored at
+  `twd/mgmt/issuer/<iss_id>`, the first offer wins, and losers delete
+  theirs.
+- **The old key file is left in place** and no new files are written.
+  `LoadOrCreateIssuer` stays for callers outside `twd-mgmt`.
+
+The test is `TestMM_F11b_SharedIssuer` (unit, `-race`). An end-to-end WIF
+check needs Funnel on a real tailnet: run `make e2e-keyless` before
+release.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -698,3 +714,4 @@ replica would serve, and sign with, a different key behind one issuer URL.
 2026-11-11 iter17 PLAN | H13 (OBO root key) | n/a | confirm if replicas report different OBO public keys for a tenant: (a) after a normal create, (b) after cold concurrent first use; refute if all agree in both | identity consistency
 2026-11-11 iter17 | H13 | n/a ×5 | CONFIRMED | identity consistency | results/*-H13 | (b) 5/8, 0/8, 3/8, 3/8, 1/8; (a) 0/40. Issuer key by code inspection only
 2026-11-11 iter18 | F11 | n/a ×5 | FIXED (OBO) | — | results/*-H13; make test-go/test-pg green | (b) 0/8 ×5; issuer key split out as F11b
+2026-11-11 iter19 | F11b | n/a | DONE | — | unit (-race); make test-go/test-pg green | e2e WIF not run (needs Funnel)

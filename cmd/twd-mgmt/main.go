@@ -173,7 +173,8 @@ func run() error {
 
 	var issuer *mgmt.Issuer
 	if *issuerURL != "" {
-		if issuer, err = mgmt.LoadOrCreateIssuer(*issuerURL, filepath.Join(*stateDir, "issuer.key")); err != nil {
+		// Shared by every replica through the store and custody (mm-loop F11b).
+		if issuer, err = mgmt.LoadSharedIssuer(ctx, *issuerURL, filepath.Join(*stateDir, "issuer.key"), store, custody); err != nil {
 			return err
 		}
 		log.Info("OIDC issuer", "base", issuer.BaseURL)
