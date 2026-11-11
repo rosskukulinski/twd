@@ -16,6 +16,7 @@ FIX_MODE: fix
 | F2 | Skew metric in `/v1/status`; not-ready above 2 s | H10 | new `TestMM_F2_SkewGate` | **DONE** (reports, doesn't refuse; see F2 note) |
 | F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | **DONE**: before 14–23/40 broken (iter2), after 0/40 and 40 keys for 40 objects, 3/3 runs; + `TestStoreMintClaim` (SQLite + Postgres), `TestCustodyNamesPerKey` |
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | `TestMM_F5_LeaseHeldExplains` | **DONE** |
+| F6 | Replica registry (`replicas` table: stable per-state-dir ID, custody fingerprint, last_seen by the store clock). A replica refuses to start if file custody would be shared with another live replica, or if live replicas' custody fingerprints differ; the same check runs each reaper tick (status not ok, warning) | H11 | `TestMM_H11_FileCustodyPerReplica` becomes "second replica refuses with a clear error"; unit test for the registry; a single replica restarting within 30 s of a SIGKILL must still start | queued |
 | F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
 
 ## Status
@@ -33,7 +34,7 @@ FIX_MODE: fix
 | H08 | P2 | open | |
 | H09 | P2 | open | |
 | H10 | P0 | **FIXED by F1** (in-process, SQLite-modelled DB clock; real Postgres clock covered by `TestStoreClockPostgres`). Host-side half is F4 | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
-| H11 | P0 | open | |
+| H11 | P0 | **CONFIRMED** (2/2 runs): with `-custody file`, each replica can release only the credentials it minted (6/12 fail on each) | `TestMM_H11_FileCustodyPerReplica` |
 | H12 | P1 | open | |
 | H13 | P1 | open | |
 | H14 | P2 | open | |
@@ -335,6 +336,25 @@ The hint says to pin a host with the deploy request's `host` field. The
 CLI has no `--host` flag (only the API field), so the hint doesn't claim
 one. Whether to add the flag is open.
 
+### H11: CONFIRMED (P0, configuration). File custody is per replica.
+
+**Repro.** `TestMM_H11_FileCustodyPerReplica`: two replicas with
+`-custody file` (the default), and 12 objects created alternately through
+each.
+
+**Result.** Every credential fetch through the replica that did *not*
+mint the object fails with `404 custody: not found`: 6 of 12 on each
+replica, and none fail on both. A host that sticks to one replica fails to
+get about half its credentials. The same applies to anything else stored
+in each replica's own state dir:
+- OBO root keys (`m.oboKeys`, loaded from custody): H13;
+- the WIF issuer key: H13;
+- `id.secret`: H14.
+
+**Fix (F6).** Don't try to share file custody; detect it and refuse to
+start. The stable replica ID matters because without it, a single replica
+restarting after a crash would see its own old row and refuse.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -368,3 +388,5 @@ one. Whether to add the flag is open.
 2026-11-11 iter5 | F2 | n/a | DONE | — | make test-go/test-pg green; lint/api-check re-run after commit | status reports clock; warns at >2 s or a 30 s-stale sample
 2026-11-11 iter6 | F3 | n/a ×6 | FIXED | — | results/*-H02 | first 3 runs correct but 66 s (claim held through backoff); after per-attempt release 3/3 correct in 12–13 s; make test-go/test-pg/lint green
 2026-11-11 iter7 | F5 | n/a | DONE | — | make test-go/test-pg/lint green | first message referenced a nonexistent --host CLI flag; corrected
+2026-11-11 iter8 PLAN | H11 | n/a | confirm if, with -custody file, any credential fetch fails on the replica that didn't mint; refute if all 12×2 succeed | I3, I8
+2026-11-11 iter8 | H11 | n/a ×2 | CONFIRMED | I3, I8 | results/*-H11 | exactly half of credential releases fail on each replica (404 custody: not found)
