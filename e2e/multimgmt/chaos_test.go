@@ -440,3 +440,52 @@ func TestMM_S2_RandomKills(t *testing.T) {
 		}
 	})
 }
+
+// signal sends sig to replica i (only the process this harness started)
+// without waiting for it to exit (SIGSTOP/SIGCONT).
+func (c *cluster) signal(i int, sig syscall.Signal) {
+	c.repMu.Lock()
+	cmd := c.replicas[i].cmd
+	c.repMu.Unlock()
+	if cmd != nil {
+		cmd.Process.Signal(sig)
+	}
+}
+
+// S3: SIGSTOP one replica for 50 s (longer than the 45 s namespace lease)
+// while it serves load, then SIGCONT: the classic zombie writer.
+func TestMM_S3_StallLongerThanLease(t *testing.T) {
+	runScenario(t, "S3", func(ctx context.Context, c *cluster, g *rng) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+		i := g.intn(3)
+		c.signal(i, syscall.SIGSTOP)
+		select {
+		case <-ctx.Done():
+		case <-time.After(50 * time.Second):
+		}
+		c.signal(i, syscall.SIGCONT)
+	})
+}
+
+// S4: blackhole one replica's Postgres connection for 30 s (its traffic is
+// held, then released), while the others keep going.
+func TestMM_S4_PostgresPartitionOneReplica(t *testing.T) {
+	runScenario(t, "S4", func(ctx context.Context, c *cluster, g *rng) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+		i := g.intn(3)
+		c.proxy(i).set("blackhole", 0)
+		select {
+		case <-ctx.Done():
+		case <-time.After(30 * time.Second):
+		}
+		c.proxy(i).set("pass", 0)
+	})
+}

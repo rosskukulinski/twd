@@ -50,7 +50,9 @@ FIX_MODE: fix
 | H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
-| S1, S3–S11 | — | 0/3 seeds each | |
+| S3 | — | **3/3 clean seeds** (SIGSTOP 50 s > 45 s lease) | `TestMM_S3_StallLongerThanLease` |
+| S4 | — | **3/3 clean seeds** (PG blackhole 30 s, one replica) | `TestMM_S4_PostgresPartitionOneReplica` |
+| S1, S5–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -854,6 +856,25 @@ credential waits of 2 s while the registration queue drains. I8 now
 counts transport errors and other 5xx, and reports `identity_pending`
 separately.
 
+### S3 and S4: clean, with one operational note
+
+- **S3**, SIGSTOP of a replica for 50 s (longer than the 45 s namespace
+  lease), then SIGCONT: all invariants hold over 3 seeds, with 2–3 of
+  about 1,100 ops failing (0.2%).
+- **S4**, a 30 s Postgres partition for one replica (traffic held, then
+  released): all invariants hold over 3 seeds, with 0 failures.
+- **Operational note from S3.** A stopped replica still *accepts* TCP
+  connections (the kernel's accept queue), so every request routed to it
+  waits out the client timeout (5 s here) before retrying elsewhere.
+  Throughput roughly halved (about 1,100 ops in S3 against 2,200–2,400 in
+  S4). A real `svc:twd-mgmt` VIP needs **active health checks** (e.g.
+  `GET /v1/status` with a short timeout) to eject a stalled replica. A dead
+  one is ejected by connection refusals anyway. Record this in the
+  deployment docs when the VIP is built (H12).
+- **Coverage gap.** The workload never moves a workload between hosts, so
+  lease safety and fencing (I1/I2) aren't exercised by S2–S4; they're
+  covered by the H10 unit test. S11 adds host failover.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -918,3 +939,5 @@ separately.
 2026-11-11 iter26 | H16 → F17 | 10 + 20 runs | CONFIRMED (2/10) then FIXED (0/20) | quota | results/*-H16 (report.txt) | H04 still 0/10; make test-go/test-pg green
 2026-11-11 iter27 PLAN | harness slice 4 (client-side LB, seeded workload, host loop, oracle I3/I5/I6/I7/I8/I9/I11) + S2 seed 1 | 1 | pass if all invariants hold after 60 s of random SIGKILLs under load | I3 I5 I6 I7 I8 I9 I11
 2026-11-11 iter27 | harness slice 4 + S2 | seeds 1,2,3 | seed 3 FAILED I9 → F18 → 3/3 PASS | I9 | results/*-S2-seed{1,2,3} | first run's I8 'violation' was an oracle misclassification (identity_pending); fixed
+2026-11-11 iter28 PLAN | S3 (SIGSTOP 50 s > 45 s lease) and S4 (PG blackhole 30 s for one replica), seed 1 | 1 | pass if all invariants hold | I3 I5 I6 I7 I8 I9 I11
+2026-11-11 iter28 | S3, S4 | seeds 1–3 each | 6/6 PASS | — | results/*-S3-*, *-S4-* | S3 throughput about halved by the stalled-but-accepting replica (needs VIP health checks)
