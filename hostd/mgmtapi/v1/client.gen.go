@@ -201,6 +201,7 @@ const (
 	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
 	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
 	ErrorCodeSuperseded              ErrorCode = "superseded"
+	ErrorCodeTakeoverUnconfirmed     ErrorCode = "takeover_unconfirmed"
 	ErrorCodeTenantHasLiveObjects    ErrorCode = "tenant_has_live_objects"
 	ErrorCodeUnknownNamespace        ErrorCode = "unknown_namespace"
 	ErrorCodeUnknownTenant           ErrorCode = "unknown_tenant"
@@ -276,6 +277,8 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodeSpawnBudgetExceeded:
 		return true
 	case ErrorCodeSuperseded:
+		return true
+	case ErrorCodeTakeoverUnconfirmed:
 		return true
 	case ErrorCodeTenantHasLiveObjects:
 		return true
@@ -743,6 +746,9 @@ type DeploymentCreate struct {
 	// Bundle tar (optionally gzipped) of the built worker + `twd.jsonc` + `wrangler.jsonc`.
 	Bundle []byte `json:"bundle"`
 
+	// ForceTakeover Confirm that the workload's current host, which has stopped heartbeating, is gone for good, so a stateful workload may move off it (ADR-028 §3). Without it such a move is refused with `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`).
+	ForceTakeover *bool `json:"forceTakeover,omitempty"`
+
 	// Host Pin a host.
 	Host *string `json:"host,omitempty"`
 
@@ -818,6 +824,7 @@ type Error struct {
 	// | `exists` | 409 | create of an existing ID |
 	// | `lease_lost` | 409 | epoch/holder fence failed |
 	// | `lease_held` | 409 | another host holds the lease |
+	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
 	// | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
@@ -871,6 +878,7 @@ type Error struct {
 // | `exists` | 409 | create of an existing ID |
 // | `lease_lost` | 409 | epoch/holder fence failed |
 // | `lease_held` | 409 | another host holds the lease |
+// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 // | `already_joined` | 409 | credential for an object that has a node |
 // | `identity_conflict` | 409 | object ID collision across identities |
 // | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
@@ -1507,6 +1515,7 @@ type TombstoneError struct {
 	// | `exists` | 409 | create of an existing ID |
 	// | `lease_lost` | 409 | epoch/holder fence failed |
 	// | `lease_held` | 409 | another host holds the lease |
+	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
 	// | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |

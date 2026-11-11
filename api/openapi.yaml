@@ -1841,6 +1841,7 @@ components:
         | `exists` | 409 | create of an existing ID |
         | `lease_lost` | 409 | epoch/holder fence failed |
         | `lease_held` | 409 | another host holds the lease |
+        | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
         | `already_joined` | 409 | credential for an object that has a node |
         | `identity_conflict` | 409 | object ID collision across identities |
         | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
@@ -1879,6 +1880,7 @@ components:
         - exists
         - lease_lost
         - lease_held
+        - takeover_unconfirmed
         - already_joined
         - identity_conflict
         - namespace_ambiguous
@@ -2241,6 +2243,12 @@ components:
         workload: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$" }
         bundle: { type: string, contentEncoding: base64, description: tar (optionally gzipped) of the built worker + `twd.jsonc` + `wrangler.jsonc`. }
         host: { type: string, description: Pin a host. }
+        forceTakeover:
+          type: boolean
+          description: >-
+            Confirm that the workload's current host, which has stopped heartbeating, is gone for good, so a
+            stateful workload may move off it (ADR-028 §3). Without it such a move is refused with
+            `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`).
         namespaces:
           type: array
           description: Override the classes read from `twd.jsonc` (tests).

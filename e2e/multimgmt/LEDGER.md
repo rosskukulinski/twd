@@ -440,6 +440,53 @@ correct for ADR-017.
   row, so each replica clamps to its own idea of the limit. Fix: call
   `SetLimit` on tenant update. Check that it's really missing.
 
+### F4: guarded moves (ADR-028 §3, as decided by Ross)
+
+**`guardTakeover`** runs in `Deploy` after placement and before
+`AcquireLease`. It **refuses with `409 takeover_unconfirmed`** when all of
+these hold:
+- the workload's lease holder is a different host;
+- that host is **still registered and not live**;
+- the bundle is stateful.
+
+The message names the host, when mgmt last heard from it, and the guarded
+classes. It gives three ways out: `twd host rm <h> --drain`,
+`--force-takeover`, or `"fence": "never"`.
+
+It **allows** the move when:
+- the old host was removed;
+- the old host is live (the existing `lease_held` refusal applies there);
+- the workload is stateless;
+- every DO class is `"fence": "never"`;
+- the deploy sets `forceTakeover`. A forced move is audited on the
+  `deploy` record with `takeoverFrom` and `forced`.
+
+**`BundleStateful`** is conservative. It counts as DO classes:
+- `twd.jsonc` `tailnet.objects`, including `node:false` classes;
+- `wrangler.jsonc`/`.json` `durable_objects`.
+
+A `wrangler.toml`, or anything unreadable, counts as stateful.
+`node_modules/` is ignored.
+
+**Spec and CLI.**
+- New `DeploymentCreate.forceTakeover` and catalog code
+  `takeover_unconfirmed` (spec first).
+- CLI: `twd deploy --force-takeover`.
+- New `twd.jsonc` field: `tailnet.objects.<Class>.fence`.
+
+**Found along the way.** A pinned move away from a **live** holder was
+already refused (`lease_held`), but F5's message said "redeploy after the
+lease expires", which never happens for a live, renewing holder. It now
+says the host is live and to drain it first.
+
+**Tests.**
+- `TestMM_F4_GuardedTakeover` (7 cases) and `TestBundleStateful` (8 cases).
+- The F5 test now uses a confirmed takeover; F5's waiting-out-the-lease
+  case only arises after confirmation.
+
+**Not run:** the real-tailnet e2e suites that redeploy across hosts.
+Hermetic `make test-go` and `make test-pg` are green.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -480,3 +527,4 @@ correct for ADR-017.
 2026-11-11 iter10 | H03 → F7 | n/a ×2 + ×2 | CONFIRMED then FIXED | I4 | results/*-H03 | before: 45 keys in 9 s (window max 45, limit 16); after: 45 in 45–48 s, window max 16; make test-go/test-pg green
 2026-11-11 iter11 PLAN | H04 | n/a | confirm if a root ends with > maxLive (5) live descendants after 40 concurrent spawns across 3 replicas; refute if ≤5 in 3 runs | I5
 2026-11-11 iter11 | H04 | n/a ×6 | NOT REPRODUCED (open) | — | results/*-H04 | 0/2/5/20 ms PG delay: always exactly 5 live. At 20 ms, 23/40 spawns exceeded the 5 s client timeout (I8 latency: look at serialisation under DB latency). Paused here for Ross's self-fencing interview
+2026-11-11 iter12 | F4 | n/a | DONE | — | unit tests; make test-go/test-pg green | the first test wrongly assumed a pinned move from a live holder is allowed (it's refused, which is safe); its message was fixed instead

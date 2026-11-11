@@ -22,7 +22,7 @@ func (c *stepClock) advance(d time.Duration)                { c.mu.Lock(); c.now
 
 // TestMM_F5_LeaseHeldExplains: the workload's host stopped heartbeating 11 s
 // ago (dead to placement after 10 s) but its 15 s lease has not expired. A
-// redeploy must say who holds it, how long ago it was seen and when the
+// confirmed takeover (ForceTakeover, F4: the workload is stateful) must say who holds it, how long ago it was seen and when the
 // lease frees up (with Retry-After), not just "lease held by another
 // holder"; once the lease expires the redeploy goes to a live host.
 func TestMM_F5_LeaseHeldExplains(t *testing.T) {
@@ -53,7 +53,7 @@ func TestMM_F5_LeaseHeldExplains(t *testing.T) {
 		}
 	}
 	deploy := func(host string) (DeployResponse, error) {
-		return m.Deploy(ctx, DeployRequest{TenantID: tn.ID, Workload: "w", Host: host,
+		return m.Deploy(ctx, DeployRequest{TenantID: tn.ID, Workload: "w", Host: host, ForceTakeover: host == "",
 			Bundle: makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})})
 	}
 	if _, err := deploy("h1"); err != nil {

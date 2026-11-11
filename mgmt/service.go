@@ -547,6 +547,10 @@ type DeployRequest struct {
 	Bundle     []byte        `json:"bundle"` // base64 in JSON
 	Namespaces []ClassConfig `json:"namespaces,omitempty"`
 	Host       string        `json:"host,omitempty"`
+	// ForceTakeover confirms that the workload's current host, which has
+	// stopped heartbeating, is really gone, so a stateful workload may move
+	// off it (ADR-028 §3). Audited.
+	ForceTakeover bool `json:"forceTakeover,omitempty"`
 	// By is the deployer (set by the API layer from the principal, never
 	// from the request body): a WhoIs login over the tailnet, the local
 	// actor on the unix socket.
@@ -623,6 +627,10 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	if err != nil {
 		return resp, err
 	}
+	takeoverFrom, err := m.guardTakeover(ctx, t, r, host)
+	if err != nil {
+		return resp, err
+	}
 	lease, err := m.store.AcquireLease(ctx, LeaseName(t.ID, r.Workload), host, NamespaceLeaseTTL, m.now())
 	if errors.Is(err, ErrLeaseHeld) {
 		return resp, m.leaseHeldError(ctx, LeaseName(t.ID, r.Workload), r.Workload)
@@ -635,8 +643,11 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	if err := m.store.CreateDeployment(ctx, d); err != nil {
 		return resp, err
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, map[string]any{"deploymentID": d.ID, "workload": d.Workload,
-		"host": host, "epoch": lease.Epoch, "by": r.By})
+	detail := map[string]any{"deploymentID": d.ID, "workload": d.Workload, "host": host, "epoch": lease.Epoch, "by": r.By}
+	if takeoverFrom != "" {
+		detail["takeoverFrom"], detail["forced"] = takeoverFrom, true
+	}
+	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, detail)
 	resp.DeploymentID, resp.Host, resp.Epoch = d.ID, host, lease.Epoch
 	resp.Endpoint.Node = r.Workload + "-" + host
 	resp.Endpoint.MagicDNS = resp.Endpoint.Node + "." + t.Tailnet
@@ -700,6 +711,44 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 	return v, nil
 }
 
+// guardTakeover refuses to move a stateful workload off a host that has
+// stopped heartbeating but is still registered (ADR-028 §3): that host may
+// still be serving the workload's Durable Objects from its own disk, and it
+// can't be told to stop. Allowed when the old host is live (it is revoked at
+// its next heartbeat), was removed (twd host rm), the workload is stateless
+// or every DO class is "fence": "never", or the deploy sets ForceTakeover.
+// It returns the old host when a forced takeover happens (for the audit).
+func (m *Mgmt) guardTakeover(ctx context.Context, t Tenant, r DeployRequest, host string) (string, error) {
+	l, err := m.store.GetLease(ctx, LeaseName(t.ID, r.Workload))
+	if err != nil || l.Holder == "" || l.Holder == host {
+		return "", nil
+	}
+	old, err := m.store.GetHost(ctx, l.Holder)
+	if err != nil {
+		return "", nil // removed: nothing left to split with
+	}
+	now := m.now()
+	if old.Live(now) {
+		return "", nil
+	}
+	stateful, why := true, "no bundle to inspect"
+	if len(r.Bundle) > 0 {
+		stateful, why = BundleStateful(r.Bundle)
+	}
+	if !stateful {
+		return "", nil
+	}
+	if r.ForceTakeover {
+		return old.ID, nil
+	}
+	seen := "never"
+	if old.LastSeen > 0 {
+		seen = now.Sub(time.UnixMilli(old.LastSeen)).Round(time.Second).String() + " ago"
+	}
+	return "", errf(409, "takeover_unconfirmed", "workload %q runs on host %s, which mgmt last heard from %s; it may still be serving the workload's %s from its own disk, so moving it to %s could run two copies. If %s is gone for good: `twd host rm %s --drain`, or redeploy with --force-takeover. If it is coming back, wait for it. Classes that tolerate two instances can set \"fence\": \"never\" in twd.jsonc",
+		r.Workload, old.ID, seen, why, host, old.ID, old.ID)
+}
+
 // leaseHeldError explains a deploy that placement sent to a new host while
 // the workload's lease is still held: the holder has stopped heartbeating
 // (dead to placement after HostLeaseTTL) but its lease (NamespaceLeaseTTL)
@@ -711,8 +760,14 @@ func (m *Mgmt) leaseHeldError(ctx context.Context, name, workload string) *Error
 		return errf(409, "lease_held", "workload %q: its lease is held by another host", workload)
 	}
 	seen := "never"
-	if h, err := m.store.GetHost(ctx, l.Holder); err == nil && h.LastSeen > 0 {
+	h, herr := m.store.GetHost(ctx, l.Holder)
+	if herr == nil && h.LastSeen > 0 {
 		seen = now.Sub(time.UnixMilli(h.LastSeen)).Round(time.Second).String() + " ago"
+	}
+	if herr == nil && h.Live(now) {
+		// A live holder keeps renewing: its lease won't run out.
+		return errf(409, "lease_held", "workload %q runs on host %s (live, epoch %d, last seen %s); it can't be placed elsewhere while %s holds it. To move it, drain that host first (`twd host rm %s --drain`)",
+			workload, l.Holder, l.Epoch, seen, l.Holder, l.Holder)
 	}
 	left := time.UnixMilli(l.ExpiresAt).Sub(now)
 	if left < 0 {

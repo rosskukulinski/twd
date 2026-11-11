@@ -281,6 +281,7 @@ func cmdDeploy(args []string) error {
 	name := f.String("name", "", "workload name (default: twd.jsonc name)")
 	allowMissing := f.Bool("allow-missing-grants", false, "deploy even if tailnet.connects grants are missing")
 	noWait := f.Bool("no-wait", false, "return once mgmt accepted the deploy")
+	forceTakeover := f.Bool("force-takeover", false, "the workload's current host is gone for good: move its Durable Objects anyway (audited; see takeover_unconfirmed)")
 	wait := f.Duration("wait", 3*time.Minute, "how long to wait for ready")
 	tenantF := tenantFlag(f)
 	vars := varFlags{}
@@ -370,7 +371,11 @@ func cmdDeploy(args []string) error {
 	}
 	ds := time.Now()
 	var dr mgmt.DeployResponse
-	if err := mc.Do(ctx, "POST", "/v1/deployments", map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}, &dr); err != nil {
+	body := map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}
+	if *forceTakeover {
+		body["forceTakeover"] = true
+	}
+	if err := mc.Do(ctx, "POST", "/v1/deployments", body, &dr); err != nil {
 		return err
 	}
 	res.DeploymentID, res.Host = dr.DeploymentID, dr.Host
