@@ -115,11 +115,17 @@ func run() error {
 	default:
 		return fmt.Errorf("unknown -custody %q", *custodyKind)
 	}
-	secret, err := mgmt.LoadOrCreateSecret(filepath.Join(*stateDir, "id.secret"))
+	replicaID, err := mgmt.LoadOrCreateReplicaID(filepath.Join(*stateDir, "replica.id"))
 	if err != nil {
 		return err
 	}
-	replicaID, err := mgmt.LoadOrCreateReplicaID(filepath.Join(*stateDir, "replica.id"))
+	// Refuse a custody mismatch with other replicas before touching any
+	// shared secret (F6 check, run early: F12).
+	if err := mgmt.PreflightReplica(ctx, store, custody, replicaID); err != nil {
+		return err
+	}
+	// Shared by every replica via the store and custody (mm-loop F12).
+	secret, err := mgmt.LoadSharedIDSecret(ctx, filepath.Join(*stateDir, "id.secret"), store, custody)
 	if err != nil {
 		return err
 	}

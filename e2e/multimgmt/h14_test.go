@@ -17,6 +17,7 @@ import (
 // one name through different replicas: one inserts, the others hit the
 // UNIQUE (tenant, workload, namespace, name) constraint.
 // Invariant: every caller gets 2xx with the same object ID.
+// Fixed by F12 (a conflicting insert answers with the existing object).
 func TestMM_H14_ConcurrentSameNameCreate(t *testing.T) {
 	const replicas, names = 3, 10
 	r := newRun(t, "H14")

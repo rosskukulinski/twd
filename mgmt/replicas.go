@@ -42,9 +42,12 @@ func LoadOrCreateReplicaID(path string) (string, error) {
 // live replicas it can see, or "" if it may: file custody is never shared,
 // and every live replica must use the same custody.
 func (m *Mgmt) replicaConflict(rs []Replica, now time.Time) string {
-	mine := CustodyFingerprint(m.custody)
+	return replicaConflictFor(m.replicaID, CustodyFingerprint(m.custody), rs, now)
+}
+
+func replicaConflictFor(myID, mine string, rs []Replica, now time.Time) string {
 	for _, r := range rs {
-		if r.ID == m.replicaID || r.LastSeen == 0 || now.Sub(time.UnixMilli(r.LastSeen)) > ReplicaLiveTTL {
+		if r.ID == myID || r.LastSeen == 0 || now.Sub(time.UnixMilli(r.LastSeen)) > ReplicaLiveTTL {
 			continue
 		}
 		seen := now.Sub(time.UnixMilli(r.LastSeen)).Round(time.Second)
@@ -58,6 +61,25 @@ func (m *Mgmt) replicaConflict(rs []Replica, now time.Time) string {
 		}
 	}
 	return ""
+}
+
+// PreflightReplica runs the replica-registry custody check before twd-mgmt
+// loads any shared secret (ID secret, issuer key), so a misconfigured
+// replica is refused with the explanation rather than failing later on a
+// secret that lives in another replica's custody.
+func PreflightReplica(ctx context.Context, st Store, cust Custody, replicaID string) error {
+	rs, err := st.ListReplicas(ctx)
+	if err != nil {
+		return fmt.Errorf("replica registry: %w", err)
+	}
+	now := time.Now()
+	if sc, ok := st.(StoreClock); ok {
+		now = sc.Now()
+	}
+	if msg := replicaConflictFor(replicaID, CustodyFingerprint(cust), rs, now); msg != "" {
+		return fmt.Errorf("refusing to start: %s", msg)
+	}
+	return nil
 }
 
 // registerReplica records this replica and checks it against the others.

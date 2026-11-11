@@ -23,7 +23,7 @@ FIX_MODE: fix
 | F10 | Durable device deletes: `objects.device_delete_at` (due ms / -1 claimed), claimed by one replica, swept by every replica's reaper, retried in 30 s on failure | H07 | `TestMM_H07_DeviceDeleteLostOnCrash` (before: device left; after: deleted by the surviving replica, 2/2); `TestStoreDeviceDelete` (SQLite + Postgres) | **DONE** |
 | F11 | Store-arbitrated shared secrets: OBO root keys (and the WIF issuer signing key) are chosen once per tenant/issuer through a DB row (`INSERT … ON CONFLICT DO NOTHING` names the winning key ID); custody holds each candidate under a per-key name, losers delete theirs; readers follow the row. Issuer key moves from the state dir into custody | H13 | `TestMM_H13_OBORootKeyDiverges` (b): before 12/40 diverged, after 0/40 (5 runs); `TestMM_F11_OBORootChosenOnce` (40 two-replica races + legacy adoption, -race) | **DONE for OBO root keys**; the WIF issuer key is still per state dir (F11b, queued) |
 | F11b | WIF issuer signing key: load or create through custody + `secret_choice` ("issuer") instead of `<state-dir>/issuer.key`, migrating an existing file key as the first offer | H13 | `TestMM_F11b_SharedIssuer` (4 concurrent first starts serve one JWKS; restart reloads it; an existing issuer.key is kept and shared). No e2e (needs Funnel and WIF) | **DONE** |
-| F12 | (a) `CreateObject`: a UNIQUE violation on insert means another replica just created it; re-read by name and return that object (the same response as the idempotent path). (b) Share `id.secret` through custody + `secret_choice` (like F11b), adopting the first replica's existing file, so object IDs and hostnames don't depend on which replica created them | H14 | `TestMM_H14_ConcurrentSameNameCreate` (all 2xx, one ID); unit test for the shared ID secret | queued |
+| F12 | (a) `CreateObject`: a UNIQUE violation on insert means another replica just created it; re-read by name and return that object (the same response as the idempotent path). (b) Share `id.secret` through custody + `secret_choice` (like F11b), adopting the first replica's existing file, so object IDs and hostnames don't depend on which replica created them | H14 | `TestMM_H14_ConcurrentSameNameCreate` (before 10/10 names broken; after 0/10 ×5 alone and after H13); `TestMM_F12_SharedIDSecret`, `_ExistingFileAdopted`, `_IdentityConflictStillRefused` | **DONE** |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -44,7 +44,7 @@ FIX_MODE: fix
 | H11 | P0 | **FIXED by F6** (was: with `-custody file`, 6/12 credential releases failed on each replica) | `TestMM_H11_FileCustodyPerReplica` |
 | H12 | P1 | open | |
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
-| H14 | P2 | **CONFIRMED** (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
+| H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | open (pre-existing, single replica too) | |
 | S1–S11 | — | 0/3 seeds each | |
 
@@ -685,6 +685,37 @@ the constraint holds.
 through different replicas (e.g. after a purge) gets a different ID and
 hostname. Fix in F12(b).
 
+### F12: idempotent creates across replicas, and a shared ID secret (fixes H14)
+
+**(a) Insert conflicts.** An insert hitting the UNIQUE constraint
+re-reads by name and returns the existing object (or 410 if it's dead).
+A lookup error other than not-found is surfaced as-is, not mislabelled.
+
+**(b) Shared ID secret.** `twd-mgmt` loads the ID secret with
+`LoadSharedIDSecret` (custody plus a `secret_choice` "id-secret" row,
+adopting the first replica's existing `id.secret`). Object IDs and
+hostnames no longer depend on which replica created them.
+
+**Two regressions, caught and fixed before commit:**
+1. **The second file-custody replica crashed instead of refusing.** With
+   file custody, it found the chosen ID secret missing from its own
+   custody and exited with `custody: id secret …: not found`, before F6's
+   clear refusal could run; `TestMM_H11` caught it. Fix: `twd-mgmt` runs
+   `PreflightReplica` (the F6 custody check, now `replicaConflictFor`)
+   before loading any shared secret. The missing-secret error also
+   explains itself now.
+2. **The by-ID pre-check became racy.** Before (b), replicas derived
+   different IDs, so a by-ID hit after a by-name miss meant a real
+   collision. With a shared secret, a concurrent creator's row produces
+   exactly that pattern. It showed up only when H14 ran after H13 (1–2
+   names out of 10). Fix: compare identities; the same identity is
+   idempotent, and a different one is still `identity_conflict`
+   (`TestMM_F12_IdentityConflictStillRefused`, a new test, since no test
+   covered genuine collisions).
+
+**After.** The full multi-replica e2e suite (H01–H14) passes, as do
+`make test-go` and `make test-pg`.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -738,3 +769,4 @@ hostname. Fix in F12(b).
 2026-11-11 iter19 | F11b | n/a | DONE | — | unit (-race); make test-go/test-pg green | e2e WIF not run (needs Funnel)
 2026-11-11 iter20 PLAN | H14 | n/a | confirm if concurrent same-name creates through 3 replicas give any non-2xx or differing object IDs; refute if all 2xx with one ID for 10 names × 2 runs | idempotency, I8
 2026-11-11 iter20 | H14 | n/a ×2 | CONFIRMED | idempotency | results/*-H14 | 10/10 names: 202 + 2×409 exists; queued F12
+2026-11-11 iter21 | F12 | n/a ×many | FIXED | — | full e2e suite + make test-go/test-pg green | two regressions found by existing e2e (H11 refusal, H13+H14 ordering) and fixed before commit

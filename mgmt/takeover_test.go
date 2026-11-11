@@ -198,3 +198,38 @@ func TestMM_F9_AssignmentFence(t *testing.T) {
 		t.Errorf("missing assignments: %v", want)
 	}
 }
+
+// TestMM_F12_IdentityConflictStillRefused: with the ID secret shared, a
+// by-ID hit for the same identity is a concurrent create (idempotent), but a
+// different identity holding the ID is still refused.
+func TestMM_F12_IdentityConflictStillRefused(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, _ := OpenStore(ctx, filepath.Join(dir, "m.db"))
+	defer st.Close()
+	cust, _ := OpenFileCustody(filepath.Join(dir, "c"))
+	m, err := New(Config{Store: st, Custody: cust, Broker: &Broker{}, IDSecret: []byte("0123456789abcdef"), ReapInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	kf := filepath.Join(dir, "api.env")
+	os.WriteFile(kf, []byte("TS_API_KEY=x\n"), 0o600)
+	tn, _ := m.CreateTenant(ctx, TenantRequest{Tailnet: "t.ts.net", MintMode: "apikey", APIKeyFile: kf})
+	m.RegisterHost(ctx, RegisterRequest{HostID: "h1", CapacityNodes: 10, Tiers: []string{"process"}}, "", "")
+	if _, err := m.Deploy(ctx, DeployRequest{TenantID: tn.ID, Workload: "w",
+		Bundle: makeBundle(t, map[string]string{"twd.jsonc": testTwdJSONC, "dist/index.js": "export default {}"})}); err != nil {
+		t.Fatal(err)
+	}
+	id := m.objectID(tn.ID, "w", "SupportAgent", "alice")
+	// Another identity already holds alice's ID (a MAC prefix collision).
+	if err := st.CreateObject(ctx, Object{ID: id, TenantID: tn.ID, Workload: "w", Namespace: "SupportAgent", Name: "mallory",
+		Hostname: id, Status: StatusPending}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.CreateObject(ctx, CreateObjectRequest{TenantID: tn.ID, Workload: "w", Namespace: "SupportAgent", ObjectName: "alice"})
+	var e *Error
+	if !errors.As(err, &e) || e.Code != "identity_conflict" {
+		t.Fatalf("a different identity holding the ID must be refused with identity_conflict, got %v", err)
+	}
+}

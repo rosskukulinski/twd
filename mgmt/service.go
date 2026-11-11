@@ -1028,7 +1028,15 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 		return resp, errf(429, "object_quota_exceeded", "tenant %s has %d live objects (maxObjects %d)", t.ID, n, t.MaxObjects)
 	}
 	id := m.objectID(t.ID, workload, r.Namespace, r.ObjectName)
-	if _, err := m.store.GetObject(ctx, id); err == nil {
+	if ex, err := m.store.GetObject(ctx, id); err == nil {
+		if ex.TenantID == t.ID && ex.Workload == workload && ex.Namespace == r.Namespace && ex.Name == r.ObjectName {
+			// The same identity, created by another replica since our by-name
+			// lookup (replicas share the ID secret: F12). Idempotent answer.
+			if !ex.Live() {
+				return resp, errf(410, "killed", "object %s (%s %s/%s) was %s", ex.ID, workload, r.Namespace, r.ObjectName, ex.Status)
+			}
+			return CreateObjectResponse{ObjectID: ex.ID, Status: ex.Status, Tags: ex.Tags, Hostname: ex.Hostname}, nil
+		}
 		// An ID collision with another identity (a 50-bit MAC prefix): never
 		// hand out an existing object's node.
 		return resp, errf(409, "identity_conflict", "object ID %s is already taken by another identity", id)
@@ -1051,7 +1059,21 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 		o.ParentID, o.RootID, o.Depth = p.ID, p.RootID, p.Depth+1
 		o.Ephemeral = ttl > 0
 	}
-	if err := m.store.CreateObject(ctx, o); err != nil {
+	if err := m.store.CreateObject(ctx, o); errors.Is(err, ErrExists) {
+		// Another replica created this name between our lookup and insert
+		// (tenantLock is per replica: H14). Answer as the idempotent path.
+		ex, gerr := m.store.GetObjectByName(ctx, t.ID, workload, r.Namespace, r.ObjectName)
+		switch {
+		case gerr == nil && !ex.Live():
+			return resp, errf(410, "killed", "object %s (%s %s/%s) was %s", ex.ID, workload, r.Namespace, r.ObjectName, ex.Status)
+		case gerr == nil:
+			return CreateObjectResponse{ObjectID: ex.ID, Status: ex.Status, Tags: ex.Tags, Hostname: ex.Hostname}, nil
+		case errors.Is(gerr, ErrNotFound):
+			return resp, errf(409, "identity_conflict", "object ID %s is already taken by another identity", o.ID)
+		default:
+			return resp, fmt.Errorf("create %s: lookup after a concurrent insert: %w", o.ID, gerr)
+		}
+	} else if err != nil {
 		return resp, err
 	}
 	detail := map[string]any{"workload": o.Workload, "namespace": o.Namespace, "name": o.Name, "tags": o.Tags, "root": o.RootID}
