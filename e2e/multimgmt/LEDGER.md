@@ -30,7 +30,7 @@ FIX_MODE: fix
 | H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
 | H04 | P1 | **not reproduced yet** (exactly 5/5 live in 6 runs at 0/2/5/20 ms PG delay); the race exists in code (per-replica `tenantLock`; `CountLive` then insert, no re-check); something narrows the window, cause not found | `TestMM_H04_SpawnBudgetRace` |
 | H05 | P2 | open | |
-| H06 | P1 | open | |
+| H06 | P1 | **CONFIRMED** (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
 | H07 | P1 | open | |
 | H08 | P2 | open | |
 | H09 | P2 | open | |
@@ -487,6 +487,35 @@ says the host is live and to drain it first.
 **Not run:** the real-tailnet e2e suites that redeploy across hosts.
 Hermetic `make test-go` and `make test-pg` are green.
 
+### CORRECTION (iteration 13): hostd already self-fences
+
+What I told Ross on 2026-11-11, and wrote into ADR-028 as the premise for
+"guarded moves now", was **wrong**: "hostd only stops serving on an
+explicit revoke and keeps serving forever when cut off from mgmt". I had
+searched only for `revoke`.
+
+In fact, since M3 (`ede3258`):
+- `hostd/host.go` `tick()` runs a heartbeat every 3 s (`HeartbeatEvery`).
+- After `FenceAfter` = 9 s without a successful heartbeat (measured on the
+  monotonic clock), it calls `fenceAll`, which **undeploys every workload,
+  stateless Workers included**.
+- When mgmt is reachable again, `syncAssignments` deploys them back.
+- `FenceAfter` has no flag. Its comment ("below the 10 s lease TTL") is
+  stale: `NamespaceLeaseTTL` is 15 s and `HostLeaseTTL` is 10 s.
+
+**Consequences:**
+- The split brain I described (a partitioned host serving forever) is
+  already prevented, as long as `fenceAll` really stops serving, because
+  9 s is less than the 15 s lease.
+- The cost is availability: any mgmt or Postgres outage of more than 9 s
+  stops **every** workload on **every** host. That includes a routine
+  Postgres restart or failover, which is often 10–30 s; S5 will show it.
+- Ross's decision ("hosts stay fail-static; Workers keep serving")
+  contradicts the current code. ADR-028 §3 needs re-deciding with the
+  facts.
+- F4 (guarded moves) stays valid: it prevents moving a stateful workload
+  onto empty state before the old host is confirmed gone.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -528,3 +557,5 @@ Hermetic `make test-go` and `make test-pg` are green.
 2026-11-11 iter11 PLAN | H04 | n/a | confirm if a root ends with > maxLive (5) live descendants after 40 concurrent spawns across 3 replicas; refute if ≤5 in 3 runs | I5
 2026-11-11 iter11 | H04 | n/a ×6 | NOT REPRODUCED (open) | — | results/*-H04 | 0/2/5/20 ms PG delay: always exactly 5 live. At 20 ms, 23/40 spawns exceeded the 5 s client timeout (I8 latency: look at serialisation under DB latency). Paused here for Ross's self-fencing interview
 2026-11-11 iter12 | F4 | n/a | DONE | — | unit tests; make test-go/test-pg green | the first test wrongly assumed a pinned move from a live holder is allowed (it's refused, which is safe); its message was fixed instead
+2026-11-11 iter13 PLAN | H06 | n/a | confirm if a kill served by r1 reaches a host registered with r0 only via heartbeat or after > 1 s; refute if pushed within 1 s | I6
+2026-11-11 iter13 | H06 | n/a ×2 | CONFIRMED | I6 | results/*-H06 | via r0: pushed in 12–15 ms; via r1: no push, heartbeat after ~1.5 s. While reading hostd's heartbeat found existing self-fencing (FenceAfter 9 s, all workloads): correction recorded, ADR-028 §3 to be re-decided
