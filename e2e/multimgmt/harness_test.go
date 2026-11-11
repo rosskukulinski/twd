@@ -6,6 +6,7 @@
 package multimgmt
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"database/sql"
@@ -129,6 +130,32 @@ type fakeTS struct {
 	liveKeys     map[string]string // key ID → object ID
 	createTimes  []time.Time
 	deletedDevs  []string
+	hold         bool // while true, key creation answers 503 (objects stay pending)
+	held         int  // 503s served while holding
+}
+
+func (f *fakeTS) setHold(v bool) { f.mu.Lock(); f.hold = v; f.mu.Unlock() }
+
+// keyCounts returns object ID → number of keys ever created for it.
+func (f *fakeTS) keyCounts() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]int{}
+	for o, ks := range f.keysByObject {
+		out[o] = len(ks)
+	}
+	return out
+}
+
+// liveKeyCounts returns object ID → number of keys created and not deleted.
+func (f *fakeTS) liveKeyCounts() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]int{}
+	for _, o := range f.liveKeys {
+		out[o]++
+	}
+	return out
 }
 
 const fakeAPIToken = "fake-api-token"
@@ -149,6 +176,11 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	switch {
+	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/keys") && f.hold:
+		f.held++
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(503)
+		w.Write([]byte(`{"message":"fakeTS: holding"}`))
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/keys"):
 		var body struct {
 			Description string `json:"description"`
@@ -356,8 +388,14 @@ func (c *cluster) client(i int) *http.Client {
 		}}}
 }
 
-// call does one API request on replica i and returns status and body.
+// call does one API request on replica i as the local principal.
 func (c *cluster) call(i int, method, path string, body any) (int, []byte, error) {
+	return c.callAs(i, "", method, path, body)
+}
+
+// callAs does one API request on replica i, as host (Twd-Host-ID) when host
+// is not empty, and returns status and body.
+func (c *cluster) callAs(i int, host, method, path string, body any) (int, []byte, error) {
 	var rd io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
@@ -365,8 +403,15 @@ func (c *cluster) call(i int, method, path string, body any) (int, []byte, error
 	}
 	req, _ := http.NewRequest(method, "http://twd-mgmt"+path, rd)
 	req.Header.Set("Twd-Host-Token", c.token)
+	if host != "" {
+		req.Header.Set("Twd-Host-ID", host)
+	}
 	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
+		ct := "application/json"
+		if method == "PATCH" {
+			ct = "application/merge-patch+json"
+		}
+		req.Header.Set("Content-Type", ct)
 	}
 	resp, err := c.client(i).Do(req)
 	if err != nil {
@@ -423,6 +468,110 @@ func advisoryHolders(db *sql.DB) ([]string, error) {
 		var granted bool
 		rows.Scan(&pid, &state, &app, &granted)
 		out = append(out, fmt.Sprintf("pid=%d state=%s app=%q granted=%v", pid, state, app, granted))
+	}
+	return out, rows.Err()
+}
+
+// ---- tenant / host / deployment setup ----
+
+const twdJSONC = `{ "tailnet": { "objects": {
+    "SupportAgent": { "tags": ["tag:twd-agent-support"], "agent": true },
+    "LookupAgent":  { "tags": ["tag:twd-agent-support-sub"], "agent": true },
+  },
+  "spawn": { "maxLive": 64, "maxDepth": 3 } } }`
+
+func makeBundle(files map[string]string) []byte {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for name, body := range files {
+		tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(body)), Typeflag: tar.TypeReg})
+		tw.Write([]byte(body))
+	}
+	tw.Close()
+	return buf.Bytes()
+}
+
+// must does callAs on replica i and fails the test unless the status is 2xx;
+// it decodes the body into out when out is not nil.
+func (c *cluster) must(i int, host, method, path string, body, out any) {
+	c.t.Helper()
+	st, b, err := c.callAs(i, host, method, path, body)
+	if err != nil || st/100 != 2 {
+		c.t.Fatalf("r%d %s %s: %d %v %.300s", i, method, path, st, err, b)
+	}
+	if out != nil {
+		if err := json.Unmarshal(b, out); err != nil {
+			c.t.Fatalf("r%d %s %s: decode: %v", i, method, path, err)
+		}
+	}
+}
+
+// firstRunning returns the index of a running replica, or -1.
+func (c *cluster) firstRunning() int {
+	for i := range c.replicas {
+		if c.running(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+type setup struct {
+	tenantID string
+	workload string
+	epoch    int64
+}
+
+// setupTenant creates a tenant (API-key mode against the fake TS API), host
+// h1, and a deployment of workload w, all through replica i.
+func (c *cluster) setupTenant(i int, rpm int) setup {
+	c.t.Helper()
+	keyFile := filepath.Join(c.r.dir, "api.env")
+	os.WriteFile(keyFile, []byte("TS_API_KEY="+fakeAPIToken+"\n"), 0o600)
+	var tn struct{ TenantID string }
+	c.must(i, "", "POST", "/v1/tenants", map[string]any{"tailnet": "t.ts.net", "mintMode": "apikey", "apiKeyFile": keyFile,
+		"registrationsPerMinute": rpm}, &tn)
+	c.must(i, "h1", "PUT", "/v1/hosts/h1", map[string]any{"capacityNodes": 10000, "tiers": []string{"process"}}, nil)
+	var dep struct {
+		Epoch int64
+	}
+	bundle := makeBundle(map[string]string{"twd.jsonc": twdJSONC, "dist/index.js": "export default {}"})
+	c.must(i, "", "POST", "/v1/deployments", map[string]any{"tenantID": tn.TenantID, "workload": "w", "bundle": bundle}, &dep)
+	return setup{tenantID: tn.TenantID, workload: "w", epoch: dep.Epoch}
+}
+
+// heartbeat keeps host h1 live (and renews its lease) every 2 s through any
+// running replica, until stop is closed.
+func (c *cluster) heartbeat(s setup, stop <-chan struct{}) {
+	go func() {
+		tk := time.NewTicker(2 * time.Second)
+		defer tk.Stop()
+		for {
+			if i := c.firstRunning(); i >= 0 {
+				c.callAs(i, "h1", "PUT", "/v1/hosts/h1/status", map[string]any{"liveNodes": 0,
+					"leases": []map[string]any{{"namespace": s.workload, "epoch": s.epoch}}})
+			}
+			select {
+			case <-stop:
+				return
+			case <-tk.C:
+			}
+		}
+	}()
+}
+
+// objectStatuses reads object ID → status straight from Postgres.
+func objectStatuses(db *sql.DB) (map[string]string, error) {
+	rows, err := db.Query("SELECT id, status FROM objects")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, st string
+		rows.Scan(&id, &st)
+		out[id] = st
 	}
 	return out, rows.Err()
 }
