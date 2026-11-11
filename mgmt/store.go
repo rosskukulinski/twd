@@ -62,6 +62,11 @@ type Store interface {
 	SetDeviceDelete(ctx context.Context, id string, due int64) error
 	ClaimDeviceDelete(ctx context.Context, id string, now int64) (bool, error)
 	DueDeviceDeletes(ctx context.Context, now int64) ([]string, error)
+	// Shared-secret arbitration (F11, H13): ChooseSecret records the first
+	// key ID offered for name and returns the chosen one.
+	ChooseSecret(ctx context.Context, name, keyID string, now int64) (string, error)
+	SecretChoice(ctx context.Context, name string) (string, error)
+	DeleteSecretChoice(ctx context.Context, name string) error
 	// UpsertReplica records a mgmt replica (registry: F6/H11); ListReplicas
 	// returns every recorded replica, live or not.
 	UpsertReplica(ctx context.Context, r Replica) error

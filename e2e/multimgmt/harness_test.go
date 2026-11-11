@@ -228,6 +228,16 @@ var setecVals = struct {
 	m map[string][]byte
 }{m: map[string][]byte{}}
 
+func setecDeletePrefix(prefix string) {
+	setecVals.Lock()
+	for k := range setecVals.m {
+		if strings.HasPrefix(k, prefix) {
+			delete(setecVals.m, k)
+		}
+	}
+	setecVals.Unlock()
+}
+
 func setecDelete(name string) {
 	setecVals.Lock()
 	delete(setecVals.m, name)

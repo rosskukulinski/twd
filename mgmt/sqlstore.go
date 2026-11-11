@@ -172,6 +172,31 @@ func (s *SQLStore) DueDeviceDeletes(ctx context.Context, now int64) ([]string, e
 	return out, rows.Err()
 }
 
+// ChooseSecret records keyID as the secret for name unless another key was
+// chosen first, and returns the chosen key ID (mm-loop F11, H13).
+func (s *SQLStore) ChooseSecret(ctx context.Context, name, keyID string, now int64) (string, error) {
+	if _, err := s.db.ExecContext(ctx, s.q("INSERT INTO secret_choice (name, key_id, created_at) VALUES (?, ?, ?) ON CONFLICT (name) DO NOTHING"),
+		name, keyID, now); err != nil {
+		return "", err
+	}
+	return s.SecretChoice(ctx, name)
+}
+
+// SecretChoice returns the chosen key ID for name (ErrNotFound if none).
+func (s *SQLStore) SecretChoice(ctx context.Context, name string) (string, error) {
+	var k string
+	err := s.db.QueryRowContext(ctx, s.q("SELECT key_id FROM secret_choice WHERE name=?"), name).Scan(&k)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return k, err
+}
+
+func (s *SQLStore) DeleteSecretChoice(ctx context.Context, name string) error {
+	_, err := s.db.ExecContext(ctx, s.q("DELETE FROM secret_choice WHERE name=?"), name)
+	return err
+}
+
 func (s *SQLStore) UpsertReplica(ctx context.Context, r Replica) error {
 	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO replicas (id, custody, started_at, last_seen) VALUES (?, ?, ?, ?)
 		ON CONFLICT (id) DO UPDATE SET custody=excluded.custody, started_at=excluded.started_at, last_seen=excluded.last_seen`),
@@ -280,6 +305,8 @@ CREATE TABLE IF NOT EXISTS revocations (
 CREATE TABLE IF NOT EXISTS tenant_throttle (
   tenant_id TEXT PRIMARY KEY, tokens REAL NOT NULL, rate REAL NOT NULL, last BIGINT NOT NULL,
   pause_till BIGINT NOT NULL, failures BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS secret_choice (
+  name TEXT PRIMARY KEY, key_id TEXT NOT NULL, created_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS replicas (
   id TEXT PRIMARY KEY, custody TEXT NOT NULL, started_at BIGINT NOT NULL, last_seen BIGINT NOT NULL);
 `

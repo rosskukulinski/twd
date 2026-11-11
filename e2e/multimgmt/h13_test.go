@@ -63,8 +63,11 @@ func TestMM_H13_OBORootKeyDiverges(t *testing.T) {
 	}
 	// (b) drop the keys from custody, restart every replica (cold caches),
 	// then hit each tenant on all replicas at once.
+	// Truly cold: no choice row and no custody entry (legacy or keyed).
+	db := c.db()
 	for _, tid := range tids {
-		setecDelete("twd/" + tid + "/obo-root")
+		db.Exec("DELETE FROM secret_choice WHERE name=$1", "obo/"+tid)
+		setecDeletePrefix("twd/" + tid + "/obo-root")
 	}
 	for i := range replicas {
 		c.stop(i, syscall.SIGTERM)

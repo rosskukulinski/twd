@@ -202,7 +202,11 @@ func (m *Mgmt) DeleteTenant(ctx context.Context, id string, force bool, by strin
 		delete(m.queues, id)
 	}
 	m.mu.Unlock()
+	if kid, err := m.store.SecretChoice(ctx, oboChoiceName(id)); err == nil {
+		m.custody.Delete(ctx, oboKeyName(id, kid))
+	}
 	m.custody.Delete(ctx, oboCustodyName(id))
+	m.store.DeleteSecretChoice(ctx, oboChoiceName(id))
 	m.audit(ctx, AuditRecord{TenantID: id, Kind: "tenant_delete", ActingFor: by}, map[string]any{"tailnet": t.Tailnet, "force": force,
 		"killed": len(res.Killed), "purged": len(res.Purged), "deployments": res.DeploymentsStopped, "by": by})
 	return res, nil
