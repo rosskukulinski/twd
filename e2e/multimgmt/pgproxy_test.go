@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -118,5 +119,9 @@ func viaProxy(t *testing.T, dsn, addr string) string {
 		t.Fatal(err)
 	}
 	u.Host = addr
-	return u.String()
+	out := u.String()
+	if extra := os.Getenv("TWD_MM_DSN_SUFFIX"); extra != "" { // e.g. &twd_max_conns=2
+		out += extra
+	}
+	return out
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,7 +64,7 @@ func (c *dbClock) sync(ctx context.Context) error {
 	mid := t0.Add(t1.Sub(t0) / 2)
 	c.mu.Lock()
 	c.base, c.at, c.syncedAt = db, mid, t1
-	c.offset = db.Sub(mid.Round(0)) // Round(0) strips the monotonic reading: wall-clock offset
+	c.offset = db.Sub(wallNowAt(mid).Round(0)) // Round(0) strips the monotonic reading: wall-clock offset
 	c.mu.Unlock()
 	return nil
 }
@@ -167,3 +168,14 @@ func (m *Mgmt) checkClock() {
 		m.log.Info("clock ok", "offsetMs", cs.OffsetMs)
 	}
 }
+
+// testWallOffset shifts this process's view of the wall clock (tests only:
+// twd-mgmt sets it from TWD_TEST_WALL_CLOCK_OFFSET, and only with
+// -local-dev). It simulates a machine whose clock is wrong (mm-loop S8).
+var testWallOffset atomic.Int64
+
+// SetTestWallClockOffset sets the simulated wall-clock error.
+func SetTestWallClockOffset(d time.Duration) { testWallOffset.Store(int64(d)) }
+
+// wallNowAt is t as this machine's (possibly wrong) wall clock reads it.
+func wallNowAt(t time.Time) time.Time { return t.Add(time.Duration(testWallOffset.Load())) }

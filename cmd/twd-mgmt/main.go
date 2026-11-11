@@ -84,6 +84,15 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if v := os.Getenv("TWD_TEST_WALL_CLOCK_OFFSET"); v != "" {
+		// Test-only (mm-loop S8): simulate a wrong machine clock.
+		d, err := time.ParseDuration(v)
+		if err != nil || !*localDev {
+			return fmt.Errorf("TWD_TEST_WALL_CLOCK_OFFSET is a test hook: it needs -local-dev and a duration (got %q)", v)
+		}
+		mgmt.SetTestWallClockOffset(d)
+		log.Warn("TEST HOOK: wall clock offset", "offset", d)
+	}
 	dsn := *dbDSN
 	if *dbDSNFile != "" {
 		b, err := os.ReadFile(*dbDSNFile)

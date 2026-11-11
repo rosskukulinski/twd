@@ -604,7 +604,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	var resp DeployResponse
 	t, err := m.store.GetTenant(ctx, r.TenantID)
 	if err != nil {
-		return resp, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID)
+		return resp, lookupErr(err, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID))
 	}
 	if !validName(r.Workload) {
 		return resp, errf(400, "bad_request", "workload must be a DNS label ([a-z0-9-], ≤63)")
@@ -969,7 +969,7 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	var resp CreateObjectResponse
 	t, err := m.store.GetTenant(ctx, r.TenantID)
 	if err != nil {
-		return resp, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID)
+		return resp, lookupErr(err, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID))
 	}
 	if r.ObjectName == "" || len(r.ObjectName) > 256 {
 		return resp, errf(400, "bad_request", "objectName required (≤256 bytes)")
@@ -977,6 +977,9 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	var parent *Object
 	if r.Parent != nil && r.Parent.ID != "" {
 		p, err := m.store.GetObject(ctx, r.Parent.ID)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return resp, asAPIError(err)
+		}
 		if err != nil || p.TenantID != t.ID {
 			return resp, errf(404, "delegation_invalid", "parent %q not found in tenant %s", r.Parent.ID, t.ID)
 		}
@@ -1001,6 +1004,9 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	}
 	if errors.Is(err, ErrAmbiguous) {
 		return resp, errf(409, "namespace_ambiguous", "%v", err)
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return resp, asAPIError(err)
 	}
 	if err != nil {
 		in := ""
@@ -1741,6 +1747,18 @@ func (r *KillResult) warnDeviceDelete(id string) {
 // revokeObjects is the fallback), deletes devices via the tenant API (tier
 // 2; deferred by DeviceDeleteDelay), revokes unused keys, wipes custody, and
 // records audit.
+// lookupErr turns a failed lookup into its API error: a real not-found is
+// notFound (a 404), anything else (a store outage, a lock timeout) keeps its
+// own retryable or internal mapping instead of masquerading as a 404 that
+// clients would not retry (found by S9: a burst got 404 unknown_tenant for an
+// existing tenant).
+func lookupErr(err error, notFound *Error) error {
+	if errors.Is(err, ErrNotFound) {
+		return notFound
+	}
+	return asAPIError(err)
+}
+
 // errAlreadyDead: the object was killed (or failed) between Kill's read and
 // its write, by another replica or the reaper.
 var errAlreadyDead = errors.New("already dead")
@@ -2354,7 +2372,7 @@ func (m *Mgmt) Preflight(ctx context.Context, tenantID string, r PreflightReques
 	res := PreflightResult{Missing: []PreflightMissing{}, MissingTagOwners: []string{}}
 	t, err := m.store.GetTenant(ctx, tenantID)
 	if err != nil {
-		return res, errf(404, "unknown_tenant", "tenant %q not found", tenantID)
+		return res, lookupErr(err, errf(404, "unknown_tenant", "tenant %q not found", tenantID))
 	}
 	pol, err := m.policies.Get(ctx, t)
 	if err != nil {

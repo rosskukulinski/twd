@@ -41,3 +41,13 @@ func TestWithSessionLimits(t *testing.T) {
 		t.Fatalf("an explicit lock_timeout must be kept: %s", d2)
 	}
 }
+
+func TestTakeMaxConns(t *testing.T) {
+	d, n := takeMaxConns("postgres://u:p@h:5432/db?sslmode=disable&twd_max_conns=3")
+	if n != 3 || strings.Contains(d, "twd_max_conns") || !strings.Contains(d, "sslmode=disable") {
+		t.Fatalf("got %q %d", d, n)
+	}
+	if _, n := takeMaxConns("postgres://h/db"); n != DefaultMaxConns {
+		t.Fatalf("default = %d", n)
+	}
+}

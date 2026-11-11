@@ -322,8 +322,9 @@ type cluster struct {
 	token     string
 	replicas  []*replica
 	extraArgs []string
-	repMu     sync.Mutex // guards replica process state (chaos runs start/stop concurrently with calls)
-	jsonc     string     // twd.jsonc for setupTenant ("" = twdJSONC)
+	repMu     sync.Mutex       // guards replica process state (chaos runs start/stop concurrently with calls)
+	jsonc     string           // twd.jsonc for setupTenant ("" = twdJSONC)
+	env       map[int][]string // extra environment per replica
 }
 
 // proxy returns replica i's Postgres fault proxy.
@@ -382,6 +383,7 @@ func (c *cluster) start(i int) {
 		"-db", viaProxy(c.t, c.dsn, rp.pg.addr()), "-custody", "setec", "-setec-url", c.setec.URL, "-tsapi-url", c.ts.srv.URL, "-reap-interval", "2s",
 		"-no-loopback"}, c.extraArgs...)
 	cmd := exec.Command(mgmtBinary(c.t), args...)
+	cmd.Env = append(os.Environ(), c.env[i]...)
 	cmd.Stdout, cmd.Stderr = lf, lf
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {

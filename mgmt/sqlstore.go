@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,10 +38,17 @@ var _ Store = (*SQLStore)(nil)
 func OpenStore(ctx context.Context, dsn string) (*SQLStore, error) {
 	var s *SQLStore
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		dsn, maxConns := takeMaxConns(dsn)
 		db, err := sql.Open("pgx", withSessionLimits(dsn))
 		if err != nil {
 			return nil, err
 		}
+		// Bounded pool (H19): a burst of requests waits for a connection
+		// instead of opening hundreds and exhausting the server's
+		// max_connections ("too many clients"), which fails every replica.
+		db.SetMaxOpenConns(maxConns)
+		db.SetMaxIdleConns(maxConns)
+		db.SetConnMaxIdleTime(5 * time.Minute)
 		s = &SQLStore{db: db, d: dialectPostgres}
 	} else {
 		path := strings.TrimPrefix(dsn, "sqlite:")
@@ -272,6 +281,29 @@ const (
 	pgLockTimeoutMs     = 3000
 	pgIdleInTxTimeoutMs = 3000
 )
+
+// DefaultMaxConns bounds each replica's Postgres pool; N replicas use at
+// most N×DefaultMaxConns connections. Override with ?twd_max_conns=K.
+const DefaultMaxConns = 16
+
+// takeMaxConns removes twd's own twd_max_conns parameter from dsn (pgx would
+// send it to the server) and returns the pool size.
+func takeMaxConns(dsn string) (string, int) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn, DefaultMaxConns
+	}
+	q := u.Query()
+	n := DefaultMaxConns
+	if v := q.Get("twd_max_conns"); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k > 0 {
+			n = k
+		}
+		q.Del("twd_max_conns")
+		u.RawQuery = q.Encode()
+	}
+	return u.String(), n
+}
 
 // withSessionLimits adds the session limits as startup parameters unless the
 // DSN already sets them.

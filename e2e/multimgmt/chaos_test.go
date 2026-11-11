@@ -198,9 +198,12 @@ func runWorkload(ctx context.Context, c *cluster, g *rng, s setup, h *history, w
 		if err != nil {
 			r.Err = err.Error()
 		} else if st/100 != 2 {
-			var e struct{ Code string }
+			var e struct{ Code, Message string }
 			json.Unmarshal(b, &e)
 			r.Code = e.Code
+			if st >= 500 {
+				r.Err = e.Message // what the server said (diagnosis)
+			}
 		}
 		h.add(r)
 		return st, b
@@ -346,6 +349,12 @@ func checkInvariants(t *testing.T, c *cluster, g *rng, s setup, h *history, r *r
 		GROUP BY root_id HAVING COUNT(*) > $2) x`, s.tenantID, chaosMaxLive).Scan(&over)
 	add("I5", over == 0, "roots over maxLive %d: %d", chaosMaxLive, over)
 
+	// Quota: live objects ≤ the tenant's maxObjects (H16).
+	var liveN, maxObj int
+	db.QueryRow("SELECT COUNT(*) FROM objects WHERE tenant_id=$1 AND status NOT IN ('killed','failed')", s.tenantID).Scan(&liveN)
+	db.QueryRow("SELECT max_objects FROM tenants WHERE id=$1", s.tenantID).Scan(&maxObj)
+	add("Quota", maxObj == 0 || liveN <= maxObj, "live objects %d, maxObjects %d", liveN, maxObj)
+
 	// I6: every killed object that had a device had it deleted.
 	rows, _ = db.Query("SELECT stable_node_id FROM objects WHERE tenant_id=$1 AND status='killed' AND stable_node_id<>''", s.tenantID)
 	c.ts.mu.Lock()
@@ -424,10 +433,18 @@ func first(l []string, n int) []string {
 // runScenario sets up 3 replicas, runs the workload with chaos(ctx, c, g)
 // for the scenario duration, restores every replica, and checks invariants.
 func runScenario(t *testing.T, name string, chaos func(ctx context.Context, c *cluster, g *rng, h *history)) {
+	runScenarioWith(t, name, nil, chaos)
+}
+
+// runScenarioWith is runScenario with prep run before the replicas start.
+func runScenarioWith(t *testing.T, name string, prep func(c *cluster), chaos func(ctx context.Context, c *cluster, g *rng, h *history)) {
 	seed := scenarioSeed()
 	r := newRun(t, fmt.Sprintf("%s-seed%d", name, seed))
 	c := newCluster(t, r, 3)
 	c.jsonc = strings.Replace(twdJSONC, `"maxLive": 64`, fmt.Sprintf(`"maxLive": %d`, chaosMaxLive), 1)
+	if prep != nil {
+		prep(c)
+	}
 	for i := range 3 {
 		c.start(i)
 		if _, err := c.waitReady(i, 10*time.Second); err != nil {
@@ -676,5 +693,102 @@ func TestMM_S7a_SimultaneousColdStart(t *testing.T) {
 			}
 			h.outage(start.Add(-time.Second), time.Now().Add(2*time.Second))
 		}
+	})
+}
+
+// S8: one replica's machine clock is 20 s ahead and another's 20 s behind
+// (test hook, -local-dev only). Ownership decisions use the store clock
+// (F1), so every invariant must hold; /v1/status on the skewed replicas
+// must report clock.ok=false (F2).
+func TestMM_S8_ClockSkew(t *testing.T) {
+	skew := map[int]time.Duration{1: 20 * time.Second, 2: -20 * time.Second}
+	runScenarioWith(t, "S8", func(c *cluster) {
+		c.env = map[int][]string{}
+		for i, d := range skew {
+			c.env[i] = []string{"TWD_TEST_WALL_CLOCK_OFFSET=" + d.String()}
+		}
+	}, func(ctx context.Context, c *cluster, g *rng, h *history) {
+		time.Sleep(12 * time.Second) // a couple of reaper ticks
+		for i := range 3 {
+			_, b, err := c.call(i, "GET", "/v1/status", nil)
+			var st struct {
+				OK    bool
+				Clock struct {
+					OK       bool
+					OffsetMs int64
+				}
+			}
+			json.Unmarshal(b, &st)
+			want := skew[i]
+			t.Logf("r%d (skew %v): status ok=%v clock ok=%v offset=%dms err=%v", i, want, st.OK, st.Clock.OK, st.Clock.OffsetMs, err)
+			if want == 0 && !st.Clock.OK {
+				t.Errorf("r%d has no skew but reports clock not ok (offset %d ms)", i, st.Clock.OffsetMs)
+			}
+			if want != 0 && (st.Clock.OK || st.Clock.OffsetMs > -want.Milliseconds()+2000 || st.Clock.OffsetMs < -want.Milliseconds()-2000) {
+				t.Errorf("r%d skewed %v: status must report clock not ok with offset ≈ %d ms, got ok=%v offset=%d", i, want, -want.Milliseconds(), st.Clock.OK, st.Clock.OffsetMs)
+			}
+		}
+		<-ctx.Done()
+	})
+}
+
+// S9: a hot tenant: 500 concurrent creates and spawns spread over the
+// replicas mid-workload (audit-head, throttle, quota and budget contention).
+func TestMM_S9_HotTenant(t *testing.T) {
+	runScenario(t, "S9", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(10 * time.Second):
+		}
+		tid := ""
+		// The tenant is the only one: read it from any replica.
+		_, b, _, _ := c.callAny(g, "", "GET", "/v1/tenants", nil)
+		var tl struct{ Items []struct{ TenantID string } }
+		json.Unmarshal(b, &tl)
+		if len(tl.Items) > 0 {
+			tid = tl.Items[0].TenantID
+		}
+		var roots []string
+		for k := range 20 {
+			_, b, _, _ := c.callAny(g, "h1", "POST", "/v1/objects", map[string]any{"tenantID": tid, "namespace": "SupportAgent", "objectName": fmt.Sprintf("hot-root-%02d", k)})
+			var o struct{ ObjectID string }
+			if json.Unmarshal(b, &o) == nil && o.ObjectID != "" {
+				roots = append(roots, o.ObjectID)
+			}
+		}
+		var wg sync.WaitGroup
+		gate := make(chan struct{})
+		for k := range 500 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-gate
+				body := map[string]any{"tenantID": tid, "namespace": "SupportAgent", "objectName": fmt.Sprintf("hot-%03d", k)}
+				op := "hot-create"
+				if k%2 == 1 && len(roots) > 0 {
+					body = map[string]any{"tenantID": tid, "namespace": "LookupAgent", "objectName": fmt.Sprintf("hot-c%03d", k),
+						"parent": map[string]any{"objectID": roots[k%len(roots)]}}
+					op = "hot-spawn"
+				}
+				t0 := time.Now()
+				st, b, rep, err, tries := c.callAnyTrace(g, "h1", "POST", "/v1/objects", body)
+				rec := opRec{T: t0.UnixMilli(), Op: op, Replica: rep, Status: st, Ms: time.Since(t0).Milliseconds(), Attempts: tries}
+				if err != nil {
+					rec.Err = err.Error()
+				} else if st/100 != 2 {
+					var e struct{ Code, Message string }
+					json.Unmarshal(b, &e)
+					rec.Code = e.Code
+					if st >= 500 {
+						rec.Err = e.Message
+					}
+				}
+				h.add(rec)
+			}()
+		}
+		close(gate)
+		wg.Wait()
+		<-ctx.Done()
 	})
 }

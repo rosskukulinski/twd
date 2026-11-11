@@ -49,6 +49,8 @@ FIX_MODE: fix
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
 | H17 | P2 | **CHANGED (FOR SHARE), effect not isolated** (iter30). Was open (from S6: fenced commits hold the workload's lease row FOR UPDATE across several round trips; a slow replica stalls everyone's credential/ready/renew for that workload; p99 3.6 s on fast replicas) | S6 locks.txt |
+| H19 | P1 | **CONFIRMED and FIXED** (F19): each replica's Postgres pool was unbounded; a 500-request burst opened enough connections to hit `max_connections` ("sorry, too many clients already", SQLSTATE 53300), failing requests on every replica. Pool now bounded (default 16, `?twd_max_conns=K`) | S9 seed 2; `TestTakeMaxConns` |
+| H20 | P1 | **CONFIRMED and FIXED**: `CreateObject` and `PreflightBundle` mapped *any* tenant, parent or namespace lookup error to a 404 (`unknown_tenant`, …), so store outages looked like permanent not-founds that clients wouldn't retry, and the I8 oracle didn't count them. They now keep their 503 or 500 mapping; real not-founds stay 404 | S9, S5 op-codes |
 | H18 | P3 | **FIXED** (iter30): store unavailable, lock timeout or idle-transaction timeout → `503 store_unavailable` with Retry-After | `TestStoreUnavailableMapping` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
@@ -58,7 +60,10 @@ FIX_MODE: fix
 | S6 | — | **3/3 clean seeds** after the harness got load-balancer semantics (iter30); was failing I8 at 1.3–2.2% | `TestMM_S6_SlowPostgresOneReplica` |
 | S1 | — | **3/3 clean seeds** (rolling SIGTERM restarts under load) | `TestMM_S1_RollingRestart` |
 | S7 | — | **clean**: S7a 3/3 seeds (all replicas killed and cold-started at once, twice, under load); S7b passes (3 concurrent `OpenStore` migrating a pre-M7 Postgres store: once, 50/50 rows intact) | `TestMM_S7a_SimultaneousColdStart`, `TestStoreConcurrentLegacyMigration` (make test-pg) |
-| S8–S11 | — | 0/3 seeds each | |
+| S8 | — | **3/3 clean seeds** (machine clock +20 s / −20 s on two replicas; skew reported by /v1/status, no invariant affected) | `TestMM_S8_ClockSkew` |
+| S9 | — | **3/3 clean seeds** after F19 + H20 (500-op burst: 300 created, 200 spawn_budget_exceeded, quota held at exactly 1000) | `TestMM_S9_HotTenant` |
+| S5 (re-verified) | — | 3/3 again after H20 (store errors now 503 inside the declared outage; 0.05–0.09% outside) | |
+| S10, S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -950,6 +955,47 @@ others, and H18 is a real fix. Their effect on S6 isn't demonstrated.
 retry on a different backend, plus passive and active health checks
 (eject on timeouts, probe `GET /v1/status`).
 
+### Iteration 32: S8 and S9, and two bugs S9 dug out (H19, H20)
+
+**S8 (clock skew, process level).** I added a test-only hook,
+`TWD_TEST_WALL_CLOCK_OFFSET` (honoured only with `-local-dev`; otherwise
+`twd-mgmt` refuses to start). It shifts mgmt's wall-clock reads (`realClock`
+and the store clock's offset measurement), simulating a wrong machine
+clock. With r1 at +20 s and r2 at −20 s:
+- `/v1/status` reports `clock.ok=false` with offsets of −19,999 ms and
+  +20,000 ms;
+- r0 stays ok;
+- every invariant holds over 3 seeds. This is the end-to-end confirmation
+  of F1 and F2.
+
+**S9 (hot tenant).**
+- 20 roots, then a 500-request burst (creates plus spawns) across the
+  replicas mid-workload.
+- New oracle invariant **Quota**: live objects ≤ `maxObjects`.
+
+**What the first S9 runs showed:**
+1. **H20 (masking).** 65–97 burst requests got `404 unknown_tenant` for a
+   tenant that exists. `CreateObject` turned any lookup error into a 404,
+   and so did the parent and namespace lookups and `PreflightBundle`.
+   `lookupErr` now keeps real not-founds as 404 and maps everything else
+   through `asAPIError` (503 or 500).
+2. **H19 (connection storm).** With the masking gone, the errors were
+   `FATAL: sorry, too many clients already`. Each replica's pool had no
+   limit. Pools are now bounded (`DefaultMaxConns` = 16; DSN
+   `twd_max_conns`), and requests queue for a connection.
+   - **Deadlock check:** with a pool of **2**, the Postgres API suites and
+     the whole multi-replica hypothesis e2e suite pass with no hang. Two
+     store tests failed only because they `sql.Open` the DSN directly, so
+     pgx forwarded the twd-only parameter.
+3. **After:** S9 seeds 1, 2, 3 are identical. 300 created and 200
+   `spawn_budget_exceeded`, 0 store errors, and the tenant holds at
+   exactly 1,000 objects.
+
+**Re-verification forced by H20.** The masking had hidden store errors in
+earlier runs. Every S5 run had 265–662 masked 404s. S5 was rerun: 3/3 pass,
+with the 503s inside the declared outage and 0.05–0.09% failures outside.
+No other scenario had masked 404s.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -1022,3 +1068,4 @@ retry on a different backend, plus passive and active health checks
 2026-11-11 iter30 | S6 diagnosis | seeds 1–3 + A/B | 3/3 PASS after harness LB semantics; mgmt: session limits, FOR SHARE fence, 503 store_unavailable (H18) | I8 | results/*-S6-* (attempts traces) | A/B: S6 passes without the mgmt changes too; recorded as defense in depth
 2026-11-11 iter31 PLAN | S1 (rolling SIGTERM restarts), S7a (simultaneous kill+cold start ×2 under load), S7b (3 concurrent OpenStore on a pre-M7 Postgres store) | seeds 1–3 | pass if all invariants hold / migration once, rows intact | I3 I5 I6 I7 I8 I9 I11, migration
 2026-11-11 iter31 | S1, S7a, S7b | seeds 1–3 | 7/7 PASS | — | results/*-S1-*, *-S7a-*; make test-pg | no product changes
+2026-11-11 iter32 | S8, S9 (+ S5 re-run) | seeds 1–3 each | all PASS after F19 + H20 | I8, Quota | results/*-S8-*, *-S9-*, *-S5-* | H19 connection storm and H20 404 masking found by S9; pool-size-2 deadlock hunt clean
