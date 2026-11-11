@@ -601,6 +601,9 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		return resp, err
 	}
 	lease, err := m.store.AcquireLease(ctx, LeaseName(t.ID, r.Workload), host, NamespaceLeaseTTL, m.now())
+	if errors.Is(err, ErrLeaseHeld) {
+		return resp, m.leaseHeldError(ctx, LeaseName(t.ID, r.Workload), r.Workload)
+	}
 	if err != nil {
 		return resp, err
 	}
@@ -672,6 +675,29 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 		v.Endpoint.Node, _, _ = strings.Cut(o.MagicDNS, ".")
 	}
 	return v, nil
+}
+
+// leaseHeldError explains a deploy that placement sent to a new host while
+// the workload's lease is still held: the holder has stopped heartbeating
+// (dead to placement after HostLeaseTTL) but its lease (NamespaceLeaseTTL)
+// has not expired. Retry-After is the time left on the lease.
+func (m *Mgmt) leaseHeldError(ctx context.Context, name, workload string) *Error {
+	now := m.now()
+	l, err := m.store.GetLease(ctx, name)
+	if err != nil {
+		return errf(409, "lease_held", "workload %q: its lease is held by another host", workload)
+	}
+	seen := "never"
+	if h, err := m.store.GetHost(ctx, l.Holder); err == nil && h.LastSeen > 0 {
+		seen = now.Sub(time.UnixMilli(h.LastSeen)).Round(time.Second).String() + " ago"
+	}
+	left := time.UnixMilli(l.ExpiresAt).Sub(now)
+	if left < 0 {
+		left = 0
+	}
+	e := errf(409, "lease_held", "workload %q is still leased to host %s (epoch %d); this mgmt last saw it %s (a host is dead to placement after %v), and the lease expires in %v. Redeploy after that, or pin a live host (the deploy request's \"host\" field)", workload, l.Holder, l.Epoch, seen, HostLeaseTTL, left.Round(time.Second))
+	e.RetryAfter = max(1, int((left+time.Second-1)/time.Second))
+	return e
 }
 
 // pickHost: MVP is a single host per tenant namespace. Keep the current

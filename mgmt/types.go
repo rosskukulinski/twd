@@ -205,6 +205,8 @@ type Error struct {
 	Snippet string         `json:"snippet,omitempty"`
 	DocURL  string         `json:"doc_url,omitempty"`
 	TraceID string         `json:"trace_id"`
+	// RetryAfter (seconds), when set, is sent as the Retry-After header.
+	RetryAfter int `json:"-"`
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }

@@ -15,7 +15,7 @@ FIX_MODE: fix
 | F1 | Postgres/SQLite clock for lease acquire/renew/expiry, host `last_seen`/liveness, expiry windows; `Store.Now` hook for tests | H10 | `TestMM_H10_LeaseClockSkew` (0–20 s, both directions) | **DONE**: fails before (same 10/15 s thresholds), passes after; `make test-go`, `make test-pg`, `make lint` green |
 | F2 | Skew metric in `/v1/status`; not-ready above 2 s | H10 | new `TestMM_F2_SkewGate` | **DONE** (reports, doesn't refuse; see F2 note) |
 | F3 | Claim before minting (`pending → minting`, stale claim takeover); custody name per key; the loser path only deletes its own entry | H02 | `TestMM_H02_DoubleMint` | **DONE**: before 14–23/40 broken (iter2), after 0/40 and 40 keys for 40 objects, 3/3 runs; + `TestStoreMintClaim` (SQLite + Postgres), `TestCustodyNamesPerKey` |
-| F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | extend `TestMM_H10` with a partitioned-holder case | queued |
+| F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | `TestMM_F5_LeaseHeldExplains` | **DONE** |
 | F4 | Host self-fencing for stateful namespaces | H10/S4 | S3, S4 | **blocked on ADR-028** |
 
 ## Status
@@ -316,6 +316,25 @@ The spec came first (`StatusClock` in `api/openapi.yaml`), then
 Mint delay after a claimer crashes mid-attempt: at most `MintClaimTTL`
 (60 s) plus one reaper interval.
 
+### F5: a still-valid lease gets an explanation, not "lease held by another holder"
+
+After F1, this happens only in one window: a host has stopped
+heartbeating for more than 10 s (`HostLeaseTTL`), so placement treats it
+as dead, but its 15 s lease hasn't expired yet.
+
+The deploy now fails with `409 lease_held` (same catalog code), and:
+- the message names the holder, the epoch, when this mgmt last saw it, and
+  when the lease expires;
+- `Retry-After` is set to the seconds left on the lease (a new
+  `Error.RetryAfter` field, sent as a header by `writeErr`).
+
+After the lease expires, the redeploy lands on a live host (asserted in
+the test).
+
+The hint says to pin a host with the deploy request's `host` field. The
+CLI has no `--host` flag (only the API field), so the hint doesn't claim
+one. Whether to add the flag is open.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -348,3 +367,4 @@ Mint delay after a claimer crashes mid-attempt: at most `MintClaimTTL`
 2026-11-11 iter4 | F1 | n/a | FIXED | — | in-process + make test-go/test-pg/lint | H10 test fails before (10/15 s), passes after; H01 e2e still green with the dbClock
 2026-11-11 iter5 | F2 | n/a | DONE | — | make test-go/test-pg green; lint/api-check re-run after commit | status reports clock; warns at >2 s or a 30 s-stale sample
 2026-11-11 iter6 | F3 | n/a ×6 | FIXED | — | results/*-H02 | first 3 runs correct but 66 s (claim held through backoff); after per-attempt release 3/3 correct in 12–13 s; make test-go/test-pg/lint green
+2026-11-11 iter7 | F5 | n/a | DONE | — | make test-go/test-pg/lint green | first message referenced a nonexistent --host CLI flag; corrected
