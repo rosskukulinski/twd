@@ -48,11 +48,15 @@ FIX_MODE: fix
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
+| H17 | P2 | open (from S6: fenced commits hold the workload's lease row FOR UPDATE across several round trips; a slow replica stalls everyone's credential/ready/renew for that workload; p99 3.6 s on fast replicas) | S6 locks.txt |
+| H18 | P3 | open (from S5: store unreachable → `500 internal`; should be a retryable `503` with Retry-After) | S5 op-codes.txt |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
 | S3 | — | **3/3 clean seeds** (SIGSTOP 50 s > 45 s lease) | `TestMM_S3_StallLongerThanLease` |
 | S4 | — | **3/3 clean seeds** (PG blackhole 30 s, one replica) | `TestMM_S4_PostgresPartitionOneReplica` |
-| S1, S5–S11 | — | 0/3 seeds each | |
+| S5 | — | **3/3 clean seeds** (PG restart mid-load; failures confined to the declared outage) | `TestMM_S5_PostgresRestart` |
+| S6 | — | **3/3 seeds, invariants hold**, but throughput collapses (~150–175 ops/60 s vs ~2,300): see H17 | `TestMM_S6_SlowPostgresOneReplica` |
+| S1, S7–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -875,6 +879,34 @@ separately.
   lease safety and fencing (I1/I2) aren't exercised by S2–S4; they're
   covered by the H10 unit test. S11 adds host failover.
 
+### S5 and S6
+
+**S5**, Postgres restarted mid-load: all invariants hold over 3 seeds. The
+replicas recover by themselves; pgx re-dials. The first run "failed" I8 at
+9%, but every failure was inside the restart (seconds 21–22, all
+`500 internal`). The oracle now takes scenario-declared outage windows,
+covering the restart through 10 s after Postgres returns. Outside them,
+0.03–0.16% of ops failed. **H18:** a store outage surfaces as
+`500 internal` rather than a retryable `503`.
+
+**S6**, 200 ms–2 s of Postgres latency on one replica: invariants hold, but
+the cluster completed only about 150–175 ops in 60 s, against about 2,300
+in S4. **The oracle doesn't check throughput, so this "passes".** The new
+lock sampler (`locks.txt`) and a latency split (seed 1) show two causes:
+1. **About half the ops first waited out a 5 s client timeout on the slow
+   replica.** That's the routing/health-check issue from S3: a real VIP
+   needs latency-aware outlier ejection. It's a harness and deployment
+   matter, not mgmt.
+2. **Lease-row contention (H17).** Of the ops served directly by *fast*
+   replicas, p50 was 10 ms but p99 was 3.6 s. Every lock wait sampled was
+   on the workload's `leases` row: fenced commits (`UpdateObject` with a
+   `Fence`) lock it `FOR UPDATE` and hold it across several round trips;
+   the slow replica showed `idle in transaction` while holding it. Fix
+   idea: `FOR SHARE` for the fence read, so fenced commits don't serialise
+   on each other, or a single-statement fenced update.
+
+The audit chain head, my first suspect, never showed up in the samples.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -941,3 +973,5 @@ separately.
 2026-11-11 iter27 | harness slice 4 + S2 | seeds 1,2,3 | seed 3 FAILED I9 → F18 → 3/3 PASS | I9 | results/*-S2-seed{1,2,3} | first run's I8 'violation' was an oracle misclassification (identity_pending); fixed
 2026-11-11 iter28 PLAN | S3 (SIGSTOP 50 s > 45 s lease) and S4 (PG blackhole 30 s for one replica), seed 1 | 1 | pass if all invariants hold | I3 I5 I6 I7 I8 I9 I11
 2026-11-11 iter28 | S3, S4 | seeds 1–3 each | 6/6 PASS | — | results/*-S3-*, *-S4-* | S3 throughput about halved by the stalled-but-accepting replica (needs VIP health checks)
+2026-11-11 iter29 PLAN | S5 (PG restart mid-load), S6 (200 ms–2 s PG latency on one replica), seed 1 | 1 | pass if all invariants hold | I3 I5 I6 I7 I8 I9 I11
+2026-11-11 iter29 | S5, S6 | seeds 1–3 each | S5 3/3 PASS (after outage windows), S6 3/3 invariants PASS with throughput finding | I8 | results/*-S5-*, *-S6-* (locks.txt) | new: PG lock sampler; H17 (lease-row contention), H18 (500 vs 503 during store outage)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -48,9 +49,27 @@ type opRec struct {
 }
 
 type history struct {
-	mu   sync.Mutex
-	f    *os.File
-	recs []opRec
+	mu      sync.Mutex
+	f       *os.File
+	recs    []opRec
+	outages [][2]int64 // [from, to] unix ms: expected-unavailability windows declared by a scenario
+}
+
+// outage declares [from, to] as a window in which failures are expected
+// (e.g. the store itself is down), excluded from I8 and reported apart.
+func (h *history) outage(from, to time.Time) {
+	h.mu.Lock()
+	h.outages = append(h.outages, [2]int64{from.UnixMilli(), to.UnixMilli()})
+	h.mu.Unlock()
+}
+
+func (h *history) inOutage(t int64) bool {
+	for _, w := range h.outages {
+		if t >= w[0] && t <= w[1] {
+			return true
+		}
+	}
+	return false
 }
 
 func newHistory(t *testing.T, dir string) *history {
@@ -332,7 +351,7 @@ func checkInvariants(t *testing.T, c *cluster, g *rng, s setup, h *history, r *r
 
 	// I8: availability: transport failures and 5xx over all ops (≥1 replica always up).
 	h.mu.Lock()
-	total, bad, pending := len(h.recs), 0, 0
+	total, bad, pending, expected := len(h.recs), 0, 0, 0
 	codes := map[string]int{}
 	for _, rec := range h.recs {
 		key := fmt.Sprintf("%s %d %s", rec.Op, rec.Status, rec.Code)
@@ -340,6 +359,8 @@ func checkInvariants(t *testing.T, c *cluster, g *rng, s setup, h *history, r *r
 		switch {
 		case rec.Status == 503 && rec.Code == "identity_pending":
 			pending++ // documented, retryable backpressure (Retry-After), not an outage
+		case (rec.Status == 0 || rec.Status >= 500) && h.inOutage(rec.T):
+			expected++ // inside a declared outage (the store was down)
 		case rec.Status == 0 || rec.Status >= 500:
 			bad++
 		}
@@ -349,7 +370,7 @@ func checkInvariants(t *testing.T, c *cluster, g *rng, s setup, h *history, r *r
 	if total > 0 {
 		rate = float64(bad) / float64(total)
 	}
-	add("I8", rate <= 0.01, "%d/%d ops failed with a transport error or 5xx (%.2f%%); identity_pending (retryable) %d", bad, total, 100*rate, pending)
+	add("I8", rate <= 0.01, "%d/%d ops failed with a transport error or 5xx outside declared outages (%.2f%%); identity_pending (retryable) %d; failures inside outages %d", bad, total, 100*rate, pending, expected)
 	keys := make([]string, 0, len(codes))
 	for k := range codes {
 		keys = append(keys, k)
@@ -380,7 +401,7 @@ func first(l []string, n int) []string {
 
 // runScenario sets up 3 replicas, runs the workload with chaos(ctx, c, g)
 // for the scenario duration, restores every replica, and checks invariants.
-func runScenario(t *testing.T, name string, chaos func(ctx context.Context, c *cluster, g *rng)) {
+func runScenario(t *testing.T, name string, chaos func(ctx context.Context, c *cluster, g *rng, h *history)) {
 	seed := scenarioSeed()
 	r := newRun(t, fmt.Sprintf("%s-seed%d", name, seed))
 	c := newCluster(t, r, 3)
@@ -399,10 +420,11 @@ func runScenario(t *testing.T, name string, chaos func(ctx context.Context, c *c
 	hostCtx, hostCancel := context.WithCancel(context.Background())
 	defer hostCancel()
 	go hostLoop(hostCtx, c, g, s)
+	go samplePGLocks(hostCtx, c, filepath.Join(r.dir, "locks.txt"))
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); runWorkload(ctx, c, g, s, h, 6) }()
-	go func() { defer wg.Done(); chaos(ctx, c, g) }()
+	go func() { defer wg.Done(); chaos(ctx, c, g, h) }()
 	wg.Wait()
 	// Quiescence: every replica back up.
 	for i := range 3 {
@@ -425,7 +447,7 @@ func runScenario(t *testing.T, name string, chaos func(ctx context.Context, c *c
 
 // S2: SIGKILL a random replica every 5–20 s; restart it after 3 s.
 func TestMM_S2_RandomKills(t *testing.T) {
-	runScenario(t, "S2", func(ctx context.Context, c *cluster, g *rng) {
+	runScenario(t, "S2", func(ctx context.Context, c *cluster, g *rng, h *history) {
 		for ctx.Err() == nil {
 			select {
 			case <-ctx.Done():
@@ -455,7 +477,7 @@ func (c *cluster) signal(i int, sig syscall.Signal) {
 // S3: SIGSTOP one replica for 50 s (longer than the 45 s namespace lease)
 // while it serves load, then SIGCONT: the classic zombie writer.
 func TestMM_S3_StallLongerThanLease(t *testing.T) {
-	runScenario(t, "S3", func(ctx context.Context, c *cluster, g *rng) {
+	runScenario(t, "S3", func(ctx context.Context, c *cluster, g *rng, h *history) {
 		select {
 		case <-ctx.Done():
 			return
@@ -474,7 +496,7 @@ func TestMM_S3_StallLongerThanLease(t *testing.T) {
 // S4: blackhole one replica's Postgres connection for 30 s (its traffic is
 // held, then released), while the others keep going.
 func TestMM_S4_PostgresPartitionOneReplica(t *testing.T) {
-	runScenario(t, "S4", func(ctx context.Context, c *cluster, g *rng) {
+	runScenario(t, "S4", func(ctx context.Context, c *cluster, g *rng, h *history) {
 		select {
 		case <-ctx.Done():
 			return
@@ -488,4 +510,75 @@ func TestMM_S4_PostgresPartitionOneReplica(t *testing.T) {
 		}
 		c.proxy(i).set("pass", 0)
 	})
+}
+
+// restartPG restarts the Postgres container in place (data kept).
+func restartPG(t *testing.T) {
+	out, err := exec.Command("docker", "--context", env("PG_CTX", "orbstack"), "restart", "-t", "2", pgContainer).CombinedOutput()
+	if err != nil {
+		t.Errorf("docker restart: %v: %s", err, out)
+	}
+}
+
+// S5: restart Postgres mid-load (every connection drops; in-flight
+// transactions abort; the server is gone for a few seconds).
+func TestMM_S5_PostgresRestart(t *testing.T) {
+	runScenario(t, "S5", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(15+g.intn(15)) * time.Second):
+		}
+		// The store itself is down: failures from 1 s before until 10 s after
+		// the restart returns are expected; anything outside is a finding.
+		start := time.Now()
+		restartPG(t)
+		h.outage(start.Add(-time.Second), time.Now().Add(10*time.Second))
+	})
+}
+
+// S6: 200 ms–2 s of Postgres latency on one replica, changing every 5 s, so
+// its transactions (and the row locks they hold) get slow.
+func TestMM_S6_SlowPostgresOneReplica(t *testing.T) {
+	runScenario(t, "S6", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		i := g.intn(3)
+		defer c.proxy(i).set("pass", 0)
+		for ctx.Err() == nil {
+			c.proxy(i).set("delay", time.Duration(200+g.intn(1800))*time.Millisecond)
+			select {
+			case <-ctx.Done():
+			case <-time.After(5 * time.Second):
+			}
+		}
+	})
+}
+
+// samplePGLocks writes, every 500 ms, each session waiting on a lock with
+// the query of the session blocking it (LOOP.md "PG sampler").
+func samplePGLocks(ctx context.Context, c *cluster, path string) {
+	f, err := os.Create(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	db := c.db()
+	for ctx.Err() == nil {
+		rows, err := db.QueryContext(ctx, `SELECT w.pid, now()-w.query_start, left(w.query, 120), b.pid, left(b.query, 120), b.state
+			FROM pg_stat_activity w JOIN LATERAL unnest(pg_blocking_pids(w.pid)) bp(pid) ON true
+			JOIN pg_stat_activity b ON b.pid = bp.pid WHERE w.wait_event_type = 'Lock'`)
+		if err == nil {
+			ts := time.Now().UTC().Format("15:04:05.000")
+			for rows.Next() {
+				var wp, bpid int
+				var waited, wq, bq, bstate string
+				rows.Scan(&wp, &waited, &wq, &bpid, &bq, &bstate)
+				fmt.Fprintf(f, "%s waiter=%d waited=%s q=%q | blocker=%d state=%s q=%q\n", ts, wp, waited, wq, bpid, bstate, bq)
+			}
+			rows.Close()
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
