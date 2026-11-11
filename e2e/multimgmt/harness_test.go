@@ -222,9 +222,24 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 
 // ---- fake setec (shared custody) ----
 
+// setecVals is the fake setec's store (tests may inspect or delete entries).
+var setecVals = struct {
+	sync.Mutex
+	m map[string][]byte
+}{m: map[string][]byte{}}
+
+func setecDelete(name string) {
+	setecVals.Lock()
+	delete(setecVals.m, name)
+	setecVals.Unlock()
+}
+
 func newFakeSetec(t *testing.T) *httptest.Server {
-	var mu sync.Mutex
-	vals := map[string][]byte{}
+	mu := &setecVals.Mutex
+	setecVals.Lock()
+	setecVals.m = map[string][]byte{}
+	setecVals.Unlock()
+	vals := setecVals.m
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Sec-X-Tailscale-No-Browsers") != "setec" {
 			w.WriteHeader(403)
@@ -598,4 +613,10 @@ func objectStatuses(db *sql.DB) (map[string]string, error) {
 		out[id] = st
 	}
 	return out, rows.Err()
+}
+
+func writeAPIKey(t *testing.T, path string) {
+	if err := os.WriteFile(path, []byte("TS_API_KEY="+fakeAPIToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
