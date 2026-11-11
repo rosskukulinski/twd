@@ -1,0 +1,119 @@
+# multi-mgmt loop ledger
+
+FIX_MODE: propose
+
+## Status
+
+| Item | Priority | Status | Evidence / test |
+|---|---|---|---|
+| Harness | P0 | not built | |
+| H01 | P0 | open | |
+| H02 | P0 | open | |
+| H03 | P1 | open | |
+| H04 | P1 | open | |
+| H05 | P2 | open | |
+| H06 | P1 | open | |
+| H07 | P1 | open | |
+| H08 | P2 | open | |
+| H09 | P2 | open | |
+| H10 | P0 | open | |
+| H11 | P0 | open | |
+| H12 | P1 | open | |
+| H13 | P1 | open | |
+| S1–S11 | — | 0/3 seeds each | |
+
+## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
+
+Every hypothesis below is unverified. Each one says where to look, what
+would go wrong, and which invariant it threatens.
+
+- **H01 (P0, I8): the migration advisory lock leaks across pooled connections.**
+  `mgmt/sqlstore.go:153` calls `pg_advisory_lock(7464)` and
+  `pg_advisory_unlock` through `*sql.DB`, which hands out a different pooled
+  connection per call. These locks belong to a session, so the unlock may run
+  on a different connection than the lock. The unlock then fails without an
+  error, and an idle pooled connection keeps holding the lock. A second
+  replica, or a restart of one, would then block forever in `migrate`.
+  - **Probe:** start replica 1, then start replica 2. Also restart replica 1
+    while replica 2 is up.
+  - **Likely fix:** pin one connection with `db.Conn(ctx)` for both lock and
+    unlock, or use `pg_advisory_xact_lock` inside a single transaction.
+- **H02 (P0, I3): double mint.**
+  - Every replica's `Start` re-enqueues every `pending` object
+    (`mgmt/service.go:156`).
+  - `mintOne` (`mgmt/service.go:~1108`) checks then acts: it reads that the
+    object is pending, calls `CreateKey`, writes custody with `Put`, then
+    updates the object.
+  - So two replicas can mint for the same object: two keys, and the
+    second custody `Put` overwrites the first.
+  - **Probe:** have pending objects in the DB, then start 3 replicas at once
+    (S7). Repeat with S2 kills during a create burst.
+  - **Likely fix:** claim the object with a conditional `pending → minting`
+    (replica, claimed_at) before calling `CreateKey`, and expire stale
+    claims.
+- **H03 (P1, I4): throttles are per replica.**
+  `m.throttles` lives in memory, so the real registration rate is N × 200/min.
+  That breaks ADR-017 and risks 429s from control.
+  - **Fix options:** a token bucket in Postgres; or divide the rate by the
+    live replica count; or make one replica the minter, chosen by an advisory
+    lock. That last one is leader election only for minting.
+- **H04 (P1, I5): spawn budgets race.**
+  `m.spawnMu` is per replica (already known: `STATUS.md:252`), so concurrent
+  spawns on different replicas can exceed maxLive.
+  - **Likely fix:** `SELECT … FOR UPDATE` on the root object row inside the
+    transaction that counts and inserts.
+- **H05 (P2, I8 latency): credential long-polls wait out their timeout.**
+  `Credential` waits on `m.waiters` (`mgmt/service.go:1161`). If a host
+  long-polls replica B while replica A does the mint, B is never notified and
+  waits its full timeout. Measure create → ready p99 under `random` routing
+  against `sticky-per-client` routing.
+- **H06 (P1, I6): kill push only works from the replica the host registered
+  with.**
+  `m.pushURLs` lives in memory and is filled at host registration
+  (`mgmt/service.go:407`). A kill served by another replica can't push, so
+  delivery falls back to heartbeat revocations and the < 1 s kill SLO is lost.
+  - **Fix:** persist push URLs in the hosts row.
+- **H07 (P1, I6): device deletes are lost on a crash.**
+  Device deletes are scheduled through `m.pending` in memory
+  (`mgmt/service.go:1593`). If a replica crashes after a kill and before the
+  delayed delete runs, the device is never deleted.
+  - **Probe:** S2 timed right after kills; then check fake TS API devices at
+    quiescence.
+  - **Fix:** a durable outbox table.
+- **H08 (P2, I10): deployment status depends on the replica.**
+  `m.depStatus` lives in memory and is filled by heartbeats. The same
+  deployment's status differs depending on which replica answers.
+- **H09 (P2, I7): every replica's reaper races the others.**
+  All replicas run the reaper. Look for duplicate kill audit records, error
+  noise, and wasted work. It may be correct but wasteful.
+- **H10 (P0, I1/I2): leases use each replica's own clock.**
+  `AcquireLease` and `RenewLease` take `now` from the replica's own clock. If
+  one replica's clock is ahead, it sees live leases as expired and can steal
+  them, which breaks I1.
+  - **Probe:** S8.
+  - **Likely fix:** use Postgres `now()` inside the SQL (one clock), and keep
+    the replica clock out of expiry decisions.
+- **H11 (P0, config): file custody is per replica.**
+  With the default `-custody file`, a key minted on replica A sits in A's
+  state dir, so replica B can't release it. `-db postgres://` together with
+  `-custody file` should be refused (or warned about loudly) whenever more
+  than one replica might run. The same goes for OBO root keys (`m.oboKeys`)
+  and the WIF issuer key in the state dir (see H13).
+  - **Probe:** run the harness with file custody once to show the failure,
+    then use fake setec.
+- **H12 (P1, I8, design): hosts can't fail over to another replica.**
+  - Hosts take a single `-mgmt` address (`cmd/twd-hostd/main.go:52`).
+  - Replicas can't all register the tsnet name `twd-mgmt`.
+  - `svc:twd-mgmt` (Tailscale Services) isn't wired up.
+  - So without a VIP, hosts have no failover path. The harness front proxy
+    stands in for the VIP. Record what the real fix needs.
+- **H13 (P1): per-replica secrets diverge.**
+  OBO root keys and the WIF issuer key are created or loaded per replica.
+  Two replicas may each create a different OBO root key for the same tenant,
+  or serve different issuer keys from the same issuer URL.
+  - **Probe:** create a tenant through A, then sign through B; verify across
+    replicas.
+
+## Run log
+
+<!-- One line per run: UTC stamp | item | seed | verdict | invariants failed | artifact dir | note -->
