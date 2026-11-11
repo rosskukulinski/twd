@@ -1314,12 +1314,18 @@ func (m *Mgmt) mintWorker(tenantID string, q chan string) {
 				break
 			}
 			th := m.throttle(t)
-			if err := th.Wait(m.ctx); err != nil {
+			// The throttle token is taken inside mintOne, after the claim, so
+			// replicas don't spend the shared budget on objects another
+			// replica is minting or has minted (S2: up to 2/3 of tokens were
+			// wasted with 3 replicas).
+			created, err := m.mintOne(m.ctx, t, id, th)
+			if m.ctx.Err() != nil {
 				return
 			}
-			err = m.mintOne(m.ctx, t, id)
 			if err == nil {
-				th.Success()
+				if created {
+					th.Success()
+				}
 				break
 			}
 			var ae *tsapi.APIError
@@ -1382,36 +1388,47 @@ const MintClaimTTL = 60 * time.Second
 
 // mintOne mints one single-use, preauthorized, ≤5-min key tagged with the
 // object's tags, and puts it in custody. The key is never logged.
-func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string) error {
+func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string, th *Throttle) (created bool, err error) {
 	o, err := m.store.GetObject(ctx, id)
 	if err != nil || o.Status != StatusPending {
-		return nil // gone, killed or already minted
+		return false, nil // gone, killed or already minted
 	}
 	// Claim the mint (H02): only one replica calls CreateKey for an object.
 	now := m.now()
 	if ok, err := m.store.ClaimMint(ctx, id, m.replicaID, now, now.Add(-MintClaimTTL)); err != nil {
-		return err
+		return false, err
 	} else if !ok {
-		return nil // another replica holds a fresh claim (or it is no longer pending)
+		return false, nil // another replica holds a fresh claim (or it is no longer pending)
 	}
 	// The claim covers this attempt only: released on every exit, so a
 	// replica backing off (429/5xx) or dying between attempts never blocks
 	// the others. Correctness does not rest on the TTL: keyed custody and
 	// the KeyID check below make a late duplicate undo only its own key.
 	defer m.store.ReleaseMint(context.WithoutCancel(ctx), id, m.replicaID)
+	// Only now take a registration token (the claim says this replica will
+	// mint), then refresh the claim: the wait may have been long.
+	if th != nil {
+		if err := th.Wait(ctx); err != nil {
+			return false, err
+		}
+		now := m.now()
+		if ok, err := m.store.ClaimMint(ctx, id, m.replicaID, now, now.Add(-MintClaimTTL)); err != nil || !ok {
+			return false, err // lost it meanwhile (killed, minted, or the claim went stale)
+		}
+	}
 	api, err := m.broker.API(ctx, t, purposeMint)
 	if err != nil {
-		return err
+		return false, err
 	}
 	k, err := api.CreateKey(ctx, tsapi.KeyOptions{Tags: o.Tags, Ephemeral: o.Ephemeral, Preauthorized: true,
 		ExpirySeconds: int(KeyExpiry / time.Second), Description: "twd " + o.ID})
 	if err != nil {
-		return err
+		return false, err
 	}
 	own := custodyKeyName(o, k.ID)
 	if err := m.custody.Put(ctx, own, []byte(k.Secret)); err != nil {
 		api.DeleteKey(ctx, k.ID)
-		return err
+		return true, err
 	}
 	exp := m.now().Add(KeyExpiry - 15*time.Second).UnixMilli() // released only with ≥15 s of life left
 	killed := false
@@ -1428,12 +1445,12 @@ func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string) error {
 		// entry. Never the object's (another replica's) credential.
 		api.DeleteKey(ctx, k.ID)
 		m.custody.Delete(ctx, own)
-		return err
+		return true, err
 	}
 	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: id, Kind: "mint"}, map[string]any{"keyID": k.ID, "tags": o.Tags,
 		"mode": t.MintMode, "ephemeral": o.Ephemeral})
 	m.notify(id)
-	return nil
+	return true, nil
 }
 
 func (m *Mgmt) notify(id string) {

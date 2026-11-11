@@ -322,6 +322,7 @@ type cluster struct {
 	token     string
 	replicas  []*replica
 	extraArgs []string
+	repMu     sync.Mutex // guards replica process state (chaos runs start/stop concurrently with calls)
 	jsonc     string // twd.jsonc for setupTenant ("" = twdJSONC)
 }
 
@@ -387,17 +388,23 @@ func (c *cluster) start(i int) {
 		c.t.Fatal(err)
 	}
 	c.r.record("twd-mgmt", fmt.Sprintf("r%d", i), cmd.Process.Pid)
+	c.repMu.Lock()
 	rp.cmd, rp.log, rp.exited = cmd, lf, make(chan struct{})
-	go func(cmd *exec.Cmd, ch chan struct{}) { cmd.Wait(); close(ch) }(cmd, rp.exited)
+	ch := rp.exited
+	c.repMu.Unlock()
+	go func(cmd *exec.Cmd, ch chan struct{}) { cmd.Wait(); close(ch) }(cmd, ch)
 }
 
 // stop signals replica i (only the process this harness started) and waits
 // up to 10 s for it to exit (SIGKILL after that).
 func (c *cluster) stop(i int, sig syscall.Signal) {
 	rp := c.replicas[i]
+	c.repMu.Lock()
 	if rp.cmd == nil {
+		c.repMu.Unlock()
 		return
 	}
+	c.repMu.Unlock()
 	rp.cmd.Process.Signal(sig)
 	select {
 	case <-rp.exited:
@@ -407,12 +414,16 @@ func (c *cluster) stop(i int, sig syscall.Signal) {
 	}
 	fmt.Fprintf(rp.log, "=== stopped (%v) %s\n", sig, time.Now().UTC().Format(time.RFC3339Nano))
 	rp.log.Close()
+	c.repMu.Lock()
 	rp.cmd = nil
+	c.repMu.Unlock()
 	os.Remove(rp.sock)
 }
 
 func (c *cluster) running(i int) bool {
 	rp := c.replicas[i]
+	c.repMu.Lock()
+	defer c.repMu.Unlock()
 	if rp.cmd == nil {
 		return false
 	}

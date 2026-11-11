@@ -32,7 +32,7 @@ FIX_MODE: fix
 
 | Item | Priority | Status | Evidence / test |
 |---|---|---|---|
-| Harness | P0 | slice 1 built (PG container, fake TS API, fake setec, N real replicas, unix-socket client, pg_locks probe). + slice 3: per-replica Postgres fault proxy (pass/delay/blackhole/reset, `pgproxy_test.go`), fake TS policy endpoint, configurable twd.jsonc. + slice 2: tenant/host/deploy setup, fake host heartbeat, fakeTS hold switch and per-object key counts. TODO: PG fault proxy, front proxy, fake hosts, workload gen, PG sampler, oracle | `e2e/multimgmt/harness_test.go` |
+| Harness | P0 | slice 1 built (PG container, fake TS API, fake setec, N real replicas, unix-socket client, pg_locks probe). + slice 4: scenario runner (`chaos_test.go`): client-side load balancing over running replicas with transport retry (stands in for the svc VIP), seeded 6-worker workload (create/spawn/credential+ready/kill-cascade/status, history.jsonl), host heartbeat loop, oracle I3/I5/I6/I7/I8/I9/I11 → report.json and op-codes.txt, pending-object diagnostics; replica state mutex. + slice 3: per-replica Postgres fault proxy (pass/delay/blackhole/reset, `pgproxy_test.go`), fake TS policy endpoint, configurable twd.jsonc. + slice 2: tenant/host/deploy setup, fake host heartbeat, fakeTS hold switch and per-object key counts. TODO: PG fault proxy, front proxy, fake hosts, workload gen, PG sampler, oracle | `e2e/multimgmt/harness_test.go` |
 | H01 | P0 | **REFUTED** (3/3 runs) — latent fragility noted | `TestMM_H01_StartupAdvisoryLock` |
 | H02 | P0 | **FIXED by F3** (was: every double-minted object lost its credential) | `TestMM_H02_DoubleMint` |
 | H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
@@ -49,7 +49,8 @@ FIX_MODE: fix
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
-| S1–S11 | — | 0/3 seeds each | |
+| S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
+| S1, S3–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -823,6 +824,36 @@ worker re-reads the tenant on every attempt, so every replica follows a
   replicas: one short transaction each. They were already serialised per
   replica.
 
+### F18: throttle tokens are spent only on real mint attempts (found by S2 seed 3)
+
+- **Symptom.** S2 seed 3 (60 s of random SIGKILLs under a create-heavy
+  load) violated **I9**: 9 objects, then 7 on a rerun, were still `pending`
+  120 s after quiescence. They were the last objects created; none had a
+  claim or a key request. No warnings were logged.
+- **Cause: F3 and F7 interacting.** Every replica's pending sweep queues
+  every pending object, and `mintWorker` took a shared throttle token
+  **before** `mintOne`, which then usually did nothing (another replica's
+  claim, or already minted). With 3 replicas, up to about 2/3 of the
+  tenant's shared budget was wasted, so a backlog drained at about a third
+  of the configured rate.
+- **Fix.** `mintOne(ctx, t, id, th)` now claims first, then waits for a
+  token, then refreshes the claim (it may have gone stale during a long
+  wait), then calls `CreateKey`. `Success` (the AIMD increase) counts only
+  attempts that created a key.
+- **After.**
+  - S2 seeds 1, 2, 3 all pass, draining in 35–42 s (1036–1105 keys).
+  - H03 is now 45 keys in **38.9 s**, which is the single-replica
+    expectation (was 45–48 s).
+  - H02 still passes.
+
+### Oracle fix (my mistake)
+
+The first S2 run reported I8 at 10%. Every one of those was
+`503 identity_pending`, the documented retryable backpressure from
+credential waits of 2 s while the registration queue drains. I8 now
+counts transport errors and other 5xx, and reports `identity_pending`
+separately.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -885,3 +916,5 @@ worker re-reads the tenant on every attempt, so every replica follows a
 2026-11-11 iter25 | H05 → F16 | unit | CONFIRMED then FIXED | I8 latency | — | 10.004 s → 506 ms; make test-go/test-pg green
 2026-11-11 iter26 PLAN | H16 | n/a | confirm if live objects exceed maxObjects (10) after 30 concurrent creates over 3 replicas (5 ms PG delay); refute if ≤10 in 10 runs | quota
 2026-11-11 iter26 | H16 → F17 | 10 + 20 runs | CONFIRMED (2/10) then FIXED (0/20) | quota | results/*-H16 (report.txt) | H04 still 0/10; make test-go/test-pg green
+2026-11-11 iter27 PLAN | harness slice 4 (client-side LB, seeded workload, host loop, oracle I3/I5/I6/I7/I8/I9/I11) + S2 seed 1 | 1 | pass if all invariants hold after 60 s of random SIGKILLs under load | I3 I5 I6 I7 I8 I9 I11
+2026-11-11 iter27 | harness slice 4 + S2 | seeds 1,2,3 | seed 3 FAILED I9 → F18 → 3/3 PASS | I9 | results/*-S2-seed{1,2,3} | first run's I8 'violation' was an oracle misclassification (identity_pending); fixed
