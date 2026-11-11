@@ -153,7 +153,11 @@ type Object struct {
 	MagicDNS     string          `json:"magicDNS,omitempty"`
 	KeyID        string          `json:"-"`
 	KeyExpires   int64           `json:"-"`
-	KillReason   string          `json:"killReason,omitempty"`
+	// DeviceDeleteAt: 0 none; >0 the device delete is due (unix ms, or a
+	// claim's lease end); -1 done. Set in the same write that kills the
+	// object, so the kill and its device cleanup commit atomically (F21).
+	DeviceDeleteAt int64  `json:"-"`
+	KillReason     string `json:"killReason,omitempty"`
 	// Kill record (the /v1 tombstone): when, by whom, whether as part of a
 	// cascade and which object the kill was issued on.
 	KilledAt    int64  `json:"killedAt,omitempty"`

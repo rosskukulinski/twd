@@ -52,6 +52,7 @@ FIX_MODE: fix
 | H19 | P1 | **CONFIRMED and FIXED** (F19): each replica's Postgres pool was unbounded; a 500-request burst opened enough connections to hit `max_connections` ("sorry, too many clients already", SQLSTATE 53300), failing requests on every replica. Pool now bounded (default 16, `?twd_max_conns=K`) | S9 seed 2; `TestTakeMaxConns` |
 | H20 | P1 | **CONFIRMED and FIXED**: `CreateObject` and `PreflightBundle` mapped *any* tenant, parent or namespace lookup error to a 404 (`unknown_tenant`, …), so store outages looked like permanent not-founds that clients wouldn't retry, and the I8 oracle didn't count them. They now keep their 503 or 500 mapping; real not-founds stay 404 | S9, S5 op-codes |
 | H21 | P1 | **CONFIRMED (soak 101) and FIXED** (F20): a device-delete claim was terminal (`-1`); a kill during a Postgres restart claimed it, the delete failed, and so did the reschedule, so the device was never deleted. Claims are now a 2-min lease and success is recorded explicitly | `TestStoreDeviceDeleteClaimLapses` |
+| H23 | P1 | **CONFIRMED (soak 101 re-run) and FIXED** (F21): the kill's device-delete intent was a separate, unchecked write after the kill; while Postgres was starting up the kill committed, that write failed, and the device was never deleted. Also `Ready` on a killed object deleted its new device inline with no durable record. Both now record `device_delete_at` in the same write as the state change | `TestMM_F21_DeviceDeleteIntentIsAtomic` |
 | H22 | P1 | **CONFIRMED (soak 101), OPEN, design**: audit appends are separate from the state change; during a store blip the kill committed but its audit record was dropped (`audit append failed`). Needs a decision: audit in the same transaction as the change, or a durable audit outbox | r1.log |
 | H18 | P3 | **FIXED** (iter30): store unavailable, lock timeout or idle-transaction timeout → `503 store_unavailable` with Retry-After | `TestStoreUnavailableMapping` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
@@ -67,7 +68,7 @@ FIX_MODE: fix
 | S5 (re-verified) | — | 3/3 again after H20 (store errors now 503 inside the declared outage; 0.05–0.09% outside) | |
 | S10 | — | **3/3 clean seeds** (kill storm: overlapping cascade kills of the same trees through every replica every 3 s; KillOnce 0, I6 ok) | `TestMM_S10_KillStorm` |
 | S11 | — | **3/3 clean runs** (failover protocol across replicas with **fake hosts**: takeover_unconfirmed → lease_held → forced takeover to h2 at epoch+1 at 47 s, audited → h1 revoked and fenced (lease_lost via every replica) → h2 joins at the new epoch). A real twd-hostd is not used | `TestMM_S11_HostFailover` |
-| Soaks | — | seed 101 **FAILED I6** (1 device never deleted, during a PG restart) → F20; seed 102 **PASS** (265,807 ops). Re-running 101 + 103 after F20 | `TestMM_Soak` |
+| Soaks | — | seed 102 **PASS**. Seed 101 failed I6 twice (F20, then F21); seed 103 crashed the **harness** (thread exhaustion from a per-call HTTP transport leak). Re-running 101 + 103 after F21 and the harness fix | `TestMM_Soak` |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -1065,6 +1066,33 @@ For a security audit log that's a real gap. Options:
 
 Recommendation: (b).
 
+### Soak re-runs: harness leak, and F21
+
+1. **My first re-run produced no output.** I'd filtered it through `grep`,
+   which hid both the error and the exit code. It was re-run with full
+   logs saved to `/tmp/mm-soak-*.log`.
+2. **Seed 103 crashed the test process** with `fatal error: thread
+   exhaustion`: 420k goroutines, about 10k blocked in `Close`.
+   `cluster.client(i)` built a new `http.Transport` per call, leaking an
+   idle keep-alive connection per request, about 250k over a 10-minute
+   soak. That also loaded the mgmt replicas with dead connections. Fixed
+   with one shared client per replica (`MaxIdleConnsPerHost` 32, idle
+   connections closed when a replica stops). It's a harness bug, but both
+   soak results from before the fix are suspect.
+3. **Seed 101 failed I6 again** with a different object. The kill landed
+   while Postgres was **starting up** after a restart. The kill committed,
+   but the separate `SetDeviceDelete` (error ignored), the inline claim and
+   the audit append all failed, so no durable intent existed. There was
+   also no "device delete failed" log line: the delete never started.
+   **F21:** `Kill`'s update function sets `DeviceDeleteAt` in the same
+   write as `status=killed`. `Ready` on a killed object persists the new
+   node IDs and `DeviceDeleteAt` in its update, and uses the claimed,
+   durable delete path (it used to call `deleteDevice` inline, with no
+   record). `objectCols` gained `device_delete_at`; placeholders are now
+   generated. `TestMM_F21_DeviceDeleteIntentIsAtomic`: the `Ready`
+   assertion would have failed before. The kill path holds by construction
+   (one write); only a soak exercises it under real store restarts.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -1142,3 +1170,4 @@ Recommendation: (b).
 2026-11-11 iter33 | S10, S11 | 3 each | 6/6 PASS | I1 I2 I6 KillOnce | results/*-S10-*, *-S11 | all scenarios now have 3 clean seeds; soaks next
 2026-11-11 iter33 PLAN | Soak ×2 (mixed faults every 10–25 s, 10 min, seeds 101 and 102) | 101, 102 | pass if every invariant holds in both | all
 2026-11-11 iter33 | soaks 101, 102 | 2 | 101 FAIL I6 → F20 (H21); 102 PASS | I6 | results/*-SOAK-* | H22 (dropped audit record during a store blip) recorded, needs a decision
+2026-11-11 iter33 | soak re-runs | 101, 103 | 101 FAIL I6 → F21 (H23); 103 harness crash (HTTP transport leak) → fixed | I6 | /tmp/mm-soak-*.log | the first re-run silently didn't run (grep hid it)

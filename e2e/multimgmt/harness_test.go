@@ -325,6 +325,7 @@ type cluster struct {
 	repMu     sync.Mutex       // guards replica process state (chaos runs start/stop concurrently with calls)
 	jsonc     string           // twd.jsonc for setupTenant ("" = twdJSONC)
 	env       map[int][]string // extra environment per replica
+	clients   map[int]*http.Client
 }
 
 // proxy returns replica i's Postgres fault proxy.
@@ -418,6 +419,9 @@ func (c *cluster) stop(i int, sig syscall.Signal) {
 	rp.log.Close()
 	c.repMu.Lock()
 	rp.cmd = nil
+	if hc := c.clients[i]; hc != nil {
+		hc.CloseIdleConnections()
+	}
 	c.repMu.Unlock()
 	os.Remove(rp.sock)
 }
@@ -437,13 +441,29 @@ func (c *cluster) running(i int) bool {
 	}
 }
 
-// client returns an HTTP client for replica i's unix socket.
+// client returns replica i's HTTP client. One client (and transport) per
+// replica socket, reused for every call: a new transport per call leaked an
+// idle keep-alive connection per request, which over a 10-minute soak
+// (~250k requests) exhausted the test process's threads and loaded the
+// replicas with dead connections.
 func (c *cluster) client(i int) *http.Client {
+	c.repMu.Lock()
+	defer c.repMu.Unlock()
+	if c.clients == nil {
+		c.clients = map[int]*http.Client{}
+	}
+	if hc := c.clients[i]; hc != nil {
+		return hc
+	}
 	sock := c.replicas[i].sock
-	return &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+	hc := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		MaxIdleConnsPerHost: 32,
+		IdleConnTimeout:     30 * time.Second,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
 		}}}
+	c.clients[i] = hc
+	return hc
 }
 
 // call does one API request on replica i as the local principal.

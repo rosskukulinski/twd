@@ -993,7 +993,10 @@ func (s *SQLStore) FindClass(ctx context.Context, tenantID, workload, class stri
 // objectColsV1 are the columns of the M7 schema; cert (RT-01) was added later
 // and is filled by addColumns on older stores.
 const objectColsV1 = "id, tenant_id, workload, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
-const objectCols = objectColsV1 + ", cert, killed_at, killed_by, kill_cascade, kill_root, acting_for"
+const objectCols = objectColsV1 + ", cert, killed_at, killed_by, kill_cascade, kill_root, acting_for, device_delete_at"
+
+// objectPlaceholders is "?,?,…" for objectCols.
+var objectPlaceholders = strings.TrimSuffix(strings.Repeat("?,", len(strings.Split(objectCols, ","))), ",")
 
 func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var o Object
@@ -1001,7 +1004,7 @@ func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var depth, eph, casc int64
 	err := sc.Scan(&o.ID, &o.TenantID, &o.Workload, &o.Namespace, &o.Name, &o.Hostname, &o.DeploymentID, &o.Lease, &tags, &caps,
 		&o.ParentID, &o.RootID, &depth, &o.TTLSeconds, &eph, &o.Status, &o.NodeID, &o.StableNodeID, &o.MagicDNS,
-		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert, &o.KilledAt, &o.KilledBy, &casc, &o.KillRoot, &o.ActingFor)
+		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert, &o.KilledAt, &o.KilledBy, &casc, &o.KillRoot, &o.ActingFor, &o.DeviceDeleteAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -1024,11 +1027,11 @@ func objectArgs(o Object) []any {
 	}
 	return []any{o.ID, o.TenantID, o.Workload, o.Namespace, o.Name, o.Hostname, o.DeploymentID, o.Lease, jsonStr(o.Tags), string(o.Caps),
 		o.ParentID, o.RootID, o.Depth, o.TTLSeconds, eph, o.Status, o.NodeID, o.StableNodeID, o.MagicDNS,
-		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert, o.KilledAt, o.KilledBy, casc, o.KillRoot, o.ActingFor}
+		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert, o.KilledAt, o.KilledBy, casc, o.KillRoot, o.ActingFor, o.DeviceDeleteAt}
 }
 
 func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES ("+objectPlaceholders+")"), objectArgs(o)...)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -1090,7 +1093,7 @@ func (s *SQLStore) CreateObjectChecked(ctx context.Context, o Object, maxObjects
 			return ErrSpawnBudget
 		}
 	}
-	if _, err := tx.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...); err != nil {
+	if _, err := tx.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES ("+objectPlaceholders+")"), objectArgs(o)...); err != nil {
 		if isUnique(err) {
 			return ErrExists
 		}

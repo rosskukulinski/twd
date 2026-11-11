@@ -1587,6 +1587,12 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 	o, err = m.store.UpdateObject(ctx, id, fence, func(o *Object) error {
 		if !o.Live() {
 			wasKilled = true
+			if r.StableNodeID != "" || r.NodeID != "" {
+				// Killed while joining: the device that just appeared must go
+				// too. Record it durably in this write (F21).
+				o.NodeID, o.StableNodeID = r.NodeID, r.StableNodeID
+				o.DeviceDeleteAt = m.now().UnixMilli()
+			}
 			return nil
 		}
 		o.Status, o.NodeID, o.StableNodeID, o.MagicDNS, o.UpdatedAt = StatusReady, r.NodeID, r.StableNodeID, r.MagicDNS, m.now().UnixMilli()
@@ -1599,7 +1605,7 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 	if wasKilled {
 		// Killed while joining: the device that just appeared must go too.
 		o.NodeID, o.StableNodeID = r.NodeID, r.StableNodeID
-		m.deleteDevice(ctx, o)
+		m.deleteDeviceClaimed(ctx, o, false) // claimed, recorded; the sweep retries if this fails
 		return o, errf(410, "killed", "object %s was killed while joining; device deleted", id)
 	}
 	// Node certificate (ADR-010): binds this node to the object's tags, lim
@@ -1802,6 +1808,11 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 				return errAlreadyDead // another replica's kill or reaper won (H09)
 			}
 			x.Status, x.KillReason, x.UpdatedAt = StatusKilled, r.Reason, now.UnixMilli()
+			if x.StableNodeID != "" || x.NodeID != "" {
+				// The device delete is recorded in the kill's own write: no
+				// window where the kill commits but the cleanup is lost (F21).
+				x.DeviceDeleteAt = now.Add(m.cfg.DeviceDeleteDelay).UnixMilli()
+			}
 			x.KilledAt, x.KilledBy, x.KillCascade, x.KillRoot = now.UnixMilli(), r.By, x.ID != id, id
 			return nil
 		})
@@ -1850,9 +1861,8 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		}
 		deleted, scheduled, unavailable := false, false, false
 		if killed.StableNodeID != "" || killed.NodeID != "" {
-			// Durable first (H07): any replica's sweep finishes this delete
-			// if this replica dies before it runs.
-			m.store.SetDeviceDelete(ctx, o.ID, m.now().Add(m.cfg.DeviceDeleteDelay).UnixMilli())
+			// Durable (F21): the kill's write recorded device_delete_at; any
+			// replica's sweep finishes this delete if this one can't.
 			if m.cfg.DeviceDeleteDelay > 0 {
 				m.scheduleDelete(killed)
 				scheduled = true

@@ -88,3 +88,44 @@ func TestMM_H15_ThrottleFollowsTenantLimit(t *testing.T) {
 		t.Fatalf("after lowering the tenant's limit to 6/min the throttle still allows %v/min", r)
 	}
 }
+
+// TestMM_F21_DeviceDeleteIntentIsAtomic (soak seed 101): the device delete
+// of a killed object is recorded in the kill's own write, and a node that
+// joins after its object was killed is recorded in Ready's write, so a store
+// blip after the state change can't lose the cleanup. The broker here has no
+// API, so the inline delete fails: the intent must still be persisted.
+func TestMM_F21_DeviceDeleteIntentIsAtomic(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, _ := OpenStore(ctx, filepath.Join(dir, "m.db"))
+	defer st.Close()
+	cust, _ := OpenFileCustody(filepath.Join(dir, "c"))
+	m, err := New(Config{Store: st, Custody: cust, Broker: &Broker{}, IDSecret: []byte("0123456789abcdef"), ReapInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	kf := filepath.Join(dir, "api.env")
+	os.WriteFile(kf, []byte("TS_API_KEY=x\n"), 0o600)
+	tn, _ := m.CreateTenant(ctx, TenantRequest{Tailnet: "t.ts.net", MintMode: "apikey", APIKeyFile: kf})
+	// A ready object with a device, killed.
+	st.CreateObject(ctx, Object{ID: "rdy", TenantID: tn.ID, Workload: "w", Namespace: "A", Name: "rdy", Hostname: "rdy", RootID: "rdy",
+		Status: StatusReady, NodeID: "1", StableNodeID: "nRDY"})
+	if _, err := m.Kill(ctx, "rdy", KillRequest{Reason: "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if o, _ := st.GetObject(ctx, "rdy"); o.DeviceDeleteAt == 0 {
+		t.Fatal("kill of an object with a device must record its device delete in the same write")
+	}
+	// An object killed while minted (no device yet); its node then reports ready.
+	st.CreateObject(ctx, Object{ID: "late", TenantID: tn.ID, Workload: "w", Namespace: "A", Name: "late", Hostname: "late", RootID: "late",
+		Status: StatusMinted})
+	m.Kill(ctx, "late", KillRequest{Reason: "t"})
+	m.Ready(ctx, "late", "", ReadyRequest{NodeID: "2", StableNodeID: "nLATE", MagicDNS: "late.t.ts.net"})
+	if o, _ := st.GetObject(ctx, "late"); o.StableNodeID != "nLATE" || o.DeviceDeleteAt == 0 {
+		t.Fatalf("a device that appears after the kill must be recorded for deletion: %+v", o)
+	}
+	if ids, _ := st.DueDeviceDeletes(ctx, time.Now().Add(time.Hour).UnixMilli()); len(ids) != 2 {
+		t.Fatalf("both device deletes must be pending for the sweep (inline delete failed): %v", ids)
+	}
+}
