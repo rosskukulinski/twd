@@ -63,7 +63,9 @@ FIX_MODE: fix
 | S8 | — | **3/3 clean seeds** (machine clock +20 s / −20 s on two replicas; skew reported by /v1/status, no invariant affected) | `TestMM_S8_ClockSkew` |
 | S9 | — | **3/3 clean seeds** after F19 + H20 (500-op burst: 300 created, 200 spawn_budget_exceeded, quota held at exactly 1000) | `TestMM_S9_HotTenant` |
 | S5 (re-verified) | — | 3/3 again after H20 (store errors now 503 inside the declared outage; 0.05–0.09% outside) | |
-| S10, S11 | — | 0/3 seeds each | |
+| S10 | — | **3/3 clean seeds** (kill storm: overlapping cascade kills of the same trees through every replica every 3 s; KillOnce 0, I6 ok) | `TestMM_S10_KillStorm` |
+| S11 | — | **3/3 clean runs** (failover protocol across replicas with **fake hosts**: takeover_unconfirmed → lease_held → forced takeover to h2 at epoch+1 at 47 s, audited → h1 revoked and fenced (lease_lost via every replica) → h2 joins at the new epoch). A real twd-hostd is not used | `TestMM_S11_HostFailover` |
+| Soaks | — | 0/2 | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -996,6 +998,31 @@ earlier runs. Every S5 run had 265–662 masked 404s. S5 was rerun: 3/3 pass,
 with the 503s inside the declared outage and 0.05–0.09% failures outside.
 No other scenario had masked 404s.
 
+### S10 and S11, and the S11 gap
+
+- **S10.** Overlapping cascade kills of the same live trees through all 3
+  replicas every 3 s, under the workload. Over 3 seeds: 0 objects with a
+  second kill record (new oracle invariant **KillOnce**, H09's property
+  under real concurrency), every device of a killed object deleted, and 0
+  failed ops.
+- **S11.** The host-failover protocol across replicas, end to end, 3 of 3
+  runs, deterministic:
+  1. h1 goes silent.
+  2. At 12 s, an unforced redeploy gets `409 takeover_unconfirmed` and a
+     forced one gets `409 lease_held`.
+  3. At 47 s, a forced redeploy through another replica lands on h2 at
+     epoch 2, audited with `takeoverFrom` h1 and `forced`.
+  4. h1 comes back at the old epoch: its heartbeat is revoked, and its
+     credential requests get `409 lease_lost` through **every** replica
+     (I1/I2).
+  5. h2 joins an object at the new epoch.
+- **Gap.** LOOP.md asked for one real `twd-hostd` in S11. In `-local-dev`,
+  hostd needs workerd, a real JS bundle and a tsnet control plane, and it
+  can only point at one replica (H12). I used fake hosts. hostd's own side
+  (stateful-only fencing at 30 s) is unit-tested (F9) but not run end to
+  end against multi-replica mgmt. Follow-up: a hostd e2e when the VIP
+  (H12) exists.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -1069,3 +1096,5 @@ No other scenario had masked 404s.
 2026-11-11 iter31 PLAN | S1 (rolling SIGTERM restarts), S7a (simultaneous kill+cold start ×2 under load), S7b (3 concurrent OpenStore on a pre-M7 Postgres store) | seeds 1–3 | pass if all invariants hold / migration once, rows intact | I3 I5 I6 I7 I8 I9 I11, migration
 2026-11-11 iter31 | S1, S7a, S7b | seeds 1–3 | 7/7 PASS | — | results/*-S1-*, *-S7a-*; make test-pg | no product changes
 2026-11-11 iter32 | S8, S9 (+ S5 re-run) | seeds 1–3 each | all PASS after F19 + H20 | I8, Quota | results/*-S8-*, *-S9-*, *-S5-* | H19 connection storm and H20 404 masking found by S9; pool-size-2 deadlock hunt clean
+2026-11-11 iter33 PLAN | S10 (kill storm), S11 (host failover protocol, fake hosts) + KillOnce invariant | seeds 1–3 | pass if invariants hold / every protocol step as specified | I1 I2 I6 I7 KillOnce
+2026-11-11 iter33 | S10, S11 | 3 each | 6/6 PASS | I1 I2 I6 KillOnce | results/*-S10-*, *-S11 | all scenarios now have 3 clean seeds; soaks next

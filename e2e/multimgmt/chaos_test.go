@@ -413,6 +413,11 @@ func checkInvariants(t *testing.T, c *cluster, g *rng, s setup, h *history, r *r
 	}
 	os.WriteFile(filepath.Join(r.dir, "op-codes.txt"), []byte(sb.String()), 0o600)
 
+	// KillOnce: no object has more than one kill record (H09).
+	var multiKill int
+	db.QueryRow(`SELECT COUNT(*) FROM (SELECT object_id FROM audit WHERE kind='kill' AND object_id<>'' GROUP BY object_id HAVING COUNT(*) > 1) x`).Scan(&multiKill)
+	add("KillOnce", multiKill == 0, "objects with more than one kill record: %d", multiKill)
+
 	// I11: no deadlocks in Postgres.
 	var deadlocks int64
 	db.QueryRow("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()").Scan(&deadlocks)
@@ -790,5 +795,56 @@ func TestMM_S9_HotTenant(t *testing.T) {
 		close(gate)
 		wg.Wait()
 		<-ctx.Done()
+	})
+}
+
+// S10: kill storm: every 3 s, overlapping cascade kills of the same live
+// trees through every replica at once.
+func TestMM_S10_KillStorm(t *testing.T) {
+	runScenario(t, "S10", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		db := c.db()
+		for ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(3 * time.Second):
+			}
+			rows, err := db.Query(`SELECT root_id FROM objects WHERE status NOT IN ('killed','failed') AND id<>root_id
+				GROUP BY root_id ORDER BY random() LIMIT 4`)
+			if err != nil {
+				continue
+			}
+			var roots []string
+			for rows.Next() {
+				var r string
+				rows.Scan(&r)
+				roots = append(roots, r)
+			}
+			rows.Close()
+			var wg sync.WaitGroup
+			for _, root := range roots {
+				for rep := range 3 {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						t0 := time.Now()
+						st, b, err := c.callAs(rep, "", "DELETE", "/v1/objects/"+root+"?cascade=true&reason=storm", nil)
+						rec := opRec{T: t0.UnixMilli(), Op: "storm-kill", Arg: root, Replica: rep, Status: st, Ms: time.Since(t0).Milliseconds()}
+						if err != nil {
+							rec.Err = err.Error()
+						} else if st/100 != 2 {
+							var e struct{ Code, Message string }
+							json.Unmarshal(b, &e)
+							rec.Code = e.Code
+							if st >= 500 {
+								rec.Err = e.Message
+							}
+						}
+						h.add(rec)
+					}()
+				}
+			}
+			wg.Wait()
+		}
 	})
 }
