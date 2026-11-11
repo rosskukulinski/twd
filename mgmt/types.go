@@ -32,7 +32,7 @@ const (
 	DefaultMaxObjects             = 1000
 	DefaultMaxLive                = 64
 	DefaultMaxDepth               = 3
-	NamespaceLeaseTTL             = 15 * time.Second
+	NamespaceLeaseTTL             = 45 * time.Second // > hostd's FenceAfter (30 s) + margin (ADR-028 §3)
 	HostLeaseTTL                  = 10 * time.Second
 	KeyExpiry                     = 5 * time.Minute
 )
@@ -115,6 +115,10 @@ type Deployment struct {
 	CreatedAt  int64  `json:"createdAt"`
 	// StoppedAt is set by undeploy (DELETE /v1/deployments/{id}).
 	StoppedAt int64 `json:"stoppedAt,omitempty"`
+	// Fence: the workload has Durable Objects that don't tolerate two
+	// instances (BundleStateful), so its host stops serving it when it loses
+	// mgmt (ADR-028 §3). Stateless workloads keep serving.
+	Fence bool `json:"fence"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per

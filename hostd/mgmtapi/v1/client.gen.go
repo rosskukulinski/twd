@@ -560,11 +560,14 @@ func (e PurgeTenantObjectsParamsState) Valid() bool {
 
 // Assignment What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
 type Assignment struct {
-	BundleURL    string        `json:"bundleURL"`
-	ControlURL   *string       `json:"controlURL,omitempty"`
-	CreatedAt    int64         `json:"createdAt"`
-	DeploymentID string        `json:"deploymentID"`
-	Epoch        int64         `json:"epoch"`
+	BundleURL    string  `json:"bundleURL"`
+	ControlURL   *string `json:"controlURL,omitempty"`
+	CreatedAt    int64   `json:"createdAt"`
+	DeploymentID string  `json:"deploymentID"`
+	Epoch        int64   `json:"epoch"`
+
+	// Fence Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s): it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true.
+	Fence        *bool         `json:"fence,omitempty"`
 	Lease        string        `json:"lease"`
 	MaxDepth     *int          `json:"maxDepth,omitempty"`
 	MaxLive      *int          `json:"maxLive,omitempty"`

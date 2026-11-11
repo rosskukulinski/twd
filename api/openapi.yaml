@@ -2265,6 +2265,12 @@ components:
         bundleURL: { type: string, format: uri-reference }
         namespaces: { type: array, items: { $ref: "#/components/schemas/ClassConfig" } }
         workloadTags: { type: array, items: { type: string } }
+        fence:
+          type: boolean
+          description: >-
+            Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s):
+            it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and
+            `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true.
         epoch: { type: integer, format: int64 }
         lease: { type: string }
         tailnet: { type: string }

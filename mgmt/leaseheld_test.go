@@ -21,7 +21,8 @@ func (c *stepClock) After(d time.Duration) <-chan time.Time { return time.After(
 func (c *stepClock) advance(d time.Duration)                { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
 
 // TestMM_F5_LeaseHeldExplains: the workload's host stopped heartbeating 11 s
-// ago (dead to placement after 10 s) but its 15 s lease has not expired. A
+// ago (dead to placement after 10 s) but its lease (NamespaceLeaseTTL) has
+// not expired. A
 // confirmed takeover (ForceTakeover, F4: the workload is stateful) must say who holds it, how long ago it was seen and when the
 // lease frees up (with Retry-After), not just "lease held by another
 // holder"; once the lease expires the redeploy goes to a live host.
@@ -71,10 +72,10 @@ func TestMM_F5_LeaseHeldExplains(t *testing.T) {
 			t.Errorf("message should mention %q: %q", want, e.Message)
 		}
 	}
-	if e.RetryAfter < 1 || e.RetryAfter > 5 {
-		t.Errorf("Retry-After = %d s, want the remaining ~4 s of the lease", e.RetryAfter)
+	if left := int((NamespaceLeaseTTL - 11*time.Second) / time.Second); e.RetryAfter < left-1 || e.RetryAfter > left+1 {
+		t.Errorf("Retry-After = %d s, want the remaining ~%d s of the lease", e.RetryAfter, left)
 	}
-	clk.advance(5 * time.Second) // lease expired
+	clk.advance(NamespaceLeaseTTL - 11*time.Second + time.Second) // lease expired
 	m.Heartbeat(ctx, "h2", 0, nil)
 	if r, err := deploy(""); err != nil || r.Host != "h2" {
 		t.Fatalf("after the lease expires the redeploy should land on h2: %+v %v", r, err)

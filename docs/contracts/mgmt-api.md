@@ -1055,6 +1055,7 @@ What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
 | `createdAt` | integer (int64) | yes |  |
 | `deploymentID` | string | yes |  |
 | `epoch` | integer (int64) | yes |  |
+| `fence` | boolean | no | Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s): it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true. |
 | `lease` | string | yes |  |
 | `maxDepth` | integer | no |  |
 | `maxLive` | integer | no |  |

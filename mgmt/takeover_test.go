@@ -87,7 +87,7 @@ func TestMM_F4_GuardedTakeover(t *testing.T) {
 				}
 				return
 			}
-			clk.advance(20 * time.Second) // h1 silent past its lease; h2 alive
+			clk.advance(NamespaceLeaseTTL + 5*time.Second) // h1 silent past its lease (and its fence); h2 alive
 			m.Heartbeat(ctx, "h2", 0, nil)
 			if s.removeH1 {
 				if _, err := m.DeleteHost(ctx, "h1", true, "test"); err != nil {
@@ -147,5 +147,54 @@ func TestBundleStateful(t *testing.T) {
 		if got, why := BundleStateful(makeBundle(t, tc.files)); got != tc.want {
 			t.Errorf("%s: stateful=%v (%s), want %v", tc.name, got, why, tc.want)
 		}
+	}
+}
+
+// TestMM_F9_AssignmentFence: deployments record whether the host must fence
+// them (BundleStateful) and assignments carry it (ADR-028 §3).
+func TestMM_F9_AssignmentFence(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := OpenStore(ctx, filepath.Join(dir, "m.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cust, _ := OpenFileCustody(filepath.Join(dir, "c"))
+	m, err := New(Config{Store: st, Custody: cust, Broker: &Broker{}, IDSecret: []byte("0123456789abcdef"), ReapInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+	kf := filepath.Join(dir, "api.env")
+	os.WriteFile(kf, []byte("TS_API_KEY=x\n"), 0o600)
+	tn, _ := m.CreateTenant(ctx, TenantRequest{Tailnet: "t.ts.net", MintMode: "apikey", APIKeyFile: kf})
+	m.RegisterHost(ctx, RegisterRequest{HostID: "h1", CapacityNodes: 10, Tiers: []string{"process"}}, "", "")
+	for _, tc := range []struct {
+		workload, jsonc string
+		fence           bool
+	}{
+		{"web", `{"tailnet":{"tags":["tag:w"]}}`, false},
+		{"agents", `{"tailnet":{"objects":{"A":{"tags":["tag:a"]}}}}`, true},
+		{"cache", `{"tailnet":{"objects":{"C":{"tags":["tag:c"],"fence":"never"}}}}`, false},
+	} {
+		if _, err := m.Deploy(ctx, DeployRequest{TenantID: tn.ID, Workload: tc.workload,
+			Bundle: makeBundle(t, map[string]string{"twd.jsonc": tc.jsonc, "dist/index.js": "export default {}"})}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	as, err := m.Assignments(ctx, "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]bool{"web": false, "agents": true, "cache": false}
+	for _, a := range as {
+		if a.Fence != want[a.Workload] {
+			t.Errorf("%s: assignment fence = %v, want %v", a.Workload, a.Fence, want[a.Workload])
+		}
+		delete(want, a.Workload)
+	}
+	if len(want) != 0 {
+		t.Errorf("missing assignments: %v", want)
 	}
 }

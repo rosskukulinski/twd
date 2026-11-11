@@ -19,7 +19,7 @@ FIX_MODE: fix
 | F6 | Replica registry (`replicas` table: stable per-state-dir ID, custody fingerprint, last_seen by the store clock). A replica refuses to start if file custody would be shared with another live replica, or if live replicas' custody fingerprints differ; the same check runs each reaper tick (status not ok, warning) | H11 | `TestMM_H11_FileCustodyPerReplica` becomes "second replica refuses with a clear error"; unit test for the registry; a single replica restarting within 30 s of a SIGKILL must still start | queued |
 | F7 | Registration throttle state in the store (`tenant_throttle`), shared by every replica and timed by the store clock | H03 | `TestMM_H03_ThrottlePerReplica` (before: 45 in a 10 s window; after: 16 = the limit, 2/2); `TestStoreSharedThrottle` (SQLite + Postgres) | **DONE** |
 | F8 | Persist each host's push target in the `hosts` row at registration, so any replica can push kills and assignments; keep the in-memory map as a cache | H06 | `TestMM_H06_KillPushAcrossReplicas` (before: via r1 heartbeat after ~1.5 s; after: pushed in 13–15 ms, 2/2), `TestMM_F8_PushTargetShared` | **DONE** |
-| F9 | ADR-028 §3 (Ross, second interview): mgmt marks each deployment `fence` (= `BundleStateful`) and sends it in assignments; hostd's heartbeat-loss fencing undeploys only workloads with `fence` (a missing field means fence: safe against an older mgmt). `FenceAfter` 9 → 30 s, `NamespaceLeaseTTL` 15 → 45 s, with a startup check that fence < lease − margin. Fix the stale comment | correction (iter13) | hostd unit test: stateless survives heartbeat loss, stateful fenced at 30 s and redeployed on reconnect; lease/fence constants test | queued |
+| F9 | ADR-028 §3 (Ross, second interview): mgmt marks each deployment `fence` (= `BundleStateful`) and sends it in assignments; hostd's heartbeat-loss fencing undeploys only workloads with `fence` (a missing field means fence: safe against an older mgmt). `FenceAfter` 9 → 30 s, `NamespaceLeaseTTL` 15 → 45 s, with a startup check that fence < lease − margin. Fix the stale comment | correction (iter13) | `TestMM_F9_FenceStatefulOnly`, `TestFenceBelowLease` (hostd), `TestMM_F9_AssignmentFence` (mgmt) | **DONE** (fence selection unit-tested; undeploy and redeploy on reconnect not exercised end to end, since that needs workerd: scenario S4) |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -535,6 +535,43 @@ In fact, since M3 (`ede3258`):
     and follows a re-registration after the old listener is gone.
   - e2e `TestMM_H06`: kills via either replica are pushed in 12–15 ms.
 
+### F9: hosts self-fence stateful workloads only, at 30 s; lease 45 s (ADR-028 §3)
+
+**mgmt.**
+- `Deployment.Fence` is `BundleStateful(bundle)`, or true when there's no
+  bundle.
+- It's stored in a new `deployments.fence` column. Existing rows default
+  to 1 (fence), the safe value.
+- It's sent as `fence` in assignments (spec first).
+- `NamespaceLeaseTTL` went from 15 s to 45 s.
+
+**hostd.**
+- Each workload remembers `noFence` from its assignment. A missing field
+  (an older mgmt) means fence.
+- Heartbeat loss now calls `fenceStateful`, which undeploys only
+  `fences()` workloads (selection lives in `fenceTargets`). The next
+  successful sync redeploys them, as before.
+- `DefaultFenceAfter` is 30 s (was 9 s). `MaxFenceAfter` is 40 s, and `New`
+  refuses anything larger.
+- New flag: `twd-hostd -fence-after`.
+- The stale "below the 10 s lease TTL" comment is replaced.
+
+**Tests.**
+- hostd: `TestMM_F9_FenceStatefulOnly` (stateful and older-mgmt are
+  fenced, stateless isn't) and `TestFenceBelowLease` (`MaxFenceAfter` + 5 s
+  ≤ `mgmt.NamespaceLeaseTTL`; default and maximum enforced).
+- mgmt: `TestMM_F9_AssignmentFence` (Workers-only → false, DO → true,
+  `fence:never` → false).
+- The F4 and F5 tests were updated for the 45 s lease.
+
+**Not run.** The real undeploy and redeploy on heartbeat loss needs
+workerd. That's scenario S4 (Postgres blackhole for one replica) and an
+mgmt outage scenario, both future.
+
+**Behavior change to note.** Takeover of a dead host's workload
+(confirmed, or stateless) now waits up to 45 s instead of 15 s. Ross
+accepted this.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -579,3 +616,4 @@ In fact, since M3 (`ede3258`):
 2026-11-11 iter13 PLAN | H06 | n/a | confirm if a kill served by r1 reaches a host registered with r0 only via heartbeat or after > 1 s; refute if pushed within 1 s | I6
 2026-11-11 iter13 | H06 | n/a ×2 | CONFIRMED | I6 | results/*-H06 | via r0: pushed in 12–15 ms; via r1: no push, heartbeat after ~1.5 s. While reading hostd's heartbeat found existing self-fencing (FenceAfter 9 s, all workloads): correction recorded, ADR-028 §3 to be re-decided
 2026-11-11 iter14 | F8 | n/a ×2 | FIXED | — | results/*-H06; make test-go/test-pg green | kill via r1 now pushed in 13–15 ms (was heartbeat, ~1.5 s)
+2026-11-11 iter15 | F9 | n/a | DONE | — | make test-go/test-pg green; e2e H01/H02/H06/H11 green | F4/F5 tests updated for the 45 s lease; my first edit left dead scaffolding (`_unusedFenceLoop`) and a duplicate import, both removed before commit

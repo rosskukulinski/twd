@@ -372,6 +372,9 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// M12: oauth mint mode (client ID + credential file path; never the secret).
 		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
 		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F9 (ADR-028 §3): hosts self-fence only stateful workloads.
+		// Existing rows default to 1 (fence), the safe value.
+		{"deployments", "fence", "ALTER TABLE deployments ADD COLUMN fence BIGINT NOT NULL DEFAULT 1"},
 		// mm-loop F8 (H06): every replica can push to a host.
 		{"hosts", "push_target", "ALTER TABLE hosts ADD COLUMN push_target TEXT NOT NULL DEFAULT ''"},
 		// mm-loop F3 (H02): one replica mints each object.
@@ -661,13 +664,14 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var ns string
-	var ml, md int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt)
+	var ml, md, fence int64
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence)
+	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -677,8 +681,12 @@ func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 }
 
 func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"),
-		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, d.Bundle)
+	fence := int64(0)
+	if d.Fence {
+		fence = 1
+	}
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence, d.Bundle)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -689,8 +697,9 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	row := s.db.QueryRowContext(ctx, s.q("SELECT "+deployCols+", bundle FROM deployments WHERE id=?"), id)
 	var d Deployment
 	var ns string
-	var ml, md int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &d.Bundle)
+	var ml, md, fence int64
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.Bundle)
+	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}

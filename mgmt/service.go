@@ -650,6 +650,10 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	if err != nil {
 		return resp, err
 	}
+	fence := true // no bundle (namespaces given directly): assume stateful
+	if len(r.Bundle) > 0 {
+		fence, _ = BundleStateful(r.Bundle)
+	}
 	lease, err := m.store.AcquireLease(ctx, LeaseName(t.ID, r.Workload), host, NamespaceLeaseTTL, m.now())
 	if errors.Is(err, ErrLeaseHeld) {
 		return resp, m.leaseHeldError(ctx, LeaseName(t.ID, r.Workload), r.Workload)
@@ -658,7 +662,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		return resp, err
 	}
 	d := Deployment{ID: newID("dp_"), TenantID: t.ID, Workload: r.Workload, HostID: host, Namespaces: classes,
-		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli()}
+		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli(), Fence: fence}
 	if err := m.store.CreateDeployment(ctx, d); err != nil {
 		return resp, err
 	}
@@ -850,6 +854,9 @@ type Assignment struct {
 	Tailnet      string        `json:"tailnet"`
 	ControlURL   string        `json:"controlURL,omitempty"`
 	WorkloadTags []string      `json:"workloadTags,omitempty"`
+	// Fence: stop serving this workload when mgmt is unreachable for
+	// FenceAfter (stateful). Hosts treat a missing field as true.
+	Fence bool `json:"fence"`
 }
 
 func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, error) {
@@ -862,7 +869,7 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 		t, _ := m.store.GetTenant(ctx, d.TenantID)
 		a := Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
 			BundleURL: "/v1/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
-			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}}
+			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}, Fence: d.Fence}
 		for _, c := range d.Namespaces {
 			if c.Class == WorkloadNamespace {
 				a.WorkloadTags = c.Tags
