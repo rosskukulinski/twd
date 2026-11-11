@@ -1523,14 +1523,20 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 			e := errf(503, "identity_pending", "object %s is waiting on the registration queue (depth %d)", id, m.QueueDepth(o.TenantID))
 			return Credential{}, e
 		}
+		// m.changed only fires for mints on this replica; another replica's
+		// mint is seen by re-reading the store (H05).
 		select {
 		case <-ch:
-		case <-time.After(left):
+		case <-time.After(min(left, credentialPoll)):
 		case <-ctx.Done():
 			return Credential{}, ctx.Err()
 		}
 	}
 }
+
+// credentialPoll is how often a waiting credential request re-reads the
+// object, to see a mint done by another replica.
+const credentialPoll = 250 * time.Millisecond
 
 // ReadyRequest is POST /v0/objects/{id}/ready. Epoch is optional (fences
 // the commit when set).

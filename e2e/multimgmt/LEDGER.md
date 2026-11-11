@@ -37,7 +37,7 @@ FIX_MODE: fix
 | H02 | P0 | **FIXED by F3** (was: every double-minted object lost its credential) | `TestMM_H02_DoubleMint` |
 | H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
 | H04 | P1 | **FIXED by F14**. Was CONFIRMED (intermittent: 3/20 runs, each 6 live descendants with maxLive 5; standalone 2/15, after H03 1/5) | `TestMM_H04_SpawnBudgetRace` (writes report.txt) |
-| H05 | P2 | open | |
+| H05 | P2 | **CONFIRMED and FIXED** (F16): a credential long-poll on one replica saw another replica's mint only after the whole wait (10.004 s for a mint at 300 ms); now 506 ms | `TestMM_H05_CredentialWaitSeesOtherReplicasMint` |
 | H06 | P1 | **FIXED by F8**. Was CONFIRMED (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
 | H07 | P1 | **FIXED by F10**. Was CONFIRMED: with a device-delete delay, SIGKILL of the killing replica inside the window left the device forever (control deleted) | `TestMM_H07_DeviceDeleteLostOnCrash`, `TestStoreDeviceDelete` |
 | H08 | P2 | **FIXED by F13**. Was CONFIRMED: after the host reported `active` to r0, r1 said `assigned` | `TestMM_H08_DeploymentStatusPerReplica`, `TestMM_F13_DeploymentStatusShared` |
@@ -789,6 +789,18 @@ the throttle at 60/min. `throttle(t)` now applies a changed limit. The mint
 worker re-reads the tenant on every attempt, so every replica follows a
 `PATCH`.
 
+### F16: credential long-polls see other replicas' mints (H05)
+
+- **Before.** `Credential` waits on `m.changed(id)`, a per-replica
+  notification, then re-reads at the deadline. hostd asks with `wait=10`.
+  With F3, any replica may mint an object, so a host polling replica B
+  while A minted waited the whole 10 s:
+  `TestMM_H05_CredentialWaitSeesOtherReplicasMint` measured **10.004 s**
+  for a mint at 300 ms. That's create-to-ready latency, not an error.
+- **Now.** The wait also wakes every `credentialPoll` (250 ms) to re-read
+  the object: **506 ms**. The cost is one `GetObject` per 250 ms per
+  waiting request.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -848,3 +860,4 @@ worker re-reads the tenant on every attempt, so every replica follows a
 2026-11-11 iter22 | H04 | 20 runs | CONFIRMED (3/20) | I5 | results/*-H04 (report.txt) | appeared in the full-suite run after F13; not related to F13 (the race predates it)
 2026-11-11 iter23 | F14 | 30 runs | FIXED | — | make test-go/test-pg green | found and fixed flaky TestV1Pagination (async mint audits); queued H16
 2026-11-11 iter24 | H09, H15 → F15 | unit | CONFIRMED then FIXED | I6/I7, I4 | — | make test-go/test-pg green; e2e H02/H03 green
+2026-11-11 iter25 | H05 → F16 | unit | CONFIRMED then FIXED | I8 latency | — | 10.004 s → 506 ms; make test-go/test-pg green
