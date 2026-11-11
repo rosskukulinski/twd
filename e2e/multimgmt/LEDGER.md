@@ -55,7 +55,7 @@ FIX_MODE: fix
 | S3 | — | **3/3 clean seeds** (SIGSTOP 50 s > 45 s lease) | `TestMM_S3_StallLongerThanLease` |
 | S4 | — | **3/3 clean seeds** (PG blackhole 30 s, one replica) | `TestMM_S4_PostgresPartitionOneReplica` |
 | S5 | — | **3/3 clean seeds** (PG restart mid-load; failures confined to the declared outage) | `TestMM_S5_PostgresRestart` |
-| S6 | — | **3/3 seeds, invariants hold**, but throughput collapses (~150–175 ops/60 s vs ~2,300): see H17 | `TestMM_S6_SlowPostgresOneReplica` |
+| S6 | — | **NOT clean**: seed 1 pass, seed 2 pass at 0.85% failures, **seed 3 FAILED I8** (2/133 = 1.5%); throughput collapses (117–175 ops/60 s vs about 2,300): see H17 | `TestMM_S6_SlowPostgresOneReplica` |
 | S1, S7–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
@@ -889,8 +889,11 @@ covering the restart through 10 s after Postgres returns. Outside them,
 0.03–0.16% of ops failed. **H18:** a store outage surfaces as
 `500 internal` rather than a retryable `503`.
 
-**S6**, 200 ms–2 s of Postgres latency on one replica: invariants hold, but
-the cluster completed only about 150–175 ops in 60 s, against about 2,300
+**S6**, 200 ms–2 s of Postgres latency on one replica. **Correction:** I
+first recorded "invariants hold, 3/3" and committed that before reading
+seed 3's result. **Seed 3 failed I8** (2 of 133 ops = 1.5%, over the 1%
+bound), and seed 2 passed narrowly at 0.85%. The counts are tiny, because
+the cluster completed only about 117–175 ops in 60 s, against about 2,300
 in S4. **The oracle doesn't check throughput, so this "passes".** The new
 lock sampler (`locks.txt`) and a latency split (seed 1) show two causes:
 1. **About half the ops first waited out a 5 s client timeout on the slow
@@ -975,3 +978,4 @@ The audit chain head, my first suspect, never showed up in the samples.
 2026-11-11 iter28 | S3, S4 | seeds 1–3 each | 6/6 PASS | — | results/*-S3-*, *-S4-* | S3 throughput about halved by the stalled-but-accepting replica (needs VIP health checks)
 2026-11-11 iter29 PLAN | S5 (PG restart mid-load), S6 (200 ms–2 s PG latency on one replica), seed 1 | 1 | pass if all invariants hold | I3 I5 I6 I7 I8 I9 I11
 2026-11-11 iter29 | S5, S6 | seeds 1–3 each | S5 3/3 PASS (after outage windows), S6 3/3 invariants PASS with throughput finding | I8 | results/*-S5-*, *-S6-* (locks.txt) | new: PG lock sampler; H17 (lease-row contention), H18 (500 vs 503 during store outage)
+2026-11-11 iter29 CORRECTION | S6 | seeds 2, 3 | seed 2 PASS (0.85%), seed 3 FAIL I8 (1.5%) | I8 | results/*-S6-seed{2,3} | the previous entry's '3/3' was written before reading seed 3's result
