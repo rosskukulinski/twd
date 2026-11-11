@@ -1,5 +1,15 @@
 # multi-mgmt loop ledger
 
+> **Stopped 2026-11-11 after iteration 3 by the I1 rule** (H10: lease and
+> liveness use each replica's clock; a healthy holder is displaced at
+> ≥12–15 s of skew).
+>
+> **Confirmed so far:** H02 (P0; a double mint destroys the credential) and
+> H10. **Refuted:** H01.
+>
+> **To resume:** decide whether clock skew is in scope, then
+> `/loop Follow e2e/multimgmt/LOOP.md`.
+
 FIX_MODE: propose
 
 ## Status
@@ -16,7 +26,7 @@ FIX_MODE: propose
 | H07 | P1 | open | |
 | H08 | P2 | open | |
 | H09 | P2 | open | |
-| H10 | P0 | open | |
+| H10 | P0 | **CONFIRMED** (SQLite + Postgres): deploys refused at ≥10 s skew; healthy holder displaced at ≥12–15 s. **Loop stopped (I1 rule)** | `mgmt/mm_h10_test.go` `TestMM_H10_LeaseClockSkew` |
 | H11 | P0 | open | |
 | H12 | P1 | open | |
 | H13 | P1 | open | |
@@ -179,6 +189,55 @@ which includes every rolling restart. A single replica can't trigger it.
 - Add an in-process unit regression test in `mgmt/` (two `Mgmt` on one PG
   store); the e2e test is the repro for now.
 
+### H10: CONFIRMED (P0, conditional on clock skew). A replica's clock decides who holds a lease.
+
+**Repro.** `go test -tags e2emultimgmt -run TestMM_H10 ./mgmt/` runs two
+`Mgmt` replicas on one store, with offset clocks:
+- h1 heartbeats every 2 s through one replica;
+- a redeploy of the same workload is served by the other replica, 1 s
+  after h1's last heartbeat;
+- the skew is swept from 0 to 20 s, with the other replica either ahead or
+  behind.
+
+**Results** (deterministic, the same in both directions):
+
+| Skew | Outcome | Invariant |
+|---|---|---|
+| ≤ 9 s | correct: the workload stays on h1 | — |
+| 10–12 s | the redeploy is **refused** (`lease held by another holder`) although h1 is healthy | I8 |
+| ≥ 15 s (≥ 12 s ahead on Postgres) | the workload **moves to h2** (epoch+1) although h1 is healthy | **I1** |
+
+When the workload moves, h1 keeps serving its DO, with its local state,
+until its next heartbeat comes back with `revoke`. Meanwhile h2 starts the
+same DO with **empty** state. That's a brief two-instance window, plus the
+state of every object in that workload lost on h2. Epoch fencing stops h1
+from getting new credentials, but not from serving.
+
+**Root cause.** Every expiry decision uses the calling replica's wall clock:
+- `TouchHost` writes `last_seen = replica now` (`mgmt/sqlstore.go:523`);
+- `Host.Live(now)` compares against `HostLeaseTTL` = 10 s
+  (`mgmt/types.go:85`), which is the 10 s threshold;
+- `AcquireLease`/`RenewLease` write and compare `expires_at` against
+  replica `now` (`mgmt/sqlstore.go:946`, `:967`), with
+  `NamespaceLeaseTTL` = 15 s, which is the 15 s threshold.
+
+**Is it realistic?** NTP-synced machines are within milliseconds, so this
+needs a broken clock: a VM resumed from suspend, a host with NTP blocked, or
+a laptop replica. With `twd up` on Macs, sleep/wake is a plausible source.
+Nothing detects or refuses skew today.
+
+**Fix sketch.**
+1. Make Postgres the only clock. Compute `expires_at`/`last_seen` with
+   `now()` inside the SQL (the SQLite equivalent is fine for one replica),
+   and compare with `now()` too; take replica `now` out of lease and
+   liveness decisions.
+2. Have `GET /v1/status` report each replica's skew against the database
+   (`SELECT now()`), and refuse to serve beyond about 2 s.
+3. Separately (also seen here): `pickHost` choosing a new host while the
+   old lease is still valid gives a confusing "lease held by another
+   holder". It should fall back to the lease holder, or say "the current
+   host looks dead to this replica".
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -204,3 +263,7 @@ which includes every rolling restart. A single replica can't trigger it.
 2026-11-11 iter2 PLAN | H02 (+ harness: tenant/host/deploy setup, fake host heartbeat, fakeTS hold) | n/a | confirm if any object gets >1 key after 3 replicas start together with 40 pending objects; refute if 3 runs show exactly 1 key per object | I3
 2026-11-11T16:37Z | H02 | n/a | CONFIRMED | I3 | results/20261111T163710Z-H02 | 60 keys/40 objects, 13 double-minted; added custody oracle
 2026-11-11T16:38Z | H02 | n/a ×3 | CONFIRMED | I3 (custody) | results/20261111T1638{26,40,51}Z-H02 | 14–17 double-minted per run, all of them left without a credential (custody 404); first custody-oracle run discarded (it treated 201 as failure)
+2026-11-11 iter3 PLAN | H10 (in-process: 2 Mgmt, one store, skewed clocks) | n/a | confirm if a healthy heartbeating holder is displaced by a redeploy through a skewed replica at any skew; report the threshold (ahead and behind); refute if no displacement up to 20 s | I1
+2026-11-11T16:4xZ | H10 | n/a | CONFIRMED | I1, I8 | in-process (SQLite) | sweep 0–20 s: refused ≥10 s, displaced ≥15 s, ahead and behind. First run aborted at 10 s (a test bug: deploy errors were fatal); fixed to record outcomes
+2026-11-11T16:4xZ | H10 | n/a | CONFIRMED | I1, I8 | in-process (Postgres twd-mm-pg) | refused ≥10 s; displaced ≥12 s ahead / ≥15 s behind (sub-cases share host rows: approximate)
+2026-11-11 | LOOP STOPPED | — | I1 violated (H10) → stop rule | — | — | needs a decision: accept skew as out of scope (and resume), or fix H10 first. Open: H03–H09, H11–H14; harness slices 3+; scenarios S1–S11 not started
