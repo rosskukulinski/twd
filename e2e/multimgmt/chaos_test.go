@@ -848,3 +848,65 @@ func TestMM_S10_KillStorm(t *testing.T) {
 		}
 	})
 }
+
+// Soak: a random mix of every fault, one every 10–25 s, for
+// TWD_MM_DURATION (LOOP.md: 2 clean soaks of 10 min with new seeds).
+func TestMM_Soak(t *testing.T) {
+	runScenario(t, "SOAK", func(ctx context.Context, c *cluster, g *rng, h *history) {
+		db := c.db()
+		for ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Duration(10+g.intn(16)) * time.Second):
+			}
+			i := g.intn(3)
+			switch g.intn(6) {
+			case 0: // crash and restart
+				c.stop(i, syscall.SIGKILL)
+				time.Sleep(3 * time.Second)
+				c.start(i)
+				c.waitReady(i, 15*time.Second)
+			case 1: // stall
+				c.signal(i, syscall.SIGSTOP)
+				time.Sleep(15 * time.Second)
+				c.signal(i, syscall.SIGCONT)
+			case 2: // partition from the store
+				c.proxy(i).set("blackhole", 0)
+				time.Sleep(10 * time.Second)
+				c.proxy(i).set("pass", 0)
+			case 3: // slow store link
+				c.proxy(i).set("delay", time.Duration(200+g.intn(1800))*time.Millisecond)
+				time.Sleep(10 * time.Second)
+				c.proxy(i).set("pass", 0)
+			case 4: // store restart (declared outage)
+				start := time.Now()
+				restartPG(t)
+				h.outage(start.Add(-time.Second), time.Now().Add(10*time.Second))
+			case 5: // kill storm on a few trees, through every replica
+				rows, err := db.Query(`SELECT root_id FROM objects WHERE status NOT IN ('killed','failed') AND id<>root_id GROUP BY root_id ORDER BY random() LIMIT 3`)
+				if err != nil {
+					continue
+				}
+				var roots []string
+				for rows.Next() {
+					var r string
+					rows.Scan(&r)
+					roots = append(roots, r)
+				}
+				rows.Close()
+				var wg sync.WaitGroup
+				for _, root := range roots {
+					for rep := range 3 {
+						wg.Add(1)
+						go func() {
+							defer wg.Done()
+							c.callAs(rep, "", "DELETE", "/v1/objects/"+root+"?cascade=true&reason=soak", nil)
+						}()
+					}
+				}
+				wg.Wait()
+			}
+		}
+	})
+}

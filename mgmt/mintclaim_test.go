@@ -195,3 +195,37 @@ func TestStoreTenantQuota(t *testing.T) {
 		}
 	})
 }
+
+// TestStoreDeviceDeleteClaimLapses (H21, soak seed 101): a claimed device
+// delete whose outcome was never recorded (claimer died, or the store blipped
+// so neither "done" nor "retry" could be written) becomes due again after
+// DeviceDeleteClaimTTL; a recorded success (-1) never does.
+func TestStoreDeviceDeleteClaimLapses(t *testing.T) {
+	forEachStore(t, func(t *testing.T, s *SQLStore) {
+		ctx := context.Background()
+		id := "ddl-" + strings.ReplaceAll(t.Name(), "/", "-")
+		if err := s.CreateObject(ctx, Object{ID: id, TenantID: "tn", Workload: "w", Namespace: "A", Name: id, Hostname: id, Status: StatusKilled}); err != nil {
+			t.Fatal(err)
+		}
+		const t0 = int64(1_800_000_000_000)
+		ttl := DeviceDeleteClaimTTL.Milliseconds()
+		s.SetDeviceDelete(ctx, id, t0)
+		if ok, _ := s.ClaimDeviceDelete(ctx, id, t0); !ok {
+			t.Fatal("claim when due")
+		}
+		// No outcome recorded (crash / store blip).
+		if ids, _ := s.DueDeviceDeletes(ctx, t0+ttl-1000); len(ids) != 0 {
+			t.Fatalf("still claimed before the TTL: %v", ids)
+		}
+		if ids, _ := s.DueDeviceDeletes(ctx, t0+ttl+1000); len(ids) != 1 {
+			t.Fatalf("an unrecorded claim must lapse and be due again after %v: %v", DeviceDeleteClaimTTL, ids)
+		}
+		if ok, _ := s.ClaimDeviceDelete(ctx, id, t0+ttl+1000); !ok {
+			t.Fatal("a lapsed claim must be claimable")
+		}
+		s.SetDeviceDelete(ctx, id, -1) // success recorded
+		if ids, _ := s.DueDeviceDeletes(ctx, t0+100*ttl); len(ids) != 0 {
+			t.Fatalf("a completed delete must never be due again: %v", ids)
+		}
+	})
+}

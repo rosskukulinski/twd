@@ -51,6 +51,8 @@ FIX_MODE: fix
 | H17 | P2 | **CHANGED (FOR SHARE), effect not isolated** (iter30). Was open (from S6: fenced commits hold the workload's lease row FOR UPDATE across several round trips; a slow replica stalls everyone's credential/ready/renew for that workload; p99 3.6 s on fast replicas) | S6 locks.txt |
 | H19 | P1 | **CONFIRMED and FIXED** (F19): each replica's Postgres pool was unbounded; a 500-request burst opened enough connections to hit `max_connections` ("sorry, too many clients already", SQLSTATE 53300), failing requests on every replica. Pool now bounded (default 16, `?twd_max_conns=K`) | S9 seed 2; `TestTakeMaxConns` |
 | H20 | P1 | **CONFIRMED and FIXED**: `CreateObject` and `PreflightBundle` mapped *any* tenant, parent or namespace lookup error to a 404 (`unknown_tenant`, …), so store outages looked like permanent not-founds that clients wouldn't retry, and the I8 oracle didn't count them. They now keep their 503 or 500 mapping; real not-founds stay 404 | S9, S5 op-codes |
+| H21 | P1 | **CONFIRMED (soak 101) and FIXED** (F20): a device-delete claim was terminal (`-1`); a kill during a Postgres restart claimed it, the delete failed, and so did the reschedule, so the device was never deleted. Claims are now a 2-min lease and success is recorded explicitly | `TestStoreDeviceDeleteClaimLapses` |
+| H22 | P1 | **CONFIRMED (soak 101), OPEN, design**: audit appends are separate from the state change; during a store blip the kill committed but its audit record was dropped (`audit append failed`). Needs a decision: audit in the same transaction as the change, or a durable audit outbox | r1.log |
 | H18 | P3 | **FIXED** (iter30): store unavailable, lock timeout or idle-transaction timeout → `503 store_unavailable` with Retry-After | `TestStoreUnavailableMapping` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
@@ -65,7 +67,7 @@ FIX_MODE: fix
 | S5 (re-verified) | — | 3/3 again after H20 (store errors now 503 inside the declared outage; 0.05–0.09% outside) | |
 | S10 | — | **3/3 clean seeds** (kill storm: overlapping cascade kills of the same trees through every replica every 3 s; KillOnce 0, I6 ok) | `TestMM_S10_KillStorm` |
 | S11 | — | **3/3 clean runs** (failover protocol across replicas with **fake hosts**: takeover_unconfirmed → lease_held → forced takeover to h2 at epoch+1 at 47 s, audited → h1 revoked and fenced (lease_lost via every replica) → h2 joins at the new epoch). A real twd-hostd is not used | `TestMM_S11_HostFailover` |
-| Soaks | — | 0/2 | |
+| Soaks | — | seed 101 **FAILED I6** (1 device never deleted, during a PG restart) → F20; seed 102 **PASS** (265,807 ops). Re-running 101 + 103 after F20 | `TestMM_Soak` |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
 
@@ -1023,6 +1025,46 @@ No other scenario had masked 404s.
   end against multi-replica mgmt. Follow-up: a hostd e2e when the VIP
   (H12) exists.
 
+### Soaks: H21 fixed (F20), H22 open
+
+Two 10-minute mixed-fault soaks: crash, stall, store partition, slow
+store, store restart and kill storm, one every 10–25 s.
+- **Seed 102:** all invariants held over 265,807 ops (28,000+ audit
+  records verified).
+- **Seed 101:** every invariant held except **I6**. Exactly one killed
+  object's device was never deleted, out of 218,863 ops.
+
+**What happened** (from r1's log). The kill landed while Postgres was
+being restarted (`57P01 terminating connection due to administrator
+command`):
+1. the object was marked killed;
+2. the inline device delete **claimed** its durable record, which set it
+   to `-1`, a terminal value;
+3. the device delete failed against the dying store;
+4. the reschedule write failed too.
+
+Nothing could ever pick it up again.
+
+**F20.** `ClaimDeviceDelete` now moves the due time to now + 2 min (a
+lease) instead of `-1`. The runner records `-1` only after success (or
+"unavailable"), and `now + 30 s` on failure. If neither write lands, the
+lease lapses and any replica's sweep retries; a gone device counts as
+success. The test is `TestStoreDeviceDeleteClaimLapses`.
+
+**H22 (OPEN, needs a decision).** The same kill's **audit record was
+dropped** (`audit append failed … 57P01`). Audit appends run after the
+state change, in their own transaction, and are best-effort. A store blip
+between the two leaves a kill, mint or credential release with no audit
+record, and the hash chain still verifies, because nothing was appended.
+For a security audit log that's a real gap. Options:
+- (a) write the audit record in the **same transaction** as the state
+  change: atomic, but touches every audited path;
+- (b) a **durable outbox**: write an intent row in the same transaction,
+  and append to the chain asynchronously;
+- (c) an in-memory retry queue: cheap, but lost on crash.
+
+Recommendation: (b).
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -1098,3 +1140,5 @@ No other scenario had masked 404s.
 2026-11-11 iter32 | S8, S9 (+ S5 re-run) | seeds 1–3 each | all PASS after F19 + H20 | I8, Quota | results/*-S8-*, *-S9-*, *-S5-* | H19 connection storm and H20 404 masking found by S9; pool-size-2 deadlock hunt clean
 2026-11-11 iter33 PLAN | S10 (kill storm), S11 (host failover protocol, fake hosts) + KillOnce invariant | seeds 1–3 | pass if invariants hold / every protocol step as specified | I1 I2 I6 I7 KillOnce
 2026-11-11 iter33 | S10, S11 | 3 each | 6/6 PASS | I1 I2 I6 KillOnce | results/*-S10-*, *-S11 | all scenarios now have 3 clean seeds; soaks next
+2026-11-11 iter33 PLAN | Soak ×2 (mixed faults every 10–25 s, 10 min, seeds 101 and 102) | 101, 102 | pass if every invariant holds in both | all
+2026-11-11 iter33 | soaks 101, 102 | 2 | 101 FAIL I6 → F20 (H21); 102 PASS | I6 | results/*-SOAK-* | H22 (dropped audit record during a store blip) recorded, needs a decision

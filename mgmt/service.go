@@ -1979,8 +1979,13 @@ func (m *Mgmt) runDeleteForce(id string, force bool) {
 }
 
 // DeviceDeleteRetry is how long a failed device delete waits before any
-// replica's sweep tries again.
-const DeviceDeleteRetry = 30 * time.Second
+// replica's sweep tries again; DeviceDeleteClaimTTL is how long a claimed
+// delete stays claimed before it is due again (claimer died or couldn't
+// record the outcome).
+const (
+	DeviceDeleteRetry    = 30 * time.Second
+	DeviceDeleteClaimTTL = 2 * time.Minute
+)
 
 // deleteDeviceClaimed claims the object's durable device delete (so exactly
 // one replica runs it), deletes the device, audits, and on a retryable
@@ -2003,7 +2008,14 @@ func (m *Mgmt) deleteDeviceClaimedAudit(ctx context.Context, o Object, force, au
 	id := o.ID
 	st := time.Now()
 	err = m.deleteDevice(ctx, o)
-	if err != nil && !errors.Is(err, errDeviceDeleteUnavailable) {
+	switch {
+	case err == nil, errors.Is(err, errDeviceDeleteUnavailable):
+		// Done (or not ours to do). If this write fails the claim lapses
+		// and the delete re-runs: harmless, a gone device is a success.
+		m.store.SetDeviceDelete(context.WithoutCancel(ctx), id, -1)
+	default:
+		// Retry sooner than the claim would lapse; if this write fails too
+		// (store blip), the claim lapsing still brings it back (H21).
 		m.store.SetDeviceDelete(context.WithoutCancel(ctx), id, m.now().Add(DeviceDeleteRetry).UnixMilli())
 	}
 	detail := map[string]any{"nodeID": o.StableNodeID, "ms": time.Since(st).Milliseconds()}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"strconv"
@@ -161,8 +162,17 @@ func (s *SQLStore) SetDeviceDelete(ctx context.Context, id string, due int64) er
 	return err
 }
 
+// ClaimDeviceDelete takes a due delete by moving its due time to now +
+// DeviceDeleteClaimTTL: a claim is a lease, not a terminal state, so a
+// claimer that dies or can't record the outcome (store blip) leaves the
+// delete due again (H21, soak 101). Callers mark success with
+// SetDeviceDelete(id, -1).
 func (s *SQLStore) ClaimDeviceDelete(ctx context.Context, id string, now int64) (bool, error) {
-	r, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=-1 WHERE id=? AND device_delete_at>0 AND device_delete_at<=?"), id, now)
+	claimUntil := now + DeviceDeleteClaimTTL.Milliseconds()
+	if now == math.MaxInt64 { // forced (FlushDeletes)
+		claimUntil = time.Now().Add(DeviceDeleteClaimTTL).UnixMilli()
+	}
+	r, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=? AND device_delete_at>0 AND device_delete_at<=?"), claimUntil, id, now)
 	if err != nil {
 		return false, err
 	}
