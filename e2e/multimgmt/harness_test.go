@@ -323,7 +323,7 @@ type cluster struct {
 	replicas  []*replica
 	extraArgs []string
 	repMu     sync.Mutex // guards replica process state (chaos runs start/stop concurrently with calls)
-	jsonc     string // twd.jsonc for setupTenant ("" = twdJSONC)
+	jsonc     string     // twd.jsonc for setupTenant ("" = twdJSONC)
 }
 
 // proxy returns replica i's Postgres fault proxy.
