@@ -258,6 +258,10 @@ func asAPIError(err error) *Error {
 		return errf(http.StatusConflict, "lease_lost", "the caller does not hold the namespace lease at this epoch (%v)", err)
 	case errors.Is(err, ErrLeaseHeld):
 		return errf(http.StatusConflict, "lease_held", "%v", err)
+	case isStoreUnavailable(err):
+		e := errf(http.StatusServiceUnavailable, "store_unavailable", "the store is unavailable or contended; retry (%v)", err)
+		e.RetryAfter = 1
+		return e
 	}
 	return errf(http.StatusInternalServerError, "internal", "%v", err)
 }

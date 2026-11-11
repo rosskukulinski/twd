@@ -36,7 +36,7 @@ var _ Store = (*SQLStore)(nil)
 func OpenStore(ctx context.Context, dsn string) (*SQLStore, error) {
 	var s *SQLStore
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		db, err := sql.Open("pgx", dsn)
+		db, err := sql.Open("pgx", withSessionLimits(dsn))
 		if err != nil {
 			return nil, err
 		}
@@ -261,6 +261,41 @@ func (s *SQLStore) q(query string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+// Session limits for mgmt's Postgres connections (S6): a replica whose link
+// to the store is slow must not stall the healthy ones. lock_timeout bounds
+// how long anyone waits for a row lock; idle_in_transaction_session_timeout
+// aborts a transaction that sits idle between its statements (the slow
+// replica), releasing its locks. Both surface as StoreUnavailable (503).
+const (
+	pgLockTimeoutMs     = 3000
+	pgIdleInTxTimeoutMs = 3000
+)
+
+// withSessionLimits adds the session limits as startup parameters unless the
+// DSN already sets them.
+func withSessionLimits(dsn string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	for k, v := range map[string]int{"lock_timeout": pgLockTimeoutMs, "idle_in_transaction_session_timeout": pgIdleInTxTimeoutMs} {
+		if !strings.Contains(dsn, k+"=") {
+			dsn += fmt.Sprintf("%s%s=%d", sep, k, v)
+			sep = "&"
+		}
+	}
+	return dsn
+}
+
+// forShare locks a row against changes but not against other sharers
+// (fence reads: concurrent fenced commits don't serialise; H17).
+func (s *SQLStore) forShare() string {
+	if s.d == dialectPostgres {
+		return " FOR SHARE"
+	}
+	return ""
 }
 
 func (s *SQLStore) forUpdate() string {
@@ -1140,7 +1175,7 @@ func (s *SQLStore) checkFence(ctx context.Context, tx *sql.Tx, f *Fence) error {
 	var holder string
 	var epoch int64
 	var expires int64
-	err := tx.QueryRowContext(ctx, s.q("SELECT holder, epoch, expires_at FROM leases WHERE name=?"+s.forUpdate()), f.Lease).Scan(&holder, &epoch, &expires)
+	err := tx.QueryRowContext(ctx, s.q("SELECT holder, epoch, expires_at FROM leases WHERE name=?"+s.forShare()), f.Lease).Scan(&holder, &epoch, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: no lease %q (caller %q asked for epoch %d)", ErrLeaseLost, f.Lease, f.Holder, f.Epoch)
 	}

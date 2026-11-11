@@ -48,14 +48,14 @@ FIX_MODE: fix
 | H13 | P1 | **FIXED** (OBO root keys by F11, WIF issuer key by F11b). Was CONFIRMED (OBO root: 12/40 tenants diverge on cold concurrent first use, 0/40 on normal create; WIF issuer key: per state dir, by code, not run) | `TestMM_H13_OBORootKeyDiverges` |
 | H14 | P2 | **FIXED by F12**. Was CONFIRMED (2/2 runs, 10/10 names): concurrent same-name creates through 3 replicas → one 202 and two `409 exists`, not the idempotent existing object | `TestMM_H14_ConcurrentSameNameCreate` |
 | H15 | P2 | **CONFIRMED and FIXED** (F15): a lowered `registrationsPerMinute` never reached an existing throttle; now applied on the mint worker's next attempt, on every replica | `TestMM_H15_ThrottleFollowsTenantLimit` |
-| H17 | P2 | open (from S6: fenced commits hold the workload's lease row FOR UPDATE across several round trips; a slow replica stalls everyone's credential/ready/renew for that workload; p99 3.6 s on fast replicas) | S6 locks.txt |
-| H18 | P3 | open (from S5: store unreachable → `500 internal`; should be a retryable `503` with Retry-After) | S5 op-codes.txt |
+| H17 | P2 | **CHANGED (FOR SHARE), effect not isolated** (iter30). Was open (from S6: fenced commits hold the workload's lease row FOR UPDATE across several round trips; a slow replica stalls everyone's credential/ready/renew for that workload; p99 3.6 s on fast replicas) | S6 locks.txt |
+| H18 | P3 | **FIXED** (iter30): store unavailable, lock timeout or idle-transaction timeout → `503 store_unavailable` with Retry-After | `TestStoreUnavailableMapping` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
 | S3 | — | **3/3 clean seeds** (SIGSTOP 50 s > 45 s lease) | `TestMM_S3_StallLongerThanLease` |
 | S4 | — | **3/3 clean seeds** (PG blackhole 30 s, one replica) | `TestMM_S4_PostgresPartitionOneReplica` |
 | S5 | — | **3/3 clean seeds** (PG restart mid-load; failures confined to the declared outage) | `TestMM_S5_PostgresRestart` |
-| S6 | — | **NOT clean**: seed 1 pass, seed 2 pass at 0.85% failures, **seed 3 FAILED I8** (2/133 = 1.5%); throughput collapses (117–175 ops/60 s vs about 2,300): see H17 | `TestMM_S6_SlowPostgresOneReplica` |
+| S6 | — | **3/3 clean seeds** after the harness got load-balancer semantics (iter30); was failing I8 at 1.3–2.2% | `TestMM_S6_SlowPostgresOneReplica` |
 | S1, S7–S11 | — | 0/3 seeds each | |
 
 ## Hypotheses (seeded from a code read on 2026-11-11, commit 84b4246)
@@ -910,6 +910,44 @@ lock sampler (`locks.txt`) and a latency split (seed 1) show two causes:
 
 The audit chain head, my first suspect, never showed up in the samples.
 
+### Iteration 30: S6 diagnosed. A harness artifact, plus defense in depth in mgmt.
+
+**What the failures were.** Both I8 failures in S6 seed 3 were
+`callAny` exhausting 4 attempts, each a 5 s timeout. I added per-attempt
+traces (`attempts` in `history.jsonl`) to look inside.
+
+**mgmt changes** (made before the traces were in):
+- Postgres sessions get `lock_timeout` = 3 s and
+  `idle_in_transaction_session_timeout` = 3 s (startup parameters;
+  `withSessionLimits`), so a replica with a slow link can't hold row locks
+  indefinitely.
+- The fence read is `FOR SHARE` (H17).
+- `isStoreUnavailable`: lock and idle-transaction timeouts, a shutting-down
+  server, and lost or refused connections map to
+  **`503 store_unavailable`** with `Retry-After` (H18). The spec was
+  changed first.
+
+**The traces then showed what was really going on.** With those changes,
+the fast replicas answered 142 attempts at p90 15–19 ms (max 266 ms). The
+failed ops were **4 random picks of the slow replica in a row**: the
+harness retried the same dead backend.
+
+**Harness fix (iter30).** `callAny` now behaves like a load balancer with
+passive health checks: no retry on a backend already tried for this
+request, and a backend that timed out is ejected for 10 s.
+- S6 seeds 1, 2, 3: 0 failures, about 2,100 ops (was 117–180).
+- S3 throughput: 2,384 ops (was about 1,100).
+
+**A/B check, to be honest about attribution.** S6 seed 3 with the **mgmt
+changes reverted** and the new harness **also passes** (0 of 2,197). So S6
+passes because of the client and VIP behavior. The mgmt changes are kept
+as defense in depth: they bound how long a sick replica can stall the
+others, and H18 is a real fix. Their effect on S6 isn't demonstrated.
+
+**Requirement for the real `svc:twd-mgmt` VIP (H12), from S3 and S6:**
+retry on a different backend, plus passive and active health checks
+(eject on timeouts, probe `GET /v1/status`).
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -979,3 +1017,4 @@ The audit chain head, my first suspect, never showed up in the samples.
 2026-11-11 iter29 PLAN | S5 (PG restart mid-load), S6 (200 ms–2 s PG latency on one replica), seed 1 | 1 | pass if all invariants hold | I3 I5 I6 I7 I8 I9 I11
 2026-11-11 iter29 | S5, S6 | seeds 1–3 each | S5 3/3 PASS (after outage windows), S6 3/3 invariants PASS with throughput finding | I8 | results/*-S5-*, *-S6-* (locks.txt) | new: PG lock sampler; H17 (lease-row contention), H18 (500 vs 503 during store outage)
 2026-11-11 iter29 CORRECTION | S6 | seeds 2, 3 | seed 2 PASS (0.85%), seed 3 FAIL I8 (1.5%) | I8 | results/*-S6-seed{2,3} | the previous entry's '3/3' was written before reading seed 3's result
+2026-11-11 iter30 | S6 diagnosis | seeds 1–3 + A/B | 3/3 PASS after harness LB semantics; mgmt: session limits, FOR SHARE fence, 503 store_unavailable (H18) | I8 | results/*-S6-* (attempts traces) | A/B: S6 passes without the mgmt changes too; recorded as defense in depth

@@ -46,6 +46,8 @@ type opRec struct {
 	Code    string `json:"code,omitempty"`
 	Err     string `json:"err,omitempty"`
 	Ms      int64  `json:"ms"`
+	// Attempts: "replica:status:ms" per try (callAny retries on transport errors).
+	Attempts []string `json:"attempts,omitempty"`
 }
 
 type history struct {
@@ -105,27 +107,47 @@ func (g *rng) intn(n int) int {
 // callAny sends a request to a random running replica, as a load-balanced
 // svc:twd-mgmt would, and retries another replica on a transport error.
 func (c *cluster) callAny(g *rng, host, method, path string, body any) (int, []byte, int, error) {
+	st, b, i, err, _ := c.callAnyTrace(g, host, method, path, body)
+	return st, b, i, err
+}
+
+func (c *cluster) callAnyTrace(g *rng, host, method, path string, body any) (int, []byte, int, error, []string) {
 	var lastErr error
+	var tries []string
+	tried := map[int]bool{}
 	for range 4 {
-		var up []int
+		// Like a load balancer with passive health checks: never retry the
+		// same backend within a request, and skip backends that timed out
+		// recently (ejected) while healthier ones are up.
+		var up, fresh []int
 		for i := range c.replicas {
-			if c.running(i) {
+			if c.running(i) && !tried[i] {
 				up = append(up, i)
+				if !c.ejected(i) {
+					fresh = append(fresh, i)
+				}
 			}
+		}
+		if len(fresh) > 0 {
+			up = fresh
 		}
 		if len(up) == 0 {
 			time.Sleep(200 * time.Millisecond)
 			continue
 		}
 		i := up[g.intn(len(up))]
+		t0 := time.Now()
 		st, b, err := c.callAs(i, host, method, path, body)
+		tries = append(tries, fmt.Sprintf("r%d:%d:%d", i, st, time.Since(t0).Milliseconds()))
+		tried[i] = true
 		if err == nil {
-			return st, b, i, nil
+			return st, b, i, nil, tries
 		}
+		c.eject(i, 10*time.Second)
 		lastErr = err
 		time.Sleep(100 * time.Millisecond)
 	}
-	return 0, nil, -1, lastErr
+	return 0, nil, -1, lastErr, tries
 }
 
 type known struct {
@@ -171,8 +193,8 @@ func runWorkload(ctx context.Context, c *cluster, g *rng, s setup, h *history, w
 	}
 	do := func(op, arg, host, method, path string, body any) (int, []byte) {
 		st0 := time.Now()
-		st, b, rep, err := c.callAny(g, host, method, path, body)
-		r := opRec{T: st0.UnixMilli(), Op: op, Arg: arg, Replica: rep, Status: st, Ms: time.Since(st0).Milliseconds()}
+		st, b, rep, err, tries := c.callAnyTrace(g, host, method, path, body)
+		r := opRec{T: st0.UnixMilli(), Op: op, Arg: arg, Replica: rep, Status: st, Ms: time.Since(st0).Milliseconds(), Attempts: tries}
 		if err != nil {
 			r.Err = err.Error()
 		} else if st/100 != 2 {
@@ -581,4 +603,25 @@ func samplePGLocks(ctx context.Context, c *cluster, path string) {
 		case <-time.After(500 * time.Millisecond):
 		}
 	}
+}
+
+// Passive health checking for callAny (a real svc VIP needs the same).
+var ejections = struct {
+	sync.Mutex
+	until map[*cluster]map[int]time.Time
+}{until: map[*cluster]map[int]time.Time{}}
+
+func (c *cluster) eject(i int, d time.Duration) {
+	ejections.Lock()
+	defer ejections.Unlock()
+	if ejections.until[c] == nil {
+		ejections.until[c] = map[int]time.Time{}
+	}
+	ejections.until[c][i] = time.Now().Add(d)
+}
+
+func (c *cluster) ejected(i int) bool {
+	ejections.Lock()
+	defer ejections.Unlock()
+	return time.Now().Before(ejections.until[c][i])
 }
