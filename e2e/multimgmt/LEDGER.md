@@ -18,7 +18,7 @@ FIX_MODE: fix
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | `TestMM_F5_LeaseHeldExplains` | **DONE** |
 | F6 | Replica registry (`replicas` table: stable per-state-dir ID, custody fingerprint, last_seen by the store clock). A replica refuses to start if file custody would be shared with another live replica, or if live replicas' custody fingerprints differ; the same check runs each reaper tick (status not ok, warning) | H11 | `TestMM_H11_FileCustodyPerReplica` becomes "second replica refuses with a clear error"; unit test for the registry; a single replica restarting within 30 s of a SIGKILL must still start | queued |
 | F7 | Registration throttle state in the store (`tenant_throttle`), shared by every replica and timed by the store clock | H03 | `TestMM_H03_ThrottlePerReplica` (before: 45 in a 10 s window; after: 16 = the limit, 2/2); `TestStoreSharedThrottle` (SQLite + Postgres) | **DONE** |
-| F8 | Persist each host's push target in the `hosts` row at registration, so any replica can push kills and assignments; keep the in-memory map as a cache | H06 | `TestMM_H06_KillPushAcrossReplicas` (kill via r1 pushed within 1 s) | next |
+| F8 | Persist each host's push target in the `hosts` row at registration, so any replica can push kills and assignments; keep the in-memory map as a cache | H06 | `TestMM_H06_KillPushAcrossReplicas` (before: via r1 heartbeat after ~1.5 s; after: pushed in 13–15 ms, 2/2), `TestMM_F8_PushTargetShared` | **DONE** |
 | F9 | ADR-028 §3 (Ross, second interview): mgmt marks each deployment `fence` (= `BundleStateful`) and sends it in assignments; hostd's heartbeat-loss fencing undeploys only workloads with `fence` (a missing field means fence: safe against an older mgmt). `FenceAfter` 9 → 30 s, `NamespaceLeaseTTL` 15 → 45 s, with a startup check that fence < lease − margin. Fix the stale comment | correction (iter13) | hostd unit test: stateless survives heartbeat loss, stateful fenced at 30 s and redeployed on reconnect; lease/fence constants test | queued |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
@@ -32,7 +32,7 @@ FIX_MODE: fix
 | H03 | P1 | **FIXED by F7** (was: 3 replicas minted 45 keys in 9 s against a 60/min limit, ≈2.8× the window limit) | `TestMM_H03_ThrottlePerReplica`, `TestStoreSharedThrottle` |
 | H04 | P1 | **not reproduced yet** (exactly 5/5 live in 6 runs at 0/2/5/20 ms PG delay); the race exists in code (per-replica `tenantLock`; `CountLive` then insert, no re-check); something narrows the window, cause not found | `TestMM_H04_SpawnBudgetRace` |
 | H05 | P2 | open | |
-| H06 | P1 | **CONFIRMED** (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
+| H06 | P1 | **FIXED by F8**. Was CONFIRMED (2/2): a kill served by a replica the host didn't register with isn't pushed; the host learns at its next heartbeat (≈1.5 s here; up to `HeartbeatEvery` = 3 s with real hostd). The kill response silently omits `pushed` | `TestMM_H06_KillPushAcrossReplicas` |
 | H07 | P1 | open | |
 | H08 | P2 | open | |
 | H09 | P2 | open | |
@@ -519,6 +519,22 @@ In fact, since M3 (`ede3258`):
 - F4 (guarded moves) stays valid: it prevents moving a stateful workload
   onto empty state before the old host is confirmed gone.
 
+### F8: push targets persisted (fixes H06)
+
+- **Storage.** A new `hosts.push_target` column (`Host.PushTarget`, `json:"-"`,
+  so no API change). It holds `unix:///…` in local-dev mode, or
+  `http://<node addr>:<port>` in tsnet mode, and is written by whichever
+  replica serves the registration.
+- **Lookup.** `pushTarget()` reads the per-replica cache first, then the
+  row.
+- **Stale caches.** `push()`, on failure, drops the cached entry, re-reads
+  the row, and retries once if the target changed (the host re-registered
+  through another replica).
+- **Tests:**
+  - `TestMM_F8_PushTargetShared`: B pushes to a host registered with A,
+    and follows a re-registration after the old listener is gone.
+  - e2e `TestMM_H06`: kills via either replica are pushed in 12–15 ms.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -562,3 +578,4 @@ In fact, since M3 (`ede3258`):
 2026-11-11 iter12 | F4 | n/a | DONE | — | unit tests; make test-go/test-pg green | the first test wrongly assumed a pinned move from a live holder is allowed (it's refused, which is safe); its message was fixed instead
 2026-11-11 iter13 PLAN | H06 | n/a | confirm if a kill served by r1 reaches a host registered with r0 only via heartbeat or after > 1 s; refute if pushed within 1 s | I6
 2026-11-11 iter13 | H06 | n/a ×2 | CONFIRMED | I6 | results/*-H06 | via r0: pushed in 12–15 ms; via r1: no push, heartbeat after ~1.5 s. While reading hostd's heartbeat found existing self-fencing (FenceAfter 9 s, all workloads): correction recorded, ADR-028 §3 to be re-decided
+2026-11-11 iter14 | F8 | n/a ×2 | FIXED | — | results/*-H06; make test-go/test-pg green | kill via r1 now pushed in 13–15 ms (was heartbeat, ~1.5 s)

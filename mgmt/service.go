@@ -438,19 +438,23 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, node
 	if err == nil && old.NodeID != "" && nodeID != "" && old.NodeID != nodeID {
 		return Host{}, false, errf(403, "host_identity_mismatch", "host %s is registered to another node", r.HostID)
 	}
-	m.mu.Lock()
+	target := ""
 	switch {
 	case strings.HasPrefix(r.PushURL, "unix:///") && nodeID == "":
-		m.pushURLs[r.HostID] = r.PushURL
+		target = r.PushURL
 	case r.PushPort > 0 && nodeAddr != "":
-		m.pushURLs[r.HostID] = "http://" + net.JoinHostPort(nodeAddr, strconv.Itoa(r.PushPort))
-	default:
+		target = "http://" + net.JoinHostPort(nodeAddr, strconv.Itoa(r.PushPort))
+	}
+	m.mu.Lock()
+	if target != "" {
+		m.pushURLs[r.HostID] = target
+	} else {
 		delete(m.pushURLs, r.HostID)
 	}
 	m.mu.Unlock()
 	now := m.now().UnixMilli()
 	h := Host{ID: r.HostID, CapacityNodes: r.CapacityNodes, Tiers: r.Tiers, NodeID: nodeID, AuditPubKey: r.AuditPubKey,
-		Pool: r.Pool, PushPort: r.PushPort, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt}
+		Pool: r.Pool, PushPort: r.PushPort, PushTarget: target, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt}
 	if h.CreatedAt == 0 {
 		h.CreatedAt = now
 	}
@@ -466,10 +470,25 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, node
 }
 
 // pushTarget returns the host's push URL ("" if none).
+// pushTarget is where to push to hostID: this replica's cache, else the
+// hosts row (written by whichever replica served the registration: H06).
 func (m *Mgmt) pushTarget(hostID string) string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.pushURLs[hostID]
+	u, ok := m.pushURLs[hostID]
+	m.mu.Unlock()
+	if ok {
+		return u
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h, err := m.store.GetHost(ctx, hostID)
+	if err != nil || h.PushTarget == "" {
+		return ""
+	}
+	m.mu.Lock()
+	m.pushURLs[hostID] = h.PushTarget
+	m.mu.Unlock()
+	return h.PushTarget
 }
 
 // HeartbeatLease is one lease a host believes it holds.
@@ -1754,12 +1773,26 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 // push POSTs body to the host's push socket (best effort; bounded by
 // PushTimeout). Hosts without a push URL get nothing (heartbeat fallback).
 func (m *Mgmt) push(hostID, path string, body any) error {
-	m.mu.Lock()
-	u := m.pushURLs[hostID]
-	m.mu.Unlock()
+	u := m.pushTarget(hostID)
 	if u == "" {
 		return errors.New("host has no push URL")
 	}
+	err := m.pushTo(u, hostID, path, body)
+	if err == nil {
+		return nil
+	}
+	// The cached target may be stale (the host re-registered through another
+	// replica): drop it, re-read the hosts row, retry once if it changed.
+	m.mu.Lock()
+	delete(m.pushURLs, hostID)
+	m.mu.Unlock()
+	if u2 := m.pushTarget(hostID); u2 != "" && u2 != u {
+		return m.pushTo(u2, hostID, path, body)
+	}
+	return err
+}
+
+func (m *Mgmt) pushTo(u, hostID, path string, body any) error {
 	base := "http://hostd"
 	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	if sock, ok := strings.CutPrefix(u, "unix://"); ok {

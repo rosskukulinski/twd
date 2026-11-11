@@ -372,6 +372,8 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// M12: oauth mint mode (client ID + credential file path; never the secret).
 		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
 		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F8 (H06): every replica can push to a host.
+		{"hosts", "push_target", "ALTER TABLE hosts ADD COLUMN push_target TEXT NOT NULL DEFAULT ''"},
 		// mm-loop F3 (H02): one replica mints each object.
 		{"objects", "mint_claim", "ALTER TABLE objects ADD COLUMN mint_claim TEXT NOT NULL DEFAULT ''"},
 		{"objects", "mint_claimed_at", "ALTER TABLE objects ADD COLUMN mint_claimed_at BIGINT NOT NULL DEFAULT 0"},
@@ -575,14 +577,14 @@ func (s *SQLStore) ListTenants(ctx context.Context, pg Page) ([]Tenant, error) {
 
 // ---- hosts ----
 
-const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at"
+const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at, push_target"
 
 func scanHost(sc interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var capacity, live int64
 	var tiers string
 	var port int64
-	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt)
+	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt, &h.PushTarget)
 	if errors.Is(err, sql.ErrNoRows) {
 		return h, ErrNotFound
 	}
@@ -602,10 +604,11 @@ func (s *SQLStore) UpsertHost(ctx context.Context, h Host) error {
 		h.CreatedAt = h.UpdatedAt
 	}
 	// created_at is kept from the first insert (the page key must be stable).
-	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET capacity=excluded.capacity, tiers=excluded.tiers, node_id=excluded.node_id,
-		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen, pool=excluded.pool, push_port=excluded.push_port, updated_at=excluded.updated_at`),
-		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt)
+		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen, pool=excluded.pool, push_port=excluded.push_port, updated_at=excluded.updated_at,
+		push_target=excluded.push_target`),
+		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt, h.PushTarget)
 	return err
 }
 

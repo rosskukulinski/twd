@@ -70,12 +70,16 @@ type Host struct {
 	AuditPubKey   string   `json:"auditPubKey,omitempty"` // base64 ed25519, verifies hostSig
 	Pool          string   `json:"pool,omitempty"`
 	// PushPort is hostd's push listener on its own tsnet node (0 = none;
-	// local-dev hosts register a unix:// push URL instead, kept in memory).
-	PushPort  int   `json:"pushPort,omitempty"`
-	LiveNodes int   `json:"liveNodes"`
-	LastSeen  int64 `json:"lastSeen"` // unix ms
-	CreatedAt int64 `json:"createdAt"`
-	UpdatedAt int64 `json:"updatedAt"`
+	// local-dev hosts register a unix:// push URL instead).
+	PushPort int `json:"pushPort,omitempty"`
+	// PushTarget is where mgmt pushes kills and assignments: unix:///… or
+	// http://<node addr>:<port>. Persisted so every replica can push, not
+	// only the one that served the registration (mm-loop F8, H06).
+	PushTarget string `json:"-"`
+	LiveNodes  int    `json:"liveNodes"`
+	LastSeen   int64  `json:"lastSeen"` // unix ms
+	CreatedAt  int64  `json:"createdAt"`
+	UpdatedAt  int64  `json:"updatedAt"`
 }
 
 // Pending reports a host created by `twd host add` that never registered.
