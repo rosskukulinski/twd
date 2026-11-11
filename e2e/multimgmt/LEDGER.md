@@ -18,6 +18,8 @@ FIX_MODE: fix
 | F5 | When `pickHost` thinks the holder is dead but its lease is still valid: keep the holder, or return a clear error (not `lease held by another holder`) | H10 (I8 side) | `TestMM_F5_LeaseHeldExplains` | **DONE** |
 | F6 | Replica registry (`replicas` table: stable per-state-dir ID, custody fingerprint, last_seen by the store clock). A replica refuses to start if file custody would be shared with another live replica, or if live replicas' custody fingerprints differ; the same check runs each reaper tick (status not ok, warning) | H11 | `TestMM_H11_FileCustodyPerReplica` becomes "second replica refuses with a clear error"; unit test for the registry; a single replica restarting within 30 s of a SIGKILL must still start | queued |
 | F7 | Registration throttle state in the store (`tenant_throttle`), shared by every replica and timed by the store clock | H03 | `TestMM_H03_ThrottlePerReplica` (before: 45 in a 10 s window; after: 16 = the limit, 2/2); `TestStoreSharedThrottle` (SQLite + Postgres) | **DONE** |
+| F8 | Persist each host's push target in the `hosts` row at registration, so any replica can push kills and assignments; keep the in-memory map as a cache | H06 | `TestMM_H06_KillPushAcrossReplicas` (kill via r1 pushed within 1 s) | next |
+| F9 | ADR-028 §3 (Ross, second interview): mgmt marks each deployment `fence` (= `BundleStateful`) and sends it in assignments; hostd's heartbeat-loss fencing undeploys only workloads with `fence` (a missing field means fence: safe against an older mgmt). `FenceAfter` 9 → 30 s, `NamespaceLeaseTTL` 15 → 45 s, with a startup check that fence < lease − margin. Fix the stale comment | correction (iter13) | hostd unit test: stateless survives heartbeat loss, stateful fenced at 30 s and redeployed on reconnect; lease/fence constants test | queued |
 | F4 | **Guarded moves** (ADR-028 §3, Ross 2026-11-11): Deploy refuses to move a workload with DO classes off a host whose lease lapsed unless the host was removed or the request carries `forceTakeover` (CLI `--force-takeover`; audited with the old host). Per-class `"fence": "never"` exempts a class. Workers (no DO classes) unaffected. Self-fencing deferred until state can move | H10/S4 | new `TestMM_F4_GuardedTakeover` (stateful refused, forced allowed + audited, Workers-only allowed, `fence: never` allowed, after `host rm` allowed) | next |
 
 ## Status
@@ -512,7 +514,8 @@ In fact, since M3 (`ede3258`):
   Postgres restart or failover, which is often 10–30 s; S5 will show it.
 - Ross's decision ("hosts stay fail-static; Workers keep serving")
   contradicts the current code. ADR-028 §3 needs re-deciding with the
-  facts.
+  facts. **Re-decided** by Ross in a second interview: fence stateful
+  workloads only, at 30 s fence / 45 s lease (F9).
 - F4 (guarded moves) stays valid: it prevents moving a stateful workload
   onto empty state before the old host is confirmed gone.
 
