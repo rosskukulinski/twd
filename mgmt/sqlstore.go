@@ -158,8 +158,10 @@ func (s *SQLStore) SetDeploymentStatus(ctx context.Context, id, status, errText 
 }
 
 func (s *SQLStore) SetDeviceDelete(ctx context.Context, id string, due int64) error {
-	_, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=?"), due, id)
-	return err
+	return s.tx(ctx, func(tx *sql.Tx) error { // a tx: a device_delete audit intent commits with it (H22)
+		_, err := tx.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=?"), due, id)
+		return err
+	})
 }
 
 // ClaimDeviceDelete takes a due delete by moving its due time to now +
@@ -388,6 +390,8 @@ CREATE TABLE IF NOT EXISTS revocations (
 CREATE TABLE IF NOT EXISTS tenant_throttle (
   tenant_id TEXT PRIMARY KEY, tokens REAL NOT NULL, rate REAL NOT NULL, last BIGINT NOT NULL,
   pause_till BIGINT NOT NULL, failures BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit_outbox (
+  id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, record TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS secret_choice (
   name TEXT PRIMARY KEY, key_id TEXT NOT NULL, created_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS replicas (
@@ -619,7 +623,101 @@ func (s *SQLStore) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	return s.commitWithIntents(ctx, tx)
+}
+
+// commitWithIntents writes the audit intents carried by ctx into
+// audit_outbox inside tx, then commits: the change and its audit record
+// commit together or not at all (H22). An outbox write failure rolls the
+// change back.
+func (s *SQLStore) commitWithIntents(ctx context.Context, tx *sql.Tx) error {
+	pend := pendingIntents(ctx)
+	for _, ai := range pend {
+		b, err := json.Marshal(ai.Rec)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.q("INSERT INTO audit_outbox (id, created_at, record) VALUES (?, ?, ?)"), ai.ID, s.Now().UnixMilli(), string(b)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("audit outbox: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, ai := range pend {
+		ai.mu.Lock()
+		ai.written = true
+		ai.mu.Unlock()
+	}
+	return nil
+}
+
+// PutAuditIntent writes a standalone intent (an audit record not bound to a
+// state change of its own).
+func (s *SQLStore) PutAuditIntent(ctx context.Context, id string, rec AuditRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, s.q("INSERT INTO audit_outbox (id, created_at, record) VALUES (?, ?, ?)"), id, s.Now().UnixMilli(), string(b))
+	return err
+}
+
+// AmendAuditIntent replaces a pending intent's record (detail known only
+// after the change). No-op if it was already drained.
+func (s *SQLStore) AmendAuditIntent(ctx context.Context, id string, rec AuditRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, s.q("UPDATE audit_outbox SET record=? WHERE id=?"), string(b), id)
+	return err
+}
+
+// DrainAuditIntent appends intent id to its chain and removes it from the
+// outbox in one transaction; false if another replica already did.
+func (s *SQLStore) DrainAuditIntent(ctx context.Context, id string) (bool, error) {
+	done := false
+	err := s.tx(withoutIntents(ctx), func(tx *sql.Tx) error {
+		var raw string
+		err := tx.QueryRowContext(ctx, s.q("DELETE FROM audit_outbox WHERE id=? RETURNING record"), id).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var rec AuditRecord
+		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+			return err
+		}
+		if _, err := s.appendAuditTx(ctx, tx, rec); err != nil {
+			return err
+		}
+		done = true
+		return nil
+	})
+	return done, err
+}
+
+// ListAuditIntents returns outbox intents created before olderThan (unix ms).
+func (s *SQLStore) ListAuditIntents(ctx context.Context, olderThan int64, limit int) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.q("SELECT id FROM audit_outbox WHERE created_at<? ORDER BY created_at, id LIMIT ?"), olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 func isUnique(err error) bool {
@@ -831,9 +929,12 @@ func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
 	if d.Fence {
 		fence = 1
 	}
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
-		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence,
-		d.HostStatus, d.HostError, d.Bundle)
+	err := s.tx(ctx, func(tx *sql.Tx) error { // a tx so a deploy's audit intent commits with it (H22)
+		_, err := tx.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+			d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence,
+			d.HostStatus, d.HostError, d.Bundle)
+		return err
+	})
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -1099,7 +1200,7 @@ func (s *SQLStore) CreateObjectChecked(ctx context.Context, o Object, maxObjects
 		}
 		return err
 	}
-	return tx.Commit()
+	return s.commitWithIntents(ctx, tx)
 }
 
 func (s *SQLStore) GetObject(ctx context.Context, id string) (Object, error) {
@@ -1352,7 +1453,21 @@ func (s *SQLStore) AppendAudit(ctx context.Context, rec AuditRecord) (AuditRecor
 	if rec.Chain == "" {
 		return rec, errors.New("audit chain required")
 	}
-	err := s.tx(ctx, func(tx *sql.Tx) error {
+	var out AuditRecord
+	err := s.tx(withoutIntents(ctx), func(tx *sql.Tx) error {
+		var err error
+		out, err = s.appendAuditTx(ctx, tx, rec)
+		return err
+	})
+	return out, err
+}
+
+// appendAuditTx appends rec to its chain inside tx.
+func (s *SQLStore) appendAuditTx(ctx context.Context, tx *sql.Tx, rec AuditRecord) (AuditRecord, error) {
+	if rec.Chain == "" {
+		return rec, errors.New("audit chain required")
+	}
+	err := func() error {
 		if _, err := tx.ExecContext(ctx, s.q("INSERT INTO audit_heads (chain, seq, hash) VALUES (?, 0, '') ON CONFLICT (chain) DO NOTHING"), rec.Chain); err != nil {
 			return err
 		}
@@ -1380,7 +1495,7 @@ func (s *SQLStore) AppendAudit(ctx context.Context, rec AuditRecord) (AuditRecor
 		}
 		_, err := tx.ExecContext(ctx, s.q("UPDATE audit_heads SET seq=?, hash=? WHERE chain=? AND seq=?"), rec.Seq, rec.Hash, rec.Chain, seq)
 		return err
-	})
+	}()
 	return rec, err
 }
 

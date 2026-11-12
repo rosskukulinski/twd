@@ -413,6 +413,24 @@ func checkInvariants(t *testing.T, c *cluster, g *rng, s setup, h *history, r *r
 	}
 	os.WriteFile(filepath.Join(r.dir, "op-codes.txt"), []byte(sb.String()), 0o600)
 
+	// AuditComplete (H22): no state change without its record, and the
+	// outbox drains.
+	var outbox int
+	for dl := time.Now().Add(30 * time.Second); ; {
+		db.QueryRow("SELECT COUNT(*) FROM audit_outbox").Scan(&outbox)
+		if outbox == 0 || time.Now().After(dl) {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	var noKillRec, noCreateRec int
+	db.QueryRow(`SELECT COUNT(*) FROM objects o WHERE o.tenant_id=$1 AND o.status='killed'
+		AND NOT EXISTS (SELECT 1 FROM audit a WHERE a.kind='kill' AND a.object_id=o.id)`, s.tenantID).Scan(&noKillRec)
+	db.QueryRow(`SELECT COUNT(*) FROM objects o WHERE o.tenant_id=$1 AND o.namespace<>'_workload'
+		AND NOT EXISTS (SELECT 1 FROM audit a WHERE a.kind IN ('create','spawn') AND a.object_id=o.id)`, s.tenantID).Scan(&noCreateRec)
+	add("AuditComplete", outbox == 0 && noKillRec == 0 && noCreateRec == 0,
+		"killed objects without a kill record: %d; objects without a create/spawn record: %d; outbox left: %d", noKillRec, noCreateRec, outbox)
+
 	// KillOnce: no object has more than one kill record (H09).
 	var multiKill int
 	db.QueryRow(`SELECT COUNT(*) FROM (SELECT object_id FROM audit WHERE kind='kill' AND object_id<>'' GROUP BY object_id HAVING COUNT(*) > 1) x`).Scan(&multiKill)

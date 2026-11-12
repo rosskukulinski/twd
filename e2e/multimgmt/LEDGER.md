@@ -33,9 +33,8 @@
 >   - Postgres session limits.
 >
 > **Still open:**
-> 1. **H22, needs a decision:** a store blip can drop an audit record (the
->    state change commits, the separate append fails). Recommended: (b) a
->    durable audit outbox written in the same transaction.
+> 1. **H22: FIXED** after the loop (F22, option b): a durable audit
+>    outbox written in the same transaction (see the F22 note).
 > 2. **H12:** no `svc:twd-mgmt` VIP yet. Hosts point at one replica. The
 >    VIP must retry on another backend and eject slow or stalled ones
 >    (from S3/S6).
@@ -102,7 +101,7 @@ FIX_MODE: fix
 | H20 | P1 | **CONFIRMED and FIXED**: `CreateObject` and `PreflightBundle` mapped *any* tenant, parent or namespace lookup error to a 404 (`unknown_tenant`, …), so store outages looked like permanent not-founds that clients wouldn't retry, and the I8 oracle didn't count them. They now keep their 503 or 500 mapping; real not-founds stay 404 | S9, S5 op-codes |
 | H21 | P1 | **CONFIRMED (soak 101) and FIXED** (F20): a device-delete claim was terminal (`-1`); a kill during a Postgres restart claimed it, the delete failed, and so did the reschedule, so the device was never deleted. Claims are now a 2-min lease and success is recorded explicitly | `TestStoreDeviceDeleteClaimLapses` |
 | H23 | P1 | **CONFIRMED (soak 101 re-run) and FIXED** (F21): the kill's device-delete intent was a separate, unchecked write after the kill; while Postgres was starting up the kill committed, that write failed, and the device was never deleted. Also `Ready` on a killed object deleted its new device inline with no durable record. Both now record `device_delete_at` in the same write as the state change | `TestMM_F21_DeviceDeleteIntentIsAtomic` |
-| H22 | P1 | **CONFIRMED (soak 101), OPEN, design**: audit appends are separate from the state change; during a store blip the kill committed but its audit record was dropped (`audit append failed`). Needs a decision: audit in the same transaction as the change, or a durable audit outbox | r1.log |
+| H22 | P1 | **FIXED (F22, option b chosen by Ross)**: durable audit outbox; see F22 note. Was CONFIRMED (soak 101), design: audit appends are separate from the state change; during a store blip the kill committed but its audit record was dropped (`audit append failed`). Needs a decision: audit in the same transaction as the change, or a durable audit outbox | r1.log |
 | H18 | P3 | **FIXED** (iter30): store unavailable, lock timeout or idle-transaction timeout → `503 store_unavailable` with Retry-After | `TestStoreUnavailableMapping` |
 | H16 | P2 | **CONFIRMED and FIXED** (F17): 2/10 runs ended with 12 live objects against maxObjects 10; after 0/20 | `TestMM_H16_TenantQuotaRace`, `TestStoreTenantQuota` |
 | S2 | — | **3/3 clean seeds** (1, 2, 3) after F18 | `TestMM_S2_RandomKills` |
@@ -1142,6 +1141,43 @@ Recommendation: (b).
    assertion would have failed before. The kill path holds by construction
    (one write); only a soak exercises it under real store restarts.
 
+### F22: durable audit outbox (H22, option b, chosen by Ross)
+
+**Mechanism.**
+- An audit *intent* rides in the request context to the one store call
+  that makes the change (`m.intend`). The store's transactions (the `tx`
+  helper, `CreateObjectChecked`, and now `CreateDeployment` and
+  `SetDeviceDelete`) insert pending intents into `audit_outbox` before
+  `Commit` (`commitWithIntents`). The change and its record commit together,
+  and an outbox failure rolls the change back.
+- After commit, `m.recordIntent` amends the detail known only afterwards
+  (kill push and device results, ready's certificate, the credential's
+  release outcome, remint's previous-device result), then `DrainAuditIntent`
+  does `DELETE … RETURNING` and appends to the chain in one transaction,
+  exactly once across replicas.
+- Every replica's reaper tick drains intents older than 3 s.
+- A no-op update withdraws its intent (`Skip`): a mint that lost the race,
+  or a ready for an object that was already killed.
+
+**Bound to the change:** create/spawn, mint, credential release, ready,
+remint, kill, device_delete, deploy.
+
+**Through the outbox but not atomic yet:** deny records (refusals), and the
+tenant, host, undeploy, purge, OBO-root and volume-key records go through
+the outbox. A failed chain append is retried, but their admin state
+changes aren't yet in the same transaction as their records. Follow-up.
+
+**Tests.**
+- `TestMM_H22_KillAndAuditCommitTogether`: with the outbox table missing,
+  the kill doesn't happen; once restored, there's 1 record.
+- `TestMM_H22_DeferredAppendIsNotLost`: with the chain table missing, the
+  kill commits and its intent waits; the drain appends exactly 1 record,
+  and the chain verifies.
+- `TestMM_H22_SkippedIntentNotRecorded`.
+- New oracle invariant **AuditComplete**: every killed object has a kill
+  record, every object has a create/spawn record, and the outbox is empty
+  at quiescence. S5 (Postgres restart) passes it.
+
 ## Notes
 
 - **H01, latent fragility:** `migrate` takes and releases the advisory lock
@@ -1221,3 +1257,4 @@ Recommendation: (b).
 2026-11-11 iter33 | soaks 101, 102 | 2 | 101 FAIL I6 → F20 (H21); 102 PASS | I6 | results/*-SOAK-* | H22 (dropped audit record during a store blip) recorded, needs a decision
 2026-11-11 iter33 | soak re-runs | 101, 103 | 101 FAIL I6 → F21 (H23); 103 harness crash (HTTP transport leak) → fixed | I6 | /tmp/mm-soak-*.log | the first re-run silently didn't run (grep hid it)
 2026-11-11 iter33 | soaks 101, 103 (after F21 + harness fix) | 2 | 2/2 PASS | all | /tmp/mm-soak-*.log, results/*-SOAK-* | the earlier re-runs never ran (my background `cd` didn't carry: `go -C` now). LOOP COMPLETE
+2026-11-11 post-loop | F22 (H22, option b) | — | unit + S5 30 s | AuditComplete | — | gates green; soaks 201, 202 queued

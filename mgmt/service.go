@@ -189,6 +189,7 @@ func (m *Mgmt) Start() error {
 					m.log.Warn("replica registry", "err", err)
 				}
 				m.sweepDeviceDeletes(m.ctx)
+				m.drainAuditOutbox(m.ctx)
 				if err := m.sweepPending(m.ctx); err != nil {
 					m.log.Warn("pending sweep", "err", err)
 				}
@@ -240,16 +241,6 @@ func traceID() string {
 
 // audit appends to the mgmt chain; failures are logged (and surfaced by
 // verify), never swallowed silently.
-func (m *Mgmt) audit(ctx context.Context, r AuditRecord, detail map[string]any) {
-	r.Chain = "mgmt"
-	r.TS = m.now().UTC().Format(time.RFC3339Nano)
-	if detail != nil {
-		r.Detail, _ = json.Marshal(detail)
-	}
-	if _, err := m.store.AppendAudit(ctx, r); err != nil {
-		m.log.Error("audit append failed", "kind", r.Kind, "object", r.ObjectID, "err", err)
-	}
-}
 
 // ---- tenants ----
 
@@ -664,14 +655,15 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	}
 	d := Deployment{ID: newID("dp_"), TenantID: t.ID, Workload: r.Workload, HostID: host, Namespaces: classes,
 		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli(), Fence: fence}
-	if err := m.store.CreateDeployment(ctx, d); err != nil {
-		return resp, err
-	}
 	detail := map[string]any{"deploymentID": d.ID, "workload": d.Workload, "host": host, "epoch": lease.Epoch, "by": r.By}
 	if takeoverFrom != "" {
 		detail["takeoverFrom"], detail["forced"] = takeoverFrom, true
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, detail)
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, detail)
+	if err := m.store.CreateDeployment(actx, d); err != nil { // the deploy record commits with it (H22)
+		return resp, err
+	}
+	m.recordIntent(ctx, ai, nil)
 	resp.DeploymentID, resp.Host, resp.Epoch = d.ID, host, lease.Epoch
 	resp.Endpoint.Node = r.Workload + "-" + host
 	resp.Endpoint.MagicDNS = resp.Endpoint.Node + "." + t.Tailnet
@@ -1078,7 +1070,19 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	if parent != nil {
 		spawnLimit = maxLive
 	}
-	if err := m.store.CreateObjectChecked(ctx, o, t.MaxObjects, spawnLimit); errors.Is(err, ErrQuota) {
+	detail := map[string]any{"workload": o.Workload, "namespace": o.Namespace, "name": o.Name, "tags": o.Tags, "root": o.RootID}
+	if o.ParentID != "" {
+		detail["parent"] = o.ParentID
+	}
+	if len(o.Caps) > 0 {
+		detail["lim"] = o.Caps
+	}
+	if ttl > 0 {
+		detail["ttl"] = ttl.String()
+	}
+	// The create/spawn record commits in the same transaction as the insert (H22).
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ID, Kind: kind, TraceID: r.TraceID, ActingFor: r.ActingFor}, detail)
+	if err := m.store.CreateObjectChecked(actx, o, t.MaxObjects, spawnLimit); errors.Is(err, ErrQuota) {
 		// The fast-path CountLive saw room, but concurrent creates (possibly
 		// through other replicas) filled the quota first (H16).
 		return resp, errf(429, "object_quota_exceeded", "tenant %s has reached its maxObjects (%d)", t.ID, t.MaxObjects)
@@ -1106,17 +1110,7 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	} else if err != nil {
 		return resp, err
 	}
-	detail := map[string]any{"workload": o.Workload, "namespace": o.Namespace, "name": o.Name, "tags": o.Tags, "root": o.RootID}
-	if o.ParentID != "" {
-		detail["parent"] = o.ParentID
-	}
-	if len(o.Caps) > 0 {
-		detail["lim"] = o.Caps
-	}
-	if ttl > 0 {
-		detail["ttl"] = ttl.String()
-	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ID, Kind: kind, TraceID: r.TraceID, ActingFor: r.ActingFor}, detail)
+	m.recordIntent(ctx, ai, nil)
 	m.enqueue(t.ID, o.ID)
 	return CreateObjectResponse{ObjectID: o.ID, Status: StatusPending, Tags: o.Tags, Hostname: o.Hostname, Created: true}, nil
 }
@@ -1438,9 +1432,12 @@ func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string, th *Throttle) (
 	}
 	exp := m.now().Add(KeyExpiry - 15*time.Second).UnixMilli() // released only with ≥15 s of life left
 	killed := false
-	_, err = m.store.UpdateObject(ctx, id, nil, func(o *Object) error {
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: t.ID, ObjectID: id, Kind: "mint"}, map[string]any{"keyID": k.ID, "tags": o.Tags,
+		"mode": t.MintMode, "ephemeral": o.Ephemeral})
+	_, err = m.store.UpdateObject(actx, id, nil, func(o *Object) error {
 		if o.Status != StatusPending || o.KeyID != "" {
 			killed = true // killed meanwhile, or (claim expired mid-mint) minted by someone else
+			ai.Skip()
 			return nil
 		}
 		o.Status, o.KeyID, o.KeyExpires, o.UpdatedAt = StatusMinted, k.ID, exp, m.now().UnixMilli()
@@ -1453,8 +1450,7 @@ func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string, th *Throttle) (
 		m.custody.Delete(ctx, own)
 		return true, err
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: id, Kind: "mint"}, map[string]any{"keyID": k.ID, "tags": o.Tags,
-		"mode": t.MintMode, "ephemeral": o.Ephemeral})
+	m.recordIntent(ctx, ai, nil) // committed with the mint (H22)
 	m.notify(id)
 	return true, nil
 }
@@ -1525,7 +1521,11 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 				break
 			}
 			fence := &Fence{Lease: o.Lease, Holder: hostID, Epoch: epoch}
-			if _, err := m.store.UpdateObject(ctx, id, fence, func(*Object) error { return nil }); err != nil {
+			// The release decision (the fenced commit) and its record commit
+			// together (H22); the outcome is amended below.
+			actx, ai := m.intend(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "credential"},
+				map[string]any{"host": hostID, "epoch": epoch, "keyID": o.KeyID})
+			if _, err := m.store.UpdateObject(actx, id, fence, func(*Object) error { return nil }); err != nil {
 				if errors.Is(err, ErrLeaseLost) {
 					m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "deny", Code: "lease_lost"},
 						map[string]any{"host": hostID, "epoch": epoch})
@@ -1537,11 +1537,11 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 				secret, err = m.custody.Get(ctx, legacyCustodyName(o)) // minted before keyed custody names
 			}
 			if err != nil {
+				m.recordIntent(ctx, ai, map[string]any{"released": false, "error": err.Error()})
 				return Credential{}, fmt.Errorf("custody: %w", err)
 			}
 			t, _ := m.store.GetTenant(ctx, o.TenantID)
-			m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "credential"},
-				map[string]any{"host": hostID, "epoch": epoch, "keyID": o.KeyID})
+			m.recordIntent(ctx, ai, nil)
 			return Credential{AuthKey: string(secret), ExpiresAt: o.KeyExpires, Tags: o.Tags, Hostname: o.Hostname,
 				Ephemeral: o.Ephemeral, ControlURL: t.ControlURL}, nil
 		}
@@ -1584,9 +1584,14 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 		fence = &Fence{Lease: o.Lease, Holder: hostID, Epoch: r.Epoch}
 	}
 	wasKilled := false
-	o, err = m.store.UpdateObject(ctx, id, fence, func(o *Object) error {
+	// The ready record commits with the status change (H22); the node
+	// certificate outcome is added below.
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "ready"},
+		map[string]any{"nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "host": hostID})
+	o, err = m.store.UpdateObject(actx, id, fence, func(o *Object) error {
 		if !o.Live() {
 			wasKilled = true
+			ai.Skip()
 			if r.StableNodeID != "" || r.NodeID != "" {
 				// Killed while joining: the device that just appeared must go
 				// too. Record it durably in this write (F21).
@@ -1611,7 +1616,7 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 	// Node certificate (ADR-010): binds this node to the object's tags, lim
 	// and lineage under the tenant's OBO root key. Receivers fetch it by
 	// stable node ID and compute effective caps = CapMap ∩ lim (RT-01).
-	detail := map[string]any{"nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "host": hostID}
+	detail := map[string]any{}
 	if cert, err := m.signNodeCert(ctx, o); err != nil {
 		m.log.Error("node certificate not issued", "object", id, "err", err)
 		detail["certError"] = err.Error()
@@ -1627,7 +1632,7 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 		}
 		detail["cert"] = true
 	}
-	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "ready"}, detail)
+	m.recordIntent(ctx, ai, detail)
 	m.notify(id)
 	return o, nil
 }
@@ -1659,7 +1664,10 @@ func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (
 	if r.Epoch > 0 {
 		fence = &Fence{Lease: old.Lease, Holder: hostID, Epoch: r.Epoch}
 	}
-	o, err := m.store.UpdateObject(ctx, id, fence, func(o *Object) error {
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: old.TenantID, ObjectID: id, Kind: "remint"},
+		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID,
+			"hostname": old.Hostname}) // committed with the reset (H22)
+	o, err := m.store.UpdateObject(actx, id, fence, func(o *Object) error {
 		if !o.Live() || o.Status == StatusPending {
 			return nil
 		}
@@ -1687,9 +1695,7 @@ func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (
 			prevDeleted = true
 		}
 	}
-	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "remint"},
-		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID,
-			"previousDeviceDeleted": prevDeleted, "hostname": o.Hostname})
+	m.recordIntent(ctx, ai, map[string]any{"previousDeviceDeleted": prevDeleted})
 	if old.Status != StatusPending {
 		m.enqueue(o.TenantID, id)
 	}
@@ -1795,6 +1801,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 	type killedObj struct {
 		o    Object
 		prev string
+		ai   *auditIntent // committed with the kill (H22); outcomes amended below
 	}
 	var done []killedObj
 	byHost := map[string][]string{}
@@ -1803,7 +1810,9 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			continue
 		}
 		prev := o.Status
-		killed, err := m.store.UpdateObject(ctx, o.ID, nil, func(x *Object) error {
+		actx, ai := m.intend(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By},
+			map[string]any{"reason": r.Reason, "cascade": r.Cascade, "requested": id, "root": o.RootID, "parent": o.ParentID, "prevStatus": prev})
+		killed, err := m.store.UpdateObject(actx, o.ID, nil, func(x *Object) error {
 			if !x.Live() {
 				return errAlreadyDead // another replica's kill or reaper won (H09)
 			}
@@ -1829,7 +1838,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			m.store.AddRevocation(ctx, l.Holder, o.ID, now)
 			byHost[l.Holder] = append(byHost[l.Holder], o.ID)
 		}
-		done = append(done, killedObj{killed, prev})
+		done = append(done, killedObj{killed, prev, ai})
 	}
 	// Tier 1: push to the hosts, all objects in parallel, before any device
 	// delete (the RST must leave while the node is still in peers' netmaps).
@@ -1854,7 +1863,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		res.PushMS = float64(time.Since(ps).Microseconds()) / 1000
 	}
 	for _, k := range done {
-		o, killed, prev := k.o, k.o, k.prev
+		o, killed, prev, ai := k.o, k.o, k.prev, k.ai
 		m.deleteCustody(ctx, o)
 		if prev != StatusReady {
 			m.revokeKey(ctx, killed)
@@ -1883,8 +1892,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 				res.DevicesDeleted = append(res.DevicesDeleted, o.ID)
 			}
 		}
-		detail := map[string]any{"reason": r.Reason, "cascade": r.Cascade, "requested": id, "root": o.RootID,
-			"parent": o.ParentID, "deviceDeleted": deleted, "prevStatus": prev, "pushed": slices.Contains(res.Pushed, o.ID)}
+		detail := map[string]any{"deviceDeleted": deleted, "pushed": slices.Contains(res.Pushed, o.ID)}
 		if scheduled {
 			detail["deviceDeleteIn"] = m.cfg.DeviceDeleteDelay.String()
 		}
@@ -1892,7 +1900,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			detail["deviceDelete"] = CodeDeviceDeleteUnavailable
 			detail["fix"] = DeviceScopeFix
 		}
-		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By}, detail)
+		m.recordIntent(ctx, ai, detail)
 	}
 	if len(res.Errors) == 0 {
 		res.Errors = nil
@@ -2018,16 +2026,6 @@ func (m *Mgmt) deleteDeviceClaimedAudit(ctx context.Context, o Object, force, au
 	id := o.ID
 	st := time.Now()
 	err = m.deleteDevice(ctx, o)
-	switch {
-	case err == nil, errors.Is(err, errDeviceDeleteUnavailable):
-		// Done (or not ours to do). If this write fails the claim lapses
-		// and the delete re-runs: harmless, a gone device is a success.
-		m.store.SetDeviceDelete(context.WithoutCancel(ctx), id, -1)
-	default:
-		// Retry sooner than the claim would lapse; if this write fails too
-		// (store blip), the claim lapsing still brings it back (H21).
-		m.store.SetDeviceDelete(context.WithoutCancel(ctx), id, m.now().Add(DeviceDeleteRetry).UnixMilli())
-	}
 	detail := map[string]any{"nodeID": o.StableNodeID, "ms": time.Since(st).Milliseconds()}
 	if errors.Is(err, errDeviceDeleteUnavailable) {
 		detail["error"], detail["code"], detail["fix"] = err.Error(), CodeDeviceDeleteUnavailable, DeviceScopeFix
@@ -2036,9 +2034,23 @@ func (m *Mgmt) deleteDeviceClaimedAudit(ctx context.Context, o Object, force, au
 		detail["error"] = err.Error()
 		m.log.Warn("device delete failed", "object", id, "err", err)
 	}
+	// The outcome write and its audit record commit together (H22).
+	octx := context.WithoutCancel(ctx)
+	var ai *auditIntent
 	if audit {
-		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
+		octx, ai = m.intend(octx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
 	}
+	switch {
+	case err == nil, errors.Is(err, errDeviceDeleteUnavailable):
+		// Done (or not ours to do). If this write fails the claim lapses
+		// and the delete re-runs: harmless, a gone device is a success.
+		m.store.SetDeviceDelete(octx, id, -1)
+	default:
+		// Retry sooner than the claim would lapse; if this write fails too
+		// (store blip), the claim lapsing still brings it back (H21).
+		m.store.SetDeviceDelete(octx, id, m.now().Add(DeviceDeleteRetry).UnixMilli())
+	}
+	m.recordIntent(ctx, ai, nil)
 	return true, err
 }
 
