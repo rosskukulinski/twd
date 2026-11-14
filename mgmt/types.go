@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"time"
+
+	"github.com/rosskukulinski/twd/internal/publicspec"
 )
 
 // Mint modes.
@@ -55,10 +57,40 @@ type Tenant struct {
 	MaxObjects             int    `json:"maxObjects"`
 	// Pool places the tenant's deployments on hosts with the same pool
 	// ("" = any host). Tier is the default isolation tier.
-	Pool      string `json:"pool,omitempty"`
-	Tier      string `json:"tier,omitempty"`
-	CreatedAt int64  `json:"createdAt"`
-	UpdatedAt int64  `json:"updatedAt"`
+	Pool string `json:"pool,omitempty"`
+	Tier string `json:"tier,omitempty"`
+	// PublicIngress is the operator gate for public (Funnel) ingress
+	// (ADR-029 D1): PublicAllow lets the tenant's twd.jsonc "public" routes
+	// take effect; "" or PublicDeny refuses them.
+	PublicIngress string `json:"publicIngress,omitempty"`
+	CreatedAt     int64  `json:"createdAt"`
+	UpdatedAt     int64  `json:"updatedAt"`
+}
+
+// Tenant.PublicIngress values.
+const (
+	PublicAllow = "allow"
+	PublicDeny  = "deny"
+)
+
+// PublicAllowed reports whether the tenant's gate lets public routes take effect.
+func (t Tenant) PublicAllowed() bool { return t.PublicIngress == PublicAllow }
+
+// DeploymentPublic is a deployment's validated twd.jsonc "public" (ADR-029),
+// plus the per-class public-create settings, persisted with the deployment.
+type DeploymentPublic struct {
+	Spec    publicspec.Spec                 `json:"spec"`
+	Classes map[string]publicspec.ClassSpec `json:"classes,omitempty"`
+}
+
+// WorkloadPublic is a workload's `twd expose` setting. It outlives
+// deployments; a workload that was never toggled is exposed.
+type WorkloadPublic struct {
+	TenantID  string `json:"tenantID"`
+	Workload  string `json:"workload"`
+	Exposed   bool   `json:"exposed"`
+	UpdatedAt int64  `json:"updatedAt,omitempty"`
+	UpdatedBy string `json:"updatedBy,omitempty"`
 }
 
 // Host is a twd-hostd instance.
@@ -123,6 +155,8 @@ type Deployment struct {
 	// and stopped) last reported; shared by every replica (F13, H08).
 	HostStatus string `json:"-"`
 	HostError  string `json:"-"`
+	// Public is the deployment's public ingress spec (nil: tailnet-only).
+	Public *DeploymentPublic `json:"-"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per

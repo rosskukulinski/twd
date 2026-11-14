@@ -19,6 +19,30 @@ import (
 type Policy struct {
 	TagOwners map[string][]string `json:"tagOwners"`
 	Grants    []Grant             `json:"grants"`
+	NodeAttrs []NodeAttr          `json:"nodeAttrs"`
+}
+
+// NodeAttr is one nodeAttrs entry. Attr values may be strings or objects
+// (e.g. ipPool); only the string ones matter to twd.
+type NodeAttr struct {
+	Target []string `json:"target"`
+	Attr   []any    `json:"attr"`
+}
+
+// HasNodeAttr reports whether some nodeAttrs entry gives tag the string
+// attribute attr (target "*" matches every node).
+func (p *Policy) HasNodeAttr(tag, attr string) bool {
+	for _, n := range p.NodeAttrs {
+		if !slices.Contains(n.Target, tag) && !slices.Contains(n.Target, "*") {
+			continue
+		}
+		for _, a := range n.Attr {
+			if s, ok := a.(string); ok && s == attr {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Grant is one policy grant.

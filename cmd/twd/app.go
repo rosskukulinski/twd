@@ -273,7 +273,9 @@ type deployResult struct {
 	Endpoint     any                  `json:"endpoint"`
 	Preflight    mgmt.PreflightResult `json:"preflight"`
 	BundleBytes  int                  `json:"bundleBytes"`
-	Timings      map[string]float64   `json:"timingsMs"`
+	// Public (ADR-029) is the workload's public URL and state, if any.
+	Public  *mgmt.DeploymentPublicView `json:"public,omitempty"`
+	Timings map[string]float64         `json:"timingsMs"`
 }
 
 func cmdDeploy(args []string) error {
@@ -283,6 +285,7 @@ func cmdDeploy(args []string) error {
 	noWait := f.Bool("no-wait", false, "return once mgmt accepted the deploy")
 	forceTakeover := f.Bool("force-takeover", false, "the workload's current host is gone for good: move its Durable Objects anyway (audited; see takeover_unconfirmed)")
 	wait := f.Duration("wait", 3*time.Minute, "how long to wait for ready")
+	waitPublic := f.Duration("wait-public", 0, "also wait (up to this long) until the public URL answers from the public internet (twd.jsonc \"public\")")
 	tenantF := tenantFlag(f)
 	vars := varFlags{}
 	f.Var(vars, "var", "override a wrangler var (KEY=VALUE, repeatable)")
@@ -345,21 +348,11 @@ func cmdDeploy(args []string) error {
 			fmt.Printf("› preflight  skipped: mgmt can't read the tailnet policy (%s)\n             add a lifecycle trust credential with scope policy_file:read (twd up --wif-lifecycle-client-id) to preflight grants; tags are still checked by Tailscale at mint\n", firstLine(policyUnavailable))
 		} else {
 			printPreflight(a, pf)
+			printPublicPreflight(pf)
 		}
 	}
 	if !pf.OK && !*allowMissing {
-		e := fail("acl_denied", "preflight failed: the tenant policy is missing grants or tagOwners this app needs")
-		if len(pf.MissingTagOwners) > 0 {
-			e.Fix = append(e.Fix, "add to your tailnet policy:", "  "+pf.TagOwnersSnippet)
-		}
-		if len(pf.Missing) > 0 {
-			e.Fix = append(e.Fix, `add to "grants" in your tailnet policy:`)
-			for _, m := range pf.Missing {
-				e.Fix = append(e.Fix, "  "+m.Snippet)
-			}
-		}
-		e.Fix = append(e.Fix, "then re-run, or deploy anyway with --allow-missing-grants")
-		return e
+		return preflightFailure(pf)
 	}
 
 	if !*f.json {
@@ -411,12 +404,32 @@ func cmdDeploy(args []string) error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	res.Status, res.Endpoint = v.Status, v.Endpoint
+	res.Status, res.Endpoint, res.Public = v.Status, v.Endpoint, v.Public
 	res.Timings["ready"] = ms(time.Since(ds))
-	res.Timings["total"] = ms(time.Since(t0))
-	emit(f, res, func() {
+	if !*f.json {
 		fmt.Printf("✓ deployed   %s@%s · node %s · http://%s/  (deploy → ready %.1fs)\n", a.Name, v.Host, v.Endpoint.Node, v.Endpoint.MagicDNS, res.Timings["ready"]/1000)
-	})
+		printPublic(v.Public)
+	}
+	if p := v.Public; *waitPublic > 0 && p != nil && p.Allowed && p.Exposed {
+		last := ""
+		d, err := waitPublicURL(ctx, p.URL, *waitPublic, func(s string) {
+			if !*f.json && s != last {
+				fmt.Printf("  … waiting for %s from the public internet: %s\n", p.URL, firstLine(s))
+				last = s
+			}
+		})
+		if err != nil {
+			return err
+		}
+		res.Timings["public"] = ms(d)
+		if !*f.json {
+			fmt.Printf("✓ public     %s answers from the public internet (%.0fs)\n", p.URL, d.Seconds())
+		}
+	}
+	res.Timings["total"] = ms(time.Since(t0))
+	if *f.json {
+		emit(f, res, func() {})
+	}
 	return nil
 }
 

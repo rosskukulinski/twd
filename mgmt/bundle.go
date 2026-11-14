@@ -13,11 +13,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/publicspec"
 	"github.com/tailscale/hujson"
 )
 
 // TwdConfig is the part of twd.jsonc mgmt reads.
 type TwdConfig struct {
+	// Runtime is "" / "workerd" or "node" (public ingress is workerd-only in v1).
+	Runtime string `json:"runtime"`
+	// Public is twd.jsonc "public" (ADR-029): path prefixes reachable from
+	// the public internet over Funnel. nil: tailnet-only.
+	Public  *publicspec.Spec `json:"public"`
 	Tailnet struct {
 		// Tags are the workload entry node's tags (the "_workload" namespace).
 		Tags []string `json:"tags"`
@@ -33,6 +39,8 @@ type TwdConfig struct {
 			// hosts at once, so mgmt may move it off an unreachable host
 			// without --force-takeover (ADR-028 §3).
 			Fence string `json:"fence"`
+			// Public lets public requests create objects of this class (ADR-029 D5).
+			Public *publicspec.ClassSpec `json:"public"`
 		} `json:"objects"`
 		Spawn struct {
 			MaxLive  int `json:"maxLive"`
@@ -61,6 +69,38 @@ func (c *TwdConfig) Classes() []ClassConfig {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Class < out[j].Class })
 	return out
+}
+
+// PublicConfig validates twd.jsonc "public" and the per-class public
+// settings; nil when the workload declares no public routes.
+func (c *TwdConfig) PublicConfig() (*DeploymentPublic, error) {
+	var classes map[string]publicspec.ClassSpec
+	for name, o := range c.Tailnet.Objects {
+		if o.Public == nil {
+			continue
+		}
+		if err := o.Public.Validate(name); err != nil {
+			return nil, err
+		}
+		if c.Public == nil && o.Public.Create {
+			return nil, fmt.Errorf("tailnet.objects.%s.public.create needs twd.jsonc \"public\" routes", name)
+		}
+		if classes == nil {
+			classes = map[string]publicspec.ClassSpec{}
+		}
+		classes[name] = *o.Public
+	}
+	if c.Public == nil {
+		return nil, nil
+	}
+	if c.Runtime == "node" {
+		return nil, errors.New("\"public\" is not supported for runtime \"node\" yet (ADR-029 v1: workerd workloads only)")
+	}
+	sp := *c.Public
+	if err := sp.Validate(); err != nil {
+		return nil, err
+	}
+	return &DeploymentPublic{Spec: sp, Classes: classes}, nil
 }
 
 // ParseTwdConfig parses twd.jsonc (JSONC/HuJSON).

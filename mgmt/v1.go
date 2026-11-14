@@ -405,7 +405,7 @@ func (a *v1api) UpdateTenant(w http.ResponseWriter, r *http.Request, id v1.Tenan
 		var sp *string
 		var ip *int
 		switch k {
-		case "mintMode", "apiKeyFile", "wifClientID", "wifLifecycleClientID", "oauthClientID", "oauthClientFile", "pool", "tier":
+		case "mintMode", "apiKeyFile", "wifClientID", "wifLifecycleClientID", "oauthClientID", "oauthClientFile", "pool", "tier", "publicIngress":
 			var s string
 			if !null {
 				if err := json.Unmarshal(raw, &s); err != nil {
@@ -455,6 +455,8 @@ func (a *v1api) UpdateTenant(w http.ResponseWriter, r *http.Request, id v1.Tenan
 			p.Pool = sp
 		case "tier":
 			p.Tier = sp
+		case "publicIngress":
+			p.PublicIngress = sp
 		case "registrationsPerMinute":
 			p.RegistrationsPerMinute = ip
 		case "maxObjects":
@@ -849,7 +851,7 @@ func (a *v1api) CreateObject(w http.ResponseWriter, r *http.Request) {
 	// A killed identity answers 410 with its tombstone.
 	if req.Namespace != "" && req.ObjectName != "" {
 		wl := req.Workload
-		if req.Namespace == WorkloadNamespace {
+		if req.Namespace == WorkloadNamespace || req.Namespace == PublicNamespace {
 			wl = req.ObjectName
 		}
 		if wl != "" {
@@ -1349,3 +1351,55 @@ func (m *Mgmt) pendingDeleteAt(id string) (int64, bool) {
 }
 
 var _ = fmt.Sprintf
+
+// ---- public ingress (ADR-029) ----
+
+func (a *v1api) GetWorkloadPublic(w http.ResponseWriter, r *http.Request, id v1.TenantID, workload v1.WorkloadName) {
+	wp, err := a.s.M.GetWorkloadPublic(r.Context(), id, workload)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	writeResource(w, r, 200, wp)
+}
+
+func (a *v1api) UpdateWorkloadPublic(w http.ResponseWriter, r *http.Request, id v1.TenantID, workload v1.WorkloadName, _ v1.UpdateWorkloadPublicParams) {
+	cur, err := a.s.M.GetWorkloadPublic(r.Context(), id, workload)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	if err := checkIfMatch(r, cur); err != nil {
+		w.Header().Set("ETag", etagOf(cur))
+		writeErr(w, r, err)
+		return
+	}
+	var body map[string]json.RawMessage
+	if err := readJSON(r, &body); err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	var exposed *bool
+	for k, raw := range body {
+		if k != "exposed" {
+			writeErr(w, r, errf(400, "bad_request", "unknown field %q (only \"exposed\" can be changed)", k))
+			return
+		}
+		var b bool
+		if err := json.Unmarshal(raw, &b); err != nil {
+			writeErr(w, r, errf(400, "bad_request", "exposed must be a boolean"))
+			return
+		}
+		exposed = &b
+	}
+	if exposed == nil {
+		writeErr(w, r, errf(400, "bad_request", "exposed is required"))
+		return
+	}
+	wp, err := a.s.M.SetWorkloadExposed(r.Context(), id, workload, *exposed, principalOf(r.Context()).Actor(r))
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	writeResource(w, r, 200, wp)
+}

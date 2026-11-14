@@ -194,8 +194,9 @@ func wifOnboard(ctx context.Context, s *state, tid, tailnet, mintID, lifeID stri
 			var tr struct {
 				TenantID string `json:"tenantID"`
 			}
+			// twd up's own tenant: public ingress allowed (ADR-029 D1).
 			if err := s.mgmt().Do(ctx, "POST", "/v1/tenants", map[string]any{"tenantID": tid, "tailnet": tailnet, "controlURL": s.Cfg.ControlURL,
-				"mintMode": "wif", "wifClientID": res.ClientID, "wifLifecycleClientID": res.Lifecycle}, &tr); err != nil {
+				"mintMode": "wif", "wifClientID": res.ClientID, "wifLifecycleClientID": res.Lifecycle, "publicIngress": mgmt.PublicAllow}, &tr); err != nil {
 				return res, err
 			}
 			res.Created = true

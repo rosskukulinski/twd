@@ -402,8 +402,51 @@ func describe(r mgmt.AuditRecord, names map[string]string) string {
 		return fmt.Sprintf("device %v deleted (%v ms)", d["nodeID"], d["ms"])
 	case "deny":
 		return fmt.Sprintf("%s %v", r.Code, d["message"])
+	// Public ingress (ADR-029). Host records are best-effort rendered from
+	// whichever of these fields they carry; the rest is shown compactly.
+	case "public_request":
+		s := fmt.Sprintf("%v %v → %v", orAny(d["method"], "?"), orAny(d["path"], "?"), orAny(d["status"], "?"))
+		if c := d["code"]; c != nil && c != "" {
+			s += fmt.Sprintf(" (%v)", c)
+		}
+		if ip := orAny(d["ip"], d["clientIP"]); ip != nil {
+			s += fmt.Sprintf(" from %v", ip)
+		}
+		if ms := orAny(d["ms"], d["durationMs"]); ms != nil {
+			s += fmt.Sprintf(" %v ms", ms)
+		}
+		return "public " + s
+	case "public_rejected":
+		s := fmt.Sprintf("public refused: %v rate-limited, %v too large, %v connections", orAny(d["rateLimited"], 0), orAny(d["tooLarge"], 0), orAny(d["connsRefused"], 0))
+		if u := d["uniqueIPApprox"]; u != nil {
+			s += fmt.Sprintf(" · ~%v IPs", u)
+		}
+		if top := d["topIPs"]; top != nil {
+			s += " · top " + compact(top)
+		}
+		return s
+	case "public_object_created":
+		s := fmt.Sprintf("%v/%v created by a public request", orAny(d["class"], d["namespace"]), d["name"])
+		if ip := orAny(d["ip"], d["clientIP"]); ip != nil {
+			s += fmt.Sprintf(" from %v", ip)
+		}
+		return s
+	case "expose_on":
+		return fmt.Sprintf("%v public routes exposed by %s", d["workload"], orDash(r.ActingFor))
+	case "expose_off":
+		return fmt.Sprintf("%v public routes unexposed by %s", d["workload"], orDash(r.ActingFor))
 	}
 	return compact(d)
+}
+
+// orAny returns the first non-nil value.
+func orAny(vs ...any) any {
+	for _, v := range vs {
+		if v != nil {
+			return v
+		}
+	}
+	return nil
 }
 
 // tenantNoteText renders a tenant_note: unverified content written by
