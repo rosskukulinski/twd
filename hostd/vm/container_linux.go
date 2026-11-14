@@ -158,6 +158,7 @@ func (s *ctrState) event(msg proto.Msg) bool {
 		return true
 	case "log":
 		s.log.Write([]byte(msg.Text + "\n"))
+		s.m.log.Debug("container output", "line", msg.Text)
 		return true
 	case "exec-exit", "hello":
 		return true
