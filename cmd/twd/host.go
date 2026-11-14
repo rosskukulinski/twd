@@ -99,16 +99,19 @@ func cmdHostSetup(args []string) error {
 // cmdHostVMCheck: `twd host vmcheck <workload> [--keyscan]` checks a
 // running microVM workload: guest memory, DO volume fsync latency, and
 // with --keyscan that no tailnet or volume key is in the guest (its disks,
-// files, and a full snapshot of its RAM). Output has no key material.
+// files, and a full snapshot of its RAM). With --container <Class>/<name>
+// it scans that object's container guest instead, with the stricter
+// sandbox needle set (ADR-032 D5). Output has no key material.
 func cmdHostVMCheck(args []string) error {
 	f := newFlags("host")
 	keyscan := f.Bool("keyscan", false, "also scan the guest's disks, files and RAM for key material")
+	ctr := f.String("container", "", "scan this object's container guest (<Class>/<name>; implies --keyscan)")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return fail("bad_request", "usage: twd host vmcheck <workload> [--keyscan]")
+		return fail("bad_request", "usage: twd host vmcheck <workload> [--keyscan] [--container <Class>/<name>]")
 	}
 	s, err := openState(*f.stateDir)
 	if err != nil {
@@ -117,8 +120,31 @@ func cmdHostVMCheck(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	q := url.Values{"workload": {pos[0]}}
-	if *keyscan {
+	if *keyscan || *ctr != "" {
 		q.Set("keyscan", "1")
+	}
+	if *ctr != "" {
+		q.Set("container", *ctr)
+		var rep hostd.ContainerCheckReport
+		if err := s.hostd().Do(ctx, "POST", "/v1/vm/check?"+q.Encode(), nil, &rep); err != nil {
+			return err
+		}
+		k := rep.KeyScan
+		bad := k == nil || len(k.Found) > 0 || len(k.GuestStateF) > 0 || !strings.HasPrefix(k.Control, "guest canary found")
+		emit(f, rep, func() {
+			mark := "✓"
+			if bad {
+				mark = "✗"
+			}
+			if k != nil {
+				fmt.Printf("%s no keys in container %s/%s/%s (VMM pid %d): %d needles (%s) · found %v · %d guest files · %d MiB RAM · %s\n",
+					mark, rep.Workload, rep.Class, rep.Object, rep.PID, k.Needles, strings.Join(k.NeedleKinds, ", "), k.Found, k.GuestFiles, k.MemoryMiB, k.Control)
+			}
+		})
+		if bad {
+			return fail("keys_in_guest", fmt.Sprintf("container keyscan failed: %+v", k))
+		}
+		return nil
 	}
 	var rep hostd.VMCheckReport
 	if err := s.hostd().Do(ctx, "POST", "/v1/vm/check?"+q.Encode(), nil, &rep); err != nil {

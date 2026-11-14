@@ -476,6 +476,15 @@ func (c *ctrVM) Kill() {
 	c.m.Kill()
 }
 
+// MemoryDump, Disks and Op serve the no-keys scan (hostd ContainerCheck).
+func (c *ctrVM) MemoryDump(ctx context.Context, dir string) (string, error) {
+	return c.m.MemoryDump(ctx, dir)
+}
+func (c *ctrVM) Disks() []string { return c.m.Disks() }
+func (c *ctrVM) Op(ctx context.Context, msg proto.Msg) (proto.Msg, error) {
+	return c.m.Op(ctx, msg)
+}
+
 func (c *ctrVM) Info() sandbox.Info { return c.m.info }
 func (c *ctrVM) RSSKB() int64       { return c.m.RSSKB() }
 func (c *ctrVM) Log() string        { return c.s.log.String() }
