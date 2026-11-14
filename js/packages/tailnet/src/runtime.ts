@@ -7,7 +7,7 @@
 // props (minted by the platform, read-only here) say which object or
 // workload is calling, so tenant code cannot act as another object.
 
-import { TailnetError, fromResponse } from "./errors.js";
+import { TailnetError, fromResponse, isTailnetError } from "./errors.js";
 
 /** The platform's TailnetApi stub (RPC). */
 export interface TailnetApiStub {
@@ -235,6 +235,122 @@ export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts:
   return W;
 }
 
+// ---- public requests (ADR-029 D5) ----
+//
+// A request delivered over Funnel (request.cf.tailscale.requester.kind ===
+// "public", set only by netd) must not create Durable Objects: every new
+// object name would mint a tailnet node. For such a request the tenant
+// handler gets a guarded env whose DO namespaces admit an object (hostd
+// "admit": it exists, or its class sets public.create and is under its
+// cap) before any call reaches it, and a ctx.tailnet that cannot spawn or
+// kill. The platform's Host DO and hostd check again (defense in depth).
+
+function isPublicReq(req: any): boolean {
+  return req?.cf?.tailscale?.requester?.kind === "public";
+}
+
+const ADMIT_CACHE_MAX = 10_000;
+// "class\nname" of objects hostd admitted in this isolate (bounded; an
+// admitted object stays admitted: a later kill answers 410 on its own).
+const admitted = new Map<string, true>();
+
+function remember(key: string) {
+  if (admitted.size >= ADMIT_CACHE_MAX) {
+    const first = admitted.keys().next().value;
+    if (first !== undefined) admitted.delete(first);
+  }
+  admitted.set(key, true);
+}
+
+async function admit(tw: TailnetApiStub | undefined, cls: string, name: string): Promise<void> {
+  const key = cls + "\n" + name;
+  if (admitted.has(key)) return;
+  if (!tw || typeof tw.call !== "function") throw new TailnetError("public_create_denied", "twd platform binding missing; refusing a public object access");
+  const r = await tw.call("admit", { class: cls, name });
+  if (!r || !r.ok) throw TailnetError.from((r as any)?.error ?? { code: "public_create_denied", message: "admit refused" });
+  remember(key);
+}
+
+function denied(msg: string): never {
+  throw new TailnetError("public_create_denied", msg);
+}
+
+function guardStub(tw: TailnetApiStub | undefined, cls: string, name: string, real: any): any {
+  return new Proxy(
+    {},
+    {
+      get(_t, p) {
+        if (p === "then") return undefined;
+        if (p === "id" || p === "name") return real[p];
+        if (typeof p === "symbol") return real[p];
+        return async (...args: unknown[]) => {
+          await admit(tw, cls, name);
+          return real[p](...args);
+        };
+      },
+    },
+  );
+}
+
+function guardNamespace(tw: TailnetApiStub | undefined, cls: string, ns: any): any {
+  return Object.freeze({
+    getByName(name: unknown) {
+      const n = String(name);
+      return guardStub(tw, cls, n, ns.getByName(n));
+    },
+    idFromName(name: unknown) {
+      return ns.idFromName(name);
+    },
+    idFromString(s: unknown) {
+      return ns.idFromString(s);
+    },
+    get(id: any, opts?: unknown) {
+      const n = id?.name;
+      if (typeof n !== "string" || !n) denied(`a public request may only address ${cls} objects by name (idFromName/getByName)`);
+      return guardStub(tw, cls, n, ns.get(id, opts));
+    },
+    newUniqueId() {
+      denied(`a public request may not create a new ${cls} object (newUniqueId)`);
+    },
+    jurisdiction(j: unknown) {
+      return guardNamespace(tw, cls, ns.jurisdiction(j));
+    },
+  });
+}
+
+/** publicEnv returns env with every DO binding guarded (see above). */
+export function publicEnv(env: any, bindings: BindingMap): any {
+  if (!env || typeof env !== "object") return env;
+  const tw: TailnetApiStub | undefined = env.__TWD;
+  const out: Record<string, unknown> = { ...env };
+  for (const [k, cls] of Object.entries(bindings)) {
+    if (env[k]) out[k] = guardNamespace(tw, cls, env[k]);
+  }
+  return out;
+}
+
+/** publicTailnet is ctx.tailnet for a public request: no spawn, no kill. */
+function publicTailnet(tn: TailnetContext): TailnetContext {
+  return Object.freeze({
+    ...tn,
+    spawn(): Promise<never> {
+      return Promise.reject(new TailnetError("public_create_denied", "a public request may not spawn objects"));
+    },
+    kill(): Promise<never> {
+      return Promise.reject(new TailnetError("public_request", "a public request may not kill objects"));
+    },
+  }) as TailnetContext;
+}
+
+// asResponse renders errors the platform throws through tenant code.
+function asResponse(e: unknown): Response | null {
+  const m = String((e as Error)?.message ?? e);
+  const i = m.indexOf("[killed]");
+  if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+  if (isTailnetError(e) && (e.code === "public_create_denied" || e.code === "public_request")) return e.toResponse();
+  return null;
+}
+
 /** wrapHandler installs ctx.tailnet (workload identity) on the default export. */
 export function wrapHandler(H: any, bindings: BindingMap) {
   if (!H) {
@@ -243,29 +359,57 @@ export function wrapHandler(H: any, bindings: BindingMap) {
     };
   }
   if (typeof H === "function") {
-    // A WorkerEntrypoint class.
-    return {
-      [H.name || "Default"]: class extends H {
-        constructor(ctx: any, env: any) {
-          define(ctx, createTailnetContext(env?.__TWD, env, bindings));
-          super(ctx, env);
+    // A WorkerEntrypoint class (one instance per request).
+    const C = class extends H {
+      constructor(ctx: any, env: any) {
+        define(ctx, createTailnetContext(env?.__TWD, env, bindings));
+        super(ctx, env);
+      }
+    };
+    if (typeof H.prototype?.fetch === "function") {
+      const f = H.prototype.fetch;
+      (C.prototype as any).fetch = async function (this: any, req: Request) {
+        if (isPublicReq(req)) {
+          const raw = this.env;
+          this.env = publicEnv(raw, bindings);
+          if (this.ctx?.tailnet) define(this.ctx, publicTailnet(this.ctx.tailnet));
         }
-      },
-    }[H.name || "Default"];
+        try {
+          return await f.call(this, req);
+        } catch (e) {
+          const r = asResponse(e);
+          if (r) return r;
+          throw e;
+        }
+      };
+    }
+    return { [H.name || "Default"]: C }[H.name || "Default"];
   }
   const out: Record<string, unknown> = { ...H };
   for (const k of Object.keys(H)) {
     if (typeof H[k] !== "function") continue;
     out[k] = function (this: unknown, a: unknown, env: any, ctx: any) {
-      if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
-      const r = H[k].call(H, a, env, ctx);
+      const pub = k === "fetch" && isPublicReq(a);
+      if (pub) {
+        const tn = env?.__TWD ? createTailnetContext(env.__TWD, env, bindings) : null;
+        env = publicEnv(env, bindings);
+        if (ctx && tn) define(ctx, publicTailnet(tn));
+      } else if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
+      let r: unknown;
+      try {
+        r = H[k].call(H, a, env, ctx);
+      } catch (e) {
+        const resp = k === "fetch" ? asResponse(e) : null;
+        if (resp) return resp;
+        throw e;
+      }
       if (k !== "fetch") return r;
       // A call into a killed object throws "[killed] …" from the platform;
-      // answer the caller with a typed 410 instead of an opaque 500.
+      // answer the caller with a typed 410 instead of an opaque 500. A
+      // public create refusal that escapes the handler becomes its 403.
       return Promise.resolve(r).catch((e: unknown) => {
-        const m = String((e as Error)?.message ?? e);
-        const i = m.indexOf("[killed]");
-        if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+        const resp = asResponse(e);
+        if (resp) return resp;
         throw e;
       });
     };

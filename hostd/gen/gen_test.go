@@ -46,6 +46,34 @@ func (f *fakeHost) api() http.Handler {
 		f.mu.Lock()
 		f.ops = append(f.ops, body)
 		f.mu.Unlock()
+		// ADR-029: only objects named "pub-ok*" exist (or are admitted) for
+		// public requests.
+		pubOK := strings.HasPrefix(fmtAny(body["name"]), "pub-ok")
+		if as, ok := body["as"].(map[string]any); ok && body["op"] == "ensure" {
+			pubOK = strings.HasPrefix(fmtAny(as["name"]), "pub-ok")
+		}
+		denyPublic := func() {
+			w.Header().Set("content-type", "application/json")
+			w.WriteHeader(403)
+			w.Write([]byte(`{"code":"public_create_denied","message":"no such object for a public request"}`))
+		}
+		switch body["op"] {
+		case "admit":
+			// "pub-adm*" passes admit but not ensure{public}: it stands in
+			// for a tenant-side guard that was bypassed, so the Host DO's
+			// own check is what refuses it.
+			if !pubOK && !strings.HasPrefix(fmtAny(body["name"]), "pub-adm") {
+				denyPublic()
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"ok": true, "existing": true})
+			return
+		case "ensure":
+			if body["public"] == true && !pubOK {
+				denyPublic()
+				return
+			}
+		}
 		switch body["op"] {
 		case "spawn":
 			json.NewEncoder(w).Encode(map[string]any{"objectID": "o-child", "status": "pending", "hostname": "probe-probe-child"})
@@ -59,6 +87,11 @@ func (f *fakeHost) api() http.Handler {
 			json.NewEncoder(w).Encode(map[string]any{"objectID": "o1", "status": "pending"})
 		}
 	})
+}
+
+func fmtAny(v any) string {
+	s, _ := v.(string)
+	return s
 }
 
 func (f *fakeHost) egressObj() http.Handler {
