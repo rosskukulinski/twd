@@ -119,8 +119,8 @@ type twdConfig struct {
 	Name    string           `json:"name"`
 	Public  *publicspec.Spec `json:"public"`
 	Tier    string           `json:"tier"`
-	Runtime string `json:"runtime"`
-	Main    string `json:"main"`
+	Runtime string           `json:"runtime"`
+	Main    string           `json:"main"`
 	Node    struct {
 		Env    map[string]string `json:"env"`
 		Listen string            `json:"listen"`
@@ -131,9 +131,9 @@ type twdConfig struct {
 		Tags     []string `json:"tags"`
 		Connects []string `json:"connects"`
 		Objects  map[string]struct {
-			Tags   []string `json:"tags"`
-			Agent  bool     `json:"agent"`
-			Egress string   `json:"egress"`
+			Tags   []string              `json:"tags"`
+			Agent  bool                  `json:"agent"`
+			Egress string                `json:"egress"`
 			TTL    string                `json:"ttl"`
 			Node   *bool                 `json:"node"`
 			Public *publicspec.ClassSpec `json:"public"`
