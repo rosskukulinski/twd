@@ -12,6 +12,39 @@ Last update: 2026-11-08 08:30 PT. L3: `make e2e-linux-reboot` PASS (clean reboot
 Last update: 2026-11-08 10:00 PT. Integration (Linux): L3 + L1 merged onto master (L2) on `int-linux`; redeploy-after-purge and lease_lost-retry fixes; full matrix green (macOS, real tailnets, twd-dev, Debian 12 / Ubuntu 24.04 arm64 with reboot + ephemeral / Ubuntu 24.04 amd64, e2e-linux-vm, e2e-linux-reboot); re-find delay diagnosed (WireGuard stale-session timeout, not DERP/netmap).
 Last update: 2026-11-08 09:05 PT. L1: ephemeral nodes now re-mint on a rejected rejoin (netd + mgmt `/remint` + hostd); reboot survival and the ephemeral restart measured on Ubuntu 24.04 arm64; 5/5 supported distros PASS.
 Last update: 2026-11-08 02:05 PT. Integration: master (M6 + M5 + M9, `57dd519`) merged into `m7-multi`; the full matrix passes on `4cce30d` (macOS, real tailnets, mbp from the release, Lima).
+Last update: 2026-11-14. Containers and code sandboxes (ADR-032, Cloudflare `ctx.container` on the microVM tier) on branch `design/containers-sandboxes-microvm-tier`; see the section at the end and the open decisions below.
+
+## Open decisions (for Ross, from ADR-032)
+
+Each item says what was built and what the build currently does. Each recommendation is the builder's; none is decided. Details are in "Containers and code sandboxes (ADR-032)" at the end of this file.
+
+1. **`enableInternet` without a gateway.** twd has no tenant exit-node or gateway path yet (RFC §4.8). So `enableInternet: true` leaves from the host's own network (`-container-internet=direct`, the default), filtered by `tailnet.egress.internet` and the ADR-019 blocks.
+   - Options: keep it; default to `off` until a gateway exists; or require an operator opt-in per tenant.
+   - *Recommendation:* operator opt-in per tenant, `direct` only in single-tenant `twd up`.
+2. **amd64 verification.** The amd64 assets build reproducibly and `make test` passes on x86. But no amd64 microVM became ready on the only x86 test host, a nested QEMU/KVM guest on an AMD Zen 1 NAS whose L2 guests lose interrupts.
+   - Decide where amd64 gets verified: a bare-metal x86 box, a cloud VM with nested virtualization, or CI. Also decide whether to tear down the current test VM.
+   - *Recommendation:* a cloud x86 VM with nested KVM, then tear down the NAS VM.
+3. **Who may push images.** Developers are global admins (`twd.dev/cap/admin`), so any developer can push into any tenant's registry namespace.
+   - Add a per-tenant developer role (a cap scoped to a tenant), or accept this for the self-hosted, single-operator case?
+4. **The plain-DO attribution limit.** In plain-DO mode (`"egress": "workload"`), code in a workload can drive another plain object's container of the *same* workload: the same trust domain as `ctx.tailnet` today. Facet mode is platform-attested.
+   - Accept and document it (current), or require facet mode for container classes?
+5. **Mac hosts in production.** The vz backend gives macOS the full microVM tier, as ADR-032 D7 decided. It has no jailer equivalent, no host cgroup (CPU fractions are enforced in the guest only) and no RAM key scan (Virtualization.framework refuses to save state).
+   - Keep Mac hosts production-eligible, or mark them dev-only until a Seatbelt profile for `twd-vz` exists?
+6. **Rosetta.** Stock amd64 Cloudflare images run under Rosetta on Apple Silicon (verified), but Rosetta is opt-in (`-vm-rosetta`). Placement treats a Rosetta Mac as arm64 only, and the native arm64 path is much faster (Bun server first `/run` 11 s vs 41 s, exec p50 105 ms vs 2.2 s at `lite`).
+   - Turn Rosetta on by default? Let placement count a Rosetta Mac as amd64-capable?
+7. **Fencing granularity.** Containers are fenced per *workload* (any fenced class fences the workload), not per class as ADR-032 D2 says.
+   - Accept, or make it per class?
+8. **Registry operations.**
+   - There is no blob garbage collection.
+   - Upload sessions are files, so mgmt replicas serving `/v2/` must share the registry directory.
+   - Mirrors re-download blobs that are already stored.
+   - Decide the storage backend for multi-replica mgmt: a shared filesystem, S3-compatible, or Postgres large objects.
+9. **Upstream and signing.** File the workerd ask for a pluggable `containerEngine` (an external `rpc::Container` server), which retires the polyfill? Image signing (cosign) is deferred: when?
+10. **Cleanup debt.**
+    - Container instance types exist twice (`internal/container` and `sandbox`).
+    - There are two arm64 guest kernels (vz 6.1.167, Firecracker 6.1.155).
+    - `KernelHasErofs` is a byte scan.
+    - Schedule a cleanup pass?
 
 ## M0: repo skeleton (DONE)
 - Layout per RFC §15:
