@@ -166,7 +166,7 @@ e2e-vz-container: deps build vz-assets
 	@[ "$$(uname -s)" = Darwin ] || { echo "e2e-vz-container: macOS only"; exit 1; }
 	@[ -f "$(VZ_CTR_IMAGES)/images.json" ] || { echo "e2e-vz-container: no $(VZ_CTR_IMAGES)/images.json (guest/images/build-sandbox-images.sh; PLATFORM=linux/amd64 for Rosetta)"; exit 1; }
 	@[ -f "$(CTR_APPS)/unmodified.txt" ] || scripts/e2e-container-prep.sh $(CTR_APPS)
-	$(VZ_CTR_ENV) $(GO) test -count=1 -v -run TestContainerSmoke ./hostd/vm
+	$(VZ_CTR_ENV) $(GO) test -count=1 -v -run 'TestContainerSmoke|TestVZContainer' ./hostd/vm
 	cd e2e/container && $(VZ_CTR_ENV) $(GO) test -tags e2econtainer -count=1 -v -timeout 20m .
 
 ## e2e-linux-vm: L3 E2E from the installed release on a FRESH nested-virt Lima VM

@@ -246,11 +246,11 @@ type vzLaunch struct {
 // launch boots one VM: run dir, config drive and disks, the VMM's
 // descriptors (NIC, control, vsock), the VMM, then the wait for the guest
 // to report ready (workerd healthy, or a container's entrypoint running).
-func (b *Backend) launch(ctx context.Context, l vzLaunch) (m *Machine, err error) {
+func (b *Backend) launch(ctx context.Context, l vzLaunch) (_ *Machine, err error) {
 	t0 := time.Now()
 	n := b.seq.Add(1)
 	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), l.name, n)
-	m = &Machine{agent: newAgent(), b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id),
+	m := &Machine{agent: newAgent(), b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id),
 		ctlPending: map[int64]chan vzapi.Ctl{}, started: make(chan vzapi.Ctl, 1), ctr: l.ctr}
 	m.log = b.cfg.Log.With("vm", id)
 	if l.log != nil {
