@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-public e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -130,7 +130,7 @@ e2e-keyless: deps
 	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
 		echo "e2e-keyless: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
-		$(GO) test -tags e2ekeyless -count=1 -v -timeout 25m ./e2e/keyless/...
+		$(GO) test -tags e2ekeyless -count=1 -v -timeout 35m ./e2e/keyless/...
 
 ## e2e-oauth: M12 on tailnet 1: `twd up --oauth-client-file` (mint mode oauth: an OAuth client with
 ## auth_keys + devices:core + policy_file:read, tag:twd; no browser, no Funnel, no API key given to twd)
@@ -141,6 +141,17 @@ e2e-oauth: deps
 		echo "e2e-oauth: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2eoauth -count=1 -v -timeout 25m ./e2e/oauth/...
+
+## e2e-public: ADR-029 on tailnet 1: public ingress over real Funnel. `twd up --oauth-client-file`,
+## a workload with twd.jsonc "public" routes, fetched through public DNS like an internet client:
+## public requester (never a tailnet caller), spoofed headers dropped, route allowlist, no public
+## object creation (opt-in up to maxObjects), `twd expose off|on`, audit, doctor probe, zero leftovers.
+## The only policy write it may make is the tag:twd-public tagOwner + its funnel nodeAttr.
+e2e-public: deps
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-public: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2epublic -count=1 -v -timeout 30m ./e2e/public/...
 
 ## release: self-contained tarballs in dist/ (darwin-arm64, linux-arm64, linux-amd64): Go binaries
 ## (CGO_ENABLED=0, esbuild built in), pinned workerd, templates + vendored node_modules,
@@ -228,6 +239,7 @@ lint: api-check
 	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags e2ekeyless ./e2e/keyless/...
 	$(GO) vet -tags e2eoauth ./e2e/oauth/...
+	$(GO) vet -tags e2epublic ./e2e/public/...
 	$(GO) vet -tags e2embp ./e2e/mbp/...
 	$(GO) vet -tags e2elinux ./e2e/linux/...
 	$(GO) vet -tags sdk ./e2e/sdk/...

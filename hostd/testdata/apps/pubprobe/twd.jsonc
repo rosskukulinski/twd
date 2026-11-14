@@ -1,0 +1,16 @@
+{
+  "name": "pubprobe",
+  // ADR-029: these paths are reachable from the public internet (Funnel).
+  "public": {
+    "routes": ["/hook/*", "/agents/*", "/spawn", "/slow", "/big"],
+    "limits": { "ipRps": 2, "ipBurst": 40, "maxBodyBytes": 1024 },
+  },
+  "tailnet": {
+    "tags": ["tag:ttest"],
+    "objects": {
+      "Room": { "tags": ["tag:ttest"] },
+      // public requests may create at most 2 of these
+      "Open": { "tags": ["tag:ttest"], "public": { "create": true, "maxObjects": 2 } },
+    },
+  },
+}

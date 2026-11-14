@@ -26,7 +26,16 @@ export type TailnetErrorCode =
   | "unknown_object"
   | "dial_failed"
   | "upstream_unavailable"
-  | "hostd_unavailable";
+  | "hostd_unavailable"
+  | "public_request"
+  | "public_create_denied"
+  | "public_ingress_not_allowed"
+  | "public_name_taken"
+  | "rate_limited"
+  | "payload_too_large"
+  | "header_too_large"
+  | "not_public"
+  | "upgrade_not_allowed";
 
 export interface CatalogEntry {
   /** HTTP status used when the error is rendered as a response. */
@@ -60,6 +69,15 @@ export const CATALOG: Readonly<Record<TailnetErrorCode, CatalogEntry>> = Object.
   dial_failed: { status: 502, title: "the tailnet dial failed" },
   upstream_unavailable: { status: 503, title: "the platform upstream is unavailable" },
   hostd_unavailable: { status: 503, title: "the host agent is unavailable" },
+  public_request: { status: 403, title: "a public (Funnel) request reached code that needs a tailnet caller; use getRequester()" },
+  public_create_denied: { status: 403, title: "a public request may not create a new object (or spawn); only existing objects, or classes with public.create" },
+  public_ingress_not_allowed: { status: 403, title: "the tenant does not allow public ingress (operator setting publicIngress)" },
+  public_name_taken: { status: 409, title: "the workload's public node name is taken on the tailnet (MagicDNS would rename it)" },
+  rate_limited: { status: 429, title: "too many public requests (per workload or per client IP)" },
+  payload_too_large: { status: 413, title: "the public request body is above the workload's limit" },
+  header_too_large: { status: 431, title: "the public request headers are above the workload's limit" },
+  not_public: { status: 404, title: "this path is not one of the workload's public routes" },
+  upgrade_not_allowed: { status: 403, title: "connection upgrades (WebSocket) are not allowed on this public route" },
 });
 
 export interface Missing {

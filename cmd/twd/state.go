@@ -28,7 +28,7 @@ type Config struct {
 	TenantID string `json:"tenantID,omitempty"`
 	// MintMode is "oauth" (the default since M12: a Tailscale OAuth client
 	// whose secret stays in a 0600 file; no browser, no Funnel), "wif"
-	// (keyless browser flow: mgmt's OIDC issuer over Funnel + a trust
+	// (keyless browser flow: the OIDC issuer on its own node over Funnel + a trust
 	// credential) or "apikey" (--api-key-file). Empty means apikey (state
 	// written before M10).
 	MintMode   string `json:"mintMode,omitempty"`
@@ -39,13 +39,18 @@ type Config struct {
 	OAuthClientID   string `json:"oauthClientID,omitempty"`
 	// Keyless mode: mgmt's own tailnet node (tag:twd-mgmt), joined by
 	// interactive login in `twd up`; the API is served on it (WhoIs auth)
-	// and the WIF issuer over Funnel.
+	// (never Funnel: the WIF issuer has its own node, Issuer* below).
 	MgmtHostname string `json:"mgmtHostname,omitempty"` // tsnet hostname (default twd-mgmt)
 	MgmtDNSName  string `json:"mgmtDNSName,omitempty"`  // twd-mgmt.<tailnet>.ts.net
 	MgmtNodeID   string `json:"mgmtNodeID,omitempty"`   // stable node ID
 	MgmtIP       string `json:"mgmtIP,omitempty"`       // tailnet IPv4
 	HTTPS        bool   `json:"https,omitempty"`        // the tailnet has HTTPS certificates (Funnel + twd link need it)
-	IssuerURL    string `json:"issuerURL,omitempty"`    // https://<mgmtDNSName> (Funnel)
+	IssuerURL    string `json:"issuerURL,omitempty"`    // https://<issuerDNSName> (Funnel, wif only)
+	// The WIF issuer's own node (tag:twd-issuer, wif only): the only node
+	// twd runs for mgmt that is Funnel-capable; mgmt's node never is.
+	IssuerHostname string `json:"issuerHostname,omitempty"`
+	IssuerDNSName  string `json:"issuerDNSName,omitempty"`
+	IssuerNodeID   string `json:"issuerNodeID,omitempty"`
 	// WIF trust credential client IDs (public identifiers, not secrets).
 	WIFClientID          string `json:"wifClientID,omitempty"`
 	WIFLifecycleClientID string `json:"wifLifecycleClientID,omitempty"`
@@ -178,6 +183,9 @@ func (s *state) linkPath() string   { return filepath.Join(s.Dir, "link.json") }
 func (s *state) mgmtTsnetDir() string {
 	return filepath.Join(s.Dir, "mgmt", "tsnet") // twd-mgmt -state-dir <state>/mgmt, tsnet under it
 }
+
+// issuerTsnetDir is the WIF issuer node's state (wif mode), next to mgmt's.
+func (s *state) issuerTsnetDir() string { return filepath.Join(s.Dir, "mgmt", "issuer-tsnet") }
 
 func (s *state) save() error {
 	if err := os.MkdirAll(s.Dir, 0o700); err != nil {

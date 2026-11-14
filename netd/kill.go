@@ -93,10 +93,13 @@ func (r *Registry) Kill(ctx context.Context, id string, opts KillOptions) (*Kill
 	if ln != nil {
 		ln.Close() // new SYNs to the port now get a RST from netstack
 	}
-	if opts.Tombstone > 0 && !opts.CloseFirst {
+	pubAborted := o.closePublic() // a public node: close the Funnel listener too
+	if opts.Tombstone > 0 && !opts.CloseFirst && o.pub == nil {
+		// (A public node has no tailnet listener to tombstone: its Funnel
+		// clients get a RST, and a killed node never answers on Funnel.)
 		o.serveTombstone(opts.Reason)
 	}
-	rep.FlowsAborted = o.abortFlows()
+	rep.FlowsAborted = o.abortFlows() + pubAborted
 	rep.AbortMS = ms(time.Since(t0))
 	// Abort only queues the RSTs; tsnet.Close tears down netstack first and
 	// would drop them, leaving callers black-holed (seen on production

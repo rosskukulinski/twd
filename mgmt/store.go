@@ -92,6 +92,11 @@ type Store interface {
 	// CountLive counts live objects of a tenant, or (rootID != "") the live
 	// descendants of rootID.
 	CountLive(ctx context.Context, tenantID, rootID string) (int, error)
+	// Public ingress (ADR-029): a workload's `twd expose` setting.
+	GetWorkloadPublic(ctx context.Context, tenantID, workload string) (WorkloadPublic, error)
+	SetWorkloadPublic(ctx context.Context, wp WorkloadPublic) error
+	// DeleteDeadObject forgets one killed/failed object (ErrNotFound if live).
+	DeleteDeadObject(ctx context.Context, id string) error
 	// DeleteDeadObjects removes a tenant's killed and failed objects (twd
 	// down --purge), so their names and IDs can be used again. It returns
 	// the removed objects; audit records are untouched.

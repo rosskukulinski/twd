@@ -1,0 +1,12 @@
+{
+  "name": "pubprobe",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      { "name": "OPEN", "class_name": "Open" },
+    ],
+  },
+}

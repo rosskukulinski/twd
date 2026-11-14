@@ -38,6 +38,7 @@ type fakeTS struct {
 	deletedKeys    []string
 	deletedDevices []string
 	policyFetches  int
+	policy         string // overrides samplePolicy when set (before the first fetch)
 	notModified    int
 	rateLimitNext  int // respond 429 to the next N key creates
 	tokenExchanges int
@@ -164,6 +165,10 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", `"p1"`)
+		if f.policy != "" {
+			w.Write([]byte(f.policy))
+			return
+		}
 		w.Write([]byte(samplePolicy))
 	default:
 		w.WriteHeader(404)

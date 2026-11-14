@@ -149,6 +149,7 @@ Funnel, no HTTPS requirement, no public issuer.**
      "tag:twd":      ["autogroup:admin"],
      "tag:twd-mgmt": ["autogroup:admin", "tag:twd"],
      "tag:twd-host": ["autogroup:admin", "tag:twd"],
+     "tag:twd-issuer": ["autogroup:admin", "tag:twd"],
    },
    "grants": [
      // hosts call mgmt's API; mgmt pushes kills to the hosts
@@ -225,7 +226,9 @@ What happens, in order (each line is a step you'll see):
    in a terminal, asks you to confirm it is in place **before** it
    requests a login URL (the login is refused with `requested tags
    [tag:twd-mgmt] are invalid or not permitted` otherwise; that refusal
-   is reported as `policy_missing_tag_owners` with the snippet):
+   is reported as `policy_missing_tag_owners` with the snippet). In WIF
+   mode the issuer runs on its **own** node, `tag:twd-issuer`; mgmt's node,
+   which serves the API, is never Funnel-capable:
    ```jsonc
    "tagOwners": {
      "tag:twd":      ["autogroup:admin"],
@@ -239,8 +242,9 @@ What happens, in order (each line is a step you'll see):
      {"src": ["autogroup:admin"], "dst": ["tag:twd-mgmt"], "ip": ["tcp:443", "tcp:80"], "app": {"twd.dev/cap/admin": [{}]}},
    ],
    "nodeAttrs": [
-     // Funnel publishes mgmt's OIDC issuer, so Tailscale can verify its tokens
-     {"target": ["tag:twd-mgmt"], "attr": ["funnel"]},
+     // Funnel publishes the OIDC issuer from its own node (discovery + JWKS
+     // only, no grants), so Tailscale can verify mgmt's tokens. Never on tag:twd-mgmt.
+     {"target": ["tag:twd-issuer"], "attr": ["funnel"]},
    ],
    ```
    Your apps' tags (`tag:twd-wl-<name>`, object class tags) are added as
@@ -249,11 +253,18 @@ What happens, in order (each line is a step you'll see):
    `tag:twd-mgmt`. twd prints a `https://login.tailscale.com/a/…` URL;
    open it and sign in as a tailnet admin. The node's state is kept under
    `~/.twd/mgmt/tsnet`, so later `twd up` runs need no login. The tailnet
-   name is read from the login (no `--tailnet`). If the tailnet has no
-   HTTPS certificates, or `tag:twd-mgmt` has no Funnel attribute, `twd up`
-   stops here and says exactly what to enable; the node stays joined.
+   name is read from the login (no `--tailnet`). Then the issuer's node
+   `twd-issuer` (`tag:twd-issuer`) joins the same way: a **second** login
+   URL (or `--issuer-authkey-file` for unattended setups); its state is
+   kept under `~/.twd/mgmt/issuer-tsnet`. If the tailnet has no HTTPS
+   certificates, or `tag:twd-issuer` has no Funnel attribute, `twd up`
+   stops here and says exactly what to enable; the nodes stay joined.
+   Upgrading from a twd that served the issuer from mgmt's node: the issuer
+   URL changes, so `twd up` clears the stored client IDs and asks for a new
+   trust credential; remove the old `tag:twd-mgmt` funnel entry (twd
+   warns while it is there).
 3. **Trust credential.** mgmt starts and publishes its OIDC issuer over
-   Funnel at `https://twd-mgmt.<tailnet>.ts.net/t/tn_<tailnet>`. twd prints
+   Funnel, from the issuer's node, at `https://twd-issuer.<tailnet>.ts.net/t/tn_<tailnet>`. twd prints
    the exact admin-console steps: Settings › Trust credentials › Add, with
    the issuer URL, the subject `twd:tenant:tn_<tailnet>:mint`, scope
    `auth_keys`, tag `tag:twd`; and an optional second **lifecycle**
@@ -414,7 +425,7 @@ twd down --purge           # kill every object and delete its devices, then stop
   console (Machines).
 - `https_required` / `funnel_required` from `twd up --wif`: enable HTTPS
   certificates (admin console › DNS) or add the `nodeAttrs` funnel entry
-  for `tag:twd-mgmt`; mgmt's node stays joined, re-run `twd up`.
+  for `tag:twd-issuer` (never `tag:twd-mgmt`); the nodes stay joined, re-run `twd up`.
 - `bootstrap_failed … not a tagOwner`: the account you logged in with may
   not own `tag:twd-mgmt`; add the tagOwners snippet, remove the node in the
   console, `twd up` again.

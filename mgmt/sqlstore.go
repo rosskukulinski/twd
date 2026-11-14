@@ -396,6 +396,9 @@ CREATE TABLE IF NOT EXISTS secret_choice (
   name TEXT PRIMARY KEY, key_id TEXT NOT NULL, created_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS replicas (
   id TEXT PRIMARY KEY, custody TEXT NOT NULL, started_at BIGINT NOT NULL, last_seen BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS workload_public (
+  tenant_id TEXT NOT NULL, workload TEXT NOT NULL, exposed BIGINT NOT NULL, updated_at BIGINT NOT NULL,
+  updated_by TEXT NOT NULL DEFAULT '', PRIMARY KEY (tenant_id, workload));
 `
 
 // Append-only audit: UPDATE/DELETE on audit rows abort (defence in depth;
@@ -530,6 +533,10 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// mm-loop F3 (H02): one replica mints each object.
 		{"objects", "mint_claim", "ALTER TABLE objects ADD COLUMN mint_claim TEXT NOT NULL DEFAULT ''"},
 		{"objects", "mint_claimed_at", "ALTER TABLE objects ADD COLUMN mint_claimed_at BIGINT NOT NULL DEFAULT 0"},
+		// ADR-029 public ingress: the tenant gate ('' = deny) and a
+		// deployment's validated twd.jsonc "public" (JSON, '' = none).
+		{"tenants", "public_ingress", "ALTER TABLE tenants ADD COLUMN public_ingress TEXT NOT NULL DEFAULT ''"},
+		{"deployments", "public_spec", "ALTER TABLE deployments ADD COLUMN public_spec TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {
@@ -735,12 +742,12 @@ func jsonStr(v any) string {
 
 // ---- tenants ----
 
-const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at, oauth_client_id, oauth_client_file"
+const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at, oauth_client_id, oauth_client_file, public_ingress"
 
 func scanTenant(sc interface{ Scan(...any) error }) (Tenant, error) {
 	var t Tenant
 	var rpm, mo int64
-	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt, &t.OAuthClientID, &t.OAuthClientFile)
+	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt, &t.OAuthClientID, &t.OAuthClientFile, &t.PublicIngress)
 	t.RegistrationsPerMinute, t.MaxObjects = int(rpm), int(mo)
 	if t.UpdatedAt == 0 {
 		t.UpdatedAt = t.CreatedAt
@@ -755,9 +762,9 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 	if t.UpdatedAt == 0 {
 		t.UpdatedAt = t.CreatedAt
 	}
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
 		t.ID, t.Tailnet, t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID,
-		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile)
+		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile, t.PublicIngress)
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -767,8 +774,8 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 // UpdateTenant rewrites a tenant's mint configuration (mode, key file,
 // WIF client IDs) and limits; ID, tailnet and createdAt are immutable.
 func (s *SQLStore) UpdateTenant(ctx context.Context, t Tenant) error {
-	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=?, oauth_client_id=?, oauth_client_file=? WHERE id=?"),
-		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile, t.ID)
+	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=?, oauth_client_id=?, oauth_client_file=?, public_ingress=? WHERE id=?"),
+		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile, t.PublicIngress, t.ID)
 	if err != nil {
 		return err
 	}
@@ -784,7 +791,7 @@ func (s *SQLStore) GetTenant(ctx context.Context, id string) (Tenant, error) {
 
 func (s *SQLStore) DeleteTenant(ctx context.Context, id string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		for _, q := range []string{"DELETE FROM objects WHERE tenant_id=?", "DELETE FROM deployments WHERE tenant_id=?",
+		for _, q := range []string{"DELETE FROM objects WHERE tenant_id=?", "DELETE FROM deployments WHERE tenant_id=?", "DELETE FROM workload_public WHERE tenant_id=?",
 			"DELETE FROM leases WHERE name LIKE ? || '/%'"} {
 			if _, err := tx.ExecContext(ctx, s.q(q), id); err != nil {
 				return err
@@ -908,14 +915,16 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence, host_status, host_error"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence, host_status, host_error, public_spec"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var ns string
 	var ml, md, fence int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError)
+	var pub string
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &pub)
 	d.Fence = fence != 0
+	d.Public = decodePublic(pub)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -930,9 +939,9 @@ func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
 		fence = 1
 	}
 	err := s.tx(ctx, func(tx *sql.Tx) error { // a tx so a deploy's audit intent commits with it (H22)
-		_, err := tx.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+		_, err := tx.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
 			d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence,
-			d.HostStatus, d.HostError, d.Bundle)
+			d.HostStatus, d.HostError, encodePublic(d.Public), d.Bundle)
 		return err
 	})
 	if isUnique(err) {
@@ -946,8 +955,10 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	var d Deployment
 	var ns string
 	var ml, md, fence int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &d.Bundle)
+	var pub string
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &pub, &d.Bundle)
 	d.Fence = fence != 0
+	d.Public = decodePublic(pub)
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -1632,4 +1643,71 @@ func (s *SQLStore) Revocations(ctx context.Context, hostID string, since time.Ti
 func (s *SQLStore) rawExec(ctx context.Context, q string, args ...any) error {
 	_, err := s.db.ExecContext(ctx, s.q(q), args...)
 	return err
+}
+
+// ---- public ingress (ADR-029) ----
+
+func encodePublic(p *DeploymentPublic) string {
+	if p == nil {
+		return ""
+	}
+	return jsonStr(p)
+}
+
+func decodePublic(s string) *DeploymentPublic {
+	if s == "" {
+		return nil
+	}
+	var p DeploymentPublic
+	if json.Unmarshal([]byte(s), &p) != nil {
+		return nil
+	}
+	return &p
+}
+
+// GetWorkloadPublic returns a workload's `twd expose` setting; a workload
+// that was never toggled is exposed (it never returns ErrNotFound).
+func (s *SQLStore) GetWorkloadPublic(ctx context.Context, tenantID, workload string) (WorkloadPublic, error) {
+	wp := WorkloadPublic{TenantID: tenantID, Workload: workload, Exposed: true}
+	var exp int64
+	err := s.db.QueryRowContext(ctx, s.q("SELECT exposed, updated_at, updated_by FROM workload_public WHERE tenant_id=? AND workload=?"), tenantID, workload).
+		Scan(&exp, &wp.UpdatedAt, &wp.UpdatedBy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return wp, nil
+	}
+	wp.Exposed = exp != 0
+	return wp, err
+}
+
+// SetWorkloadPublic upserts a workload's `twd expose` setting (in a
+// transaction, so an audit intent in ctx commits with it: H22).
+func (s *SQLStore) SetWorkloadPublic(ctx context.Context, wp WorkloadPublic) error {
+	exp := int64(0)
+	if wp.Exposed {
+		exp = 1
+	}
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, s.q(`INSERT INTO workload_public (tenant_id, workload, exposed, updated_at, updated_by) VALUES (?,?,?,?,?)
+		ON CONFLICT (tenant_id, workload) DO UPDATE SET exposed=excluded.exposed, updated_at=excluded.updated_at, updated_by=excluded.updated_by`),
+			wp.TenantID, wp.Workload, exp, wp.UpdatedAt, wp.UpdatedBy)
+		return err
+	})
+}
+
+// DeleteDeadObject forgets one killed or failed object and its kill
+// revocations (ADR-029: a workload's public node, so re-declaring public
+// routes can create it again under its deterministic ID). A live object is
+// never deleted (ErrNotFound).
+func (s *SQLStore) DeleteDeadObject(ctx context.Context, id string) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, s.q("DELETE FROM objects WHERE id=? AND status IN (?,?)"), id, StatusKilled, StatusFailed)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		_, err = tx.ExecContext(ctx, s.q("DELETE FROM revocations WHERE object_id=?"), id)
+		return err
+	})
 }

@@ -276,7 +276,17 @@ func (h *Host) startNodeLocked(o *object) {
 		o.readyCh = make(chan struct{})
 	}
 	eph := h.cfg.Ephemeral
-	no, err := t.reg.Create(o.NetdID, netd.ObjectOptions{Hostname: o.Hostname, Tags: o.Tags, Ephemeral: &eph})
+	opts := netd.ObjectOptions{Hostname: o.Hostname, Tags: o.Tags, Ephemeral: &eph}
+	if o.isPublicNode() {
+		// A public node never starts without its public options (it would
+		// otherwise come up as a tailnet listener): wait for applyPublic.
+		if opts.Public = h.publicOptionsLocked(o.TenantID, o.Workload); opts.Public == nil {
+			return
+		}
+		f := false
+		opts.Ephemeral = &f // its name is the public URL: never an ephemeral node
+	}
+	no, err := t.reg.Create(o.NetdID, opts)
 	if err != nil {
 		o.Status, o.Err = statusFailed, err.Error()
 		closeOnce(o.readyCh)
@@ -316,8 +326,26 @@ func (h *Host) awaitNode(t *tenant, o *object, no *netd.Object) {
 	if len(info.IPs) > 0 {
 		o.IP = info.IPs[0]
 	}
+	nameTaken := false
+	if o.isPublicNode() {
+		// ADR-029 D6: the public URL is <workload>.<tailnet>.ts.net. If
+		// MagicDNS de-duplicated the name (another device holds it), never
+		// publish a different URL: close the listener and report it.
+		if label, _, _ := strings.Cut(o.MagicDNS, "."); label != "" && label != o.Hostname {
+			nameTaken = true
+			o.Err = "public_name_taken: the public node joined as " + o.MagicDNS + ", not " + o.Hostname +
+				": another device already uses that name (delete it, or rename the workload); its Funnel listener stays closed"
+		}
+	}
 	ch := o.readyCh
 	h.mu.Unlock()
+	if nameTaken {
+		if err := t.reg.SetPublicEnabled(o.NetdID, false); err != nil {
+			h.log.Warn("public node: closing listener after a name clash failed", "object", o.ID, "err", netd.RedactError(err))
+		}
+		h.log.Error("public node name taken; public ingress stays closed", "object", o.ID, "want", o.Hostname, "got", o.MagicDNS)
+		h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "deny", Code: "public_name_taken", Detail: mgmtapi.Note(o.Err), TraceID: newTraceID()})
+	}
 	rctx, rcancel := context.WithTimeout(h.ctx, 15*time.Second)
 	var epoch int64
 	if w := h.workloadOf(o); w != nil {
@@ -449,7 +477,10 @@ func (h *Host) killLocal(objectID, reason string) {
 			h.log.Info("object killed (tier 1)", "object", o.ID, "flows", rep.FlowsAborted, "abort_ms", rep.AbortMS)
 		}
 	}
-	if w != nil && o.Class != "" {
+	if o.ActingFor == OriginPublic && o.Class != "" {
+		h.pubCreates.forget(o.TenantID, o.Workload, o.Class, o.Name)
+	}
+	if w != nil && o.Class != "" && !o.isPublicNode() {
 		if inst := w.current(); inst != nil {
 			inst.admin(map[string]any{"kind": "admin", "op": "kill", "class": o.Class, "name": o.Name, "reason": reason})
 		}

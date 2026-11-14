@@ -1,7 +1,7 @@
 // @twd/tailnet: verified tailnet caller identity and per-object egress for
 // twd Workers and Durable Objects (RFC §6.1).
-export { getCaller, principalKey } from "./caller.js";
-export type { Caller } from "./caller.js";
+export { getCaller, getRequester, isPublicRequest, principalKey } from "./caller.js";
+export type { Caller, Requester, PublicRequester, TailnetRequester } from "./caller.js";
 export { TailnetError, isTailnetError, fromResponse, CATALOG, DOC_BASE } from "./errors.js";
 export type { TailnetErrorCode, TailnetErrorInit, Missing, CatalogEntry } from "./errors.js";
 export type { TailnetContext, SpawnOptions, Spawned } from "./runtime.js";

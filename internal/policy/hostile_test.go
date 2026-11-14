@@ -33,7 +33,16 @@ func TestHostileSnippetsRefused(t *testing.T) {
 		"tagOwners twd owned by user":   {TagOwners: map[string][]string{"tag:twd-wl-x": {"alice@example.com"}}},
 		"tagOwners twd owned by group":  {TagOwners: map[string][]string{"tag:twd-wl-x": {"group:eng"}}},
 		"tagOwners empty owners":        {TagOwners: map[string][]string{"tag:twd-wl-x": {}}},
-		"tagOwners prefix trick":        {TagOwners: map[string][]string{"tag:twdprod": {"tag:twd"}, "tag:twd-x": {"tag:twd"}}}, // tag:twdprod is NOT a twd tag? It has the prefix: allowed by prefix rule; see below
+		// ADR-029 D6: funnel only on tag:twd-public and tag:twd-issuer, never mgmt.
+		"funnel on tag:twd-mgmt":     {NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"funnel"}}}},
+		"funnel issuer + mgmt":       {NodeAttrs: []map[string]any{{"target": []string{"tag:twd-issuer", "tag:twd-mgmt"}, "attr": []string{"funnel"}}}},
+		"funnel on tag:twd":          {NodeAttrs: []map[string]any{{"target": []string{"tag:twd"}, "attr": []string{"funnel"}}}},
+		"funnel on object tag":       {NodeAttrs: []map[string]any{{"target": []string{"tag:twd-do-x"}, "attr": []string{"funnel"}}}},
+		"funnel on workload tag":     {NodeAttrs: []map[string]any{{"target": []string{"tag:twd-wl-support"}, "attr": []string{"funnel"}}}},
+		"funnel public + object tag": {NodeAttrs: []map[string]any{{"target": []string{"tag:twd-public", "tag:twd-do-x"}, "attr": []string{"funnel"}}}},
+		"funnel on tag:twd-public-x": {NodeAttrs: []map[string]any{{"target": []string{"tag:twd-public-x"}, "attr": []string{"funnel"}}}},
+		"funnel on autogroup:member": {NodeAttrs: []map[string]any{{"target": []string{"autogroup:member"}, "attr": []string{"funnel"}}}},
+		"tagOwners prefix trick":     {TagOwners: map[string][]string{"tag:twdprod": {"tag:twd"}, "tag:twd-x": {"tag:twd"}}}, // tag:twdprod is NOT a twd tag? It has the prefix: allowed by prefix rule; see below
 	}
 	delete(cases, "tagOwners prefix trick") // documented: anything under tag:twd* is twd's namespace by construction
 	for name, s := range cases {
@@ -123,4 +132,27 @@ func FuzzMergeAdditive(f *testing.F) {
 			t.Fatalf("not idempotent: %+v %v", m, err)
 		}
 	})
+}
+
+// ADR-029 D6: the public snippet passes Check and merges additively; it
+// sets funnel on tag:twd-public only.
+func TestPublicSnippet(t *testing.T) {
+	s := PublicSnippet()
+	if err := Check(s, Options{}); err != nil {
+		t.Fatalf("PublicSnippet refused: %v", err)
+	}
+	if got := s.HuJSON(); !strings.Contains(got, `"tag:twd-public"`) || !strings.Contains(got, `"funnel"`) {
+		t.Fatalf("HuJSON: %s", got)
+	}
+	out, err := Merge([]byte(base), s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyAdditive([]byte(base), out, s); err != nil {
+		t.Fatal(err)
+	}
+	miss, err := Missing(out, s)
+	if err != nil || !miss.Empty() {
+		t.Fatalf("after merge still missing %+v (%v)", miss, err)
+	}
 }

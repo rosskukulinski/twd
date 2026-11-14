@@ -20,33 +20,38 @@ import (
 
 // Defines values for AuditKind.
 const (
-	AuditKindAllow        AuditKind = "allow"
-	AuditKindCreate       AuditKind = "create"
-	AuditKindCredential   AuditKind = "credential"
-	AuditKindDeny         AuditKind = "deny"
-	AuditKindDeploy       AuditKind = "deploy"
-	AuditKindDeviceDelete AuditKind = "device_delete"
-	AuditKindEgress       AuditKind = "egress"
-	AuditKindHostAdd      AuditKind = "host_add"
-	AuditKindHostDelete   AuditKind = "host_delete"
-	AuditKindHostRegister AuditKind = "host_register"
-	AuditKindKill         AuditKind = "kill"
-	AuditKindMint         AuditKind = "mint"
-	AuditKindObjectUpdate AuditKind = "object_update"
-	AuditKindOboRoot      AuditKind = "obo_root"
-	AuditKindPreflight    AuditKind = "preflight"
-	AuditKindPrincipal    AuditKind = "principal"
-	AuditKindPurge        AuditKind = "purge"
-	AuditKindReady        AuditKind = "ready"
-	AuditKindReap         AuditKind = "reap"
-	AuditKindRemint       AuditKind = "remint"
-	AuditKindSpawn        AuditKind = "spawn"
-	AuditKindTenantCreate AuditKind = "tenant_create"
-	AuditKindTenantDelete AuditKind = "tenant_delete"
-	AuditKindTenantNote   AuditKind = "tenant_note"
-	AuditKindTenantUpdate AuditKind = "tenant_update"
-	AuditKindUndeploy     AuditKind = "undeploy"
-	AuditKindVolumeKey    AuditKind = "volume_key"
+	AuditKindAllow               AuditKind = "allow"
+	AuditKindCreate              AuditKind = "create"
+	AuditKindCredential          AuditKind = "credential"
+	AuditKindDeny                AuditKind = "deny"
+	AuditKindDeploy              AuditKind = "deploy"
+	AuditKindDeviceDelete        AuditKind = "device_delete"
+	AuditKindEgress              AuditKind = "egress"
+	AuditKindExposeOff           AuditKind = "expose_off"
+	AuditKindExposeOn            AuditKind = "expose_on"
+	AuditKindHostAdd             AuditKind = "host_add"
+	AuditKindHostDelete          AuditKind = "host_delete"
+	AuditKindHostRegister        AuditKind = "host_register"
+	AuditKindKill                AuditKind = "kill"
+	AuditKindMint                AuditKind = "mint"
+	AuditKindObjectUpdate        AuditKind = "object_update"
+	AuditKindOboRoot             AuditKind = "obo_root"
+	AuditKindPreflight           AuditKind = "preflight"
+	AuditKindPrincipal           AuditKind = "principal"
+	AuditKindPublicObjectCreated AuditKind = "public_object_created"
+	AuditKindPublicRejected      AuditKind = "public_rejected"
+	AuditKindPublicRequest       AuditKind = "public_request"
+	AuditKindPurge               AuditKind = "purge"
+	AuditKindReady               AuditKind = "ready"
+	AuditKindReap                AuditKind = "reap"
+	AuditKindRemint              AuditKind = "remint"
+	AuditKindSpawn               AuditKind = "spawn"
+	AuditKindTenantCreate        AuditKind = "tenant_create"
+	AuditKindTenantDelete        AuditKind = "tenant_delete"
+	AuditKindTenantNote          AuditKind = "tenant_note"
+	AuditKindTenantUpdate        AuditKind = "tenant_update"
+	AuditKindUndeploy            AuditKind = "undeploy"
+	AuditKindVolumeKey           AuditKind = "volume_key"
 )
 
 // Valid indicates whether the value is a known member of the AuditKind enum.
@@ -66,6 +71,10 @@ func (e AuditKind) Valid() bool {
 		return true
 	case AuditKindEgress:
 		return true
+	case AuditKindExposeOff:
+		return true
+	case AuditKindExposeOn:
+		return true
 	case AuditKindHostAdd:
 		return true
 	case AuditKindHostDelete:
@@ -83,6 +92,12 @@ func (e AuditKind) Valid() bool {
 	case AuditKindPreflight:
 		return true
 	case AuditKindPrincipal:
+		return true
+	case AuditKindPublicObjectCreated:
+		return true
+	case AuditKindPublicRejected:
+		return true
+	case AuditKindPublicRequest:
 		return true
 	case AuditKindPurge:
 		return true
@@ -199,6 +214,7 @@ const (
 	ErrorCodePolicyMissingTagOwners  ErrorCode = "policy_missing_tag_owners"
 	ErrorCodePolicyUnavailable       ErrorCode = "policy_unavailable"
 	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
+	ErrorCodePublicIngressNotAllowed ErrorCode = "public_ingress_not_allowed"
 	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
 	ErrorCodeStoreUnavailable        ErrorCode = "store_unavailable"
 	ErrorCodeSuperseded              ErrorCode = "superseded"
@@ -207,6 +223,7 @@ const (
 	ErrorCodeTierUnavailable         ErrorCode = "tier_unavailable"
 	ErrorCodeUnknownNamespace        ErrorCode = "unknown_namespace"
 	ErrorCodeUnknownTenant           ErrorCode = "unknown_tenant"
+	ErrorCodeUnknownWorkload         ErrorCode = "unknown_workload"
 )
 
 // Valid indicates whether the value is a known member of the ErrorCode enum.
@@ -276,6 +293,8 @@ func (e ErrorCode) Valid() bool {
 		return true
 	case ErrorCodePreconditionFailed:
 		return true
+	case ErrorCodePublicIngressNotAllowed:
+		return true
 	case ErrorCodeSpawnBudgetExceeded:
 		return true
 	case ErrorCodeStoreUnavailable:
@@ -291,6 +310,8 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodeUnknownNamespace:
 		return true
 	case ErrorCodeUnknownTenant:
+		return true
+	case ErrorCodeUnknownWorkload:
 		return true
 	default:
 		return false
@@ -426,6 +447,24 @@ func (e ObjectStatus) Valid() bool {
 	case ObjectStatusPending:
 		return true
 	case ObjectStatusReady:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for PublicIngress.
+const (
+	PublicIngressAllow PublicIngress = "allow"
+	PublicIngressDeny  PublicIngress = "deny"
+)
+
+// Valid indicates whether the value is a known member of the PublicIngress enum.
+func (e PublicIngress) Valid() bool {
+	switch e {
+	case PublicIngressAllow:
+		return true
+	case PublicIngressDeny:
 		return true
 	default:
 		return false
@@ -573,16 +612,22 @@ type Assignment struct {
 	Epoch        int64   `json:"epoch"`
 
 	// Fence Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s): it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true.
-	Fence        *bool         `json:"fence,omitempty"`
-	Lease        string        `json:"lease"`
-	MaxDepth     *int          `json:"maxDepth,omitempty"`
-	MaxLive      *int          `json:"maxLive,omitempty"`
-	Namespaces   []ClassConfig `json:"namespaces"`
-	Tailnet      string        `json:"tailnet"`
-	TenantID     string        `json:"tenantID"`
-	Tier         *Tier         `json:"tier,omitempty"`
-	Workload     string        `json:"workload"`
-	WorkloadTags *[]string     `json:"workloadTags,omitempty"`
+	Fence      *bool         `json:"fence,omitempty"`
+	Lease      string        `json:"lease"`
+	MaxDepth   *int          `json:"maxDepth,omitempty"`
+	MaxLive    *int          `json:"maxLive,omitempty"`
+	Namespaces []ClassConfig `json:"namespaces"`
+
+	// Public A workload's public ingress (ADR-029). The host runs one extra node
+	// for it (namespace `_public`, object name = the workload, hostname =
+	// the workload name, `tags`) whose Funnel listener serves `routes`
+	// while `exposed`.
+	Public       *PublicAssignment `json:"public,omitempty"`
+	Tailnet      string            `json:"tailnet"`
+	TenantID     string            `json:"tenantID"`
+	Tier         *Tier             `json:"tier,omitempty"`
+	Workload     string            `json:"workload"`
+	WorkloadTags *[]string         `json:"workloadTags,omitempty"`
 }
 
 // AssignmentPage defines model for AssignmentPage.
@@ -610,6 +655,11 @@ type AuditBatch struct {
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
 // `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+// Public ingress (ADR-029), host chain: `public_request` (one per public
+// request), `public_rejected` (per-minute summary of requests the limits
+// refused), `public_object_created` (a name admitted for a public create);
+// `expose_on` / `expose_off` on both chains (mgmt: the operator's change;
+// host: the listener opened/closed).
 type AuditKind string
 
 // AuditPage defines model for AuditPage.
@@ -650,6 +700,11 @@ type AuditRecord struct {
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
 	// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+	// Public ingress (ADR-029), host chain: `public_request` (one per public
+	// request), `public_rejected` (per-minute summary of requests the limits
+	// refused), `public_object_created` (a name admitted for a public create);
+	// `expose_on` / `expose_off` on both chains (mgmt: the operator's change;
+	// host: the listener opened/closed).
 	Kind     AuditKind `json:"kind"`
 	ObjectID *string   `json:"objectID,omitempty"`
 
@@ -735,19 +790,22 @@ type Deployment struct {
 	DeploymentID string `json:"deploymentID"`
 
 	// Endpoint The workload entry node (`_workload` object).
-	Endpoint     Endpoint         `json:"endpoint"`
-	Epoch        int64            `json:"epoch"`
-	Error        *string          `json:"error,omitempty"`
-	Host         string           `json:"host"`
-	MaxDepth     *int             `json:"maxDepth,omitempty"`
-	MaxLive      *int             `json:"maxLive,omitempty"`
-	Namespaces   []ClassConfig    `json:"namespaces"`
-	Status       DeploymentStatus `json:"status"`
-	TenantID     string           `json:"tenantID"`
-	Tier         *Tier            `json:"tier,omitempty"`
-	UpdatedAt    *int64           `json:"updatedAt,omitempty"`
-	Workload     string           `json:"workload"`
-	WorkloadTags *[]string        `json:"workloadTags,omitempty"`
+	Endpoint   Endpoint      `json:"endpoint"`
+	Epoch      int64         `json:"epoch"`
+	Error      *string       `json:"error,omitempty"`
+	Host       string        `json:"host"`
+	MaxDepth   *int          `json:"maxDepth,omitempty"`
+	MaxLive    *int          `json:"maxLive,omitempty"`
+	Namespaces []ClassConfig `json:"namespaces"`
+
+	// Public The deployment's public routes (ADR-029); absent when tailnet-only.
+	Public       *DeploymentPublic `json:"public,omitempty"`
+	Status       DeploymentStatus  `json:"status"`
+	TenantID     string            `json:"tenantID"`
+	Tier         *Tier             `json:"tier,omitempty"`
+	UpdatedAt    *int64            `json:"updatedAt,omitempty"`
+	Workload     string            `json:"workload"`
+	WorkloadTags *[]string         `json:"workloadTags,omitempty"`
 }
 
 // DeploymentCreate defines model for DeploymentCreate.
@@ -773,6 +831,19 @@ type DeploymentPage struct {
 
 	// NextCursor Pass as `?cursor=` for the next page; `null` when there is none.
 	NextCursor nullable.Nullable[string] `json:"nextCursor"`
+}
+
+// DeploymentPublic The deployment's public routes (ADR-029); absent when tailnet-only.
+type DeploymentPublic struct {
+	// Allowed The tenant's `publicIngress` is `allow`; false: declared but not served.
+	Allowed bool `json:"allowed"`
+
+	// Exposed `twd expose` setting.
+	Exposed bool     `json:"exposed"`
+	Routes  []string `json:"routes"`
+
+	// URL Examples: https://support.tail7906d5.ts.net/
+	URL string `json:"url"`
 }
 
 // DeploymentReport defines model for DeploymentReport.
@@ -1287,9 +1358,18 @@ type PreflightMissing struct {
 
 // PreflightResult defines model for PreflightResult.
 type PreflightResult struct {
-	Missing          []PreflightMissing `json:"missing"`
-	MissingTagOwners []string           `json:"missingTagOwners"`
-	Ok               bool               `json:"ok"`
+	Missing []PreflightMissing `json:"missing"`
+
+	// MissingNodeAttrs Missing policy `nodeAttrs` (ADR-029 D6), e.g. `funnel on tag:twd-public` for a workload with public routes.
+	MissingNodeAttrs *[]string `json:"missingNodeAttrs,omitempty"`
+	MissingTagOwners []string  `json:"missingTagOwners"`
+
+	// NodeAttrsSnippet The `tagOwners` + `nodeAttrs` policy to add (HuJSON).
+	NodeAttrsSnippet *string `json:"nodeAttrsSnippet,omitempty"`
+	Ok               bool    `json:"ok"`
+
+	// PublicURL Where the workload's public routes will be served.
+	PublicURL *string `json:"publicURL,omitempty"`
 
 	// SrcTags The tags checked (workload + object tags from the bundle).
 	SrcTags          *[]string `json:"srcTags,omitempty"`
@@ -1297,6 +1377,49 @@ type PreflightResult struct {
 
 	// Unchecked `tailnet.connects` entries that are names, not tags.
 	Unchecked *[]string `json:"unchecked,omitempty"`
+}
+
+// PublicAssignment A workload's public ingress (ADR-029). The host runs one extra node
+// for it (namespace `_public`, object name = the workload, hostname =
+// the workload name, `tags`) whose Funnel listener serves `routes`
+// while `exposed`.
+type PublicAssignment struct {
+	Exposed bool `json:"exposed"`
+
+	// Limits netd's limits on a public listener (ADR-029 D5); defaults filled in.
+	Limits PublicLimits `json:"limits"`
+
+	// Routes Examples: ["/webhooks/*","/oauth/callback"]
+	Routes []string `json:"routes"`
+
+	// Tags Examples: ["tag:twd-public"]
+	Tags []string `json:"tags"`
+
+	// Upgrade Routes on which WebSocket/SSE upgrades are allowed.
+	Upgrade *[]string `json:"upgrade,omitempty"`
+}
+
+// PublicIngress Operator gate for public (Funnel) ingress (ADR-029 D1). `allow`: the
+// tenant's `twd.jsonc` `public` routes take effect. `deny` (or absent):
+// a deploy that declares them is refused `403 public_ingress_not_allowed`,
+// and setting `deny` later makes hosts close every public listener.
+// `twd up` (single-tenant) creates its tenant with `allow`.
+type PublicIngress string
+
+// PublicLimits netd's limits on a public listener (ADR-029 D5); defaults filled in.
+type PublicLimits struct {
+	Burst   *int `json:"burst,omitempty"`
+	IPBurst *int `json:"ipBurst,omitempty"`
+
+	// IPRps Requests per second, per client IP.
+	IPRps          *float32 `json:"ipRps,omitempty"`
+	MaxBodyBytes   *int64   `json:"maxBodyBytes,omitempty"`
+	MaxConns       *int     `json:"maxConns,omitempty"`
+	MaxHeaderBytes *int     `json:"maxHeaderBytes,omitempty"`
+
+	// Rps Requests per second, per workload.
+	Rps            *float32 `json:"rps,omitempty"`
+	TimeoutSeconds *int     `json:"timeoutSeconds,omitempty"`
 }
 
 // PurgeResult defines model for PurgeResult.
@@ -1395,8 +1518,15 @@ type Tenant struct {
 	OboPublicKey *string `json:"oboPublicKey,omitempty"`
 
 	// Pool Host pool the tenant's deployments are placed on (hosts with a matching `pool`; empty = any host).
-	Pool                   *string `json:"pool,omitempty"`
-	RegistrationsPerMinute int     `json:"registrationsPerMinute"`
+	Pool *string `json:"pool,omitempty"`
+
+	// PublicIngress Operator gate for public (Funnel) ingress (ADR-029 D1). `allow`: the
+	// tenant's `twd.jsonc` `public` routes take effect. `deny` (or absent):
+	// a deploy that declares them is refused `403 public_ingress_not_allowed`,
+	// and setting `deny` later makes hosts close every public listener.
+	// `twd up` (single-tenant) creates its tenant with `allow`.
+	PublicIngress          *PublicIngress `json:"publicIngress,omitempty"`
+	RegistrationsPerMinute int            `json:"registrationsPerMinute"`
 
 	// Tailnet MagicDNS suffix of the customer tailnet.
 	//
@@ -1425,12 +1555,19 @@ type TenantCreate struct {
 	MaxObjects *int    `json:"maxObjects,omitempty"`
 
 	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
-	MintMode               MintMode `json:"mintMode"`
-	OauthClientFile        *string  `json:"oauthClientFile,omitempty"`
-	OauthClientID          *string  `json:"oauthClientID,omitempty"`
-	Pool                   *string  `json:"pool,omitempty"`
-	RegistrationsPerMinute *int     `json:"registrationsPerMinute,omitempty"`
-	Tailnet                string   `json:"tailnet"`
+	MintMode        MintMode `json:"mintMode"`
+	OauthClientFile *string  `json:"oauthClientFile,omitempty"`
+	OauthClientID   *string  `json:"oauthClientID,omitempty"`
+	Pool            *string  `json:"pool,omitempty"`
+
+	// PublicIngress Operator gate for public (Funnel) ingress (ADR-029 D1). `allow`: the
+	// tenant's `twd.jsonc` `public` routes take effect. `deny` (or absent):
+	// a deploy that declares them is refused `403 public_ingress_not_allowed`,
+	// and setting `deny` later makes hosts close every public listener.
+	// `twd up` (single-tenant) creates its tenant with `allow`.
+	PublicIngress          *PublicIngress `json:"publicIngress,omitempty"`
+	RegistrationsPerMinute *int           `json:"registrationsPerMinute,omitempty"`
+	Tailnet                string         `json:"tailnet"`
 
 	// TenantID Optional; generated (`tn_…`) when absent.
 	TenantID             *string `json:"tenantID,omitempty"`
@@ -1462,10 +1599,13 @@ type TenantPatch struct {
 	MaxObjects *int                      `json:"maxObjects,omitempty"`
 
 	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
-	MintMode               *MintMode                 `json:"mintMode,omitempty"`
-	OauthClientFile        nullable.Nullable[string] `json:"oauthClientFile,omitempty"`
-	OauthClientID          nullable.Nullable[string] `json:"oauthClientID,omitempty"`
-	Pool                   nullable.Nullable[string] `json:"pool,omitempty"`
+	MintMode        *MintMode                 `json:"mintMode,omitempty"`
+	OauthClientFile nullable.Nullable[string] `json:"oauthClientFile,omitempty"`
+	OauthClientID   nullable.Nullable[string] `json:"oauthClientID,omitempty"`
+	Pool            nullable.Nullable[string] `json:"pool,omitempty"`
+
+	// PublicIngress The ADR-029 gate: `allow` or `deny` (anything else is `400 bad_request`); `null` clears it (= `deny`).
+	PublicIngress          nullable.Nullable[string] `json:"publicIngress,omitempty"`
 	RegistrationsPerMinute *int                      `json:"registrationsPerMinute,omitempty"`
 	Tier                   *Tier                     `json:"tier,omitempty"`
 	WifClientID            nullable.Nullable[string] `json:"wifClientID,omitempty"`
@@ -1628,6 +1768,23 @@ type WhoAmI struct {
 // WhoAmIKind defines model for WhoAmI.Kind.
 type WhoAmIKind string
 
+// WorkloadPublic defines model for WorkloadPublic.
+type WorkloadPublic struct {
+	// Exposed `twd expose on` (true, the default) or `off`.
+	Exposed   bool   `json:"exposed"`
+	TenantID  string `json:"tenantID"`
+	UpdatedAt *int64 `json:"updatedAt,omitempty"`
+
+	// UpdatedBy The actor who last toggled it (see Conventions).
+	UpdatedBy *string `json:"updatedBy,omitempty"`
+	Workload  string  `json:"workload"`
+}
+
+// WorkloadPublicPatch defines model for WorkloadPublicPatch.
+type WorkloadPublicPatch struct {
+	Exposed bool `json:"exposed"`
+}
+
 // Cursor defines model for cursor.
 type Cursor = string
 
@@ -1660,6 +1817,9 @@ type TenantPath = string
 
 // VolumeID defines model for volumeID.
 type VolumeID = string
+
+// WorkloadName defines model for workloadName.
+type WorkloadName = string
 
 // BadRequest The DX.md error catalog shape. `code` is stable and machine-readable;
 // `missing` names what is absent (grant, cap, field, quota); `snippet`
@@ -1907,6 +2067,12 @@ type PurgeTenantObjectsParams struct {
 // PurgeTenantObjectsParamsState defines parameters for PurgeTenantObjects.
 type PurgeTenantObjectsParamsState string
 
+// UpdateWorkloadPublicParams defines parameters for UpdateWorkloadPublic.
+type UpdateWorkloadPublicParams struct {
+	// IfMatch Only apply if the resource's current `ETag` matches; otherwise `412 precondition_failed`.
+	IfMatch *IfMatch `json:"If-Match,omitempty"`
+}
+
 // CreateVolumeKeyGrantParams defines parameters for CreateVolumeKeyGrant.
 type CreateVolumeKeyGrantParams struct {
 	// Epoch The namespace lease epoch the caller believes it holds. Fenced in the store (`409 lease_lost`).
@@ -1945,6 +2111,12 @@ type UpdateTenantJSONRequestBody = TenantPatch
 
 // UpdateTenantApplicationMergePatchPlusJSONRequestBody defines body for UpdateTenant for application/merge-patch+json ContentType.
 type UpdateTenantApplicationMergePatchPlusJSONRequestBody = TenantPatch
+
+// UpdateWorkloadPublicJSONRequestBody defines body for UpdateWorkloadPublic for application/json ContentType.
+type UpdateWorkloadPublicJSONRequestBody = WorkloadPublicPatch
+
+// UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody defines body for UpdateWorkloadPublic for application/merge-patch+json ContentType.
+type UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody = WorkloadPublicPatch
 
 // Getter for additional properties for OIDCConfiguration. Returns the specified
 // element and whether it was found
@@ -2880,6 +3052,59 @@ type ClientInterface interface {
 	//
 	// Corresponds with POST /v1/tenants/{id}/wif-check (the `CheckTenantWIF` operationId).
 	CheckTenantWIF(ctx context.Context, id TenantID, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// GetWorkloadPublic Read a workload's public-ingress exposure (`twd expose`)
+	//
+	// ADR-029. A workload whose `twd.jsonc` declares `public` routes is
+	// served over Funnel from its public node
+	// (`https://<workload>.<tailnet>.ts.net/`) while `exposed` is true and
+	// the tenant's `publicIngress` is `allow`. A workload that was never
+	// toggled is exposed.
+	//
+	// Corresponds with GET /v1/tenants/{id}/workloads/{workload}/public (the `GetWorkloadPublic` operationId).
+	GetWorkloadPublic(ctx context.Context, id TenantID, workload WorkloadName, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// UpdateWorkloadPublicWithBody Expose or unexpose a workload's public routes (JSON Merge Patch)
+	//
+	// `twd expose on|off` (ADR-029 D1): an operator override that survives
+	// redeploys. `exposed: false` makes the host close the public node's
+	// Funnel listener and reset its flows (the node and its certificate
+	// stay); `true` reopens it. The lease holder is pushed at once.
+	// `404 unknown_workload` when the tenant has no deployment of the
+	// workload. Audited (`kind: expose_on` / `expose_off`).
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+	UpdateWorkloadPublicWithBody(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// UpdateWorkloadPublic Expose or unexpose a workload's public routes (JSON Merge Patch)
+	//
+	// `twd expose on|off` (ADR-029 D1): an operator override that survives
+	// redeploys. `exposed: false` makes the host close the public node's
+	// Funnel listener and reset its flows (the node and its certificate
+	// stay); `true` reopens it. The lease holder is pushed at once.
+	// `404 unknown_workload` when the tenant has no deployment of the
+	// workload. Audited (`kind: expose_on` / `expose_off`).
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+	UpdateWorkloadPublic(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBody Expose or unexpose a workload's public routes (JSON Merge Patch)
+	//
+	// `twd expose on|off` (ADR-029 D1): an operator override that survives
+	// redeploys. `exposed: false` makes the host close the public node's
+	// Funnel listener and reset its flows (the node and its certificate
+	// stay); `true` reopens it. The lease holder is pushed at once.
+	// `404 unknown_workload` when the tenant has no deployment of the
+	// workload. Audited (`kind: expose_on` / `expose_off`).
+	//
+	// Takes a body of the `application/merge-patch+json` content type.
+	//
+	// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+	UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBody(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// CreateVolumeKeyGrant Release a volume's dm-crypt data key to the lease holder
 	//
@@ -3971,6 +4196,99 @@ func (c *Client) PurgeTenantObjects(ctx context.Context, id TenantID, params *Pu
 // Corresponds with POST /v1/tenants/{id}/wif-check (the `CheckTenantWIF` operationId).
 func (c *Client) CheckTenantWIF(ctx context.Context, id TenantID, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewCheckTenantWIFRequest(c.Server, id)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// GetWorkloadPublic Read a workload's public-ingress exposure (`twd expose`)
+//
+// ADR-029. A workload whose `twd.jsonc` declares `public` routes is
+// served over Funnel from its public node
+// (`https://<workload>.<tailnet>.ts.net/`) while `exposed` is true and
+// the tenant's `publicIngress` is `allow`. A workload that was never
+// toggled is exposed.
+//
+// Corresponds with GET /v1/tenants/{id}/workloads/{workload}/public (the `GetWorkloadPublic` operationId).
+func (c *Client) GetWorkloadPublic(ctx context.Context, id TenantID, workload WorkloadName, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewGetWorkloadPublicRequest(c.Server, id, workload)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// UpdateWorkloadPublicWithBody Expose or unexpose a workload's public routes (JSON Merge Patch)
+//
+// `twd expose on|off` (ADR-029 D1): an operator override that survives
+// redeploys. `exposed: false` makes the host close the public node's
+// Funnel listener and reset its flows (the node and its certificate
+// stay); `true` reopens it. The lease holder is pushed at once.
+// `404 unknown_workload` when the tenant has no deployment of the
+// workload. Audited (`kind: expose_on` / `expose_off`).
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+func (c *Client) UpdateWorkloadPublicWithBody(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdateWorkloadPublicRequestWithBody(c.Server, id, workload, params, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// UpdateWorkloadPublic Expose or unexpose a workload's public routes (JSON Merge Patch)
+//
+// `twd expose on|off` (ADR-029 D1): an operator override that survives
+// redeploys. `exposed: false` makes the host close the public node's
+// Funnel listener and reset its flows (the node and its certificate
+// stay); `true` reopens it. The lease holder is pushed at once.
+// `404 unknown_workload` when the tenant has no deployment of the
+// workload. Audited (`kind: expose_on` / `expose_off`).
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+func (c *Client) UpdateWorkloadPublic(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdateWorkloadPublicRequest(c.Server, id, workload, params, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBody Expose or unexpose a workload's public routes (JSON Merge Patch)
+//
+// `twd expose on|off` (ADR-029 D1): an operator override that survives
+// redeploys. `exposed: false` makes the host close the public node's
+// Funnel listener and reset its flows (the node and its certificate
+// stay); `true` reopens it. The lease holder is pushed at once.
+// `404 unknown_workload` when the tenant has no deployment of the
+// workload. Audited (`kind: expose_on` / `expose_off`).
+//
+// Takes a body of the `application/merge-patch+json` content type.
+//
+// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+func (c *Client) UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBody(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewUpdateWorkloadPublicRequestWithApplicationMergePatchPlusJSONBody(c.Server, id, workload, params, body)
 	if err != nil {
 		return nil, err
 	}
@@ -6161,6 +6479,127 @@ func NewCheckTenantWIFRequest(server string, id TenantID) (*http.Request, error)
 	return req, nil
 }
 
+// NewGetWorkloadPublicRequest constructs an http.Request for the GetWorkloadPublic method
+func NewGetWorkloadPublicRequest(server string, id TenantID, workload WorkloadName) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "workload", workload, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/tenants/%s/workloads/%s/public", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewUpdateWorkloadPublicRequest calls the generic UpdateWorkloadPublic builder with application/json body
+func NewUpdateWorkloadPublicRequest(server string, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewUpdateWorkloadPublicRequestWithBody(server, id, workload, params, "application/json", bodyReader)
+}
+
+// NewUpdateWorkloadPublicRequestWithApplicationMergePatchPlusJSONBody calls the generic UpdateWorkloadPublic builder with application/merge-patch+json body
+func NewUpdateWorkloadPublicRequestWithApplicationMergePatchPlusJSONBody(server string, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewUpdateWorkloadPublicRequestWithBody(server, id, workload, params, "application/merge-patch+json", bodyReader)
+}
+
+// NewUpdateWorkloadPublicRequestWithBody constructs an http.Request for the UpdateWorkloadPublic method, with any body, and a specified content type
+func NewUpdateWorkloadPublicRequestWithBody(server string, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	var pathParam1 string
+
+	pathParam1, err = runtime.StyleParamWithOptions("simple", false, "workload", workload, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/tenants/%s/workloads/%s/public", pathParam0, pathParam1)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPatch, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	if params != nil {
+
+		if params.IfMatch != nil {
+			var headerParam0 string
+
+			headerParam0, err = runtime.StyleParamWithOptions("simple", false, "If-Match", *params.IfMatch, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationHeader, Type: "string", Format: ""})
+			if err != nil {
+				return nil, err
+			}
+
+			req.Header.Set("If-Match", headerParam0)
+		}
+
+	}
+
+	return req, nil
+}
+
 // NewCreateVolumeKeyGrantRequest constructs an http.Request for the CreateVolumeKeyGrant method
 func NewCreateVolumeKeyGrantRequest(server string, id VolumeID, params *CreateVolumeKeyGrantParams) (*http.Request, error) {
 	var err error
@@ -6942,6 +7381,61 @@ type ClientWithResponsesInterface interface {
 	//
 	// Corresponds with POST /v1/tenants/{id}/wif-check (the `CheckTenantWIF` operationId).
 	CheckTenantWIFWithResponse(ctx context.Context, id TenantID, reqEditors ...RequestEditorFn) (*CheckTenantWIFResponse, error)
+
+	// GetWorkloadPublicWithResponse Read a workload's public-ingress exposure (`twd expose`)
+	//
+	// ADR-029. A workload whose `twd.jsonc` declares `public` routes is
+	// served over Funnel from its public node
+	// (`https://<workload>.<tailnet>.ts.net/`) while `exposed` is true and
+	// the tenant's `publicIngress` is `allow`. A workload that was never
+	// toggled is exposed.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/tenants/{id}/workloads/{workload}/public (the `GetWorkloadPublic` operationId).
+	GetWorkloadPublicWithResponse(ctx context.Context, id TenantID, workload WorkloadName, reqEditors ...RequestEditorFn) (*GetWorkloadPublicResponse, error)
+
+	// UpdateWorkloadPublicWithBodyWithResponse Expose or unexpose a workload's public routes (JSON Merge Patch)
+	//
+	// `twd expose on|off` (ADR-029 D1): an operator override that survives
+	// redeploys. `exposed: false` makes the host close the public node's
+	// Funnel listener and reset its flows (the node and its certificate
+	// stay); `true` reopens it. The lease holder is pushed at once.
+	// `404 unknown_workload` when the tenant has no deployment of the
+	// workload. Audited (`kind: expose_on` / `expose_off`).
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+	UpdateWorkloadPublicWithBodyWithResponse(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateWorkloadPublicResponse, error)
+
+	// UpdateWorkloadPublicWithResponse Expose or unexpose a workload's public routes (JSON Merge Patch)
+	//
+	// `twd expose on|off` (ADR-029 D1): an operator override that survives
+	// redeploys. `exposed: false` makes the host close the public node's
+	// Funnel listener and reset its flows (the node and its certificate
+	// stay); `true` reopens it. The lease holder is pushed at once.
+	// `404 unknown_workload` when the tenant has no deployment of the
+	// workload. Audited (`kind: expose_on` / `expose_off`).
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+	UpdateWorkloadPublicWithResponse(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateWorkloadPublicResponse, error)
+
+	// UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBodyWithResponse Expose or unexpose a workload's public routes (JSON Merge Patch)
+	//
+	// `twd expose on|off` (ADR-029 D1): an operator override that survives
+	// redeploys. `exposed: false` makes the host close the public node's
+	// Funnel listener and reset its flows (the node and its certificate
+	// stay); `true` reopens it. The lease holder is pushed at once.
+	// `404 unknown_workload` when the tenant has no deployment of the
+	// workload. Audited (`kind: expose_on` / `expose_off`).
+	//
+	// Takes a body of the `application/merge-patch+json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+	UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBodyWithResponse(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateWorkloadPublicResponse, error)
 
 	// CreateVolumeKeyGrantWithResponse Release a volume's dm-crypt data key to the lease holder
 	//
@@ -10466,6 +10960,215 @@ func (r CheckTenantWIFResponse) ContentType() string {
 	return ""
 }
 
+// GetWorkloadPublicResponse200Headers the declared response headers of an HTTP 200 response for GetWorkloadPublic
+type GetWorkloadPublicResponse200Headers struct {
+	ETag *string
+}
+
+// GetWorkloadPublicResponse403Headers the declared response headers of an HTTP 403 response for GetWorkloadPublic
+type GetWorkloadPublicResponse403Headers struct {
+	TwdError *string
+}
+
+// GetWorkloadPublicResponse404Headers the declared response headers of an HTTP 404 response for GetWorkloadPublic
+type GetWorkloadPublicResponse404Headers struct {
+	TwdError *string
+}
+
+// GetWorkloadPublicResponseDefaultHeaders the declared response headers of an HTTP default response for GetWorkloadPublic
+type GetWorkloadPublicResponseDefaultHeaders struct {
+	TwdError *string
+}
+
+type GetWorkloadPublicResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *WorkloadPublic
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *Forbidden
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *GetWorkloadPublicResponse200Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *GetWorkloadPublicResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *GetWorkloadPublicResponse404Headers
+	// HeadersDefault the parsed response headers for an HTTP default response
+	HeadersDefault *GetWorkloadPublicResponseDefaultHeaders
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r GetWorkloadPublicResponse) GetJSON200() *WorkloadPublic {
+	return r.JSON200
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r GetWorkloadPublicResponse) GetJSON403() *Forbidden {
+	return r.JSON403
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r GetWorkloadPublicResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r GetWorkloadPublicResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r GetWorkloadPublicResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r GetWorkloadPublicResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r GetWorkloadPublicResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r GetWorkloadPublicResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// UpdateWorkloadPublicResponse200Headers the declared response headers of an HTTP 200 response for UpdateWorkloadPublic
+type UpdateWorkloadPublicResponse200Headers struct {
+	ETag *string
+}
+
+// UpdateWorkloadPublicResponse400Headers the declared response headers of an HTTP 400 response for UpdateWorkloadPublic
+type UpdateWorkloadPublicResponse400Headers struct {
+	TwdError *string
+}
+
+// UpdateWorkloadPublicResponse403Headers the declared response headers of an HTTP 403 response for UpdateWorkloadPublic
+type UpdateWorkloadPublicResponse403Headers struct {
+	TwdError *string
+}
+
+// UpdateWorkloadPublicResponse404Headers the declared response headers of an HTTP 404 response for UpdateWorkloadPublic
+type UpdateWorkloadPublicResponse404Headers struct {
+	TwdError *string
+}
+
+// UpdateWorkloadPublicResponse412Headers the declared response headers of an HTTP 412 response for UpdateWorkloadPublic
+type UpdateWorkloadPublicResponse412Headers struct {
+	ETag     *string
+	TwdError *string
+}
+
+// UpdateWorkloadPublicResponseDefaultHeaders the declared response headers of an HTTP default response for UpdateWorkloadPublic
+type UpdateWorkloadPublicResponseDefaultHeaders struct {
+	TwdError *string
+}
+
+type UpdateWorkloadPublicResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *WorkloadPublic
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *Forbidden
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSON412 the response for an HTTP 412 `application/json` response
+	JSON412 *PreconditionFailed
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+	// Headers200 the parsed response headers for an HTTP 200 response
+	Headers200 *UpdateWorkloadPublicResponse200Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *UpdateWorkloadPublicResponse400Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *UpdateWorkloadPublicResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *UpdateWorkloadPublicResponse404Headers
+	// Headers412 the parsed response headers for an HTTP 412 response
+	Headers412 *UpdateWorkloadPublicResponse412Headers
+	// HeadersDefault the parsed response headers for an HTTP default response
+	HeadersDefault *UpdateWorkloadPublicResponseDefaultHeaders
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r UpdateWorkloadPublicResponse) GetJSON200() *WorkloadPublic {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r UpdateWorkloadPublicResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r UpdateWorkloadPublicResponse) GetJSON403() *Forbidden {
+	return r.JSON403
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r UpdateWorkloadPublicResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSON412 returns the response for an HTTP 412 `application/json` response
+func (r UpdateWorkloadPublicResponse) GetJSON412() *PreconditionFailed {
+	return r.JSON412
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r UpdateWorkloadPublicResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r UpdateWorkloadPublicResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r UpdateWorkloadPublicResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r UpdateWorkloadPublicResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r UpdateWorkloadPublicResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
 // CreateVolumeKeyGrantResponse201Headers the declared response headers of an HTTP 201 response for CreateVolumeKeyGrant
 type CreateVolumeKeyGrantResponse201Headers struct {
 	CacheControl *string
@@ -11595,6 +12298,85 @@ func (c *ClientWithResponses) CheckTenantWIFWithResponse(ctx context.Context, id
 		return nil, err
 	}
 	return ParseCheckTenantWIFResponse(rsp)
+}
+
+// GetWorkloadPublicWithResponse Read a workload's public-ingress exposure (`twd expose`)
+//
+// ADR-029. A workload whose `twd.jsonc` declares `public` routes is
+// served over Funnel from its public node
+// (`https://<workload>.<tailnet>.ts.net/`) while `exposed` is true and
+// the tenant's `publicIngress` is `allow`. A workload that was never
+// toggled is exposed.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/tenants/{id}/workloads/{workload}/public (the `GetWorkloadPublic` operationId).
+func (c *ClientWithResponses) GetWorkloadPublicWithResponse(ctx context.Context, id TenantID, workload WorkloadName, reqEditors ...RequestEditorFn) (*GetWorkloadPublicResponse, error) {
+	rsp, err := c.GetWorkloadPublic(ctx, id, workload, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseGetWorkloadPublicResponse(rsp)
+}
+
+// UpdateWorkloadPublicWithBodyWithResponse Expose or unexpose a workload's public routes (JSON Merge Patch)
+//
+// `twd expose on|off` (ADR-029 D1): an operator override that survives
+// redeploys. `exposed: false` makes the host close the public node's
+// Funnel listener and reset its flows (the node and its certificate
+// stay); `true` reopens it. The lease holder is pushed at once.
+// `404 unknown_workload` when the tenant has no deployment of the
+// workload. Audited (`kind: expose_on` / `expose_off`).
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+func (c *ClientWithResponses) UpdateWorkloadPublicWithBodyWithResponse(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*UpdateWorkloadPublicResponse, error) {
+	rsp, err := c.UpdateWorkloadPublicWithBody(ctx, id, workload, params, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseUpdateWorkloadPublicResponse(rsp)
+}
+
+// UpdateWorkloadPublicWithResponse Expose or unexpose a workload's public routes (JSON Merge Patch)
+//
+// `twd expose on|off` (ADR-029 D1): an operator override that survives
+// redeploys. `exposed: false` makes the host close the public node's
+// Funnel listener and reset its flows (the node and its certificate
+// stay); `true` reopens it. The lease holder is pushed at once.
+// `404 unknown_workload` when the tenant has no deployment of the
+// workload. Audited (`kind: expose_on` / `expose_off`).
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+func (c *ClientWithResponses) UpdateWorkloadPublicWithResponse(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateWorkloadPublicResponse, error) {
+	rsp, err := c.UpdateWorkloadPublic(ctx, id, workload, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseUpdateWorkloadPublicResponse(rsp)
+}
+
+// UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBodyWithResponse Expose or unexpose a workload's public routes (JSON Merge Patch)
+//
+// `twd expose on|off` (ADR-029 D1): an operator override that survives
+// redeploys. `exposed: false` makes the host close the public node's
+// Funnel listener and reset its flows (the node and its certificate
+// stay); `true` reopens it. The lease holder is pushed at once.
+// `404 unknown_workload` when the tenant has no deployment of the
+// workload. Audited (`kind: expose_on` / `expose_off`).
+//
+// Takes a body of the `application/merge-patch+json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with PATCH /v1/tenants/{id}/workloads/{workload}/public (the `UpdateWorkloadPublic` operationId).
+func (c *ClientWithResponses) UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBodyWithResponse(ctx context.Context, id TenantID, workload WorkloadName, params *UpdateWorkloadPublicParams, body UpdateWorkloadPublicApplicationMergePatchPlusJSONRequestBody, reqEditors ...RequestEditorFn) (*UpdateWorkloadPublicResponse, error) {
+	rsp, err := c.UpdateWorkloadPublicWithApplicationMergePatchPlusJSONBody(ctx, id, workload, params, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseUpdateWorkloadPublicResponse(rsp)
 }
 
 // CreateVolumeKeyGrantWithResponse Release a volume's dm-crypt data key to the lease holder
@@ -15166,6 +15948,227 @@ func ParseCheckTenantWIFResponse(rsp *http.Response) (*CheckTenantWIFResponse, e
 		response.Headers404 = &headers
 	case true:
 		var headers CheckTenantWIFResponseDefaultHeaders
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.HeadersDefault = &headers
+	}
+
+	return response, nil
+}
+
+// ParseGetWorkloadPublicResponse parses an HTTP response from a GetWorkloadPublicWithResponse call
+func ParseGetWorkloadPublicResponse(rsp *http.Response) (*GetWorkloadPublicResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &GetWorkloadPublicResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest WorkloadPublic
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers GetWorkloadPublicResponse200Headers
+		if values := rsp.Header.Values("ETag"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "ETag", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.ETag = &value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 403:
+		var headers GetWorkloadPublicResponse403Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers GetWorkloadPublicResponse404Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers404 = &headers
+	case true:
+		var headers GetWorkloadPublicResponseDefaultHeaders
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.HeadersDefault = &headers
+	}
+
+	return response, nil
+}
+
+// ParseUpdateWorkloadPublicResponse parses an HTTP response from a UpdateWorkloadPublicWithResponse call
+func ParseUpdateWorkloadPublicResponse(rsp *http.Response) (*UpdateWorkloadPublicResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &UpdateWorkloadPublicResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest WorkloadPublic
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 412:
+		var dest PreconditionFailed
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON412 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 200:
+		var headers UpdateWorkloadPublicResponse200Headers
+		if values := rsp.Header.Values("ETag"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "ETag", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.ETag = &value
+		}
+		response.Headers200 = &headers
+	case rsp.StatusCode == 400:
+		var headers UpdateWorkloadPublicResponse400Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 403:
+		var headers UpdateWorkloadPublicResponse403Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers UpdateWorkloadPublicResponse404Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers404 = &headers
+	case rsp.StatusCode == 412:
+		var headers UpdateWorkloadPublicResponse412Headers
+		if values := rsp.Header.Values("ETag"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "ETag", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.ETag = &value
+		}
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers412 = &headers
+	case true:
+		var headers UpdateWorkloadPublicResponseDefaultHeaders
 		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
