@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -161,6 +162,30 @@ type Config struct {
 	ContainerMaxLife time.Duration
 	// ContainerGrace caps destroy()'s SIGTERM → SIGKILL grace (10 s).
 	ContainerGrace time.Duration
+	// ContainerInternet is the sandbox internet path (ADR-032 D4): how a
+	// container started with enableInternet reaches the hosts on its
+	// workload's egress.internet allowlist. Nil: none; such flows are
+	// refused. twd-hostd sets DirectInternet unless -container-internet=off.
+	ContainerInternet *ContainerInternet
+}
+
+// ContainerInternet dials allowlisted internet hosts for containers. The
+// sandbox egress proxy (netd/sbxnet) applies the allowlist and the ADR-019
+// blocks to every resolved address before Dial is called.
+type ContainerInternet struct {
+	Dial    func(ctx context.Context, network, addr string) (net.Conn, error)
+	Resolve func(ctx context.Context, host string) ([]netip.Addr, error)
+	// HostAddrs are never dialled (nil: the host's interface addresses).
+	HostAddrs []netip.Addr
+}
+
+// DirectInternet is the host network and resolver (twd has no tenant
+// exit-node or gateway path yet; RFC §4.8).
+func DirectInternet() *ContainerInternet {
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	return &ContainerInternet{Dial: d.DialContext, Resolve: func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	}}
 }
 
 // Host is a running twd-hostd.

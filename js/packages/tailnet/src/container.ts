@@ -31,6 +31,37 @@ const RUNTIME_SIGNALLED = "Runtime signalled the container to exit: ";
 
 const STATE_KEY = "__twd_container";
 
+// The handlers each object registered with interceptOutbound*: the
+// platform delivers an intercepted container request to the object
+// (__twd_intercept), which looks the handler up by the key hostd matched.
+const handlers = new WeakMap<object, Map<string, unknown>>();
+
+/**
+ * dispatchIntercept runs one request the container sent through the
+ * object's handler registered under key (ADR-032 D4). It runs in the
+ * object, so the handler's own fetch() leaves with the object's identity,
+ * egress policy and lim; the request is untrusted input.
+ */
+export async function dispatchIntercept(ctx: any, key: string, req: Request): Promise<Response> {
+  const h: any = handlers.get(ctx)?.get(key);
+  const fetcher = typeof h === "function" ? { fetch: h } : h;
+  if (!fetcher || typeof fetcher.fetch !== "function") {
+    return new Response(
+      JSON.stringify({ code: "intercept_unavailable", message: "no handler for " + key + " in this object (it was registered before the object restarted; register it again)" }),
+      { status: 502, headers: { "content-type": "application/json", "twd-error": "intercept_unavailable" } },
+    );
+  }
+  return await fetcher.fetch(req);
+}
+
+/** notSupportedPreview: Sandbox SDK preview URLs need public ingress (ADR-029). */
+export function notSupportedPreview(): Error {
+  return Object.assign(
+    new Error("exposePort()/preview URLs are not supported on twd yet: they need public ingress (ADR-029); reach a container port from its object with ctx.container.getTcpPort(port).fetch()"),
+    { code: "not_supported" },
+  );
+}
+
 function err(body: any, fallback: string): Error {
   const code = body?.code ?? "container_error";
   let msg = String(body?.message ?? body?.detail ?? fallback);
@@ -168,6 +199,7 @@ export function createContainer(tw: Tw, ctx: any, cls: string, spec: ContainerSp
   let starting: Promise<void> | null = null;
   let startErr: unknown = null;
   const intercepts = new Map<string, unknown>();
+  if (ctx && typeof ctx === "object") handlers.set(ctx, intercepts);
   const save = () => {
     try {
       kv?.put(STATE_KEY, { running, gen });
@@ -210,6 +242,14 @@ export function createContainer(tw: Tw, ctx: any, cls: string, spec: ContainerSp
         if (watching === g) watching = 0;
       }
     })());
+  };
+  const intercept = async (kind: string, addr: string, binding: unknown) => {
+    const b: any = binding;
+    if (!b || (typeof b !== "function" && typeof b.fetch !== "function")) throw new TypeError("intercept: the handler must be a Fetcher (an object with fetch())");
+    await settle();
+    const key = kind + " " + addr;
+    const v = await op("intercept", { kind, addr });
+    intercepts.set(String(v?.key ?? key), binding);
   };
   const settle = async () => {
     if (starting) await starting.catch(() => {});
@@ -436,23 +476,20 @@ export function createContainer(tw: Tw, ctx: any, cls: string, spec: ContainerSp
         },
       };
     },
-    // Egress interception registers the handler with hostd's (phase B)
-    // egress proxy. Until it exists the container has no egress at all, so
-    // nothing reaches the handler (deny-all is the stricter behaviour).
+    // Egress interception: hostd's sandbox egress proxy delivers the
+    // container's matching requests back to this object, which runs them
+    // through the handler kept here (dispatchIntercept). HTTPS is
+    // terminated with the container's own ephemeral CA (its certificate is
+    // at /etc/cloudflare/certs/cloudflare-containers-ca.crt in the
+    // container). At most 128 per container.
     async interceptOutboundHttp(addr: string, binding: unknown): Promise<void> {
-      await settle();
-      intercepts.set("http " + addr, binding);
-      await op("intercept", { kind: "http", addr: String(addr) });
+      await intercept("http", String(addr), binding);
     },
     async interceptOutboundHttps(addr: string, binding: unknown): Promise<void> {
-      await settle();
-      intercepts.set("https " + addr, binding);
-      await op("intercept", { kind: "https", addr: String(addr) });
+      await intercept("https", String(addr), binding);
     },
     async interceptAllOutboundHttp(binding: unknown): Promise<void> {
-      await settle();
-      intercepts.set("all *", binding);
-      await op("intercept", { kind: "all", addr: "*" });
+      await intercept("all", "*", binding);
     },
     async snapshotContainer(): Promise<never> {
       throw Object.assign(new Error("snapshotContainer() is not supported on twd yet (ADR-032 D6: v1.1)"), { code: "not_supported" });

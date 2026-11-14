@@ -23,6 +23,8 @@ import (
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/internal/container"
+	"github.com/rosskukulinski/twd/netd"
+	"github.com/rosskukulinski/twd/netd/sbxnet"
 )
 
 // Containers (ADR-032): one microVM per container, attached to exactly
@@ -86,7 +88,8 @@ type ctr struct {
 	lastActive time.Time
 	active     int // requests in flight (exec streams, port fetches, monitors)
 	release    func()
-	intercepts []string
+	net        *sbxnet.Proxy // the sandbox egress proxy of the current run
+	canary     string        // the run's keyscan positive control
 	stopping   bool
 }
 
@@ -228,7 +231,7 @@ func (m *ctrManager) start(ctx context.Context, inst *instance, k ctrKey, cc *co
 	c.gen++
 	gen := c.gen
 	c.done = make(chan struct{})
-	c.exitCode, c.exitReason, c.stopping, c.intercepts = 0, "", false, nil
+	c.exitCode, c.exitReason, c.stopping = 0, "", false
 	c.idle, c.lastActive = m.idle, time.Now()
 	c.mu.Unlock()
 	fail := func(e error) (map[string]any, error) {
@@ -273,12 +276,20 @@ func (m *ctrManager) start(ctx context.Context, inst *instance, k ctrKey, cc *co
 	m.seq++
 	id := fmt.Sprintf("c%d", m.seq)
 	m.mu.Unlock()
+	// The guest's only network: its own sandbox egress proxy (ADR-032 D4).
+	pn, err := sbxnet.New(m.netConfig(c, k, r.EnableInternet, inst.app.Internet))
+	if err != nil {
+		release()
+		return fail(ctrError("container_start_failed", "egress proxy: %v", err))
+	}
+	canary := newCanary()
 	st := time.Now()
 	vm, err := m.backend.BootContainer(ctx, sandbox.ContainerSpec{ID: id, Image: img.Path, ScratchMiB: scratch, VCPUs: vcpus, CPUMax: cpuMax,
 		MemMiB: memMiB, Pids: 4096, Argv: argv, Env: env, Cwd: ic.WorkingDir, User: ic.User, Hostname: "sandbox",
-		EnableInternet: r.EnableInternet, Egress: &sandbox.EgressPolicy{Internet: inst.app.Internet},
+		EnableInternet: r.EnableInternet, Net: pn, CACert: pn.CACertPEM(), Canary: canary,
 		Log: m.h.log.With("container", k.String())})
 	if err != nil {
+		pn.Close()
 		release()
 		return fail(ctrError("container_start_failed", "%v", err))
 	}
@@ -287,11 +298,12 @@ func (m *ctrManager) start(ctx context.Context, inst *instance, k ctrKey, cc *co
 	if c.gen != gen || c.stopping {
 		// destroyed (or killed) while booting
 		c.mu.Unlock()
+		pn.Close()
 		vm.Stop(0)
 		release()
 		return nil, ctrError("container_not_running", "the container was destroyed while starting")
 	}
-	c.vm, c.state, c.digest, c.startedAt, c.readyMS, c.release = vm, "running", img.Digest, time.Now(), ready, release
+	c.vm, c.state, c.digest, c.startedAt, c.readyMS, c.release, c.net, c.canary = vm, "running", img.Digest, time.Now(), ready, release, pn, canary
 	c.lastActive = time.Now()
 	c.mu.Unlock()
 	m.h.audit.add(mgmtapi.AuditRecord{Kind: "container_start", ObjectID: m.objectID(k), TraceID: newTraceID(),
@@ -355,8 +367,12 @@ func (m *ctrManager) finish(c *ctr, gen int64, vm sandbox.Container, code int, r
 		return
 	}
 	c.stopping = true
+	pn := c.net
 	c.mu.Unlock()
 	st := time.Now()
+	if pn != nil {
+		pn.Close() // its flows end with the run
+	}
 	if vm != nil {
 		vm.Stop(grace)
 		select {
@@ -467,6 +483,10 @@ type ContainerStatus struct {
 	RSSKB                           int64
 	Jail                            *sandbox.Jail `json:",omitempty"`
 	PID                             int
+	// Intercepts are the registered intercept keys; Refused the guest
+	// flows and lookups its egress proxy refused ("dst code").
+	Intercepts []string `json:",omitempty"`
+	Refused    []string `json:",omitempty"`
 }
 
 // Containers lists this host's containers (running and stopped slots).
@@ -487,6 +507,9 @@ func (h *Host) Containers() []ContainerStatus {
 			s.RSSKB = c.vm.RSSKB()
 			s.Jail = c.vm.Info().Jail
 			s.PID = c.vm.Info().PID
+		}
+		if c.net != nil {
+			s.Intercepts, s.Refused = c.net.Intercepts(), c.net.Refused()
 		}
 		c.mu.Unlock()
 		out = append(out, s)
@@ -722,26 +745,25 @@ func (m *ctrManager) op(ctx context.Context, inst *instance, k ctrKey, cc *conta
 			"instance":  map[string]any{"vcpu": c.res.VCPU, "memoryMib": c.res.MemoryMiB, "diskMb": c.res.DiskMB},
 			"startedAt": c.startedAt.UnixMilli(), "gen": c.gen}}, nil
 	case "intercept":
-		// Registered for the egress proxy (ADR-032 D4, phase B). Until it
-		// exists the guest has no egress at all, so nothing is delivered.
+		// The sandbox egress proxy delivers matching requests from the
+		// container to the parent's handler registered under key
+		// (ADR-032 D4; the polyfill keeps the handler, hostd the policy).
 		c, vm, _ := m.running(k)
 		if vm == nil {
 			return nil, ctrError("container_not_running", "the container is not running")
 		}
-		switch req.Kind {
-		case "http", "https", "all":
-		default:
-			return nil, ctrError("bad_request", "intercept kind %q", req.Kind)
-		}
-		if len(req.Addr) > 255 {
-			return nil, ctrError("bad_request", "intercept address too long")
-		}
 		c.mu.Lock()
-		if len(c.intercepts) < 256 {
-			c.intercepts = append(c.intercepts, req.Kind+" "+req.Addr)
-		}
+		pn := c.net
 		c.mu.Unlock()
-		return map[string]any{"ok": true, "enforced": false}, nil
+		if pn == nil {
+			return nil, ctrError("container_not_running", "the container is not running")
+		}
+		key, err := pn.Intercept(req.Kind, req.Addr)
+		if err != nil {
+			return nil, ctrError("bad_request", "intercept: %v", err)
+		}
+		c.touch()
+		return map[string]any{"ok": true, "enforced": true, "key": key}, nil
 	case "exec-signal", "exec-resize":
 		m.mu.Lock()
 		e := m.execs[req.Exec]
@@ -1054,4 +1076,77 @@ func (m *ctrManager) classLiveLocked(k ctrKey) int {
 		c.mu.Unlock()
 	}
 	return n
+}
+
+// netConfig is the sandbox egress policy of k's run: intercepts go to the
+// parent object's handler, enableInternet reaches only the workload's
+// egress.internet hosts through the host's ContainerInternet path, and
+// every allowed internet flow and every refusal is audited as
+// "sandbox-of <object>".
+func (m *ctrManager) netConfig(c *ctr, k ctrKey, internet bool, allow []string) sbxnet.Config {
+	obj := m.objectID(k)
+	who := obj
+	if who == "" {
+		who = k.String()
+	}
+	cfg := sbxnet.Config{Object: who, Internet: internet, Allow: allow, Log: m.h.log.With("container", k.String()),
+		Deliver: func(ctx context.Context, key string, req *http.Request) (*http.Response, error) {
+			return m.deliverIntercept(ctx, k, key, req)
+		},
+		Activity: c.begin,
+		Audit: func(e sbxnet.AuditEvent) {
+			r := mgmtapi.AuditRecord{Kind: e.Kind, ObjectID: obj, Dst: e.Dst, Code: e.Code, ActingFor: "sandbox-of " + who, TraceID: newTraceID()}
+			if e.Detail != "" {
+				r.Detail = mgmtapi.Note(e.Detail)
+			}
+			m.h.audit.add(r)
+		}}
+	if ci := m.h.cfg.ContainerInternet; ci != nil {
+		cfg.Dial, cfg.Resolve, cfg.HostAddrs = ci.Dial, ci.Resolve, ci.HostAddrs
+	} else if internet {
+		cfg.Internet = false // this host has no internet path for containers
+		m.h.log.Info("container asked for the internet; this host has no container internet path", "container", k.String())
+	}
+	return cfg
+}
+
+// deliverIntercept hands one intercepted container request to the parent
+// object's handler: through the workload's current instance (it may be a
+// newer deployment than the one that started the container) to the
+// platform wrapper, which only hostd can address (cf.twd), and on to
+// ctx.container's registered handler for key in the object itself.
+func (m *ctrManager) deliverIntercept(ctx context.Context, k ctrKey, key string, req *http.Request) (*http.Response, error) {
+	m.h.mu.Lock()
+	w := m.h.workloads[k.tenant+"/"+k.workload]
+	m.h.mu.Unlock()
+	if w == nil {
+		return nil, fmt.Errorf("the parent workload is gone")
+	}
+	inst := w.current()
+	if inst == nil || inst.direct == nil {
+		return nil, fmt.Errorf("the parent workload is not running")
+	}
+	blob, _ := json.Marshal(map[string]any{"twd": map[string]any{"kind": "intercept", "class": k.class, "name": k.name, "key": key, "url": req.URL.String()}})
+	out := req.Clone(ctx)
+	out.URL = &url.URL{Scheme: "http", Host: "platform", Path: "/_twd/intercept"}
+	out.Host, out.RequestURI = "platform", ""
+	for hk := range out.Header {
+		if l := strings.ToLower(hk); strings.HasPrefix(l, "x-twd") || strings.HasPrefix(l, "twd-") || strings.HasPrefix(l, "cf-") {
+			out.Header.Del(hk)
+		}
+	}
+	out.Header.Set(netd.HeaderCF, string(blob))
+	resp, err := inst.interceptClient().Do(out)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// newCanary is the no-keys scan's positive control for one container
+// guest (it is in the guest's memory; it is no secret).
+func newCanary() string {
+	var b [16]byte
+	rand.Read(b[:])
+	return "twd-canary-" + hex.EncodeToString(b[:])
 }

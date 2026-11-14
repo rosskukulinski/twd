@@ -72,3 +72,34 @@ func TestMergeEnvAndLookPath(t *testing.T) {
 		t.Fatal("missing binary accepted")
 	}
 }
+
+// The intercept CA lands at Cloudflare's path and in the image's trust
+// bundle, and an image symlink can't redirect the write outside the root.
+func TestInstallCA(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "host-bundle.crt")
+	os.WriteFile(outside, []byte("HOST\n"), 0o644)
+	os.MkdirAll(filepath.Join(root, "etc/ssl/certs"), 0o755)
+	os.MkdirAll(filepath.Join(root, "usr/share"), 0o755)
+	os.WriteFile(filepath.Join(root, "usr/share/bundle.crt"), []byte("IMAGE ROOTS\n"), 0o644)
+	// Debian-style relative symlink, and a hostile absolute one.
+	os.Symlink("../../../usr/share/bundle.crt", filepath.Join(root, "etc/ssl/certs/ca-certificates.crt"))
+	os.MkdirAll(filepath.Join(root, "etc/pki/tls/certs"), 0o755)
+	os.Symlink(outside, filepath.Join(root, "etc/pki/tls/certs/ca-bundle.crt"))
+	pem := "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+	if err := installCA(root, pem); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "etc/cloudflare/certs/cloudflare-containers-ca.crt")); string(b) != pem {
+		t.Fatalf("CA file: %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(root, "usr/share/bundle.crt")); !strings.HasPrefix(string(b), "IMAGE ROOTS\n") || !strings.HasSuffix(string(b), pem) {
+		t.Fatalf("trust bundle: %q", b)
+	}
+	if b, _ := os.ReadFile(outside); string(b) != "HOST\n" {
+		t.Fatalf("a symlink in the image redirected the write out of the root: %q", b)
+	}
+	if p, err := resolveIn(root, "/etc/ssl/certs/../../../../etc/ssl/certs/ca-certificates.crt"); err != nil || p != filepath.Join(root, "usr/share/bundle.crt") {
+		t.Fatalf("resolveIn: %q %v", p, err)
+	}
+}

@@ -231,10 +231,91 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 	unix.Sethostname([]byte(host))
 	writeIfAbsent(r("etc/hosts"), "127.0.0.1\tlocalhost\n::1\tlocalhost ip6-localhost ip6-loopback\n127.0.1.1\t"+host+"\n")
 	os.WriteFile(r("etc/hostname"), []byte(host+"\n"), 0o644)
-	// No DNS in v1 (egress is deny-all; ADR-032 D4): an empty resolv.conf
-	// makes lookups fail fast instead of timing out.
-	writeIfAbsent(r("etc/resolv.conf"), "")
+	// DNS is the host's sandbox egress proxy (ADR-032 D4), which answers
+	// only names the container may reach. Without it, an empty resolv.conf
+	// makes lookups fail fast instead of timing out. Like Docker, this
+	// replaces the image's own resolv.conf.
+	os.Remove(r("etc/resolv.conf"))
+	rc := ""
+	if cc.DNS != "" {
+		rc = "nameserver " + cc.DNS + "\noptions timeout:2 attempts:2\n"
+	}
+	os.WriteFile(r("etc/resolv.conf"), []byte(rc), 0o644)
+	if cc.CACert != "" {
+		if err := installCA(ctrRoot, cc.CACert); err != nil {
+			return fmt.Errorf("intercept CA: %w", err)
+		}
+	}
 	return nil
+}
+
+// installCA puts the HTTPS-intercept CA certificate at proto.CACertPath
+// and appends it to every trust bundle the image has (resolved inside the
+// container root, so an image symlink can't point outside it).
+func installCA(root, pem string) error {
+	p := filepath.Join(root, proto.CACertPath)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	os.Remove(p)
+	if err := os.WriteFile(p, []byte(pem), 0o644); err != nil {
+		return err
+	}
+	for _, b := range proto.CATrustBundles {
+		bp, err := resolveIn(root, b)
+		if err != nil {
+			continue
+		}
+		fi, err := os.Stat(bp)
+		if err != nil || !fi.Mode().IsRegular() {
+			continue
+		}
+		f, err := os.OpenFile(bp, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			logf("trust bundle %s: %v", b, err)
+			continue
+		}
+		f.WriteString("\n# twd: this container's HTTPS-intercept CA (ADR-032)\n" + pem)
+		f.Close()
+	}
+	return nil
+}
+
+// resolveIn resolves p (an absolute path inside the container) under
+// root, following symlinks as the container would: absolute targets are
+// relative to root and ".." never leaves it.
+func resolveIn(root, p string) (string, error) {
+	cur := "/"
+	parts := strings.Split(strings.TrimPrefix(filepath.Clean(p), "/"), "/")
+	for hops := 0; len(parts) > 0; {
+		part := parts[0]
+		parts = parts[1:]
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(cur, part) // Clean: ".." stops at "/"
+		fi, err := os.Lstat(filepath.Join(root, next))
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		if hops++; hops > 40 {
+			return "", errors.New("too many symlinks")
+		}
+		t, err := os.Readlink(filepath.Join(root, next))
+		if err != nil {
+			return "", err
+		}
+		if !strings.HasPrefix(t, "/") {
+			t = filepath.Join(cur, t)
+		}
+		parts = append(strings.Split(strings.TrimPrefix(filepath.Clean(t), "/"), "/"), parts...)
+		cur = "/"
+	}
+	return filepath.Join(root, cur), nil
 }
 
 func writeIfAbsent(p, s string) {

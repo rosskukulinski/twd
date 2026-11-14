@@ -20,6 +20,8 @@ async function handle(self, req) {
     case "start": {
       const opts = { env: { GREETING: "hi" } };
       if (q.has("entrypoint")) opts.entrypoint = arg("entrypoint");
+      if (q.has("internet")) opts.enableInternet = q.get("internet") === "1";
+      if (q.has("instance")) opts.instance = arg("instance");
       if (q.has("image")) opts.image = q.get("image");
       c.start(opts);
       // start() returns at once; running is true right away.
@@ -65,6 +67,11 @@ async function handle(self, req) {
         rest += dec.decode(value);
       }
       return J({ first: dec.decode(first.value), tFirst, rest, code: await p.exitCode, tTotal: Date.now() - t0 });
+    }
+    case "tail": {
+      // An endless exec streamed straight to the caller.
+      const p = await c.exec(["sh", "-c", "while true; do echo tick; sleep 0.1; done"]);
+      return new Response(p.stdout, { headers: { "content-type": "text/plain" } });
     }
     case "kill": {
       const p = await c.exec(["sleep", "30"]);
@@ -119,6 +126,51 @@ async function handle(self, req) {
     case "intercept":
       await c.interceptOutboundHttp("api.example.com", { fetch: () => new Response("x") });
       return J({ ok: true });
+    case "icept": {
+      // The credential-proxy pattern: the container's request reaches this
+      // handler, which relays to ?relay= under the object's own identity.
+      const relay = q.get("relay");
+      const name = self.ctx.id.name;
+      const handler = {
+        async fetch(r) {
+          const body = r.method === "GET" || r.method === "HEAD" ? "" : await r.text();
+          let echo = null;
+          if (relay) {
+            const e = await fetch(relay);
+            echo = await e.json();
+          }
+          const seen = {};
+          for (const [k, v] of r.headers) if (k.startsWith("x-twd") || k.startsWith("twd-") || k === "x-from-guest") seen[k] = v;
+          return J({ fromParent: name, url: r.url, method: r.method, body, headers: seen, echo });
+        },
+      };
+      const kind = q.get("kind") ?? "http";
+      if (kind === "all") await c.interceptAllOutboundHttp(handler);
+      else if (kind === "https") await c.interceptOutboundHttps(q.get("addr"), handler);
+      else await c.interceptOutboundHttp(q.get("addr"), handler);
+      return J({ ok: true });
+    }
+    case "iceptMany": {
+      let n = 0;
+      try {
+        for (let i = 0; i < 200; i++) {
+          await c.interceptOutboundHttp("h" + i + ".example.com", { fetch: () => new Response("x") });
+          n++;
+        }
+      } catch (e) {
+        return J({ n, error: String(e.message) });
+      }
+      return J({ n });
+    }
+    case "expose": {
+      // Sandbox SDK 0.x's preview URLs (exposePort; see Base below).
+      try {
+        const r = await self.exposePort(8080, { hostname: "example.com" });
+        return J({ url: r.url });
+      } catch (e) {
+        return J({ error: String(e.message), code: e.code ?? null });
+      }
+    }
     case "selfkill":
       await self.ctx.tailnet.kill({ reason: "test kill" });
       return J({ ok: true });
@@ -138,6 +190,11 @@ async function handle(self, req) {
 }
 
 class Base extends DurableObject {
+  // What the Sandbox SDK 0.x's exposePort does: mint a preview URL (twd
+  // must refuse it: no public ingress, ADR-029).
+  async exposePort(port, opts) {
+    return { url: "https://" + port + "-" + this.ctx.id.name + "-tok." + opts.hostname };
+  }
   async fetch(req) {
     try {
       return await handle(this, req);

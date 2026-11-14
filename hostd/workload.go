@@ -411,8 +411,12 @@ type instance struct {
 	res     *gen.Result
 	ingress http.Handler
 	direct  *http.Client
-	tier    string // bundle.TierProcess | bundle.TierMicroVM
-	spec    sandbox.Spec
+	// icOnce/ic: the client delivering intercepted container requests
+	// (direct's dialer; no timeout, no transparent compression).
+	icOnce sync.Once
+	ic     *http.Client
+	tier   string // bundle.TierProcess | bundle.TierMicroVM
+	spec   sandbox.Spec
 	// doStorage is the workload's DO storage (process tier), under its
 	// tenant's dir; profile is the Seatbelt profile it runs under, if any.
 	doStorage string
@@ -928,6 +932,20 @@ func (inst *instance) admin(twd map[string]any) (int, []byte) {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, b
+}
+
+// interceptClient sends intercepted container requests to the platform
+// (ADR-032 D4). Like direct, but streaming: no overall timeout, no
+// redirects followed, bodies passed through unchanged.
+func (inst *instance) interceptClient() *http.Client {
+	inst.icOnce.Do(func() {
+		tr := &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Minute}
+		if t, ok := inst.direct.Transport.(*http.Transport); ok {
+			tr.DialContext = t.DialContext
+		}
+		inst.ic = &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	})
+	return inst.ic
 }
 
 func (inst *instance) drain(timeout time.Duration) {

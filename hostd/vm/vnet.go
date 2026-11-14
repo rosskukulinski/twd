@@ -31,6 +31,10 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
+
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 )
 
 const nicID = 1
@@ -40,6 +44,7 @@ type vnet struct {
 	gw      netip.Addr
 	guest   netip.Addr
 	servers []*http.Server
+	udp     *gonet.UDPConn
 
 	onClose func()
 
@@ -52,10 +57,14 @@ type vnet struct {
 // newVnetOn builds the stack on ep (an ethernet link endpoint whose
 // address is the gateway's MAC) and serves the handlers on gateway:port.
 // onClose runs after the stack is closed (the link's own cleanup).
-func newVnetOn(ep stack.LinkEndpoint, gw, guest netip.Addr, prefix int, handlers map[uint16]http.Handler, onClose func()) (*vnet, error) {
+func newVnetOn(ep stack.LinkEndpoint, gw, guest netip.Addr, prefix int, handlers map[uint16]http.Handler, gnet sandbox.ContainerNet, onClose func()) (*vnet, error) {
+	tps := []stack.TransportProtocolFactory{tcp.NewProtocol}
+	if gnet != nil {
+		tps = append(tps, udp.NewProtocol) // only for gateway:53 (DNS)
+	}
 	st := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
-		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+		TransportProtocols: tps,
 	})
 	sack := tcpip.TCPSACKEnabled(true)
 	st.SetTransportProtocolOption(tcp.ProtocolNumber, &sack)
@@ -77,10 +86,32 @@ func newVnetOn(ep stack.LinkEndpoint, gw, guest netip.Addr, prefix int, handlers
 	st.SetRouteTable([]tcpip.Route{{Destination: sub, NIC: nicID}})
 
 	v := &vnet{st: st, gw: gw, guest: guest, conns: map[*gonet.TCPConn]struct{}{}, onClose: onClose}
-	// Unmatched TCP (anything but the listeners below): reset and record.
+	// Unmatched TCP (anything but the listeners below): a container
+	// guest's flow goes to its sandbox egress proxy if that accepts it;
+	// everything else is reset and recorded.
 	fwd := tcp.NewForwarder(st, 0, 1024, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
 		dst := netip.AddrPortFrom(addrOf(id.LocalAddress), id.LocalPort)
+		if gnet != nil && dst.Addr() != gw && gnet.Accept(dst) {
+			var wq waiter.Queue
+			ep, e := r.CreateEndpoint(&wq)
+			if e != nil {
+				r.Complete(true)
+				return
+			}
+			r.Complete(false)
+			c := gonet.NewTCPConn(&wq, ep)
+			v.mu.Lock()
+			if v.closed {
+				v.mu.Unlock()
+				c.Close()
+				return
+			}
+			v.conns[c] = struct{}{}
+			v.mu.Unlock()
+			go gnet.Serve(&trackedConn{TCPConn: c, v: v}, dst)
+			return
+		}
 		v.mu.Lock()
 		if len(v.refused) < 1024 {
 			v.refused = append(v.refused, dst.String())
@@ -89,6 +120,15 @@ func newVnetOn(ep stack.LinkEndpoint, gw, guest netip.Addr, prefix int, handlers
 		r.Complete(true) // RST
 	})
 	st.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+	if gnet != nil {
+		pc, err := gonet.DialUDP(st, &tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(gw.As4()), Port: 53}, nil, ipv4.ProtocolNumber)
+		if err != nil {
+			st.Close()
+			return nil, fmt.Errorf("listen gateway:53/udp: %w", err)
+		}
+		v.udp = pc
+		go serveDNS(pc, gnet)
+	}
 
 	for port, h := range handlers {
 		ln, err := gonet.ListenTCP(st, tcpip.FullAddress{NIC: nicID, Addr: tcpip.AddrFrom4(gw.As4()), Port: port}, ipv4.ProtocolNumber)
@@ -111,6 +151,21 @@ func newVnetOn(ep stack.LinkEndpoint, gw, guest netip.Addr, prefix int, handlers
 		go srv.Serve(ln)
 	}
 	return v, nil
+}
+
+// serveDNS answers a container guest's DNS queries (gateway:53/udp) from
+// its sandbox egress proxy, one datagram at a time.
+func serveDNS(pc *gonet.UDPConn, gnet sandbox.ContainerNet) {
+	buf := make([]byte, 1500)
+	for {
+		n, from, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if resp := gnet.DNS(append([]byte(nil), buf[:n]...)); resp != nil {
+			pc.WriteTo(resp, from)
+		}
+	}
 }
 
 func addrOf(a tcpip.Address) netip.Addr {
@@ -190,6 +245,9 @@ func (v *vnet) close() {
 	v.mu.Unlock()
 	for _, s := range v.servers {
 		s.Close()
+	}
+	if v.udp != nil {
+		v.udp.Close()
 	}
 	v.abortAll()
 	v.st.Close()

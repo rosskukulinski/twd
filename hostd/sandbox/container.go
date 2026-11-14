@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"sort"
 	"strings"
 	"time"
@@ -38,19 +39,33 @@ type ContainerSpec struct {
 	Cwd      string
 	User     string
 	Hostname string
-	// EnableInternet is start({enableInternet}). v1: the guest's NIC has
-	// no egress at all either way (deny-all); the sandbox egress proxy
-	// (ADR-032 D4) implements Egress.
+	// EnableInternet is start({enableInternet}) (recorded; Net enforces it).
 	EnableInternet bool
-	Egress         *EgressPolicy
-	Log            *slog.Logger
+	// Net is the host side of the guest's NIC (ADR-032 D4: the sandbox
+	// egress proxy, netd/sbxnet). Nil: no egress of any kind, and no DNS.
+	Net ContainerNet
+	// CACert is the PEM certificate of the container's HTTPS-intercept CA,
+	// installed in the guest (its key never is).
+	CACert []byte
+	// Canary, if set, is put into the guest's memory (an env var of the
+	// guest agent's container config) as the no-keys scan's positive
+	// control: a RAM dump that doesn't contain it isn't a real dump.
+	Canary string
+	Log    *slog.Logger
 }
 
-// EgressPolicy is the container's outbound policy (placeholder for the
-// ADR-032 D4 egress proxy: allowlisted internet, intercepts to the parent).
-type EgressPolicy struct {
-	Internet  []string // the class's egress.internet allowlist
-	Intercept []string // host[:port] patterns delivered to the parent DO
+// ContainerNet is the host side of a container guest's network. The
+// backend hands it every TCP flow and DNS query the guest makes; nothing
+// else leaves the guest.
+type ContainerNet interface {
+	// Accept decides a TCP flow to dst before its handshake completes:
+	// false resets it.
+	Accept(dst netip.AddrPort) bool
+	// Serve owns an accepted flow until it ends.
+	Serve(c net.Conn, dst netip.AddrPort)
+	// DNS answers one query to the gateway's port 53 (wire format); nil
+	// drops it.
+	DNS(query []byte) []byte
 }
 
 // ExecSpec is one exec in a container.

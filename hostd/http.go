@@ -425,6 +425,20 @@ func (h *Host) pushAPI() http.Handler {
 	// socket is the user's (0700 dir); answers carry no key material.
 	m.HandleFunc("POST /v1/vm/check", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		if ct := q.Get("container"); ct != "" { // <Class>/<name>: that object's container guest
+			cls, name, ok := strings.Cut(ct, "/")
+			if !ok || q.Get("keyscan") != "1" {
+				writeAPIError(w, &apiError{Code: "bad_request", Detail: "container=<Class>/<name> needs keyscan=1"})
+				return
+			}
+			rep, err := h.ContainerCheck(r.Context(), q.Get("tenant"), q.Get("workload"), cls, name)
+			if err != nil {
+				writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})
+				return
+			}
+			writeJSON(w, 200, rep)
+			return
+		}
 		rep, err := h.VMCheck(r.Context(), q.Get("tenant"), q.Get("workload"), q.Get("keyscan") == "1")
 		if err != nil {
 			writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})

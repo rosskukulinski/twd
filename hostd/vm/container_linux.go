@@ -60,9 +60,10 @@ func (b *Backend) helperContainers() error {
 // BootContainer implements sandbox.ContainerBackend: one Firecracker VM
 // per container, in its own jail (uid, netns, cgroup), with the image as a
 // read-only drive and a scratch disk the helper makes fresh. The guest's
-// NIC goes to a userspace stack with no handlers at all, so it has no
-// egress of any kind (ADR-032 D4 deny-all; the egress proxy is phase B);
-// hostd reaches the container's ports through that stack (DialPort).
+// NIC goes to a userspace stack with no gateway services: its only DNS
+// server and its only TCP destinations are the sandbox egress proxy
+// s.Net (ADR-032 D4; nil = no egress of any kind). hostd reaches the
+// container's ports through that stack (DialPort).
 func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (sandbox.Container, error) {
 	if err := b.helperContainers(); err != nil {
 		return nil, err
@@ -91,12 +92,16 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 	cs := &ctrState{exited: make(chan struct{}), streams: map[string]chan net.Conn{}, log: &tailBuf{max: 64 << 10}}
 	gc := proto.GuestConfig{UnixNano: time.Now().UnixNano(), IP: proto.GuestIP, Gateway: proto.GatewayIP, Prefix: proto.PrefixLen,
 		MTU: b.cfg.MTU, Container: &proto.ContainerConfig{Image: proto.ImageDev, Argv: s.Argv, Env: s.Env, Cwd: s.Cwd, User: s.User,
-			Pids: pids, Hostname: s.Hostname}}
+			Pids: pids, Hostname: s.Hostname, CACert: string(s.CACert), Canary: s.Canary}}
 	if s.ScratchMiB > 0 {
 		gc.Container.Scratch = proto.ScratchDev
 	}
+	if s.Net != nil {
+		gc.Container.DNS = proto.GatewayIP
+	}
 	l := launch{name: s.ID, log: s.Log, kernel: kernel, req: req, ctr: cs,
-		handlers: nil, // no egress: every guest flow is refused at the host stack
+		handlers: nil, // no gateway services (DO egress, host API) for a container
+		gnet:     s.Net,
 		drive:    func(p string) error { return writeGuestJSON(p, gc) },
 		extra: func(m *Machine) (*os.File, error) {
 			f, err := os.Open(s.Image)
@@ -469,6 +474,15 @@ func (c *ctrVM) Stop(grace time.Duration) {
 func (c *ctrVM) Kill() {
 	c.m.stopped.Store(true)
 	c.m.Kill()
+}
+
+// MemoryDump, Disks and Op serve the no-keys scan (hostd ContainerCheck).
+func (c *ctrVM) MemoryDump(ctx context.Context, dir string) (string, error) {
+	return c.m.MemoryDump(ctx, dir)
+}
+func (c *ctrVM) Disks() []string { return c.m.Disks() }
+func (c *ctrVM) Op(ctx context.Context, msg proto.Msg) (proto.Msg, error) {
+	return c.m.Op(ctx, msg)
 }
 
 func (c *ctrVM) Info() sandbox.Info { return c.m.info }

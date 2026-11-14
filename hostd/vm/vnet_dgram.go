@@ -45,7 +45,7 @@ func newDgramVnet(f *os.File, mtu uint32, gwMAC net.HardwareAddr, gw, guest neti
 	if err != nil {
 		return nil, err
 	}
-	v, err := newVnetOn(ep, gw, guest, prefix, handlers, closeLink)
+	v, err := newVnetOn(ep, gw, guest, prefix, handlers, nil, closeLink)
 	if err != nil {
 		closeLink()
 		return nil, err

@@ -102,6 +102,16 @@ export default {
         return admin(req, env, ctx, t);
       case "object":
         return routeObject(env, ctx, t.class, t.name, req);
+      case "intercept": {
+        // A request an object's container sent to an intercepted
+        // destination (hostd's sandbox egress proxy, ADR-032 D4): only the
+        // object's own registered handler sees it, in the object.
+        if (!CFG.classes[t.class]?.container) return errResponse("unknown_object", "no container class " + t.class + " in this app");
+        if (!t.name || typeof t.key !== "string" || typeof t.url !== "string") return errResponse("bad_request", "bad intercept route");
+        const hasBody = req.method !== "GET" && req.method !== "HEAD";
+        const r = new Request(t.url, { method: req.method, headers: req.headers, body: hasBody ? req.body : undefined, redirect: "manual" });
+        return objectStub(env, ctx, t.class, t.name).__twd_intercept(t.key, r);
+      }
       case "workload": {
         // /_twd/o/<Class>/<name>/... on the workload node reaches an object
         // before (or instead of) its own node.
@@ -228,6 +238,11 @@ function makeHost(cls) {
         return null;
       }
       return await this.ctx.storage.getAlarm();
+    }
+    // A request the object's container sent to an intercepted destination.
+    async __twd_intercept(key, req) {
+      if (this.__killed) return errResponse("killed", "object " + cls + "/" + this.ctx.id.name + " was killed: " + this.__killed);
+      return this.__facet(true).__twd_intercept(key, req);
     }
     async alarm(info) {
       if (this.__killed) return;

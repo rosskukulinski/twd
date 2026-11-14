@@ -97,7 +97,25 @@ type ContainerConfig struct {
 	// Pids is pids.max of the container's cgroup in the guest (0 = 4096).
 	Pids     int    `json:"pids,omitempty"`
 	Hostname string `json:"hostname,omitempty"`
+	// DNS is the container's nameserver (the gateway, answered by the
+	// host's sandbox egress proxy); "" = no DNS (an empty resolv.conf).
+	DNS string `json:"dns,omitempty"`
+	// CACert is the PEM certificate of the container's HTTPS-intercept CA
+	// (ADR-032 D4), installed at CACertPath and appended to the image's
+	// trust bundles. Its key never enters the guest.
+	CACert string `json:"caCert,omitempty"`
+	// Canary is held in guestd's memory as the no-keys scan's positive
+	// control (it is not a secret).
+	Canary string `json:"canary,omitempty"`
 }
+
+// CACertPath is where a container finds its HTTPS-intercept CA certificate
+// (Cloudflare's path).
+const CACertPath = "/etc/cloudflare/certs/cloudflare-containers-ca.crt"
+
+// CATrustBundles are the image trust stores the CA is appended to, where
+// they exist (Debian/Ubuntu/Alpine, RHEL/Fedora, and the OpenSSL default).
+var CATrustBundles = []string{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"}
 
 // Container-mode stream framing.
 const (

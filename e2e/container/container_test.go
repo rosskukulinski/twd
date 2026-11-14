@@ -75,15 +75,26 @@ func TestE2EContainer(t *testing.T) {
 	}
 	t.Cleanup(ctl.Close)
 	ctl.Server.SetGlobalAppCaps(tailcfg.PeerCapMap{nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue}})
+	inet, dialed := internetStandIn(t)
 	e := hostdtest.Start(t, hostdtest.Options{ControlURL: ctl.URL, Fake: fakemgmt.Config{StaticKey: nettest.DummyKey}, Ephemeral: true, KillTombstone: 5 * time.Second,
 		Tenant:     mgmtapi.Tenant{Tailnet: "ttest.ts.net", ControlURL: ctl.URL, MintMode: "static"},
-		Containers: be, Images: store, ContainerGrace: 3 * time.Second})
+		Containers: be, Images: store, ContainerGrace: 3 * time.Second, ContainerInternet: inet})
 	ctx := context.Background()
 	client, err := nettest.NewNode(ctx, ctl.URL, nettest.DummyKey, "ttest-client", filepath.Join(e.Dir, "client"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { client.Close() })
+	// A hermetic tailnet peer: what a container must not reach, and what
+	// its parent relays to under its own identity.
+	echo, err := nettest.NewNode(ctx, ctl.URL, nettest.DummyKey, "ttest-echo", filepath.Join(e.Dir, "echo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { echo.Close() })
+	if err := echo.ServeEcho(); err != nil {
+		t.Fatal(err)
+	}
 	hc := client.HTTPClient(120 * time.Second)
 	do := func(method, u string, body []byte) (int, []byte, time.Duration) {
 		t.Helper()
@@ -391,5 +402,66 @@ func TestE2EContainer(t *testing.T) {
 			}
 		}
 		set("rss_kb_per_running_container_vm", rss)
+	})
+
+	t.Run("KillStreamingCallerFailsFast", func(t *testing.T) {
+		call("/f/ks/start")
+		call("/f/ks/exec", "argv", `["true"]`)
+		pid := ctrOf("Box", "ks").PID
+		e.WaitObject("ctr", "Box", "ks", 60*time.Second)
+		resp, err := hc.Get(cbase + "/f/ks/tail")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		buf := make([]byte, 64)
+		if n, err := resp.Body.Read(buf); err != nil || !strings.Contains(string(buf[:n]), "tick") {
+			t.Fatalf("stream: %q %v", buf[:n], err)
+		}
+		ended := make(chan time.Time, 1)
+		go func() {
+			io.Copy(io.Discard, resp.Body)
+			ended <- time.Now()
+		}()
+		st := time.Now()
+		call("/f/ks/selfkill")
+		select {
+		case at := <-ended:
+			d := at.Sub(st)
+			set("ctr_kill_streaming_exec_caller_fails_ms", d.Milliseconds())
+			if d > time.Second {
+				t.Fatalf("streaming caller ended %v after the kill (want < 1 s)", d)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("streaming exec caller still reading 5 s after its object was killed")
+		}
+		if c, _ := waitStopped("ks", 5*time.Second); c.State != "stopped" || !vmGone(pid) {
+			t.Fatalf("after kill: %+v", c)
+		}
+	})
+
+	// Make room under Box's max_instances (4) for the egress and limits containers.
+	call("/f/a/destroy")
+	call("/f/srv/destroy")
+	ev := &egressEnv{call: call, echoIP: echo.IP4, tenant: e.TenantID, dialed: dialed, host: e.Host, parentW: "ctr",
+		objIP: func(name string) string { return e.WaitObject("ctr", "Box", name, 60*time.Second).IP }}
+	waitPeer(echo.IP4)
+	t.Run("Egress", func(t *testing.T) { testEgress(t, ev, set) })
+	t.Run("Limits", func(t *testing.T) {
+		vmAlive := func(name string) (int, bool) {
+			c := ctrOf("Box", name)
+			return c.PID, c.State == "running" && c.PID > 0 && !vmGone(c.PID)
+		}
+		hostPids := func() int {
+			ents, _ := os.ReadDir("/proc")
+			n := 0
+			for _, d := range ents {
+				if d.Name()[0] >= '0' && d.Name()[0] <= '9' {
+					n++
+				}
+			}
+			return n
+		}
+		testLimits(t, ev, vmAlive, hostPids, set)
 	})
 }

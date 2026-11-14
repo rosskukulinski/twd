@@ -89,6 +89,24 @@ var NOT_RUNNING = "the container is not running, consider calling start()";
 var UNEXPECTED_EXIT = "Container exited with unexpected exit code: ";
 var RUNTIME_SIGNALLED = "Runtime signalled the container to exit: ";
 var STATE_KEY = "__twd_container";
+var handlers = /* @__PURE__ */ new WeakMap();
+async function dispatchIntercept(ctx, key, req) {
+  const h = handlers.get(ctx)?.get(key);
+  const fetcher = typeof h === "function" ? { fetch: h } : h;
+  if (!fetcher || typeof fetcher.fetch !== "function") {
+    return new Response(
+      JSON.stringify({ code: "intercept_unavailable", message: "no handler for " + key + " in this object (it was registered before the object restarted; register it again)" }),
+      { status: 502, headers: { "content-type": "application/json", "twd-error": "intercept_unavailable" } }
+    );
+  }
+  return await fetcher.fetch(req);
+}
+function notSupportedPreview() {
+  return Object.assign(
+    new Error("exposePort()/preview URLs are not supported on twd yet: they need public ingress (ADR-029); reach a container port from its object with ctx.container.getTcpPort(port).fetch()"),
+    { code: "not_supported" }
+  );
+}
 function err(body, fallback) {
   const code = body?.code ?? "container_error";
   let msg = String(body?.message ?? body?.detail ?? fallback);
@@ -213,6 +231,7 @@ function createContainer(tw, ctx, cls, spec, self) {
   let starting = null;
   let startErr = null;
   const intercepts = /* @__PURE__ */ new Map();
+  if (ctx && typeof ctx === "object") handlers.set(ctx, intercepts);
   const save = () => {
     try {
       kv?.put(STATE_KEY, { running, gen });
@@ -247,6 +266,14 @@ function createContainer(tw, ctx, cls, spec, self) {
         if (watching === g) watching = 0;
       }
     })());
+  };
+  const intercept = async (kind, addr, binding) => {
+    const b = binding;
+    if (!b || typeof b !== "function" && typeof b.fetch !== "function") throw new TypeError("intercept: the handler must be a Fetcher (an object with fetch())");
+    await settle();
+    const key = kind + " " + addr;
+    const v = await op("intercept", { kind, addr });
+    intercepts.set(String(v?.key ?? key), binding);
   };
   const settle = async () => {
     if (starting) await starting.catch(() => {
@@ -472,23 +499,20 @@ function createContainer(tw, ctx, cls, spec, self) {
         }
       };
     },
-    // Egress interception registers the handler with hostd's (phase B)
-    // egress proxy. Until it exists the container has no egress at all, so
-    // nothing reaches the handler (deny-all is the stricter behaviour).
+    // Egress interception: hostd's sandbox egress proxy delivers the
+    // container's matching requests back to this object, which runs them
+    // through the handler kept here (dispatchIntercept). HTTPS is
+    // terminated with the container's own ephemeral CA (its certificate is
+    // at /etc/cloudflare/certs/cloudflare-containers-ca.crt in the
+    // container). At most 128 per container.
     async interceptOutboundHttp(addr, binding) {
-      await settle();
-      intercepts.set("http " + addr, binding);
-      await op("intercept", { kind: "http", addr: String(addr) });
+      await intercept("http", String(addr), binding);
     },
     async interceptOutboundHttps(addr, binding) {
-      await settle();
-      intercepts.set("https " + addr, binding);
-      await op("intercept", { kind: "https", addr: String(addr) });
+      await intercept("https", String(addr), binding);
     },
     async interceptAllOutboundHttp(binding) {
-      await settle();
-      intercepts.set("all *", binding);
-      await op("intercept", { kind: "all", addr: "*" });
+      await intercept("all", "*", binding);
     },
     async snapshotContainer() {
       throw Object.assign(new Error("snapshotContainer() is not supported on twd yet (ADR-032 D6: v1.1)"), { code: "not_supported" });
@@ -628,9 +652,37 @@ function wrapFacetClass(C, name, bindings, opts = {}) {
         const self = this;
         if (typeof self.alarm === "function") return self.alarm(info);
       }
+      // Called by the Host DO with a request the container sent to an
+      // intercepted destination (hostd's sandbox egress proxy).
+      async __twd_intercept(key, req) {
+        return dispatchIntercept(this.ctx, key, req);
+      }
     }
   }[name];
+  if (opts.container) noPreviewURLs(W);
   return W;
+}
+var PREVIEW_HEADER = "x-sandbox-preview-proxy";
+function noPreviewURLs(W) {
+  const proto = Object.getPrototypeOf(W.prototype);
+  if (typeof proto?.exposePort === "function") {
+    W.prototype.exposePort = async function() {
+      throw notSupportedPreview();
+    };
+  }
+  const f = W.prototype.fetch;
+  if (typeof f === "function") {
+    W.prototype.fetch = async function(req) {
+      if (req?.headers?.get?.(PREVIEW_HEADER)) {
+        const e = notSupportedPreview();
+        return new Response(JSON.stringify({ code: "not_supported", message: e.message }), {
+          status: 501,
+          headers: { "content-type": "application/json", "twd-error": "not_supported" }
+        });
+      }
+      return f.call(this, req);
+    };
+  }
 }
 function wrapPlainClass(C, name, bindings, opts) {
   if (typeof C !== "function") throw new Error(`twd: durable_objects class ${name} is not exported by the main module`);
@@ -657,6 +709,12 @@ function wrapPlainClass(C, name, bindings, opts) {
         this.ctx.storage.kv.put("__twd_killed", reason || "killed");
         return true;
       }
+      async __twd_intercept(key, req) {
+        const self = this;
+        const k = self.ctx.storage.kv.get("__twd_killed");
+        if (k) return killedResponse(k);
+        return dispatchIntercept(self.ctx, key, req);
+      }
     }
   }[name];
   if (typeof proto.fetch === "function") {
@@ -666,6 +724,7 @@ function wrapPlainClass(C, name, bindings, opts) {
       return proto.fetch.call(this, req);
     };
   }
+  if (opts.container) noPreviewURLs(W);
   return W;
 }
 function wrapHandler(H, bindings) {
