@@ -934,9 +934,14 @@ func (m *ctrManager) serveExec(w http.ResponseWriter, r *http.Request, k ctrKey,
 	}
 	// The DO going away (its isolate evicted, the request canceled) kills
 	// the exec: nothing else could ever read or stop it.
+	exited := make(chan struct{})
+	defer close(exited)
 	go func() {
-		<-r.Context().Done()
-		ex.Signal(9)
+		select {
+		case <-r.Context().Done():
+			ex.Signal(9)
+		case <-exited:
+		}
 	}()
 	code, err := ex.Wait(context.Background())
 	wg.Wait()
