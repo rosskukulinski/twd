@@ -236,6 +236,9 @@ type Object struct {
 	upDone   chan struct{}
 	tr       *http.Transport
 	flows    map[*flow]struct{}
+	// pub is non-nil for a public (Funnel) node (ADR-029); set at Create
+	// and never changed.
+	pub *publicState
 }
 
 // ObjectInfo is a snapshot of an object, safe to serialize.
@@ -253,6 +256,10 @@ type ObjectInfo struct {
 	Reminted  bool     `json:"reminted,omitempty"`
 	JoinMS    float64  `json:"joinMs,omitempty"`
 	Flows     int      `json:"flows"`
+	// Public is set for a public (Funnel) node; PublicListening reports
+	// whether its Funnel listener is open (ADR-029).
+	Public          bool `json:"public,omitempty"`
+	PublicListening bool `json:"publicListening,omitempty"`
 }
 
 // objectMeta is persisted next to the tsnet state so Rejoin can restore it.
@@ -261,6 +268,9 @@ type objectMeta struct {
 	Hostname  string   `json:"hostname"`
 	Tags      []string `json:"tags,omitempty"`
 	Ephemeral bool     `json:"ephemeral"`
+	// Public restores a public node as public on rejoin (never as a
+	// tailnet listener). Its Enabled is not trusted on restore.
+	Public *PublicOptions `json:"public,omitempty"`
 }
 
 // ErrClosed is returned after Close.
@@ -299,6 +309,9 @@ func (r *Registry) Create(id string, opts ObjectOptions) (*Object, error) {
 		queued:    time.Now(),
 		flows:     map[*flow]struct{}{},
 	}
+	if opts.Public != nil {
+		o.pub = newPublicState(*opts.Public)
+	}
 	if o.hostname == "" {
 		o.hostname = r.cfg.Hostname(id)
 	}
@@ -311,6 +324,13 @@ func (r *Registry) Create(id string, opts ObjectOptions) (*Object, error) {
 	// A saved object.json wins: a rejoin must come back as the same node.
 	if m, err := readMeta(o.dir); err == nil {
 		o.hostname, o.tags, o.ephemeral = m.Hostname, m.Tags, m.Ephemeral
+		if opts.Public == nil && m.Public != nil {
+			// Restored from saved state alone: public, but closed until the
+			// owner calls SetPublicEnabled (fail closed).
+			po := *m.Public
+			po.Enabled = false
+			o.pub = newPublicState(po)
+		}
 	}
 	r.objects[id] = o
 	r.joins.Add(1)
@@ -408,7 +428,14 @@ func (o *Object) start(ctx context.Context) error {
 		}
 		key = k
 	}
-	mb, _ := json.Marshal(objectMeta{ID: o.id, Hostname: o.hostname, Tags: o.tags, Ephemeral: o.ephemeral})
+	meta := objectMeta{ID: o.id, Hostname: o.hostname, Tags: o.tags, Ephemeral: o.ephemeral}
+	if o.pub != nil {
+		o.pub.mu.Lock()
+		po := o.pub.opts
+		o.pub.mu.Unlock()
+		meta.Public = &po
+	}
+	mb, _ := json.Marshal(meta)
 	if err := os.WriteFile(filepath.Join(o.dir, "object.json"), mb, 0o600); err != nil {
 		return err
 	}
@@ -440,9 +467,15 @@ func (o *Object) start(ctx context.Context) error {
 	srv := o.srv
 	o.mu.Unlock()
 	ip4, ip6 := srv.TailscaleIPs()
-	ln, err := srv.Listen("tcp", fmt.Sprintf(":%d", r.cfg.IngressPort))
-	if err != nil {
-		return err
+	// A public node never listens on the tailnet: its only listener is
+	// the Funnel one, opened below once the node is ready (ADR-029).
+	var ln net.Listener
+	if o.pub == nil {
+		l, err := srv.Listen("tcp", fmt.Sprintf(":%d", r.cfg.IngressPort))
+		if err != nil {
+			return err
+		}
+		ln = l
 	}
 	tr := &http.Transport{
 		DialContext:         o.dialEgress,
@@ -460,17 +493,26 @@ func (o *Object) start(ctx context.Context) error {
 	o.mu.Lock()
 	if o.state != StatePending {
 		o.mu.Unlock()
-		ln.Close()
+		if ln != nil {
+			ln.Close()
+		}
 		return errors.New("killed while joining")
 	}
 	o.lc, o.ip4, o.ip6, o.joinDur, o.rejoined, o.reminted = lc, ip4, ip6, joinDur, rejoin, reminted
 	if sst.Self != nil {
 		o.nodeID, o.dnsName = sst.Self.ID, sst.Self.DNSName
 	}
-	o.ln = &trackedListener{Listener: ln, o: o}
+	if ln != nil {
+		o.ln = &trackedListener{Listener: ln, o: o}
+	}
 	o.httpSrv, o.tr = hs, tr
 	o.state = StateReady
-	close(o.ready)
+	if o.pub == nil {
+		close(o.ready)
+	}
+	// A public node signals ready once its Funnel listener was attempted
+	// (below), so Ready means "listening" when Enabled. Only start closes
+	// o.ready once the state has left pending.
 	o.mu.Unlock()
 
 	r.mu.Lock()
@@ -480,7 +522,21 @@ func (o *Object) start(ctx context.Context) error {
 		}
 	}
 	r.mu.Unlock()
-	go hs.Serve(o.ln)
+	if o.pub != nil {
+		o.startPublicFlusher()
+		if err := o.openPublic(); err != nil {
+			// The node is up; only the Funnel listener failed (HTTPS
+			// certificates or the funnel nodeAttr missing). Report it and
+			// let the owner retry with SetPublicEnabled.
+			o.mu.Lock()
+			o.err = fmt.Errorf("public listener: %w", err)
+			o.mu.Unlock()
+			r.log.Warn("public listener failed", "object", o.id, "err", RedactError(err))
+		}
+		close(o.ready)
+	} else {
+		go hs.Serve(o.ln)
+	}
 	r.log.Info("object ready", "object", o.id, "hostname", o.hostname, "ip", ip4.String(),
 		"node", string(o.nodeID), "join_ms", joinDur.Milliseconds(), "rejoined", rejoin, "reminted", reminted)
 	return nil
@@ -623,6 +679,8 @@ func (o *Object) teardown() {
 			<-upDone
 		}
 	}
+	o.closePublic()
+	o.stopPublicFlusher()
 	o.mu.Lock()
 	srv, hs, tr, ts := o.srv, o.httpSrv, o.tr, o.tombSrv
 	o.mu.Unlock()
@@ -720,6 +778,9 @@ func (o *Object) Info() ObjectInfo {
 	in := ObjectInfo{ID: o.id, Hostname: o.hostname, State: o.state, NodeID: string(o.nodeID),
 		DNSName: o.dnsName, Tags: o.tags, Ephemeral: o.ephemeral, Rejoined: o.rejoined, Reminted: o.reminted,
 		JoinMS: float64(o.joinDur.Microseconds()) / 1000, Flows: len(o.flows)}
+	if o.pub != nil {
+		in.Public, in.PublicListening = true, o.PublicListening()
+	}
 	if o.err != nil {
 		in.Error = Redact(o.err.Error())
 	}

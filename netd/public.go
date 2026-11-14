@@ -3,7 +3,7 @@ package netd
 // Public ingress (ADR-029): a node created with ObjectOptions.Public serves
 // the public internet over Funnel instead of the tailnet.
 //
-// CONTRACT (implemented in this file):
+// CONTRACT (implemented in public_serve.go):
 //
 //   - The node never listens on the tailnet (no IngressPort listener, no
 //     WhoIs). Its only listener comes from Config.PublicListen (default:
@@ -52,15 +52,18 @@ import (
 // PublicOptions make a node a public (Funnel) node.
 type PublicOptions struct {
 	// Routes and Upgrade are publicspec patterns (already validated).
-	Routes  []string
-	Upgrade []string
+	Routes  []string `json:"routes"`
+	Upgrade []string `json:"upgrade,omitempty"`
 	// Limits are the effective limits (publicspec.Limits.Effective()).
-	Limits publicspec.Limits
+	Limits publicspec.Limits `json:"limits"`
 	// DeliverTo is the netd object ID stamped as HeaderObject/objectId:
 	// the workload entry node this public node fronts.
-	DeliverTo string
+	DeliverTo string `json:"deliverTo"`
 	// Enabled opens the listener once the node is ready (`twd expose`).
-	Enabled bool
+	// It is persisted but NOT restored by a rejoin from saved state alone
+	// (Registry.Rejoin, or Create without Public): such a node comes back
+	// public but closed until SetPublicEnabled(id, true) (fail closed).
+	Enabled bool `json:"enabled"`
 }
 
 // PublicRequester is cf.tailscale.requester for a public request.
@@ -106,11 +109,3 @@ type IPCount struct {
 
 // PublicRejectWindow is how often rejected requests are summarized.
 const PublicRejectWindow = time.Minute
-
-// SetPublicEnabled opens or closes a public node's Funnel listener
-// (`twd expose on|off`). Closing aborts the node's public flows.
-func (r *Registry) SetPublicEnabled(id string, on bool) error {
-	return errNotImplemented
-}
-
-var errNotImplemented = newErr(CodeUpstreamUnavailable, "public ingress: not implemented")
