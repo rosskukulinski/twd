@@ -83,6 +83,58 @@ type Class struct {
 	// Arch is the image's architecture when the bundle states it ("" = not
 	// stated: any host offering containers; pinning at deploy fills it).
 	Arch string `json:"arch,omitempty"`
+	// Pins are what mgmt resolved every image reference to at deploy, per
+	// architecture (ADR-032 D3): a repository in twd's registry and an
+	// image manifest digest. Hosts pull exactly these and nothing else.
+	Pins []Pin `json:"pins,omitempty"`
+}
+
+// Pin is one image reference of a class, resolved once at deploy for one
+// architecture. Retagging the upstream ref later changes nothing: hosts
+// pull Repository@Digest from twd's registry.
+type Pin struct {
+	// Name is the class's image name (wrangler "images" key; "" = the
+	// default image).
+	Name string `json:"name,omitempty"`
+	// Ref is the reference as ctx.container sees it (the wrangler image,
+	// or the twd.local ref twd deploy built).
+	Ref  string `json:"ref"`
+	Arch string `json:"arch"`
+	// Repository is in twd's registry: "<tenantID>/…" or "public/…".
+	Repository string `json:"repository"`
+	// Digest is the linux/Arch image manifest (never an index).
+	Digest string `json:"digest"`
+	// From records what was resolved (an upstream ref and its digest, an
+	// alias target, a public base), for status and audit.
+	From string `json:"from,omitempty"`
+}
+
+// PinFor is the pin of ref for arch (nil: not pinned).
+func (c Class) PinFor(ref, arch string) *Pin {
+	for i := range c.Pins {
+		if c.Pins[i].Ref == ref && c.Pins[i].Arch == arch {
+			return &c.Pins[i]
+		}
+	}
+	return nil
+}
+
+// Named lists the class's images as (name, ref) pairs: the default image
+// first (name ""), then the named ones sorted; unbuilt ones have ref "".
+func (c Class) Named() [][2]string {
+	var out [][2]string
+	if c.Image != "" || len(c.Images) == 0 {
+		out = append(out, [2]string{"", c.Image})
+	}
+	names := make([]string, 0, len(c.Images))
+	for n := range c.Images {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		out = append(out, [2]string{n, c.Images[n]})
+	}
+	return out
 }
 
 // Resources is what one container of this class reserves.
