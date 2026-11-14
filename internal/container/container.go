@@ -21,18 +21,18 @@ type Resources struct {
 	DiskMiB int     `json:"diskMiB"`
 }
 
-// MilliVCPU is VCPU in thousandths (stores and sums use integers).
-func (r Resources) MilliVCPU() int64 { return int64(math.Round(r.VCPU * 1000)) }
+// MicroVCPU is VCPU in millionths (stores and sums use integers; 1/16 is exact).
+func (r Resources) MicroVCPU() int64 { return int64(math.Round(r.VCPU * 1e6)) }
 
 // Valid reports whether every dimension is positive and bounded.
 func (r Resources) Valid() bool {
-	return r.MilliVCPU() > 0 && r.VCPU <= 64 && r.MemMiB > 0 && r.MemMiB <= 1<<20 && r.DiskMiB >= 0 && r.DiskMiB <= 1<<22
+	return r.MicroVCPU() > 0 && r.VCPU <= 64 && r.MemMiB > 0 && r.MemMiB <= 1<<20 && r.DiskMiB >= 0 && r.DiskMiB <= 1<<22
 }
 
 // Fits reports whether r is within held (a restart may reuse a reservation
 // only for the same or a smaller container).
 func (r Resources) Fits(held Resources) bool {
-	return r.MilliVCPU() <= held.MilliVCPU() && r.MemMiB <= held.MemMiB && r.DiskMiB <= held.DiskMiB
+	return r.MicroVCPU() <= held.MicroVCPU() && r.MemMiB <= held.MemMiB && r.DiskMiB <= held.DiskMiB
 }
 
 // DefaultInstanceType is Cloudflare's default (containers/platform-details).

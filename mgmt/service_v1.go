@@ -26,6 +26,9 @@ type TenantPatch struct {
 	OAuthClientFile        *string
 	RegistrationsPerMinute *int
 	MaxObjects             *int
+	MaxContainers          *int
+	MaxContainerMemMiB     *int
+	MaxContainerVCPU       *float64
 	Pool                   *string
 	Tier                   *string
 	By                     string
@@ -82,6 +85,27 @@ func (m *Mgmt) UpdateTenant(ctx context.Context, id string, p TenantPatch) (Tena
 		}
 		t.MaxObjects = *p.MaxObjects
 		changed["maxObjects"] = t.MaxObjects
+	}
+	for _, q := range []struct {
+		name string
+		p    *int
+		dst  *int
+	}{{"maxContainers", p.MaxContainers, &t.MaxContainers}, {"maxContainerMemMiB", p.MaxContainerMemMiB, &t.MaxContainerMemMiB}} {
+		if q.p == nil {
+			continue
+		}
+		if *q.p <= 0 {
+			return Tenant{}, errf(400, "bad_request", "%s must be positive", q.name)
+		}
+		*q.dst = *q.p
+		changed[q.name] = *q.p
+	}
+	if p.MaxContainerVCPU != nil {
+		if *p.MaxContainerVCPU <= 0 {
+			return Tenant{}, errf(400, "bad_request", "maxContainerVCPU must be positive")
+		}
+		t.MaxContainerVCPU = *p.MaxContainerVCPU
+		changed["maxContainerVCPU"] = t.MaxContainerVCPU
 	}
 	if p.Pool != nil {
 		t.Pool = *p.Pool
