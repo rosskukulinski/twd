@@ -1432,3 +1432,12 @@ Run `e6d03b` (2026-11-08 23:56 PT) via `policy.ApplyWith` (additions only, valid
 - The interactive confirmation before the WIF login URL and the translation of a join-time tag refusal were exercised only by unit tests (no real browser login can be automated).
 - Not exercised for real: an OAuth client **without** `devices:core` (hermetic only), and a real `policy_missing_tag_owners` (would need breaking tailnet 1's policy); both covered hermetically.
 - `twd up` without `policy_file:read` can't check grants; it reports that and relies on the mints proving tag ownership. Without that scope `spawn()` answers `policy_unavailable` (same as WIF without a lifecycle credential).
+
+## Tier-aware placement (2026-11-13)
+
+- **Bug:** `pickHost` ignored `Host.Tiers`, and mgmt never read twd.jsonc `"tier"`. A `"tier": "microvm"` workload (or a tenant with default tier `microvm`) could be placed on a process-only host. hostd's `tierFor` then **fell back to the process tier with only a log warning**: a silent isolation downgrade on mixed clusters.
+- **Fix (`mgmt/service.go`):** `placementTier` = twd.jsonc `"tier"`, else the tenant's `tier`. `process` and `runtime: "node"` place anywhere. Eligible hosts are live, in the tenant's pool and list the tier (a host listing no tiers is process-only). Ties on free capacity go to the lower host ID (deterministic across replicas).
+  - No eligible host → `503 no_host` naming the missing tier and the fix (`sudo twd host setup --microvm`).
+  - `--host` without the tier, or a live lease holder without the tier the workload now asks for → new `409 tier_unavailable` with the fix (`twd undeploy` then deploy, or pick another host). Stickiness never keeps a workload on the wrong tier.
+- **Tests:** `mgmt/tier_test.go` (`TestPlacementTier` 10 cases, `TestPlacementTierStickyHolder`). `make test`, `make lint`, `make test-pg`: PASS.
+- **Not changed:** hostd's fallback (`hostd/workload.go` `tierFor`) still downgrades with a warning when a microvm assignment reaches a host without a VM backend (e.g. the backend vanished after registration, or `twd dev`). Making it refuse is a follow-up.

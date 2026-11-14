@@ -608,6 +608,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	classes := r.Namespaces
 	maxLive, maxDepth := DefaultMaxLive, DefaultMaxDepth
 	var pub *DeploymentPublic
+	tier := placementTier(t, nil)
 	if len(r.Bundle) > 0 {
 		cfg, err := BundleConfig(r.Bundle)
 		if err != nil && len(classes) == 0 {
@@ -620,6 +621,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 			if err := checkPublicDeploy(t, r.Workload, pub); err != nil {
 				return resp, err
 			}
+			tier = placementTier(t, cfg)
 			if len(classes) == 0 {
 				classes = cfg.Classes()
 			} else if len(cfg.Tailnet.Tags) > 0 && !slices.ContainsFunc(classes, func(c ClassConfig) bool { return c.Class == WorkloadNamespace }) {
@@ -647,7 +649,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 			}
 		}
 	}
-	host, err := m.pickHost(ctx, t, r.Workload, r.Host)
+	host, err := m.pickHost(ctx, t, r.Workload, r.Host, tier)
 	if err != nil {
 		return resp, err
 	}
@@ -828,9 +830,38 @@ func (m *Mgmt) leaseHeldError(ctx context.Context, name, workload string) *Error
 	return e
 }
 
-// pickHost: MVP is a single host per tenant namespace. Keep the current
-// live lease holder; otherwise the live host with the most free capacity.
-func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want string) (string, error) {
+// placementTier is the tier a host must offer to run the deployment: the
+// bundle's twd.jsonc "tier", else the tenant's default. "" means any host
+// (every host offers the process tier). Node apps always run in the process
+// tier (the microVM guest has no Node.js).
+func placementTier(t Tenant, cfg *TwdConfig) string {
+	tier := t.Tier
+	if cfg != nil {
+		if cfg.Runtime == "node" {
+			return ""
+		}
+		if cfg.Tier != "" {
+			tier = cfg.Tier
+		}
+	}
+	if tier == "process" {
+		return ""
+	}
+	return tier
+}
+
+// offersTier reports whether h can run a workload that needs tier ("" =
+// any). Hosts list their tiers at registration; one that lists none is
+// treated as process-only.
+func (h Host) offersTier(tier string) bool {
+	return tier == "" || slices.Contains(h.Tiers, tier)
+}
+
+// pickHost: MVP is a single host per tenant namespace. Eligible hosts are
+// live, in the tenant's pool and offer the deployment's tier. Keep the
+// current live lease holder; otherwise the eligible host with the most free
+// capacity.
+func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want, tier string) (string, error) {
 	now := m.now()
 	hosts, err := m.store.ListHosts(ctx, Page{})
 	if err != nil {
@@ -843,29 +874,50 @@ func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want string) (s
 		}
 	}
 	if want != "" {
-		if _, ok := live[want]; !ok {
+		h, ok := live[want]
+		if !ok {
 			return "", errf(503, "no_host", "host %q is not live (no heartbeat within %v)", want, HostLeaseTTL)
+		}
+		if !h.offersTier(tier) {
+			return "", errf(409, "tier_unavailable", "host %q does not offer the %q tier (it offers %s); deploy without --host, or pick a host set up with `sudo twd host setup --microvm`", want, tier, tierList(h))
 		}
 		return want, nil
 	}
 	if l, err := m.store.GetLease(ctx, LeaseName(t.ID, workload)); err == nil && l.Holder != "" {
-		if _, ok := live[l.Holder]; ok {
+		if h, ok := live[l.Holder]; ok {
+			if !h.offersTier(tier) {
+				return "", errf(409, "tier_unavailable", "workload %q runs on host %s, which does not offer the %q tier it now asks for (the host offers %s); run `twd undeploy %s`, then deploy again to place it on a host with that tier", workload, h.ID, tier, tierList(h), workload)
+			}
 			return l.Holder, nil
 		}
 	}
-	best, bestFree := "", -1<<62
+	best, bestFree, others := "", -1<<62, 0
 	for _, h := range hosts {
 		if _, ok := live[h.ID]; !ok {
 			continue
 		}
-		if free := h.CapacityNodes - h.LiveNodes; free > bestFree {
+		if !h.offersTier(tier) {
+			others++
+			continue
+		}
+		if free := h.CapacityNodes - h.LiveNodes; free > bestFree || free == bestFree && h.ID < best {
 			best, bestFree = h.ID, free
 		}
 	}
 	if best == "" {
+		if tier != "" && others > 0 {
+			return "", errf(503, "no_host", "no live host offers the %q tier (%d live host(s) offer only other tiers); set one up with `sudo twd host setup --microvm`, or deploy with \"tier\": \"process\"", tier, others)
+		}
 		return "", errf(503, "no_host", "no live host (register twd-hostd and heartbeat first)")
 	}
 	return best, nil
+}
+
+func tierList(h Host) string {
+	if len(h.Tiers) == 0 {
+		return "none listed (process only)"
+	}
+	return strings.Join(h.Tiers, ", ")
 }
 
 // Assignment is one GET /v0/hosts/{id}/assignments entry. Tailnet,

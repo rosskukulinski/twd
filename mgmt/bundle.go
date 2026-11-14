@@ -19,7 +19,12 @@ import (
 
 // TwdConfig is the part of twd.jsonc mgmt reads.
 type TwdConfig struct {
-	// Runtime is "" / "workerd" or "node" (public ingress is workerd-only in v1).
+	// Tier is the requested isolation tier ("process", "microvm"; "" = the
+	// tenant's default). Placement only sends a workload to hosts that offer
+	// its tier.
+	Tier string `json:"tier"`
+	// Runtime is "" / "workerd" or "node" (Node apps always run in the
+	// process tier; public ingress is workerd-only in v1).
 	Runtime string `json:"runtime"`
 	// Public is twd.jsonc "public" (ADR-029): path prefixes reachable from
 	// the public internet over Funnel. nil: tailnet-only.
