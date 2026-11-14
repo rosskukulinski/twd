@@ -1,4 +1,4 @@
-//go:build !linux
+//go:build !linux && !darwin
 
 package main
 
@@ -9,10 +9,12 @@ import (
 )
 
 type vmOptions struct {
-	kernel, rootfs, firecracker, jailer, helper, hugePages string
-	memMiB, vcpus                                          int
+	kernel, rootfs, firecracker, jailer, helper, hugePages, containerKernel, vzVMM string
+	memMiB, vcpus                                                                  int
+	rosetta                                                                        bool
 }
 
-// vmBackend: the microVM tier needs Linux + KVM; on this OS every workload
-// runs in the process tier.
+// vmBackend: the microVM tier needs Linux + KVM or macOS; this OS offers the
+// process tier only, and microvm deployments are refused (tier_unavailable),
+// never downgraded.
 func vmBackend(vmOptions, *slog.Logger) sandbox.Backend { return nil }

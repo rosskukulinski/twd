@@ -191,12 +191,28 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 			c.Tags = ns.Tags
 		}
 	}
+	// Container classes as mgmt resolved them at deploy (ADR-032 D3): the
+	// image refs the polyfill passes and their per-arch pins. A class the
+	// bundle doesn't declare is ignored.
+	for _, c := range a.Containers {
+		if _, ok := app.Containers[c.Class]; ok {
+			app.Containers[c.Class] = c
+		}
+	}
 	w.mu.Lock()
 	w.tenant, w.epoch = t, a.Epoch
 	if w.app == nil {
 		w.app = app
 	}
 	w.mu.Unlock()
+
+	// Refuse a tier this host can't run before anything of the workload
+	// starts (no node, no workerd).
+	tier, err := h.tierFor(app, t)
+	if err != nil {
+		w.fail(a.DeploymentID, err)
+		return
+	}
 
 	// The workload entry node (async; requests wait for it).
 	wl, err := h.ensure(ctx, w, "", w.name, nil, nil, "")
@@ -208,7 +224,6 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	w.wl = wl
 	w.mu.Unlock()
 
-	tier := h.tierFor(app, t)
 	if tier == bundle.TierProcess {
 		// RT-08: a Node app on a host with NO process sandbox has fully
 		// cooperative egress (raw sockets bypass the proxy); on a host that
@@ -368,6 +383,12 @@ func (h *Host) undeploy(w *workload, reason string) {
 	if inst != nil {
 		inst.stop()
 	}
+	// The workload's containers stop with it: on a fence (ADR-028) the
+	// parent must not run here any more, and neither may its containers
+	// (two live copies under one identity). No grace: VMM SIGKILL.
+	if n := h.ctr.destroyWhere(func(k ctrKey) bool { return k.tenant == w.tenantID && k.workload == w.name }, "workload stopped: "+reason, 0); n > 0 {
+		h.log.Warn("workload's containers destroyed", "workload", w.name, "n", n, "reason", reason)
+	}
 	if t == nil {
 		return
 	}
@@ -398,8 +419,12 @@ type instance struct {
 	res     *gen.Result
 	ingress http.Handler
 	direct  *http.Client
-	tier    string // bundle.TierProcess | bundle.TierMicroVM
-	spec    sandbox.Spec
+	// icOnce/ic: the client delivering intercepted container requests
+	// (direct's dialer; no timeout, no transparent compression).
+	icOnce sync.Once
+	ic     *http.Client
+	tier   string // bundle.TierProcess | bundle.TierMicroVM
+	spec   sandbox.Spec
 	// doStorage is the workload's DO storage (process tier), under its
 	// tenant's dir; profile is the Seatbelt profile it runs under, if any.
 	doStorage string
@@ -426,12 +451,15 @@ type instance struct {
 }
 
 // tierFor picks a deployment's isolation tier: the bundle's twd.jsonc
-// "tier", else the tenant's, else the host default. microvm falls back to
-// process (with a warning) when this host has no microVM backend (macOS, no
-// KVM, not root).
-func (h *Host) tierFor(app *bundle.App, t *tenant) string {
+// "tier", else the tenant's, else the host default. It never downgrades: a
+// microvm deployment on a host without a microVM backend (macOS, no KVM, the
+// backend gone since registration) is refused with tier_unavailable, which
+// the host reports to mgmt as the deployment's error (ADR-032 D5b). The one
+// exception is explicit local development (Config.ForceProcessTier, twd
+// dev), which runs everything in the process tier and says so.
+func (h *Host) tierFor(app *bundle.App, t *tenant) (string, error) {
 	if app.Runtime == bundle.RuntimeNode {
-		return bundle.TierProcess // the microVM guest has no Node.js (see STATUS.md M9)
+		return bundle.TierProcess, nil // the microVM guest has no Node.js (see STATUS.md M9)
 	}
 	tier := app.Tier
 	if tier == "" && t != nil {
@@ -440,14 +468,26 @@ func (h *Host) tierFor(app *bundle.App, t *tenant) string {
 	if tier == "" {
 		tier = h.cfg.DefaultTier
 	}
-	if tier == bundle.TierMicroVM && h.cfg.VM == nil {
-		h.log.Warn("microvm tier requested but this host has no microVM backend; using the process tier", "app", app.Name)
-		tier = bundle.TierProcess
-	}
 	if tier != bundle.TierMicroVM {
-		tier = bundle.TierProcess
+		return bundle.TierProcess, nil
 	}
-	return tier
+	if h.cfg.ForceProcessTier {
+		h.log.Info("microvm tier requested; running it in the process tier (ForceProcessTier: explicit local development)", "app", app.Name)
+		return bundle.TierProcess, nil
+	}
+	if h.cfg.VM == nil {
+		return "", errTierUnavailable(app.Name)
+	}
+	return bundle.TierMicroVM, nil
+}
+
+// errTierUnavailable refuses a microvm deployment on a host that can't run
+// microVMs. It is never run in the process tier instead: the workload asked
+// for VM isolation (ADR-032 D5b).
+func errTierUnavailable(app string) *apiError {
+	return &apiError{Code: "tier_unavailable", Detail: fmt.Sprintf(
+		"%q asks for the microvm tier, but this host has no microVM backend (Linux with KVM and twd-vmhelper); it is not run in the process tier instead. "+
+			"Set the tier up here (`sudo twd host setup --microvm`, then restart twd-hostd), deploy to a host that offers it, or set \"tier\": \"process\" in twd.jsonc", app)}
 }
 
 func (h *Host) startInstance(w *workload, depID string, app *bundle.App, tier string) (*instance, error) {
@@ -900,6 +940,20 @@ func (inst *instance) admin(twd map[string]any) (int, []byte) {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return resp.StatusCode, b
+}
+
+// interceptClient sends intercepted container requests to the platform
+// (ADR-032 D4). Like direct, but streaming: no overall timeout, no
+// redirects followed, bodies passed through unchanged.
+func (inst *instance) interceptClient() *http.Client {
+	inst.icOnce.Do(func() {
+		tr := &http.Transport{DisableCompression: true, ResponseHeaderTimeout: 5 * time.Minute}
+		if t, ok := inst.direct.Transport.(*http.Transport); ok {
+			tr.DialContext = t.DialContext
+		}
+		inst.ic = &http.Client{Transport: tr, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	})
+	return inst.ic
 }
 
 func (inst *instance) drain(timeout time.Duration) {

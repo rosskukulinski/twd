@@ -454,6 +454,12 @@ func (h *Host) killLocal(objectID, reason string) {
 			inst.admin(map[string]any{"kind": "admin", "op": "kill", "class": o.Class, "name": o.Name, "reason": reason})
 		}
 	}
+	if o.Class != "" {
+		// Its container goes with it (ADR-032 D2): VMM SIGKILL, no grace.
+		if h.ctr.destroy(ctrKey{o.TenantID, o.Workload, o.Class, o.Name}, "object killed: "+trimReason(reason), 0) {
+			h.log.Info("object's container destroyed", "object", o.ID)
+		}
+	}
 	h.audit.add(mgmtapi.AuditRecord{ObjectID: o.ID, Kind: "kill", Detail: mgmtapi.Note(reason), TraceID: newTraceID()})
 	h.saveObjects()
 	h.log.Info("object killed", "object", o.ID, "reason", reason, "ms", time.Since(st).Milliseconds())

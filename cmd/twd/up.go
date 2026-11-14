@@ -1094,6 +1094,11 @@ type statusResult struct {
 	Workloads  []hostd.WorkloadStatus `json:"workloads"`
 	Objects    map[string]int         `json:"objectsByStatus"`
 	Healthy    bool                   `json:"healthy"`
+	// Containers (ADR-032): this host's containers, mgmt's reservations
+	// and every host's capacity vector and usage.
+	Containers   []hostd.ContainerStatus     `json:"containers,omitempty"`
+	Reservations []mgmt.ContainerReservation `json:"containerReservations,omitempty"`
+	Capacity     []hostCapacity              `json:"hostCapacity,omitempty"`
 }
 
 func cmdStatus(args []string) error {
@@ -1170,6 +1175,10 @@ func cmdStatus(args []string) error {
 		}
 		r.Tenants = append(r.Tenants, ts)
 	}
+	r.Containers = hv.Containers
+	if r.Mgmt {
+		r.Capacity, r.Reservations = containerState(ctx, s.mgmt(), "")
+	}
 	r.Healthy = r.Supervisor && r.Mgmt && r.Host
 	emit(f, r, func() {
 		mark := func(ok bool) string {
@@ -1207,6 +1216,7 @@ func cmdStatus(args []string) error {
 			}
 			fmt.Printf("%s workload    %s %s (tenant %s, %s, epoch %d, %d requests%s)%s\n", mark(w.Status == "active"), w.Workload, w.Status, w.TenantID, w.DeploymentID, w.Epoch, w.Requests, sb, e)
 		}
+		printContainers(r.Capacity, r.Reservations, r.Containers, hv.ImageCacheBytes)
 	})
 	if !r.Healthy {
 		return fail("unhealthy", "twd is not healthy in "+s.Dir).withFix("twd logs --component supervisor", "twd up")
@@ -1240,7 +1250,9 @@ func remoteStatus(f *flags, s *state) error {
 			live++
 		}
 	}
-	res := map[string]any{"linked": s.Link, "whoami": w, "hosts": hosts, "tenants": tenants, "healthy": live > 0}
+	capv, resv := containerState(ctx, s.mgmt(), "")
+	res := map[string]any{"linked": s.Link, "whoami": w, "hosts": hosts, "tenants": tenants, "healthy": live > 0,
+		"hostCapacity": capv, "containerReservations": resv}
 	emit(f, res, func() {
 		fmt.Printf("twd status · linked to %s · tailnet %s · you are %s (admin by WhoIs)\n", s.Link.Endpoint, w.Mgmt.Tailnet, w.Actor)
 		for _, h := range hosts {
@@ -1257,9 +1269,18 @@ func remoteStatus(f *flags, s *state) error {
 				if d.DeployedBy != "" {
 					by = " · by " + d.DeployedBy
 				}
+				if d.Error != "" {
+					by += " · " + d.Error
+				}
 				fmt.Printf("  workload    %s %s · http://%s/%s\n", d.Workload, d.Status, d.Endpoint.MagicDNS, by)
+				for _, c := range d.Containers {
+					for _, p := range c.Pins {
+						fmt.Printf("    image     %s %s linux/%s → %s@%s\n", c.Class, p.Ref, p.Arch, p.Repository, p.Digest)
+					}
+				}
 			}
 		}
+		printContainers(capv, resv, nil, 0)
 	})
 	if live == 0 {
 		return fail("unhealthy", "no live host at "+s.Link.Endpoint).withFix("twd status on the host")
@@ -1289,6 +1310,9 @@ func tierLine(s *state) string {
 		sb = "Seatbelt, dev-grade isolation"
 	}
 	if runtime.GOOS == "darwin" {
+		if slices.Contains(hv.Tiers, "microvm") {
+			return "tiers: process [" + sb + "], microvm [Virtualization.framework, one VMM + VM service per guest, via " + hv.VMVia + "; \"tier\": \"microvm\" in twd.jsonc]"
+		}
 		return "tier: process [" + sb + "]"
 	}
 	if slices.Contains(hv.Tiers, "microvm") {

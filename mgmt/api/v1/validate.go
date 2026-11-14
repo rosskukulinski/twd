@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/getkin/kin-openapi/openapi3filter"
@@ -105,6 +106,12 @@ func (v *Validator) ValidateResponse(r *http.Request, route *routers.Route, path
 func (v *Validator) Middleware(report func(error)) func(http.Handler) http.Handler {
 	return func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/") {
+				// The OCI registry: an external spec (tag "registry",
+				// excluded from generation and from the embedded spec).
+				h.ServeHTTP(w, r)
+				return
+			}
 			route, pathParams, err := v.router.FindRoute(r)
 			if err != nil {
 				report(fmt.Errorf("%s %s: not in the spec: %w", r.Method, r.URL.Path, err))

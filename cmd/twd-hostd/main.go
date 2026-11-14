@@ -26,7 +26,9 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd"
+	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd"
@@ -69,7 +71,7 @@ func run() error {
 		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
 		tsnetLogs  = flag.Bool("tsnet-logs", false, "forward tsnet logs at debug level")
 		tier       = flag.String("default-tier", "process", "tier for deployments and tenants that name none: process | microvm")
-		vmKernel   = flag.String("vm-kernel", vmAsset(home, "vmlinux"), "microVM tier: guest kernel (Linux only)")
+		vmKernel   = flag.String("vm-kernel", vmAsset(home, "vmlinux"), "microVM tier: guest kernel (Firecracker on Linux, Virtualization.framework on macOS)")
 		vmRootfs   = flag.String("vm-rootfs", vmAsset(home, "rootfs.ext4"), "microVM tier: guest image from guest/build-image.sh")
 		vmHelper   = flag.String("vm-helper", helperapi.DefaultSocket, "microVM tier: twd-vmhelper socket (sudo twd host setup --microvm)")
 		vmFC       = flag.String("firecracker", "/usr/local/bin/firecracker", "microVM tier, as root without the helper service: firecracker binary")
@@ -78,12 +80,28 @@ func run() error {
 		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
 		vmCPUs     = flag.Int("vm-vcpus", 2, "microVM tier: guest vCPUs")
 		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
+		vzVMM      = flag.String("vz-vmm", "", "microVM tier on macOS: the twd-vz VMM, signed with the virtualization entitlement (default: next to twd-hostd)")
+		vmRosetta  = flag.Bool("vm-rosetta", false, "microVM tier on macOS (Apple silicon): share Rosetta for Linux into guests so x86_64 binaries run")
 		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd/Node sandbox: auto (seatbelt on macOS, landlock on Linux) | seatbelt | landlock | none")
 		insecureSH = flag.Bool("insecure-shared-host", false, "without a process sandbox, still run process-tier workloads of more than one tenant (tenants are NOT isolated from each other)")
 		sbDeny     = flag.String("sandbox-deny", "", "comma-separated extra paths no workerd may read, write or connect to (twd up: its state and run dirs)")
 		nodeBin    = flag.String("node", "", "Node process tier (runtime \"node\"): node binary (default: $TWD_NODE, or node on PATH)")
 		tokenFile  = flag.String("mgmt-token-file", filepath.Join(home, ".twd", "hostd", "mgmt.token"), "per-host token file minted by twd-mgmt (sent as Twd-Host-Token on the unix socket; \"\" = none)")
 		siblings   = flag.Bool("allow-sibling-egress", false, "let objects reach other objects hosted here over the tailnet (hairpin; single-host tests/demos)")
+		ctrOff     = flag.Bool("no-containers", false, "don't offer containers (ctx.container) even with a microVM backend")
+		ctrKernel  = flag.String("vm-container-kernel", "", "containers: guest kernel with erofs (guest/build-kernel.sh; default -vm-kernel)")
+		ctrCache   = flag.String("container-image-cache", "", "containers: converted image cache (default <data-dir>/images)")
+		ctrImages  = flag.String("container-image-dir", "", "containers: dir of image tarballs with an images.json index (tests and hosts without a registry; deployments with pinned images pull from mgmt's registry instead)")
+		ctrPublic  = flag.String("container-public-images", "", "containers: comma-separated image refs cached once for all tenants (public bases; -container-image-dir only: pinned images take their scope from the pin)")
+		ctrImgMB   = flag.Int64("container-image-max-mib", image.DefaultMaxImageBytes>>20, "containers: cap on one image's uncompressed layers while converting it (also 128 layers, 1 Mi entries); an image over it fails to convert")
+		ctrCacheMB = flag.Int64("container-image-cache-max-mib", 0, "containers: cap on the converted image cache; past it the least recently used images not in use are removed (0 = no cap)")
+		ctrIdle    = flag.Duration("container-idle", hostd.DefaultContainerIdle, "containers: default inactivity timeout (setInactivityTimeout overrides, ≤ 6 h)")
+		ctrMaxLife = flag.Duration("container-max-lifetime", hostd.DefaultContainerMaxLife, "containers: hard max lifetime of a container")
+		ctrGrace   = flag.Duration("container-stop-grace", hostd.DefaultContainerGrace, "containers: cap on destroy()'s SIGTERM → SIGKILL grace")
+		ctrMax     = flag.Int("container-max", 0, "containers: max running on this host (0 = unlimited)")
+		ctrMemMiB  = flag.Int("container-mem-mib", 0, "containers: max total guest memory on this host (0 = unlimited)")
+		ctrVCPU    = flag.Float64("container-vcpu", 0, "containers: max total vCPU on this host (0 = unlimited)")
+		ctrInet    = flag.String("container-internet", "direct", "containers: how start({enableInternet}) reaches a workload's egress.internet hosts: direct (this host's network, public addresses only) or off")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -155,9 +173,50 @@ func run() error {
 		HeartbeatEvery: *hb, FenceAfter: *fenceAfter, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
 		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH, AllowSiblingEgress: *siblings,
-		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB,
+		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB, VMMemMiB: *vmMem, VMVCPUs: *vmCPUs,
 		VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, jailer: *vmJailer, helper: *vmHelper,
-			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)}
+			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge, containerKernel: *ctrKernel, vzVMM: *vzVMM, rosetta: *vmRosetta}, log),
+		ContainerIdle: *ctrIdle, ContainerMaxLife: *ctrMaxLife, ContainerGrace: *ctrGrace,
+		ContainerCapacity: hostd.ContainerCapacity{Max: *ctrMax, MemMiB: *ctrMemMiB, VCPU: *ctrVCPU}}
+	// Containers (ADR-032) run on the microVM backend; without it this host
+	// offers none (start() fails with tier_unavailable, no fallback).
+	if cb, ok := hcfg.VM.(sandbox.ContainerBackend); ok && hcfg.VM != nil && !*ctrOff {
+		// Images pinned at deploy are pulled from mgmt's registry over the
+		// same connection as the API (ADR-032 D3: never from Docker Hub).
+		st := &image.Store{Dir: *ctrCache, Aliases: image.DefaultAliases, Public: map[string]bool{},
+			Puller: image.RegistryPuller{Client: mc.OCI()}, MaxBytes: *ctrCacheMB << 20, Limits: image.Limits{MaxBytes: *ctrImgMB << 20}}
+		if *ctrCache == "" {
+			st.Dir = filepath.Join(*dataDir, "images")
+		}
+		if *ctrImages != "" {
+			st.Sources = append(st.Sources, image.DirSource{Dir: *ctrImages})
+		}
+		for _, r := range splitList(*ctrPublic) {
+			st.Public[image.NormalizeRef(r)] = true
+		}
+		// vz with Rosetta for Linux runs linux/amd64 images as they are
+		// (ADR-032 D7): the stock cloudflare/sandbox images, so no arm64
+		// alias substitution.
+		if em, ok := cb.(interface{ EmulatedArches() []string }); ok && len(em.EmulatedArches()) > 0 {
+			st.Emulated, st.Aliases = em.EmulatedArches(), nil
+			log.Info("containers: emulated image arches (no alias map)", "arches", st.Emulated)
+		}
+		// Offer containers only when they can actually run here (the host
+		// advertises the "containers" tier from this; ADR-032 D5).
+		if err := containersUsable(cb, st); err != nil {
+			log.Info("containers unavailable on this host; not offered", "reason", err)
+		} else {
+			hcfg.Containers, hcfg.Images = cb, st
+			log.Info("containers available", "image_cache", st.Dir, "image_dir", *ctrImages, "idle", *ctrIdle, "max_life", *ctrMaxLife, "internet", *ctrInet)
+		}
+	}
+	switch *ctrInet {
+	case "direct":
+		hcfg.ContainerInternet = hostd.DirectInternet()
+	case "off":
+	default:
+		return fmt.Errorf("-container-internet %q: want direct or off", *ctrInet)
+	}
 	if pushLn != nil {
 		hcfg.PushListener, hcfg.PushPort = pushLn, *pushPort
 	}
@@ -320,4 +379,15 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// containersUsable: the container backend can boot guests here (helper,
+// kernel with erofs) and the image store can convert images (mkfs.erofs).
+func containersUsable(cb sandbox.ContainerBackend, st *image.Store) error {
+	if u, ok := cb.(interface{ ContainersUsable() error }); ok {
+		if err := u.ContainersUsable(); err != nil {
+			return err
+		}
+	}
+	return st.Check()
 }

@@ -181,7 +181,7 @@ func doctorLinuxHost(run func(string, func() (string, string, string)), s *state
 	// /dev/kvm and runs the jailer, so the user needs neither kvm access nor
 	// root). While twd runs, that twd-hostd offers the tier and every
 	// microVM workload is jailed. A warn, never a failure: microvm
-	// deployments fall back to the process tier.
+	// deployments are refused (tier_unavailable), never run in the process tier.
 	run("microvm_tier", func() (string, string, string) {
 		st, d, fix := doctorMicroVM(s)
 		if !cg2 {

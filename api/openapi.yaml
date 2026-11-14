@@ -132,6 +132,27 @@ tags:
     description: Hash-chained, append-only audit log.
   - name: volumes
     description: dm-crypt data keys for DO volumes (microVM tier).
+  - name: containers
+    description: Container and code-sandbox reservations against tenant quotas (microVM tier, ADR-032).
+  - name: images
+    description: Container images (ADR-032 D3) — public base images shared across tenants, and the arm64 alias map.
+  - name: registry
+    description: |
+      twd's OCI distribution registry (ADR-032 D3), served by twd-mgmt at `/v2/` on the same listeners
+      and behind the same WhoIs gate as `/v1`. Its wire protocol is the external OCI Distribution Spec v1.1
+      (push and pull subset); these entries document the routes and the roles twd enforces, and are
+      excluded from code generation (the registry is hand-written: `internal/registry`).
+
+      - `{name}` is a repository and may contain `/`: `<tenantID>/<path>` (one namespace per tenant) or
+        `public/<path>` (operator base images and alias targets).
+      - **admins** push and pull every namespace; **hosts** only pull, and only `public/…` and the
+        namespaces of tenants they hold a deployment of (`403 DENIED` otherwise).
+      - Blobs are content-addressed and stored once, but visible only through a repository they were
+        pushed or mirrored into: another namespace answers `404 BLOB_UNKNOWN` exactly as for absent
+        content, cross-namespace mounts are refused, and a manifest may only reference content already
+        in its own repository.
+      - Errors are the spec's `{"errors": [{code, message}]}`; the body also carries twd's `code`
+        (`forbidden`, `not_found`, `bad_request`) and `Twd-Error`.
   - name: operational
     description: Health, status, identity, maintenance.
   - name: oidc
@@ -1387,6 +1408,385 @@ paths:
         "409": { $ref: "#/components/responses/LeaseLost" }
         default: { $ref: "#/components/responses/Error" }
 
+  # ------------------------------------------------------------- containers
+  /v1/container-reservations:
+    post:
+      tags: [containers]
+      operationId: CreateContainerReservation
+      summary: Reserve quota for a container before it starts
+      description: |
+        hostd calls this synchronously at `ctx.container.start()`, after its
+        own capacity check (`503 capacity_exhausted` is hostd's, never
+        mgmt's) and before it boots the container's VM. Only the host holding
+        the workload's lease at `epoch` may reserve (`409 lease_lost`).
+
+        The key is `(tenantID, workload, class, object)`: one container per
+        DO instance (ADR-032 D2). Reserving a key that already holds a
+        reservation is **idempotent** (`200`, the same `reservationID`; a
+        larger container re-checks the quota for the difference), so a
+        restart never needs new headroom, and a host that took the workload
+        over adopts the key. A new key is checked atomically, in the store,
+        against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+        and `maxContainerVCPU`, and the class's `max_instances` from the
+        deployment: over any of them is `429 container_quota_exceeded`
+        (`missing: {quota, limit, used, requested}`). Containers are not
+        objects: they count against neither `maxObjects` nor a host's
+        `capacityNodes`.
+
+        hostd **fails closed** when mgmt is unreachable: no reservation, no
+        start, except a restart of a container whose reservation it already
+        holds. Released by `DELETE` on stop; a reservation that no heartbeat
+        reports (`HostStatus.containers`) for 30 s after its creation is
+        released by mgmt, and one whose host stopped reporting it for 2 min no
+        longer counts, both on the store clock. Audited
+        (`kind: container_reserve`).
+      x-twd-role: host
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ContainerReservationCreate" }
+            example:
+              tenantID: tn_tail7906d5
+              workload: agent
+              class: Sandbox
+              object: my-sandbox
+              epoch: 3
+              resources: { vcpu: 0.0625, memMiB: 256, diskMiB: 2000 }
+      responses:
+        "201":
+          description: Reserved.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContainerReservation" }
+        "200":
+          description: The key already held a reservation (restart, or a takeover by the lease holder); it is returned, renewed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContainerReservation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: Unknown tenant (`unknown_tenant`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409": { $ref: "#/components/responses/LeaseLost" }
+        "429":
+          description: Over a container quota (`container_quota_exceeded`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: container_quota_exceeded
+                message: "tenant tn_tail7906d5 runs 10 containers (maxContainers 10)"
+                missing: { quota: maxContainers, limit: 10, used: 10, requested: 1 }
+                doc_url: https://twd.dev/errors/container_quota_exceeded
+                trace_id: 7f3a…
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [containers]
+      operationId: ListContainerReservations
+      summary: List container reservations
+      description: Hosts see their own reservations only.
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: tenant
+          in: query
+          schema: { type: string }
+        - name: host
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: One page of reservations, ordered by `(createdAt, reservationID)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContainerReservationPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/container-reservations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/reservationID"
+    delete:
+      tags: [containers]
+      operationId: DeleteContainerReservation
+      summary: Release a container reservation (the container stopped)
+      description: |
+        Only the holding host (or an admin) may release it (`403 forbidden`).
+        Idempotent from the host's side: `404` means it is already gone.
+        Audited (`kind: container_release`).
+      x-twd-role: host|admin
+      x-twd-audit: true
+      responses:
+        "204":
+          description: Released.
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------- images
+  /v1/images/public:
+    get:
+      tags: [images]
+      operationId: ListPublicImages
+      summary: List public base images
+      description: |
+        Operator-marked public bases (ADR-032 D3): images every tenant's deploy may pin without a
+        per-tenant mirror, and every host caches once for all tenants (hostd's `public` cache
+        scope). Everything else is cached per tenant, so a cache hit never tells one tenant which
+        images another uses.
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+      responses:
+        "200":
+          description: One page of public images, ordered by `(createdAt, id)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicImagePage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+    post:
+      tags: [images]
+      operationId: CreatePublicImage
+      summary: Mark an image as a public base (mirrors it now)
+      description: |
+        `twd image public add <ref>`. An upstream ref (`docker.io/cloudflare/sandbox:0.12.14`) is
+        mirrored now through mgmt's egress into `public/<registry>/<repository>` and pinned by digest
+        for each arch (default: every linux amd64/arm64 image it has); a `twd.local/<name>` ref names
+        an image already pushed to `public/<name>` (`twd image push`). Re-adding refreshes the
+        digest; deployments already pinned keep theirs. Audited (`kind: image_public`).
+      x-twd-role: admin
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PublicImageCreate" }
+            example: { ref: "docker.io/cloudflare/sandbox:0.12.14", arches: [amd64] }
+      responses:
+        "201":
+          description: Marked; one entry per arch.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PublicImageList" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: This mgmt has no registry, or does not mirror (`registry_unavailable`, `mirror_disabled`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "502":
+          description: The upstream image could not be mirrored (`image_unavailable`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/images/public/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Public image entry ID (`pi_…`).
+        schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
+    delete:
+      tags: [images]
+      operationId: DeletePublicImage
+      summary: Unmark a public base image
+      description: "New deploys then mirror the ref into each tenant's namespace; pinned deployments keep pulling what they pinned. Audited (`kind: image_public`)."
+      x-twd-role: admin
+      x-twd-audit: true
+      responses:
+        "204":
+          description: Unmarked.
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/images/aliases:
+    get:
+      tags: [images]
+      operationId: ListImageAliases
+      summary: The image alias map
+      description: |
+        Upstream refs swapped for another image on one arch (ADR-032 D3: Cloudflare publishes
+        `cloudflare/sandbox` for linux/amd64 only; arm64 hosts get twd's rebuild from the Apache-2.0
+        source, in `public/`). Deploys apply it when pinning; `twd deploy` applies it as BuildKit named
+        contexts when it builds a Dockerfile, so app source never changes.
+      x-twd-role: admin|host
+      responses:
+        "200":
+          description: The aliases.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ImageAliasList" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  # ------------------------------------------------------------ registry (OCI distribution, external spec)
+  /v2/:
+    get:
+      tags: [registry]
+      operationId: RegistryBase
+      summary: OCI API version check
+      description: "`200 {}` with `Docker-Distribution-API-Version: registry/2.0` (clients probe it before pushing or pulling). Authentication is WhoIs on the connection: there is no token challenge."
+      x-twd-role: admin|host
+      responses:
+        "200": { description: The registry speaks the distribution API and admits the caller. }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /v2/{name}/manifests/{reference}:
+    parameters:
+      - $ref: "#/components/parameters/repositoryName"
+      - name: reference
+        in: path
+        required: true
+        description: A tag or a `sha256:` digest.
+        schema: { type: string }
+    get:
+      tags: [registry]
+      operationId: RegistryGetManifest
+      summary: Pull a manifest or index (by tag or digest)
+      description: "`Content-Type` is the manifest's media type; `Docker-Content-Digest` its digest. `HEAD` answers the same headers without the body."
+      x-twd-role: admin|host
+      responses:
+        "200": { description: The manifest bytes, exactly as pushed. }
+        "403": { description: "`DENIED`: a host pulling a tenant namespace it serves no deployment of." }
+        "404": { description: "`MANIFEST_UNKNOWN`." }
+    head:
+      tags: [registry]
+      operationId: RegistryHeadManifest
+      summary: Check a manifest exists (and resolve a tag to its digest)
+      x-twd-role: admin|host
+      responses:
+        "200": { description: Exists; `Docker-Content-Digest` names it. }
+        "404": { description: "`MANIFEST_UNKNOWN`." }
+    put:
+      tags: [registry]
+      operationId: RegistryPutManifest
+      summary: Push a manifest or index (by tag or digest)
+      description: |
+        Image manifests (OCI and Docker v2 schema 2) and indexes (multi-arch). Every blob (config,
+        layers) or child manifest it references must already be in **this** repository
+        (`400 MANIFEST_BLOB_UNKNOWN`). A digest reference must match the body's digest. Audited
+        (`kind: image_push`).
+      x-twd-role: admin
+      x-twd-audit: true
+      responses:
+        "201": { description: "Stored; `Location` and `Docker-Content-Digest` name it." }
+        "400": { description: "`MANIFEST_INVALID`, `MANIFEST_BLOB_UNKNOWN`, `DIGEST_INVALID`, `TAG_INVALID`." }
+        "403": { description: "`DENIED` (hosts never push)." }
+  /v2/{name}/blobs/{digest}:
+    parameters:
+      - $ref: "#/components/parameters/repositoryName"
+      - name: digest
+        in: path
+        required: true
+        schema: { type: string, pattern: "^sha256:[a-f0-9]{64}$" }
+    get:
+      tags: [registry]
+      operationId: RegistryGetBlob
+      summary: Pull a blob (Range supported)
+      x-twd-role: admin|host
+      responses:
+        "200": { description: The content; it hashes to `digest`. }
+        "403": { description: "`DENIED`." }
+        "404": { description: "`BLOB_UNKNOWN`: not in this repository (whether or not another namespace has it)." }
+    head:
+      tags: [registry]
+      operationId: RegistryHeadBlob
+      summary: Check a blob exists in this repository
+      x-twd-role: admin|host
+      responses:
+        "200": { description: Exists; `Content-Length` is its size. }
+        "404": { description: "`BLOB_UNKNOWN`." }
+  /v2/{name}/blobs/uploads/:
+    parameters:
+      - $ref: "#/components/parameters/repositoryName"
+    post:
+      tags: [registry]
+      operationId: RegistryStartUpload
+      summary: Start a blob upload (or a monolithic upload, or a mount)
+      description: |
+        `202` with `Location: /v2/{name}/blobs/uploads/{uuid}`. With `?digest=` and a body: a
+        monolithic upload (`201`). With `?mount=<digest>&from=<repo>`: links the blob from `from`
+        (`201`) only when `from` is in the same namespace and has it; otherwise a fresh upload
+        (`202`), so another tenant's content is never borrowed. Upload sessions are files under
+        mgmt's registry dir (any replica sharing it can continue one).
+      x-twd-role: admin
+      parameters:
+        - { name: digest, in: query, schema: { type: string } }
+        - { name: mount, in: query, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string } }
+      responses:
+        "201": { description: Monolithic upload or mount done. }
+        "202": { description: "Upload started; `Location`, `Docker-Upload-UUID`, `Range: 0-0`." }
+        "403": { description: "`DENIED`." }
+  /v2/{name}/blobs/uploads/{uuid}:
+    parameters:
+      - $ref: "#/components/parameters/repositoryName"
+      - name: uuid
+        in: path
+        required: true
+        schema: { type: string, pattern: "^[a-f0-9]{32}$" }
+    get:
+      tags: [registry]
+      operationId: RegistryUploadStatus
+      summary: Upload progress
+      x-twd-role: admin
+      responses:
+        "204": { description: "`Range: 0-<last byte>`." }
+        "404": { description: "`BLOB_UPLOAD_UNKNOWN` (also for another repository's session)." }
+    patch:
+      tags: [registry]
+      operationId: RegistryUploadChunk
+      summary: Upload a chunk
+      description: "`Content-Range: <start>-<end>` is optional; when given, `start` must equal the bytes received so far (`416` otherwise)."
+      x-twd-role: admin
+      responses:
+        "202": { description: "Accepted; `Range: 0-<last byte>`." }
+        "416": { description: "`BLOB_UPLOAD_INVALID`: out-of-order chunk." }
+    put:
+      tags: [registry]
+      operationId: RegistryFinishUpload
+      summary: Finish an upload (`?digest=` required; optional final chunk as the body)
+      description: The whole upload must hash to `digest` (`400 DIGEST_INVALID`, and nothing is linked).
+      x-twd-role: admin
+      parameters:
+        - { name: digest, in: query, required: true, schema: { type: string, pattern: "^sha256:[a-f0-9]{64}$" } }
+      responses:
+        "201": { description: "Stored and linked into the repository; `Location`, `Docker-Content-Digest`." }
+        "400": { description: "`DIGEST_INVALID`." }
+    delete:
+      tags: [registry]
+      operationId: RegistryCancelUpload
+      summary: Cancel an upload
+      x-twd-role: admin
+      responses:
+        "204": { description: Cancelled. }
+  /v2/{name}/tags/list:
+    parameters:
+      - $ref: "#/components/parameters/repositoryName"
+    get:
+      tags: [registry]
+      operationId: RegistryListTags
+      summary: List a repository's tags (`?n=` / `?last=` paging)
+      x-twd-role: admin|host
+      parameters:
+        - { name: n, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: last, in: query, schema: { type: string } }
+      responses:
+        "200": { description: "`{name, tags}`." }
+
   # ------------------------------------------------------------ operational
   /v1/healthz:
     get:
@@ -1608,6 +2008,18 @@ components:
       description: "Volume ID `<tenantID>:<workload>` (one volume per workload; `:` is a legal path character)."
       schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[a-z0-9][a-z0-9-]{0,62}$" }
       example: "tn_tail7906d5:agent"
+    repositoryName:
+      name: name
+      in: path
+      required: true
+      description: "A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`)."
+      schema: { type: string }
+    reservationID:
+      name: id
+      in: path
+      required: true
+      description: Container reservation ID (`cr_…`).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
 
   headers:
     ETag:
@@ -1842,7 +2254,7 @@ components:
         | `lease_lost` | 409 | epoch/holder fence failed |
         | `lease_held` | 409 | another host holds the lease |
         | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
-        | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+        | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers |
         | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
         | `already_joined` | 409 | credential for an object that has a node |
         | `identity_conflict` | 409 | object ID collision across identities |
@@ -1855,10 +2267,14 @@ components:
         | `precondition_failed` | 412 | `If-Match` mismatch |
         | `object_quota_exceeded` | 429 | tenant `maxObjects` |
         | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+        | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
+        | `image_unavailable` | 502 | a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) |
+        | `registry_unavailable` | 409 | this twd-mgmt serves no OCI registry (`-registry-dir off`) |
+        | `mirror_disabled` | 409 | this twd-mgmt does not mirror external images (`-no-mirror`) |
         | `bootstrap_failed` | 502 | control plane refused the mint |
         | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
         | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
-        | `no_host` | 503 | no live host for the deployment |
+        | `no_host` | 503 | no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) |
         | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
         | `internal` | 500 | — |
       enum:
@@ -1896,11 +2312,15 @@ components:
         - precondition_failed
         - object_quota_exceeded
         - spawn_budget_exceeded
+        - container_quota_exceeded
         - bootstrap_failed
         - host_token_unconfigured
         - identity_pending
         - no_host
         - policy_unavailable
+        - image_unavailable
+        - registry_unavailable
+        - mirror_disabled
         - internal
     TombstoneError:
       description: "`410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`)."
@@ -1964,6 +2384,12 @@ components:
         - type: object
           properties:
             items: { type: array, items: { $ref: "#/components/schemas/Deployment" } }
+    ContainerReservationPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/ContainerReservation" } }
     ObjectPage:
       allOf:
         - $ref: "#/components/schemas/Page"
@@ -2013,6 +2439,9 @@ components:
         wif: { $ref: "#/components/schemas/WIFInfo" }
         registrationsPerMinute: { type: integer, minimum: 1, default: 200 }
         maxObjects: { type: integer, minimum: 1, default: 1000 }
+        maxContainers: { type: integer, minimum: 1, default: 10, description: "Running containers (ADR-032), across the tenant's workloads. Not objects: they don't count against `maxObjects`." }
+        maxContainerMemMiB: { type: integer, minimum: 1, default: 16384, description: Total guest memory of the tenant's running containers. }
+        maxContainerVCPU: { type: number, exclusiveMinimum: 0, default: 8, description: "Total vCPUs of the tenant's running containers (fractional: `lite` is 1/16)." }
         pool:
           type: string
           description: Host pool the tenant's deployments are placed on (hosts with a matching `pool`; empty = any host).
@@ -2043,6 +2472,9 @@ components:
         oauthClientFile: { type: string }
         registrationsPerMinute: { type: integer, minimum: 1 }
         maxObjects: { type: integer, minimum: 1 }
+        maxContainers: { type: integer, minimum: 1 }
+        maxContainerMemMiB: { type: integer, minimum: 1 }
+        maxContainerVCPU: { type: number, exclusiveMinimum: 0 }
         pool: { type: string }
         tier: { $ref: "#/components/schemas/Tier" }
       additionalProperties: false
@@ -2058,6 +2490,9 @@ components:
         oauthClientFile: { type: [string, "null"] }
         registrationsPerMinute: { type: integer, minimum: 1 }
         maxObjects: { type: integer, minimum: 1 }
+        maxContainers: { type: integer, minimum: 1 }
+        maxContainerMemMiB: { type: integer, minimum: 1 }
+        maxContainerVCPU: { type: number, exclusiveMinimum: 0 }
         pool: { type: [string, "null"] }
         tier: { $ref: "#/components/schemas/Tier" }
       additionalProperties: false
@@ -2106,6 +2541,46 @@ components:
       properties:
         port: { type: integer, minimum: 1, maximum: 65535 }
         url: { type: string, description: "`unix:///path/hostd.sock`; local-dev only." }
+    HostTier:
+      type: string
+      description: "What a host offers: the isolation tiers (`process`, `microvm`) and `containers` (ADR-032: it can run containers and code sandboxes, one microVM each, for images of its `arch`)."
+      enum: [process, microvm, containers]
+    Arch:
+      type: string
+      description: A Go GOARCH. Container images must match their host's.
+      enum: [amd64, arm64]
+    HostCapacity:
+      type: object
+      description: |
+        The capacity vector a host registers (ADR-032 D9). `nodes` is
+        tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO
+        instances and containers alike): their count, guest memory (all, and
+        the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit`
+        for scheduling) and scratch disk. A host without a microVM backend
+        reports 0 for every VM dimension.
+      required: [nodes, vms, vmMemMiB, hugeMemMiB, vcpus, vcpuOvercommit, scratchMiB]
+      properties:
+        nodes: { type: integer, minimum: 0 }
+        vms: { type: integer, minimum: 0 }
+        vmMemMiB: { type: integer, minimum: 0 }
+        hugeMemMiB: { type: integer, minimum: 0 }
+        vcpus: { type: integer, minimum: 0 }
+        vcpuOvercommit: { type: number, minimum: 0 }
+        scratchMiB: { type: integer, minimum: 0 }
+      additionalProperties: false
+    HostUsage:
+      type: object
+      description: Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`).
+      required: [nodes, vms, vmMemMiB, hugeMemMiB, vcpus, scratchMiB, containers]
+      properties:
+        nodes: { type: integer, minimum: 0 }
+        vms: { type: integer, minimum: 0 }
+        vmMemMiB: { type: integer, minimum: 0 }
+        hugeMemMiB: { type: integer, minimum: 0 }
+        vcpus: { type: number, minimum: 0 }
+        scratchMiB: { type: integer, minimum: 0 }
+        containers: { type: integer, minimum: 0 }
+      additionalProperties: false
     Host:
       type: object
       required: [hostID, status, capacityNodes, tiers, liveNodes, lastSeen, createdAt, updatedAt]
@@ -2113,7 +2588,10 @@ components:
         hostID: { type: string }
         status: { $ref: "#/components/schemas/HostStatusEnum" }
         capacityNodes: { type: integer }
-        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+        tiers: { type: array, items: { $ref: "#/components/schemas/HostTier" } }
+        arch: { $ref: "#/components/schemas/Arch" }
+        capacity: { $ref: "#/components/schemas/HostCapacity" }
+        usage: { $ref: "#/components/schemas/HostUsage" }
         pool: { type: string }
         nodeID: { type: string, description: "Stable node ID of the host's `tag:twd-host` tsnet node (bound at registration)." }
         dnsName: { type: string, description: "`twd-host-<hostID>.<tailnet>`." }
@@ -2133,7 +2611,7 @@ components:
           type: string
           description: "The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own)."
         pool: { type: string }
-        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+        tiers: { type: array, items: { $ref: "#/components/schemas/HostTier" } }
       additionalProperties: false
     HostJoin:
       type: object
@@ -2153,7 +2631,9 @@ components:
       required: [capacityNodes, tiers]
       properties:
         capacityNodes: { type: integer, minimum: 0 }
-        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" }, minItems: 1 }
+        tiers: { type: array, items: { $ref: "#/components/schemas/HostTier" }, minItems: 1 }
+        arch: { $ref: "#/components/schemas/Arch" }
+        capacity: { $ref: "#/components/schemas/HostCapacity" }
         pool: { type: string }
         auditPubKey: { type: string }
         push: { $ref: "#/components/schemas/HostPush" }
@@ -2180,6 +2660,17 @@ components:
         liveNodes: { type: integer, minimum: 0 }
         leases: { type: array, items: { $ref: "#/components/schemas/Lease" } }
         deployments: { type: array, items: { $ref: "#/components/schemas/DeploymentReport" } }
+        usage: { $ref: "#/components/schemas/HostUsage" }
+        containers:
+          type: array
+          description: |
+            Every container running on this host (reservation reconciliation,
+            ADR-032 D9): a reported reservation is renewed; a host's
+            reservation left out for 30 s after its creation is released; a
+            reported container with no reservation is adopted if this host
+            holds the workload's lease (it runs; mgmt records it, over quota
+            or not, audited `container_reserve` with `adopted`), else ignored.
+          items: { $ref: "#/components/schemas/RunningContainer" }
       additionalProperties: false
     HostStatusResponse:
       type: object
@@ -2237,6 +2728,10 @@ components:
         maxDepth: { type: integer }
         endpoint: { $ref: "#/components/schemas/Endpoint" }
         deployedBy: { type: string, description: The actor who deployed (see Conventions). }
+        containers:
+          type: array
+          description: "The bundle's container classes with the images pinned at deploy (ADR-032 D3): what hosts pull, by digest."
+          items: { $ref: "#/components/schemas/ContainerClass" }
         createdAt: { type: integer, format: int64 }
         updatedAt: { type: integer, format: int64 }
     DeploymentCreate:
@@ -2257,6 +2752,7 @@ components:
           type: array
           description: Override the classes read from `twd.jsonc` (tests).
           items: { $ref: "#/components/schemas/ClassConfig" }
+        containerImages: { $ref: "#/components/schemas/ContainerImages" }
       additionalProperties: false
     Assignment:
       type: object
@@ -2283,6 +2779,13 @@ components:
         maxLive: { type: integer }
         maxDepth: { type: integer }
         createdAt: { type: integer, format: int64 }
+        containers:
+          type: array
+          description: |
+            The workload's container classes as mgmt resolved them at deploy (ADR-032 D3): the image
+            refs `ctx.container` sees and their per-arch pins. hostd starts a container only from the
+            pin for its own arch, pulled by digest from twd's registry.
+          items: { $ref: "#/components/schemas/ContainerClass" }
     PreflightMissing:
       type: object
       required: [src, dst, snippet]
@@ -2453,11 +2956,15 @@ components:
       type: string
       description: |
         Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-        `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+        `principal`, `tenant_note` (source `tenant`, unverified),
+        `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
         `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
         `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
         `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-        `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+        `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`,
+        `container_reserve`, `container_release`, `image_push` (a manifest pushed to the registry),
+        `image_pin` (a deploy resolved its container images to digests, mirroring external ones),
+        `image_public` (a public base image added or removed).
       enum:
         - allow
         - deny
@@ -2466,6 +2973,8 @@ components:
         - kill
         - principal
         - tenant_note
+        - container_start
+        - container_stop
         - tenant_create
         - tenant_update
         - tenant_delete
@@ -2486,6 +2995,11 @@ components:
         - credential
         - obo_root
         - object_update
+        - container_reserve
+        - container_release
+        - image_push
+        - image_pin
+        - image_public
     AuditSource:
       type: string
       description: "`mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content)."
@@ -2559,6 +3073,138 @@ components:
         key: { type: string, contentEncoding: base64, format: password, description: 32 bytes. }
         grantedAt: { type: integer, format: int64 }
       x-twd-secret: true
+
+    # ---------------------------------------------------------- containers
+    ContainerResources:
+      type: object
+      description: "What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`)."
+      required: [vcpu, memMiB, diskMiB]
+      properties:
+        vcpu: { type: number, exclusiveMinimum: 0, maximum: 64 }
+        memMiB: { type: integer, minimum: 1 }
+        diskMiB: { type: integer, minimum: 0 }
+      additionalProperties: false
+    ContainerReservationCreate:
+      type: object
+      required: [tenantID, workload, class, object, epoch, resources]
+      properties:
+        tenantID: { type: string }
+        workload: { type: string }
+        class: { type: string, description: "The DO class (a wrangler `containers[].class_name`)." }
+        object: { type: string, minLength: 1, maxLength: 256, description: "The DO instance (its name or hex ID): one container per instance." }
+        epoch: { type: integer, format: int64, minimum: 1, description: The workload's lease epoch the host holds. }
+        resources: { $ref: "#/components/schemas/ContainerResources" }
+      additionalProperties: false
+    ContainerReservation:
+      type: object
+      required: [reservationID, tenantID, workload, class, object, host, resources, createdAt, renewedAt]
+      properties:
+        reservationID: { type: string, examples: [cr_5k2m9q] }
+        tenantID: { type: string }
+        workload: { type: string }
+        class: { type: string }
+        object: { type: string }
+        host: { type: string }
+        resources: { $ref: "#/components/schemas/ContainerResources" }
+        createdAt: { type: integer, format: int64, description: unix ms (store clock) }
+        renewedAt: { type: integer, format: int64, description: unix ms of the last reserve or heartbeat that reported it (store clock) }
+    RunningContainer:
+      type: object
+      description: One running container in a heartbeat.
+      required: [tenantID, workload, class, object, resources]
+      properties:
+        reservationID: { type: string, description: "The reservation it runs under (absent: started without one, e.g. a restart while mgmt was unreachable)." }
+        tenantID: { type: string }
+        workload: { type: string }
+        class: { type: string }
+        object: { type: string, minLength: 1, maxLength: 256 }
+        resources: { $ref: "#/components/schemas/ContainerResources" }
+      additionalProperties: false
+
+    ContainerImagePin:
+      type: object
+      description: |
+        One image reference of a container class, resolved once at deploy for one arch (ADR-032 D3):
+        hosts pull exactly `repository@digest` from twd's registry and nothing else. Retagging the
+        upstream ref later changes nothing until the next deploy.
+      required: [ref, arch, repository, digest]
+      properties:
+        name: { type: string, description: "The class's image name (wrangler `images` key); absent for the default image." }
+        ref: { type: string, description: "The reference as `ctx.container` sees it (the wrangler image, or the `twd.local/<tenant>/…@sha256:…` ref `twd deploy` built)." }
+        arch: { type: string, enum: [amd64, arm64] }
+        repository: { type: string, description: "`<tenantID>/…` (the tenant's builds and mirrors) or `public/…` (public bases, alias targets)." }
+        digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$", description: The linux/`arch` image manifest (never an index). }
+        from: { type: string, description: "What was resolved: `<upstream ref>@<digest>` (mirrored), `alias <ref>`, `public <ref>`, or the twd.local ref." }
+      additionalProperties: false
+    ContainerClass:
+      type: object
+      description: A container class of a deployment (a wrangler `containers` entry plus twd.jsonc overrides) and its pinned images.
+      required: [class]
+      properties:
+        class: { type: string }
+        source: { type: string, description: "The wrangler `image` as written (a ref, or a Dockerfile path)." }
+        image: { type: string, description: The default image reference `start()` runs. }
+        images: { type: object, additionalProperties: { type: string }, description: "Named images (`ctx.container.images`): name → reference." }
+        imageSources: { type: object, additionalProperties: { type: string }, description: "Named images twd deploy builds: name → the wrangler Dockerfile, as written." }
+        instanceType: { type: string }
+        custom: { $ref: "#/components/schemas/ContainerResources" }
+        maxInstances: { type: integer, minimum: 0 }
+        arch: { type: string, enum: [amd64, arm64] }
+        pins: { type: array, items: { $ref: "#/components/schemas/ContainerImagePin" } }
+    ContainerImages:
+      type: object
+      description: |
+        Images `twd deploy` built and pushed, by class: `{"<Class>": {"image": ref, "images": {name: ref}}}`
+        with `twd.local/<tenantID>/<repo>@sha256:…` refs (an index when built for several arches). They
+        replace the class's Dockerfile `image` / `images` entries; every ref is then pinned like any other.
+      additionalProperties:
+        type: object
+        properties:
+          image: { type: string }
+          images: { type: object, additionalProperties: { type: string } }
+        additionalProperties: false
+    PublicImage:
+      type: object
+      required: [id, ref, arch, repository, digest, sourceDigest, createdAt]
+      properties:
+        id: { type: string, examples: [pi_3f9a1c2b7d8e4f50] }
+        ref: { type: string, description: The normalised upstream ref (or twd.local ref) deploys match. }
+        arch: { type: string, enum: [amd64, arm64] }
+        repository: { type: string, description: "`public/…`" }
+        digest: { type: string, pattern: "^sha256:[a-f0-9]{64}$", description: The linux/`arch` image manifest. }
+        sourceDigest: { type: string, description: The upstream top-level digest (index or manifest) at add time. }
+        createdBy: { type: string }
+        createdAt: { type: integer, format: int64 }
+    PublicImageCreate:
+      type: object
+      required: [ref]
+      properties:
+        ref: { type: string, minLength: 1 }
+        arches: { type: array, items: { type: string, enum: [amd64, arm64] }, description: Default every linux amd64/arm64 image the ref has. }
+      additionalProperties: false
+    PublicImageList:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/PublicImage" } }
+    PublicImagePage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/PublicImage" } }
+    ImageAlias:
+      type: object
+      required: [from, to]
+      properties:
+        from: { type: string }
+        to: { type: string }
+        arch: { type: string, description: '"" = every arch.' }
+    ImageAliasList:
+      type: object
+      required: [items]
+      properties:
+        items: { type: array, items: { $ref: "#/components/schemas/ImageAlias" } }
 
     # --------------------------------------------------------- operational
     Health:

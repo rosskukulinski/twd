@@ -69,6 +69,10 @@ func (v *Volume) String() string {
 // Info is a sandbox's boot accounting.
 type Info struct {
 	PID int // VMM process
+	// ServicePID is the hypervisor process that holds the guest's memory and
+	// vCPUs when that is not the VMM itself (vz: Virtualization.framework's
+	// per-VM XPC service). 0 under Firecracker.
+	ServicePID int `json:",omitempty"`
 	// Boot is InstanceStart → guest init reported in; Ready is
 	// InstanceStart → workerd healthy in the guest; Total is the whole Boot()
 	// call (netns, TAP, stack, VMM, API calls, boot, workerd).

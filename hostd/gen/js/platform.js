@@ -102,6 +102,16 @@ export default {
         return admin(req, env, ctx, t);
       case "object":
         return routeObject(env, ctx, t.class, t.name, req);
+      case "intercept": {
+        // A request an object's container sent to an intercepted
+        // destination (hostd's sandbox egress proxy, ADR-032 D4): only the
+        // object's own registered handler sees it, in the object.
+        if (!CFG.classes[t.class]?.container) return errResponse("unknown_object", "no container class " + t.class + " in this app");
+        if (!t.name || typeof t.key !== "string" || typeof t.url !== "string") return errResponse("bad_request", "bad intercept route");
+        const hasBody = req.method !== "GET" && req.method !== "HEAD";
+        const r = new Request(t.url, { method: req.method, headers: req.headers, body: hasBody ? req.body : undefined, redirect: "manual" });
+        return objectStub(env, ctx, t.class, t.name).__twd_intercept(t.key, r);
+      }
       case "workload": {
         // /_twd/o/<Class>/<name>/... on the workload node reaches an object
         // before (or instead of) its own node.
@@ -229,6 +239,11 @@ function makeHost(cls) {
       }
       return await this.ctx.storage.getAlarm();
     }
+    // A request the object's container sent to an intercepted destination.
+    async __twd_intercept(key, req) {
+      if (this.__killed) return errResponse("killed", "object " + cls + "/" + this.ctx.id.name + " was killed: " + this.__killed);
+      return this.__facet(true).__twd_intercept(key, req);
+    }
     async alarm(info) {
       if (this.__killed) return;
       // AlarmInvocationInfo is not serializable; pass its fields.
@@ -325,19 +340,88 @@ export class WorkloadEgress extends WorkerEntrypoint {
   }
 }
 
-// TailnetApi backs ctx.tailnet. props: {kind:"object", class, name} for a
-// facet (unforgeable), or {kind:"workload"} for the tenant service, which may
-// act as a plain-DO object it hosts (args.as) but never as a facet object.
+// attestedAs is who a TailnetApi call acts for: the facet object named by
+// props (unforgeable), or a plain-DO object the tenant service claims
+// (args.as; never a facet object).
+function attestedAs(props, args) {
+  if (props.kind === "object") return { class: props.class, name: props.name };
+  if (args?.as && CFG.classes[args.as.class] && !isFacet(args.as.class)) return { class: String(args.as.class), name: String(args.as.name) };
+  return null;
+}
+
+const ctrErr = (message) => ({ ok: false, error: errBody("bad_request", message) });
+
+// containerAs: the calling object, which must have a container (wrangler
+// "containers"); container ops only ever act on that object's own one.
+function containerAs(props, args) {
+  const as = attestedAs(props, args);
+  if (!as || !as.name) return null;
+  if (!CFG.classes[as.class]?.container) return null;
+  return as;
+}
+
+// TailnetApi backs ctx.tailnet and ctx.container. props: {kind:"object",
+// class, name} for a facet (unforgeable), or {kind:"workload"} for the
+// tenant service, which may act as a plain-DO object it hosts (args.as) but
+// never as a facet object.
 export class TailnetApi extends WorkerEntrypoint {
+  // ctx.container ops (JSON): status, start, destroy, signal, monitor,
+  // setInactivityTimeout, inspect, intercept, exec-signal, exec-resize.
+  async ctr(op, args = {}) {
+    const as = containerAs(this.ctx.props ?? {}, args);
+    if (!as) return ctrErr("ctx.container is only for the calling object's own container");
+    const { as: _ignored, ...rest } = args;
+    try {
+      return { ok: true, value: await hostd(this.env, "container", { ...rest, op: String(op), as }) };
+    } catch (e) {
+      return { ok: false, error: e.body ?? errBody("hostd_unavailable", String(e)) };
+    }
+  }
+  // exec: a streamed Response (stdio frames), headers x-twd-exec(-pid).
+  async ctrExec(args = {}) {
+    const as = containerAs(this.ctx.props ?? {}, args);
+    if (!as) return errResponse("bad_request", "ctx.container is only for the calling object's own container");
+    return this.env.HOSTD.fetch("http://hostd/v1/container/exec", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ as, spec: args.spec ?? {} }),
+    });
+  }
+  // stdin: body streams into the exec's stdin, then it is half-closed.
+  async ctrStdin(args = {}, body) {
+    const as = containerAs(this.ctx.props ?? {}, args);
+    if (!as) return ctrErr("ctx.container is only for the calling object's own container");
+    const r = await this.env.HOSTD.fetch("http://hostd/v1/container/stdin?exec=" + encodeURIComponent(String(args.exec ?? "")), {
+      method: "POST",
+      headers: { "x-twd-as": JSON.stringify(as) },
+      body,
+    });
+    return { ok: r.ok, status: r.status };
+  }
+  // getTcpPort(port).fetch(request)
+  async ctrFetch(args = {}, request) {
+    const as = containerAs(this.ctx.props ?? {}, args);
+    if (!as) return errResponse("bad_request", "ctx.container is only for the calling object's own container");
+    const port = Number(args.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return errResponse("bad_request", "bad port");
+    const u = new URL(request.url);
+    const h = new Headers(request.headers);
+    for (const k of [...h.keys()]) if (k.startsWith("x-twd") || k.startsWith("twd-")) h.delete(k);
+    h.set("x-twd-as", JSON.stringify(as));
+    h.set("x-twd-host", u.host);
+    const hasBody = request.method !== "GET" && request.method !== "HEAD";
+    return this.env.HOSTD.fetch("http://hostd/v1/container/port/" + port + u.pathname + u.search, {
+      method: request.method,
+      headers: h,
+      body: hasBody ? request.body : undefined,
+      redirect: "manual",
+    });
+  }
   async call(op, args = {}) {
     const p = this.ctx.props ?? {};
-    let as = null;
-    if (p.kind === "object") as = { class: p.class, name: p.name };
-    else if (args.as) {
-      if (!CFG.classes[args.as.class] || isFacet(args.as.class)) {
-        return { ok: false, error: errBody("bad_request", "the workload may only act as its plain-DO objects") };
-      }
-      as = { class: String(args.as.class), name: String(args.as.name) };
+    const as = attestedAs(p, args);
+    if (p.kind !== "object" && args.as && !as) {
+      return { ok: false, error: errBody("bad_request", "the workload may only act as its plain-DO objects") };
     }
     if (op === "alarm") {
       // Only a facet object may manage its own (delegated) alarm.

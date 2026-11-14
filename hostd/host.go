@@ -25,12 +25,15 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/internal/procsb"
@@ -80,8 +83,25 @@ type Config struct {
 	Logger       *slog.Logger
 	TSNetLogs    bool
 	// VM boots microVM sandboxes (hostd/vm: Firecracker on Linux + KVM).
-	// Nil means every workload runs in the process tier, whatever it asks for.
+	// Nil means this host offers the process tier only: a microvm
+	// deployment is refused (tier_unavailable), never downgraded.
 	VM sandbox.Backend
+	// ForceProcessTier is explicit local development (twd dev): every
+	// workload runs in the process tier whatever its twd.jsonc or tenant
+	// asks for, and the host registers the process tier only. Never set it
+	// on a host that serves real tenants (ADR-032 D5b).
+	ForceProcessTier bool
+	// Capacity sets the capacity vector's VM dimensions (nil: measured; see
+	// capacity.go). Its nodes are always CapacityNodes; without a microVM
+	// backend every VM dimension is 0.
+	Capacity *mgmtapi.HostCapacity
+	// VMMemMiB and VMVCPUs are a microVM DO instance's guest size, for usage
+	// accounting (defaults 512 and 2, twd-hostd's -vm-mem-mib / -vm-vcpus).
+	VMMemMiB, VMVCPUs int
+	// ContainerQuota reserves container quota at ctx.container.start()
+	// (default: mgmt's /v1/container-reservations through Mgmt; tests: a
+	// fake).
+	ContainerQuota ContainerQuota
 	// DefaultTier applies when neither the deployment (twd.jsonc "tier")
 	// nor the tenant names one. Default "process".
 	DefaultTier string
@@ -123,6 +143,49 @@ type Config struct {
 	// The unix push socket (local-dev) is always served too.
 	PushListener net.Listener
 	PushPort     int
+
+	// Containers boots container guests (ADR-032; hostd/vm on Linux +
+	// KVM). Nil: this host offers no containers, and ctx.container.start()
+	// fails with tier_unavailable (no fallback, D5).
+	Containers sandbox.ContainerBackend
+	// Images converts and caches container images (hostd/image).
+	Images *image.Store
+	// ContainerCapacity optionally bounds this host's running containers
+	// further, on top of the capacity vector (Capacity) they share with
+	// microVM DO instances (0 = no extra bound).
+	ContainerCapacity ContainerCapacity
+	// ContainerIdle is the default inactivity timeout (DefaultContainerIdle);
+	// setInactivityTimeout changes it per container, up to 6 h.
+	ContainerIdle time.Duration
+	// ContainerMaxLife is the operator's hard max lifetime of a container
+	// (DefaultContainerMaxLife, 24 h).
+	ContainerMaxLife time.Duration
+	// ContainerGrace caps destroy()'s SIGTERM → SIGKILL grace (10 s).
+	ContainerGrace time.Duration
+	// ContainerInternet is the sandbox internet path (ADR-032 D4): how a
+	// container started with enableInternet reaches the hosts on its
+	// workload's egress.internet allowlist. Nil: none; such flows are
+	// refused. twd-hostd sets DirectInternet unless -container-internet=off.
+	ContainerInternet *ContainerInternet
+}
+
+// ContainerInternet dials allowlisted internet hosts for containers. The
+// sandbox egress proxy (netd/sbxnet) applies the allowlist and the ADR-019
+// blocks to every resolved address before Dial is called.
+type ContainerInternet struct {
+	Dial    func(ctx context.Context, network, addr string) (net.Conn, error)
+	Resolve func(ctx context.Context, host string) ([]netip.Addr, error)
+	// HostAddrs are never dialled (nil: the host's interface addresses).
+	HostAddrs []netip.Addr
+}
+
+// DirectInternet is the host network and resolver (twd has no tenant
+// exit-node or gateway path yet; RFC §4.8).
+func DirectInternet() *ContainerInternet {
+	d := &net.Dialer{Timeout: 10 * time.Second}
+	return &ContainerInternet{Dial: d.DialContext, Resolve: func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+	}}
 }
 
 // Host is a running twd-hostd.
@@ -145,6 +208,11 @@ type Host struct {
 	lastHB    time.Time
 	fenced    bool
 
+	capOnce    sync.Once
+	capVec     mgmtapi.HostCapacity // capacity(): measured once
+	containers containerLedger      // admitted containers and held reservations
+	quota      ContainerQuota
+
 	syncMu      sync.Mutex
 	syncNow     chan struct{}
 	pushSrv     *http.Server
@@ -152,6 +220,7 @@ type Host struct {
 	audit       *auditLog
 	wg          sync.WaitGroup
 	runDirOwned bool
+	ctr         *ctrManager
 }
 
 // DefaultFenceAfter rides out typical mgmt restarts and database failovers;
@@ -192,8 +261,20 @@ func New(cfg Config) (*Host, error) {
 	if cfg.CapacityNodes == 0 {
 		cfg.CapacityNodes = 1000
 	}
+	if cfg.VMMemMiB == 0 {
+		cfg.VMMemMiB = 512
+	}
+	if cfg.VMVCPUs == 0 {
+		cfg.VMVCPUs = 2
+	}
+	if cfg.ContainerQuota == nil {
+		cfg.ContainerQuota = mgmtQuota{cfg.Mgmt}
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
+	}
+	if cfg.DefaultTier == "microvm" && cfg.VM == nil && !cfg.ForceProcessTier {
+		return nil, errors.New("hostd: default tier microvm needs a microVM backend (Linux + KVM + twd-vmhelper: `sudo twd host setup --microvm`); without one, use -default-tier process")
 	}
 	sb, err := ResolveSandbox(cfg.Sandbox)
 	if err != nil {
@@ -203,7 +284,8 @@ func New(cfg Config) (*Host, error) {
 	h := &Host{cfg: cfg, sandbox: sb, log: cfg.Logger, mgmt: cfg.Mgmt,
 		tenants: map[string]*tenant{}, workloads: map[string]*workload{}, objects: map[string]*object{},
 		byNetd: map[string]*object{}, byKey: map[string]*object{}, creating: map[string]*createCall{},
-		syncNow: make(chan struct{}, 1)}
+		syncNow: make(chan struct{}, 1), quota: cfg.ContainerQuota, containers: containerLedger{held: map[ContainerKey]*ctrEntry{}}}
+	h.ctr = newCtrManager(h)
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -265,11 +347,9 @@ func (h *Host) Start(ctx context.Context) error {
 }
 
 func (h *Host) register(ctx context.Context) error {
-	tiers := []string{"process"}
-	if h.cfg.VM != nil {
-		tiers = append(tiers, "microvm")
-	}
-	req := mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes, Tiers: tiers,
+	capVec := h.capacity()
+	req := mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes, Tiers: h.tiers(),
+		Arch: runtime.GOARCH, Capacity: &capVec,
 		AuditPubKey: base64.StdEncoding.EncodeToString(h.audit.key.Public().(ed25519.PublicKey))}
 	if h.cfg.PushPort > 0 {
 		// tsnet transport: mgmt pushes to this host's node at PushPort.
@@ -279,6 +359,20 @@ func (h *Host) register(ctx context.Context) error {
 		req.PushURL = "unix://" + h.pushSock
 	}
 	return h.mgmt.Register(ctx, req)
+}
+
+// tiers lists what this host offers: the process tier always, the microVM
+// tier with a backend (not under ForceProcessTier), and "containers" when
+// it can run them (ADR-032).
+func (h *Host) tiers() []string {
+	tiers := []string{"process"}
+	if h.cfg.VM != nil && !h.cfg.ForceProcessTier {
+		tiers = append(tiers, "microvm")
+	}
+	if h.containersOffered() {
+		tiers = append(tiers, "containers")
+	}
+	return tiers
 }
 
 // Close stops every workload and node (node state is kept for rejoin).
@@ -300,6 +394,7 @@ func (h *Host) Close() error {
 		ts = append(ts, t)
 	}
 	h.mu.Unlock()
+	h.ctr.destroyWhere(func(ctrKey) bool { return true }, "host shutdown", 0)
 	for _, w := range wls {
 		w.stopAll()
 	}
@@ -371,10 +466,12 @@ func (h *Host) tick() {
 		h.log.Warn("assignment sync failed", "err", err)
 	}
 	h.flushAudit(ctx)
+	h.retryReleases(ctx)
 }
 
 func (h *Host) heartbeat(ctx context.Context) error {
-	req := mgmtapi.HeartbeatRequest{Leases: []mgmtapi.Lease{}}
+	usage := h.usage()
+	req := mgmtapi.HeartbeatRequest{Leases: []mgmtapi.Lease{}, Usage: &usage, Containers: h.containers.running()}
 	h.mu.Lock()
 	for _, o := range h.objects {
 		if o.Status == statusReady {

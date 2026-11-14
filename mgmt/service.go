@@ -24,6 +24,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/container"
+	"github.com/rosskukulinski/twd/internal/oci"
+	"github.com/rosskukulinski/twd/internal/registry"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 )
 
@@ -64,6 +67,18 @@ type Config struct {
 	OperatorTailnet string
 	// OperatorControlURL is passed to hosts with their join key.
 	OperatorControlURL string
+	// Registry (ADR-032 D3): RegistryDir holds the OCI registry's blobs
+	// ("" = no registry: container images are not pinned at deploy).
+	// RegistryUpstream returns the client mgmt mirrors an external image
+	// through (nil: oci.RegistryBase over HTTPS for every host, except the
+	// RegistryInsecure hosts, over plain HTTP). NoMirror refuses external
+	// images (only twd.local refs and public bases deploy). ImageAliases
+	// default to registry.DefaultAliases.
+	RegistryDir      string
+	RegistryUpstream func(host string) *oci.Client
+	RegistryInsecure []string
+	NoMirror         bool
+	ImageAliases     []registry.Alias
 }
 
 // Mgmt is twd-mgmt's core: tenants, deployments, objects, the mint broker
@@ -89,6 +104,9 @@ type Mgmt struct {
 	spawnMu      map[string]*sync.Mutex // per tenant: serialises budget checks
 	pushURLs     map[string]string      // hostID → unix:// push socket (in memory; hosts re-register)
 	pending      map[string]*pendingDelete
+	// reg is the OCI registry (nil without Config.RegistryDir).
+	reg      *registry.Registry
+	resolver *registry.Resolver
 	// noDeviceScope: tenants whose credential got a 403 on a device delete
 	// (an OAuth client without devices:core); kills then warn up front.
 	noDeviceScope map[string]bool
@@ -143,6 +161,11 @@ func New(cfg Config) (*Mgmt, error) {
 	}
 	m.policies = &PolicyCache{Fetch: src, MaxAge: cfg.PolicyMaxAge, Clock: cfg.Clock}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	if cfg.RegistryDir != "" {
+		if err := m.initRegistry(); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
 }
 
@@ -257,6 +280,10 @@ type TenantRequest struct {
 	OAuthClientFile        string `json:"oauthClientFile,omitempty"`
 	RegistrationsPerMinute int    `json:"registrationsPerMinute,omitempty"`
 	MaxObjects             int    `json:"maxObjects,omitempty"`
+	// Container quotas (ADR-032 D9); 0 = the defaults.
+	MaxContainers      int     `json:"maxContainers,omitempty"`
+	MaxContainerMemMiB int     `json:"maxContainerMemMiB,omitempty"`
+	MaxContainerVCPU   float64 `json:"maxContainerVCPU,omitempty"`
 }
 
 func (m *Mgmt) CreateTenant(ctx context.Context, r TenantRequest) (Tenant, error) {
@@ -292,7 +319,12 @@ func (m *Mgmt) CreateTenant(ctx context.Context, r TenantRequest) (Tenant, error
 	}
 	t := Tenant{ID: r.ID, Tailnet: r.Tailnet, ControlURL: r.ControlURL, MintMode: r.MintMode, APIKeyFile: r.APIKeyFile,
 		WIFClientID: r.WIFClientID, WIFLifecycleClientID: r.WIFLifecycleClientID, OAuthClientID: r.OAuthClientID, OAuthClientFile: r.OAuthClientFile,
-		RegistrationsPerMinute: r.RegistrationsPerMinute, MaxObjects: r.MaxObjects, CreatedAt: m.now().UnixMilli()}
+		RegistrationsPerMinute: r.RegistrationsPerMinute, MaxObjects: r.MaxObjects, CreatedAt: m.now().UnixMilli(),
+		MaxContainers: r.MaxContainers, MaxContainerMemMiB: r.MaxContainerMemMiB, MaxContainerVCPU: r.MaxContainerVCPU}
+	t.containerDefaults()
+	if t.ID == registry.PublicNamespace {
+		return Tenant{}, errf(400, "bad_request", "tenant ID %q is reserved (the registry's operator namespace)", t.ID)
+	}
 	if t.ID == "" {
 		t.ID = newID("tn_")[:11]
 	}
@@ -416,6 +448,9 @@ type RegisterRequest struct {
 	// PushPort instead: mgmt pushes to the WhoIs node's address.
 	PushURL  string `json:"pushURL,omitempty"`
 	PushPort int    `json:"pushPort,omitempty"`
+	// Arch (GOARCH) and Capacity, the capacity vector (ADR-032 D9).
+	Arch     string        `json:"arch,omitempty"`
+	Capacity *HostCapacity `json:"capacity,omitempty"`
 }
 
 // RegisterHost binds the host record to the calling node (nodeID, nodeAddr
@@ -424,6 +459,10 @@ type RegisterRequest struct {
 func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, nodeAddr string) (Host, bool, error) {
 	if r.HostID == "" {
 		return Host{}, false, errf(400, "bad_request", "hostID required")
+	}
+	if r.Capacity != nil { // capacityNodes is the node dimension
+		c := *r.Capacity
+		c.Nodes, r.Capacity = r.CapacityNodes, &c
 	}
 	old, err := m.store.GetHost(ctx, r.HostID)
 	created := errors.Is(err, ErrNotFound)
@@ -446,7 +485,8 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, node
 	m.mu.Unlock()
 	now := m.now().UnixMilli()
 	h := Host{ID: r.HostID, CapacityNodes: r.CapacityNodes, Tiers: r.Tiers, NodeID: nodeID, AuditPubKey: r.AuditPubKey,
-		Pool: r.Pool, PushPort: r.PushPort, PushTarget: target, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt}
+		Pool: r.Pool, PushPort: r.PushPort, PushTarget: target, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt,
+		Arch: r.Arch, Capacity: r.Capacity, Usage: old.Usage}
 	if h.CreatedAt == 0 {
 		h.CreatedAt = now
 	}
@@ -457,7 +497,7 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, node
 		return Host{}, false, err
 	}
 	m.audit(ctx, AuditRecord{Kind: "host_register", ActingFor: "host:" + r.HostID}, map[string]any{"host": r.HostID, "node": nodeID,
-		"tiers": r.Tiers, "capacity": r.CapacityNodes, "push": m.pushTarget(r.HostID) != "", "new": created})
+		"tiers": r.Tiers, "capacity": r.CapacityNodes, "arch": r.Arch, "capacityVector": r.Capacity, "push": m.pushTarget(r.HostID) != "", "new": created})
 	return h, created, nil
 }
 
@@ -499,13 +539,32 @@ type HeartbeatResponse struct {
 }
 
 func (m *Mgmt) Heartbeat(ctx context.Context, hostID string, liveNodes int, leases []HeartbeatLease, deps ...DeploymentStatus) (HeartbeatResponse, error) {
-	for _, d := range deps {
+	return m.ReportHostStatus(ctx, hostID, HostReport{LiveNodes: liveNodes, Leases: leases, Deployments: deps})
+}
+
+// HostReport is the heartbeat body (PUT /v1/hosts/{id}/status).
+type HostReport struct {
+	LiveNodes   int                `json:"liveNodes"`
+	Leases      []HeartbeatLease   `json:"leases"`
+	Deployments []DeploymentStatus `json:"deployments"`
+	// Usage is the live capacity usage (nil: not reported). Containers are
+	// the running containers; nil (not reported) skips the reconciliation,
+	// an empty list means none run.
+	Usage      *HostUsage         `json:"usage"`
+	Containers []RunningContainer `json:"containers"`
+}
+
+// ReportHostStatus is a heartbeat: host liveness and usage, lease renewals,
+// deployment statuses and the container reservation reconciliation.
+func (m *Mgmt) ReportHostStatus(ctx context.Context, hostID string, rep HostReport) (HeartbeatResponse, error) {
+	liveNodes, leases := rep.LiveNodes, rep.Leases
+	for _, d := range rep.Deployments {
 		if d.DeploymentID != "" {
 			m.setDepStatus(d.DeploymentID, d)
 		}
 	}
 	now := m.now()
-	if err := m.store.TouchHost(ctx, hostID, liveNodes, now); err != nil {
+	if err := m.store.TouchHost(ctx, hostID, liveNodes, rep.Usage, now); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return HeartbeatResponse{}, errf(404, "host_not_registered", "host %s is not registered", hostID)
 		}
@@ -517,6 +576,9 @@ func (m *Mgmt) Heartbeat(ctx context.Context, hostID string, liveNodes int, leas
 		if _, err := m.store.RenewLease(ctx, name, hostID, hl.Epoch, NamespaceLeaseTTL, now); err != nil {
 			resp.Revoke = append(resp.Revoke, hl.Namespace)
 		}
+	}
+	if rep.Containers != nil {
+		m.reconcileContainers(ctx, hostID, rep.Containers)
 	}
 	objs, err := m.store.Revocations(ctx, hostID, now.Add(-m.cfg.RevocationWindow))
 	if err != nil {
@@ -552,6 +614,9 @@ func (m *Mgmt) resolveLease(ctx context.Context, hostID, ns string) string {
 // DeployRequest is POST /v0/deployments. Namespaces and Host are additions
 // to the v0 contract: explicit class config (instead of twd.jsonc in the
 // bundle) and an explicit host choice.
+// BuiltImages are one class's images built by twd deploy.
+type BuiltImages = registry.Built
+
 type DeployRequest struct {
 	TenantID   string        `json:"tenantID"`
 	Workload   string        `json:"workload"`
@@ -562,6 +627,10 @@ type DeployRequest struct {
 	// stopped heartbeating, is really gone, so a stateful workload may move
 	// off it (ADR-028 §3). Audited.
 	ForceTakeover bool `json:"forceTakeover,omitempty"`
+	// ContainerImages are the images twd deploy built and pushed, by class
+	// (twd.local/<tenant>/…@sha256 refs): they replace the class's Dockerfile
+	// image / images before every ref is pinned (ADR-032 D3).
+	ContainerImages map[string]BuiltImages `json:"containerImages,omitempty"`
 	// By is the deployer (set by the API layer from the principal, never
 	// from the request body): a WhoIs login over the tailnet, the local
 	// actor on the unix socket.
@@ -636,7 +705,27 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 			}
 		}
 	}
-	host, err := m.pickHost(ctx, t, r.Workload, r.Host, tier)
+	need := placementNeed{Tier: tier}
+	var ctrs []container.Class
+	if len(r.Bundle) > 0 {
+		if ctrs, err = BundleContainers(r.Bundle); err != nil {
+			return resp, errf(400, "bad_bundle", "%v", err)
+		}
+		if need.Arch, err = container.Arch(ctrs); err != nil {
+			return resp, errf(400, "bad_bundle", "%v", err)
+		}
+		need.Containers = len(ctrs) > 0
+	}
+	if ctrs, err = registry.ApplyBuilt(t.ID, ctrs, r.ContainerImages); err != nil {
+		return resp, errf(400, "bad_request", "%v", err)
+	}
+	// Pin every image to a digest once, now (ADR-032 D3), for the arches of
+	// the tenant's container hosts; placement then needs one of the arches
+	// every image resolved for.
+	if ctrs, need.Arches, err = m.pinContainers(ctx, t, ctrs, need.Arch, r.By); err != nil {
+		return resp, err
+	}
+	host, err := m.pickHost(ctx, t, r.Workload, r.Host, need)
 	if err != nil {
 		return resp, err
 	}
@@ -656,7 +745,8 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		return resp, err
 	}
 	d := Deployment{ID: newID("dp_"), TenantID: t.ID, Workload: r.Workload, HostID: host, Namespaces: classes,
-		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli(), Fence: fence}
+		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli(), Fence: fence,
+		Containers: ctrs}
 	detail := map[string]any{"deploymentID": d.ID, "workload": d.Workload, "host": host, "epoch": lease.Epoch, "by": r.By}
 	if takeoverFrom != "" {
 		detail["takeoverFrom"], detail["forced"] = takeoverFrom, true
@@ -708,7 +798,9 @@ type DeploymentView struct {
 	Namespaces   []ClassConfig `json:"namespaces"`
 	DeployedBy   string        `json:"deployedBy,omitempty"`
 	CreatedAt    int64         `json:"createdAt"`
-	Endpoint     struct {
+	// Containers are the container classes and their pinned images.
+	Containers []container.Class `json:"containers,omitempty"`
+	Endpoint   struct {
 		ObjectID string `json:"objectID,omitempty"`
 		Node     string `json:"node"`
 		MagicDNS string `json:"magicDNS"`
@@ -727,6 +819,7 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 	}
 	v.DeploymentID, v.TenantID, v.Workload, v.Host, v.Epoch, v.Namespaces, v.CreatedAt = d.ID, d.TenantID, d.Workload, d.HostID, d.Epoch, d.Namespaces, d.CreatedAt
 	v.DeployedBy = d.DeployedBy
+	v.Containers = d.Containers
 	v.Status, v.Error = m.deploymentStatus(ctx, d)
 	if o, err := m.store.GetObjectByName(ctx, d.TenantID, d.Workload, WorkloadNamespace, d.Workload); err == nil {
 		v.Endpoint.ObjectID, v.Endpoint.MagicDNS, v.Endpoint.Status = o.ID, o.MagicDNS, o.Status
@@ -829,11 +922,60 @@ func (h Host) offersTier(tier string) bool {
 	return tier == "" || slices.Contains(h.Tiers, tier)
 }
 
+// placementNeed is what a host must offer to run a deployment: its tier
+// ("" = any) and, when the bundle declares containers, the "containers"
+// capability for the images' arch ("" = any). A container always runs on
+// its parent DO's host (ADR-032 D9), so this holds for process-tier parents
+// too.
+type placementNeed struct {
+	Tier       string
+	Containers bool
+	Arch       string
+	// Arches, when set, are the arches the deploy's images were pinned for
+	// (the host's arch must be one of them).
+	Arches []string
+}
+
+func (h Host) offers(n placementNeed) bool {
+	if !h.offersTier(n.Tier) {
+		return false
+	}
+	return !n.Containers || slices.Contains(h.Tiers, CapContainers) && (n.Arch == "" || h.Arch == n.Arch) &&
+		(len(n.Arches) == 0 || slices.Contains(n.Arches, h.Arch))
+}
+
+// String names the need in errors: `the "microvm" tier`, `containers
+// (amd64 images)`, or both.
+func (n placementNeed) String() string {
+	var parts []string
+	if n.Tier != "" {
+		parts = append(parts, fmt.Sprintf("the %q tier", n.Tier))
+	}
+	if n.Containers {
+		c := "containers"
+		if n.Arch != "" {
+			c += " (" + n.Arch + " images)"
+		} else if len(n.Arches) > 0 {
+			c += " (" + strings.Join(n.Arches, " or ") + " images: the arches every image was pinned for)"
+		}
+		parts = append(parts, c)
+	}
+	return strings.Join(parts, " and ")
+}
+
+// fix is how to get a host that offers n.
+func (n placementNeed) fix() string {
+	if n.Containers && n.Arch != "" {
+		return fmt.Sprintf("set up a %s Linux host with KVM (`sudo twd host setup --microvm`)", n.Arch)
+	}
+	return "set one up with `sudo twd host setup --microvm`"
+}
+
 // pickHost: MVP is a single host per tenant namespace. Eligible hosts are
-// live, in the tenant's pool and offer the deployment's tier. Keep the
-// current live lease holder; otherwise the eligible host with the most free
-// capacity.
-func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want, tier string) (string, error) {
+// live, in the tenant's pool and offer what the deployment needs (its tier;
+// containers for its images' arch). Keep the current live lease holder;
+// otherwise the eligible host with the most free capacity.
+func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want string, need placementNeed) (string, error) {
 	now := m.now()
 	hosts, err := m.store.ListHosts(ctx, Page{})
 	if err != nil {
@@ -850,15 +992,15 @@ func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want, tier stri
 		if !ok {
 			return "", errf(503, "no_host", "host %q is not live (no heartbeat within %v)", want, HostLeaseTTL)
 		}
-		if !h.offersTier(tier) {
-			return "", errf(409, "tier_unavailable", "host %q does not offer the %q tier (it offers %s); deploy without --host, or pick a host set up with `sudo twd host setup --microvm`", want, tier, tierList(h))
+		if !h.offers(need) {
+			return "", errf(409, "tier_unavailable", "host %q does not offer %s (it offers %s); deploy without --host, or pick a host set up with `sudo twd host setup --microvm`", want, need, tierList(h))
 		}
 		return want, nil
 	}
 	if l, err := m.store.GetLease(ctx, LeaseName(t.ID, workload)); err == nil && l.Holder != "" {
 		if h, ok := live[l.Holder]; ok {
-			if !h.offersTier(tier) {
-				return "", errf(409, "tier_unavailable", "workload %q runs on host %s, which does not offer the %q tier it now asks for (the host offers %s); run `twd undeploy %s`, then deploy again to place it on a host with that tier", workload, h.ID, tier, tierList(h), workload)
+			if !h.offers(need) {
+				return "", errf(409, "tier_unavailable", "workload %q runs on host %s, which does not offer %s it now asks for (the host offers %s); run `twd undeploy %s`, then deploy again to place it on a host that does", workload, h.ID, need, tierList(h), workload)
 			}
 			return l.Holder, nil
 		}
@@ -868,7 +1010,7 @@ func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want, tier stri
 		if _, ok := live[h.ID]; !ok {
 			continue
 		}
-		if !h.offersTier(tier) {
+		if !h.offers(need) {
 			others++
 			continue
 		}
@@ -877,8 +1019,11 @@ func (m *Mgmt) pickHost(ctx context.Context, t Tenant, workload, want, tier stri
 		}
 	}
 	if best == "" {
-		if tier != "" && others > 0 {
-			return "", errf(503, "no_host", "no live host offers the %q tier (%d live host(s) offer only other tiers); set one up with `sudo twd host setup --microvm`, or deploy with \"tier\": \"process\"", tier, others)
+		if others > 0 && need.Containers {
+			return "", errf(503, "no_host", "no live host offers %s, which the bundle's \"containers\" need (%d live host(s) don't); %s. NAS and no-KVM hosts never offer containers", need, others, need.fix())
+		}
+		if need.Tier != "" && others > 0 {
+			return "", errf(503, "no_host", "no live host offers %s (%d live host(s) offer only other tiers); %s, or deploy with \"tier\": \"process\"", need, others, need.fix())
 		}
 		return "", errf(503, "no_host", "no live host (register twd-hostd and heartbeat first)")
 	}
@@ -889,7 +1034,11 @@ func tierList(h Host) string {
 	if len(h.Tiers) == 0 {
 		return "none listed (process only)"
 	}
-	return strings.Join(h.Tiers, ", ")
+	s := strings.Join(h.Tiers, ", ")
+	if h.Arch != "" {
+		s += "; arch " + h.Arch
+	}
+	return s
 }
 
 // Assignment is one GET /v0/hosts/{id}/assignments entry. Tailnet,
@@ -908,6 +1057,9 @@ type Assignment struct {
 	// Fence: stop serving this workload when mgmt is unreachable for
 	// FenceAfter (stateful). Hosts treat a missing field as true.
 	Fence bool `json:"fence"`
+	// Containers are the container classes with their pinned images
+	// (ADR-032 D3): hosts pull only these digests.
+	Containers []container.Class `json:"containers,omitempty"`
 }
 
 func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, error) {
@@ -920,7 +1072,7 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 		t, _ := m.store.GetTenant(ctx, d.TenantID)
 		a := Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
 			BundleURL: "/v1/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
-			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}, Fence: d.Fence}
+			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}, Fence: d.Fence, Containers: d.Containers}
 		for _, c := range d.Namespaces {
 			if c.Class == WorkloadNamespace {
 				a.WorkloadTags = c.Tags
@@ -2287,7 +2439,8 @@ const (
 // PrivilegedKinds are the kinds a tenant may never submit (RT-02).
 var PrivilegedKinds = map[string]bool{"allow": true, "deny": true, "egress": true, "spawn": true, "kill": true,
 	"create": true, "mint": true, "ready": true, "credential": true, "principal": true, "device_delete": true,
-	"tenant": true, "deploy": true, "obo_root": true}
+	"tenant": true, "deploy": true, "obo_root": true, "container_start": true, "container_stop": true,
+	"image_push": true, "image_pin": true, "image_public": true}
 
 // checkAuditSource enforces the provenance contract on a host-submitted
 // record: a "tenant" source may only carry a tenant_note, and a tenant_note

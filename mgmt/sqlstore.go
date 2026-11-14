@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/container"
+
 	_ "github.com/jackc/pgx/v5/stdlib" // Postgres driver "pgx"
 	_ "modernc.org/sqlite"             // pure-Go SQLite driver "sqlite" (no cgo)
 )
@@ -396,6 +398,23 @@ CREATE TABLE IF NOT EXISTS secret_choice (
   name TEXT PRIMARY KEY, key_id TEXT NOT NULL, created_at BIGINT NOT NULL);
 CREATE TABLE IF NOT EXISTS replicas (
   id TEXT PRIMARY KEY, custody TEXT NOT NULL, started_at BIGINT NOT NULL, last_seen BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS container_reservations (
+  id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, workload TEXT NOT NULL, class TEXT NOT NULL, object TEXT NOT NULL,
+  host_id TEXT NOT NULL, uvcpu BIGINT NOT NULL, mem_mib BIGINT NOT NULL, disk_mib BIGINT NOT NULL,
+  created_at BIGINT NOT NULL, renewed_at BIGINT NOT NULL,
+  UNIQUE (tenant_id, workload, class, object));
+CREATE INDEX IF NOT EXISTS container_reservations_tenant ON container_reservations (tenant_id, renewed_at);
+CREATE INDEX IF NOT EXISTS container_reservations_host ON container_reservations (host_id);
+CREATE TABLE IF NOT EXISTS registry_links (
+  repo TEXT NOT NULL, digest TEXT NOT NULL, kind TEXT NOT NULL, media_type TEXT NOT NULL, size BIGINT NOT NULL, created_at BIGINT NOT NULL,
+  PRIMARY KEY (repo, digest, kind));
+CREATE TABLE IF NOT EXISTS registry_tags (
+  repo TEXT NOT NULL, tag TEXT NOT NULL, digest TEXT NOT NULL, updated_at BIGINT NOT NULL,
+  PRIMARY KEY (repo, tag));
+CREATE TABLE IF NOT EXISTS public_images (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL, arch TEXT NOT NULL, repo TEXT NOT NULL, digest TEXT NOT NULL,
+  source_digest TEXT NOT NULL, created_by TEXT NOT NULL, created_at BIGINT NOT NULL,
+  UNIQUE (ref, arch));
 `
 
 // Append-only audit: UPDATE/DELETE on audit rows abort (defence in depth;
@@ -530,6 +549,15 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// mm-loop F3 (H02): one replica mints each object.
 		{"objects", "mint_claim", "ALTER TABLE objects ADD COLUMN mint_claim TEXT NOT NULL DEFAULT ''"},
 		{"objects", "mint_claimed_at", "ALTER TABLE objects ADD COLUMN mint_claimed_at BIGINT NOT NULL DEFAULT 0"},
+		// ADR-032: container quotas (0 = the default), host arch and
+		// capacity/usage vectors (JSON), a deployment's container classes.
+		{"tenants", "max_containers", "ALTER TABLE tenants ADD COLUMN max_containers BIGINT NOT NULL DEFAULT 0"},
+		{"tenants", "max_container_mem", "ALTER TABLE tenants ADD COLUMN max_container_mem BIGINT NOT NULL DEFAULT 0"},
+		{"tenants", "max_container_uvcpu", "ALTER TABLE tenants ADD COLUMN max_container_uvcpu BIGINT NOT NULL DEFAULT 0"},
+		{"hosts", "arch", "ALTER TABLE hosts ADD COLUMN arch TEXT NOT NULL DEFAULT ''"},
+		{"hosts", "capacity_vec", "ALTER TABLE hosts ADD COLUMN capacity_vec TEXT NOT NULL DEFAULT ''"},
+		{"hosts", "usage_vec", "ALTER TABLE hosts ADD COLUMN usage_vec TEXT NOT NULL DEFAULT ''"},
+		{"deployments", "containers", "ALTER TABLE deployments ADD COLUMN containers TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {
@@ -735,13 +763,16 @@ func jsonStr(v any) string {
 
 // ---- tenants ----
 
-const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at, oauth_client_id, oauth_client_file"
+const tenantCols = "id, tailnet, control_url, mint_mode, api_key_file, wif_client_id, wif_lifecycle_client_id, rpm, max_objects, created_at, pool, tier, updated_at, oauth_client_id, oauth_client_file, max_containers, max_container_mem, max_container_uvcpu"
 
 func scanTenant(sc interface{ Scan(...any) error }) (Tenant, error) {
 	var t Tenant
-	var rpm, mo int64
-	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt, &t.OAuthClientID, &t.OAuthClientFile)
+	var rpm, mo, mc, mm, mv int64
+	err := sc.Scan(&t.ID, &t.Tailnet, &t.ControlURL, &t.MintMode, &t.APIKeyFile, &t.WIFClientID, &t.WIFLifecycleClientID, &rpm, &mo, &t.CreatedAt, &t.Pool, &t.Tier, &t.UpdatedAt, &t.OAuthClientID, &t.OAuthClientFile,
+		&mc, &mm, &mv)
 	t.RegistrationsPerMinute, t.MaxObjects = int(rpm), int(mo)
+	t.MaxContainers, t.MaxContainerMemMiB, t.MaxContainerVCPU = int(mc), int(mm), float64(mv)/1e6
+	t.containerDefaults() // rows from before the columns
 	if t.UpdatedAt == 0 {
 		t.UpdatedAt = t.CreatedAt
 	}
@@ -751,13 +782,17 @@ func scanTenant(sc interface{ Scan(...any) error }) (Tenant, error) {
 	return t, err
 }
 
+// micro is a fractional vCPU count in millionths (the stored unit).
+func micro(v float64) int64 { return int64(math.Round(v * 1e6)) }
+
 func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 	if t.UpdatedAt == 0 {
 		t.UpdatedAt = t.CreatedAt
 	}
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO tenants ("+tenantCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
 		t.ID, t.Tailnet, t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID,
-		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile)
+		t.RegistrationsPerMinute, t.MaxObjects, t.CreatedAt, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile,
+		t.MaxContainers, t.MaxContainerMemMiB, micro(t.MaxContainerVCPU))
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -767,8 +802,9 @@ func (s *SQLStore) CreateTenant(ctx context.Context, t Tenant) error {
 // UpdateTenant rewrites a tenant's mint configuration (mode, key file,
 // WIF client IDs) and limits; ID, tailnet and createdAt are immutable.
 func (s *SQLStore) UpdateTenant(ctx context.Context, t Tenant) error {
-	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=?, oauth_client_id=?, oauth_client_file=? WHERE id=?"),
-		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile, t.ID)
+	res, err := s.db.ExecContext(ctx, s.q("UPDATE tenants SET control_url=?, mint_mode=?, api_key_file=?, wif_client_id=?, wif_lifecycle_client_id=?, rpm=?, max_objects=?, pool=?, tier=?, updated_at=?, oauth_client_id=?, oauth_client_file=?, max_containers=?, max_container_mem=?, max_container_uvcpu=? WHERE id=?"),
+		t.ControlURL, t.MintMode, t.APIKeyFile, t.WIFClientID, t.WIFLifecycleClientID, t.RegistrationsPerMinute, t.MaxObjects, t.Pool, t.Tier, t.UpdatedAt, t.OAuthClientID, t.OAuthClientFile,
+		t.MaxContainers, t.MaxContainerMemMiB, micro(t.MaxContainerVCPU), t.ID)
 	if err != nil {
 		return err
 	}
@@ -785,8 +821,16 @@ func (s *SQLStore) GetTenant(ctx context.Context, id string) (Tenant, error) {
 func (s *SQLStore) DeleteTenant(ctx context.Context, id string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		for _, q := range []string{"DELETE FROM objects WHERE tenant_id=?", "DELETE FROM deployments WHERE tenant_id=?",
-			"DELETE FROM leases WHERE name LIKE ? || '/%'"} {
+			"DELETE FROM leases WHERE name LIKE ? || '/%'", "DELETE FROM container_reservations WHERE tenant_id=?"} {
 			if _, err := tx.ExecContext(ctx, s.q(q), id); err != nil {
+				return err
+			}
+		}
+		// The tenant's registry namespace (ADR-032 D3): its links and tags go
+		// (blobs stay content-addressed on disk). A prefix compare, not LIKE:
+		// "_" in a tenant ID must not match another tenant's namespace.
+		for _, q := range []string{"DELETE FROM registry_links WHERE substr(repo, 1, ?) = ?", "DELETE FROM registry_tags WHERE substr(repo, 1, ?) = ?"} {
+			if _, err := tx.ExecContext(ctx, s.q(q), len(id)+1, id+"/"); err != nil {
 				return err
 			}
 		}
@@ -824,14 +868,15 @@ func (s *SQLStore) ListTenants(ctx context.Context, pg Page) ([]Tenant, error) {
 
 // ---- hosts ----
 
-const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at, push_target"
+const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at, push_target, arch, capacity_vec, usage_vec"
 
 func scanHost(sc interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var capacity, live int64
-	var tiers string
+	var tiers, capVec, usageVec string
 	var port int64
-	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt, &h.PushTarget)
+	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt, &h.PushTarget,
+		&h.Arch, &capVec, &usageVec)
 	if errors.Is(err, sql.ErrNoRows) {
 		return h, ErrNotFound
 	}
@@ -840,7 +885,23 @@ func scanHost(sc interface{ Scan(...any) error }) (Host, error) {
 		h.UpdatedAt = h.LastSeen
 	}
 	json.Unmarshal([]byte(tiers), &h.Tiers)
+	if capVec != "" {
+		h.Capacity = &HostCapacity{}
+		json.Unmarshal([]byte(capVec), h.Capacity)
+	}
+	if usageVec != "" {
+		h.Usage = &HostUsage{}
+		json.Unmarshal([]byte(usageVec), h.Usage)
+	}
 	return h, err
+}
+
+// vecStr is a capacity/usage vector column ("" = none reported).
+func vecStr[T any](v *T) string {
+	if v == nil {
+		return ""
+	}
+	return jsonStr(v)
 }
 
 func (s *SQLStore) UpsertHost(ctx context.Context, h Host) error {
@@ -851,11 +912,13 @@ func (s *SQLStore) UpsertHost(ctx context.Context, h Host) error {
 		h.CreatedAt = h.UpdatedAt
 	}
 	// created_at is kept from the first insert (the page key must be stable).
-	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+	// usage_vec is the heartbeat's (TouchHost), kept across re-registration.
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET capacity=excluded.capacity, tiers=excluded.tiers, node_id=excluded.node_id,
 		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen, pool=excluded.pool, push_port=excluded.push_port, updated_at=excluded.updated_at,
-		push_target=excluded.push_target`),
-		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt, h.PushTarget)
+		push_target=excluded.push_target, arch=excluded.arch, capacity_vec=excluded.capacity_vec`),
+		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt, h.PushTarget,
+		h.Arch, vecStr(h.Capacity), vecStr(h.Usage))
 	return err
 }
 
@@ -863,15 +926,20 @@ func (s *SQLStore) GetHost(ctx context.Context, id string) (Host, error) {
 	return scanHost(s.db.QueryRowContext(ctx, s.q("SELECT "+hostCols+" FROM hosts WHERE id=?"), id))
 }
 
+// DeleteHost removes the host and its container reservations (its
+// containers die with it: ADR-032 D2).
 func (s *SQLStore) DeleteHost(ctx context.Context, id string) error {
-	res, err := s.db.ExecContext(ctx, s.q("DELETE FROM hosts WHERE id=?"), id)
-	if err != nil {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, s.q("DELETE FROM hosts WHERE id=?"), id)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return ErrNotFound
+		}
+		_, err = tx.ExecContext(ctx, s.q("DELETE FROM container_reservations WHERE host_id=?"), id)
 		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	})
 }
 
 func (s *SQLStore) ListHosts(ctx context.Context, pg Page) ([]Host, error) {
@@ -895,8 +963,12 @@ func (s *SQLStore) ListHosts(ctx context.Context, pg Page) ([]Host, error) {
 	return out, rows.Err()
 }
 
-func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now time.Time) error {
-	r, err := s.db.ExecContext(ctx, s.q("UPDATE hosts SET live_nodes=?, last_seen=? WHERE id=?"), liveNodes, now.UnixMilli(), id)
+func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, usage *HostUsage, now time.Time) error {
+	q, args := "UPDATE hosts SET live_nodes=?, last_seen=? WHERE id=?", []any{liveNodes, now.UnixMilli(), id}
+	if usage != nil {
+		q, args = "UPDATE hosts SET live_nodes=?, last_seen=?, usage_vec=? WHERE id=?", []any{liveNodes, now.UnixMilli(), jsonStr(usage), id}
+	}
+	r, err := s.db.ExecContext(ctx, s.q(q), args...)
 	if err != nil {
 		return err
 	}
@@ -908,20 +980,31 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence, host_status, host_error"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence, host_status, host_error, containers"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
-	var ns string
+	var ns, cs string
 	var ml, md, fence int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError)
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &cs)
 	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
 	d.MaxLive, d.MaxDepth = int(ml), int(md)
 	json.Unmarshal([]byte(ns), &d.Namespaces)
+	if cs != "" {
+		json.Unmarshal([]byte(cs), &d.Containers)
+	}
 	return d, err
+}
+
+// containersStr is the deployments.containers column ("" = none).
+func containersStr(cs []container.Class) string {
+	if len(cs) == 0 {
+		return ""
+	}
+	return jsonStr(cs)
 }
 
 func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
@@ -930,9 +1013,9 @@ func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
 		fence = 1
 	}
 	err := s.tx(ctx, func(tx *sql.Tx) error { // a tx so a deploy's audit intent commits with it (H22)
-		_, err := tx.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+		_, err := tx.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
 			d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence,
-			d.HostStatus, d.HostError, d.Bundle)
+			d.HostStatus, d.HostError, containersStr(d.Containers), d.Bundle)
 		return err
 	})
 	if isUnique(err) {
@@ -944,15 +1027,18 @@ func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
 func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, error) {
 	row := s.db.QueryRowContext(ctx, s.q("SELECT "+deployCols+", bundle FROM deployments WHERE id=?"), id)
 	var d Deployment
-	var ns string
+	var ns, cs string
 	var ml, md, fence int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &d.Bundle)
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &cs, &d.Bundle)
 	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
 	d.MaxLive, d.MaxDepth = int(ml), int(md)
 	json.Unmarshal([]byte(ns), &d.Namespaces)
+	if cs != "" {
+		json.Unmarshal([]byte(cs), &d.Containers)
+	}
 	return d, err
 }
 

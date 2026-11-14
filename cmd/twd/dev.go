@@ -104,7 +104,10 @@ func cmdDev(args []string) error {
 	}
 	hc, _ := mgmtapi.NewClient("unix://" + sock)
 	h, err := hostd.New(hostd.Config{HostID: "dev", Mgmt: hc, DataDir: filepath.Join(tmp, "data"), RunDir: filepath.Join(tmp, "run"),
-		WorkerdBin: wd, HeartbeatEvery: 300 * time.Millisecond, Ephemeral: true, ControlURL: ctl.URL, Logger: log, HostnamePrefix: "dev-"})
+		WorkerdBin: wd, HeartbeatEvery: 300 * time.Millisecond, Ephemeral: true, ControlURL: ctl.URL, Logger: log, HostnamePrefix: "dev-",
+		// twd dev is explicitly process-tier: a "tier": "microvm" app runs
+		// in a local process here (never on a host serving tenants).
+		ForceProcessTier: true})
 	if err != nil {
 		return err
 	}
@@ -177,6 +180,9 @@ func cmdDev(args []string) error {
 		return nil
 	}
 	fmt.Printf("twd dev · process tier · embedded control plane (127.0.0.1) · no policy evaluator yet: every dev node sees every other\n")
+	if a.Cfg.Tier == "microvm" {
+		fmt.Printf("  twd.jsonc asks for \"tier\": \"microvm\"; twd dev runs it in the process tier (deployed hosts refuse it without a microVM backend)\n")
+	}
 	fmt.Printf("  node %-28s %s\n", wl.Hostname, strings.Join(a.Cfg.Tailnet.Tags, ","))
 	for _, c := range a.Cfg.Classes() {
 		if c.Class != "_workload" {

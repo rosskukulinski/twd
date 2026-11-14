@@ -103,6 +103,9 @@ hostd's API, not this document's.
 | `POST` | `/v1/audit` | host | yes | `AppendAudit` | Append a batch of host audit records |
 | `GET` | `/v1/audit/verification` | admin | no | `GetAuditVerification` | Verify every audit chain |
 | `GET` | `/v1/certificates/{stableNodeID}` | host\|admin | no | `GetCertificate` | Look up a node certificate by stable node ID |
+| `GET` | `/v1/container-reservations` | admin\|host | no | `ListContainerReservations` | List container reservations |
+| `POST` | `/v1/container-reservations` | host | yes | `CreateContainerReservation` | Reserve quota for a container before it starts |
+| `DELETE` | `/v1/container-reservations/{id}` | host\|admin | yes | `DeleteContainerReservation` | Release a container reservation (the container stopped) |
 | `GET` | `/v1/deployments` | admin | no | `ListDeployments` | List deployments |
 | `POST` | `/v1/deployments` | admin | yes | `CreateDeployment` | Deploy a workload (async), or preflight it with dryRun |
 | `GET` | `/v1/deployments/{id}` | admin\|host | no | `GetDeployment` | Read a deployment and its status |
@@ -117,6 +120,10 @@ hostd's API, not this document's.
 | `DELETE` | `/v1/hosts/{id}` | admin | yes | `DeleteHost` | Drain and remove a host |
 | `GET` | `/v1/hosts/{id}/assignments` | host\|admin | no | `ListHostAssignments` | List the deployments assigned to a host |
 | `PUT` | `/v1/hosts/{id}/status` | host | no | `ReportHostStatus` | Heartbeat (replace the host's reported status) |
+| `GET` | `/v1/images/aliases` | admin\|host | no | `ListImageAliases` | The image alias map |
+| `GET` | `/v1/images/public` | admin\|host | no | `ListPublicImages` | List public base images |
+| `POST` | `/v1/images/public` | admin | yes | `CreatePublicImage` | Mark an image as a public base (mirrors it now) |
+| `DELETE` | `/v1/images/public/{id}` | admin | yes | `DeletePublicImage` | Unmark a public base image |
 | `GET` | `/v1/objects` | admin\|host | no | `ListObjects` | List objects (with lineage) |
 | `POST` | `/v1/objects` | host | yes | `CreateObject` | Create an object (async mint) |
 | `GET` | `/v1/objects/{id}` | admin\|host | no | `GetObject` | Read an object (lineage, children, kill record) |
@@ -138,6 +145,16 @@ hostd's API, not this document's.
 | `GET` | `/jwks` | public | no | `GetJWKS` | Issuer signing keys |
 | `GET` | `/t/{tenant}/.well-known/openid-configuration` | public | no | `GetTenantOIDCConfiguration` | OIDC discovery (per-tenant issuer `…/t/{tenant}`) |
 | `GET` | `/t/{tenant}/jwks` | public | no | `GetTenantJWKS` | Per-tenant issuer signing keys (same key set) |
+| `GET` | `/v2/` | admin\|host | no | `RegistryBase` | OCI API version check |
+| `POST` | `/v2/{name}/blobs/uploads/` | admin | no | `RegistryStartUpload` | Start a blob upload (or a monolithic upload, or a mount) |
+| `GET` | `/v2/{name}/blobs/uploads/{uuid}` | admin | no | `RegistryUploadStatus` | Upload progress |
+| `PUT` | `/v2/{name}/blobs/uploads/{uuid}` | admin | no | `RegistryFinishUpload` | Finish an upload (`?digest=` required; optional final chunk as the body) |
+| `PATCH` | `/v2/{name}/blobs/uploads/{uuid}` | admin | no | `RegistryUploadChunk` | Upload a chunk |
+| `DELETE` | `/v2/{name}/blobs/uploads/{uuid}` | admin | no | `RegistryCancelUpload` | Cancel an upload |
+| `GET` | `/v2/{name}/blobs/{digest}` | admin\|host | no | `RegistryGetBlob` | Pull a blob (Range supported) |
+| `GET` | `/v2/{name}/manifests/{reference}` | admin\|host | no | `RegistryGetManifest` | Pull a manifest or index (by tag or digest) |
+| `PUT` | `/v2/{name}/manifests/{reference}` | admin | yes | `RegistryPutManifest` | Push a manifest or index (by tag or digest) |
+| `GET` | `/v2/{name}/tags/list` | admin\|host | no | `RegistryListTags` | List a repository's tags (`?n=` / `?last=` paging) |
 
 ## Tenants
 
@@ -917,6 +934,348 @@ logged. Replaces `GET /v0/volumes/key`.
 | 409 | `Error` | The caller does not hold the namespace lease at this epoch. |
 | default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
 
+## Containers
+
+Container and code-sandbox reservations against tenant quotas (microVM tier, ADR-032).
+
+### `GET /v1/container-reservations` — List container reservations
+
+`ListContainerReservations` · role **admin\|host** · audited: no
+
+Hosts see their own reservations only.
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
+| `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
+| `tenant` | query | string | no |  |
+| `host` | query | string | no |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | `ContainerReservationPage` | One page of reservations, ordered by `(createdAt, reservationID)`. |
+| 400 | `Error` | Malformed request, body, filter or cursor. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+### `POST /v1/container-reservations` — Reserve quota for a container before it starts
+
+`CreateContainerReservation` · role **host** · audited: yes
+
+hostd calls this synchronously at `ctx.container.start()`, after its
+own capacity check (`503 capacity_exhausted` is hostd's, never
+mgmt's) and before it boots the container's VM. Only the host holding
+the workload's lease at `epoch` may reserve (`409 lease_lost`).
+
+The key is `(tenantID, workload, class, object)`: one container per
+DO instance (ADR-032 D2). Reserving a key that already holds a
+reservation is **idempotent** (`200`, the same `reservationID`; a
+larger container re-checks the quota for the difference), so a
+restart never needs new headroom, and a host that took the workload
+over adopts the key. A new key is checked atomically, in the store,
+against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+and `maxContainerVCPU`, and the class's `max_instances` from the
+deployment: over any of them is `429 container_quota_exceeded`
+(`missing: {quota, limit, used, requested}`). Containers are not
+objects: they count against neither `maxObjects` nor a host's
+`capacityNodes`.
+
+hostd **fails closed** when mgmt is unreachable: no reservation, no
+start, except a restart of a container whose reservation it already
+holds. Released by `DELETE` on stop; a reservation that no heartbeat
+reports (`HostStatus.containers`) for 30 s after its creation is
+released by mgmt, and one whose host stopped reporting it for 2 min no
+longer counts, both on the store clock. Audited
+(`kind: container_reserve`).
+
+**Request** `application/json`: `ContainerReservationCreate`
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | `ContainerReservation` | The key already held a reservation (restart, or a takeover by the lease holder); it is returned, renewed. |
+| 201 | `ContainerReservation` | Reserved. |
+| 400 | `Error` | Malformed request, body, filter or cursor. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| 404 | `Error` | Unknown tenant (`unknown_tenant`). |
+| 409 | `Error` | The caller does not hold the namespace lease at this epoch. |
+| 429 | `Error` | Over a container quota (`container_quota_exceeded`). |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+### `DELETE /v1/container-reservations/{id}` — Release a container reservation (the container stopped)
+
+`DeleteContainerReservation` · role **host\|admin** · audited: yes
+
+Only the holding host (or an admin) may release it (`403 forbidden`).
+Idempotent from the host's side: `404` means it is already gone.
+Audited (`kind: container_release`).
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `id` | path | string | yes | Container reservation ID (`cr_…`). |
+
+| Status | Body | Description |
+|---|---|---|
+| 204 | — | Released. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| 404 | `Error` | No such resource (or none the caller may see). |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+## Images
+
+Container images (ADR-032 D3) — public base images shared across tenants, and the arm64 alias map.
+
+### `GET /v1/images/aliases` — The image alias map
+
+`ListImageAliases` · role **admin\|host** · audited: no
+
+Upstream refs swapped for another image on one arch (ADR-032 D3: Cloudflare publishes
+`cloudflare/sandbox` for linux/amd64 only; arm64 hosts get twd's rebuild from the Apache-2.0
+source, in `public/`). Deploys apply it when pinning; `twd deploy` applies it as BuildKit named
+contexts when it builds a Dockerfile, so app source never changes.
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | `ImageAliasList` | The aliases. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+### `GET /v1/images/public` — List public base images
+
+`ListPublicImages` · role **admin\|host** · audited: no
+
+Operator-marked public bases (ADR-032 D3): images every tenant's deploy may pin without a
+per-tenant mirror, and every host caches once for all tenants (hostd's `public` cache
+scope). Everything else is cached per tenant, so a cache hit never tells one tenant which
+images another uses.
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `limit` | query | integer | no | Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`. |
+| `cursor` | query | string | no | Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged. |
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | `PublicImagePage` | One page of public images, ordered by `(createdAt, id)`. |
+| 400 | `Error` | Malformed request, body, filter or cursor. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+### `POST /v1/images/public` — Mark an image as a public base (mirrors it now)
+
+`CreatePublicImage` · role **admin** · audited: yes
+
+`twd image public add <ref>`. An upstream ref (`docker.io/cloudflare/sandbox:0.12.14`) is
+mirrored now through mgmt's egress into `public/<registry>/<repository>` and pinned by digest
+for each arch (default: every linux amd64/arm64 image it has); a `twd.local/<name>` ref names
+an image already pushed to `public/<name>` (`twd image push`). Re-adding refreshes the
+digest; deployments already pinned keep theirs. Audited (`kind: image_public`).
+
+**Request** `application/json`: `PublicImageCreate`
+
+| Status | Body | Description |
+|---|---|---|
+| 201 | `PublicImageList` | Marked; one entry per arch. |
+| 400 | `Error` | Malformed request, body, filter or cursor. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| 409 | `Error` | This mgmt has no registry, or does not mirror (`registry_unavailable`, `mirror_disabled`). |
+| 502 | `Error` | The upstream image could not be mirrored (`image_unavailable`). |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+### `DELETE /v1/images/public/{id}` — Unmark a public base image
+
+`DeletePublicImage` · role **admin** · audited: yes
+
+New deploys then mirror the ref into each tenant's namespace; pinned deployments keep pulling what they pinned. Audited (`kind: image_public`).
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `id` | path | string | yes | Public image entry ID (`pi_…`). |
+
+| Status | Body | Description |
+|---|---|---|
+| 204 | — | Unmarked. |
+| 403 | `Error` | The caller is authenticated but lacks the role, or a host acts outside its own records/namespaces. |
+| 404 | `Error` | No such resource (or none the caller may see). |
+| default | `Error` | Unexpected error. The body is always the typed catalog shape; `Twd-Error` carries the code. |
+
+## Registry
+
+twd's OCI distribution registry (ADR-032 D3), served by twd-mgmt at `/v2/` on the same listeners
+and behind the same WhoIs gate as `/v1`. Its wire protocol is the external OCI Distribution Spec v1.1
+(push and pull subset); these entries document the routes and the roles twd enforces, and are
+excluded from code generation (the registry is hand-written: `internal/registry`).
+
+- `{name}` is a repository and may contain `/`: `<tenantID>/<path>` (one namespace per tenant) or
+  `public/<path>` (operator base images and alias targets).
+- **admins** push and pull every namespace; **hosts** only pull, and only `public/…` and the
+  namespaces of tenants they hold a deployment of (`403 DENIED` otherwise).
+- Blobs are content-addressed and stored once, but visible only through a repository they were
+  pushed or mirrored into: another namespace answers `404 BLOB_UNKNOWN` exactly as for absent
+  content, cross-namespace mounts are refused, and a manifest may only reference content already
+  in its own repository.
+- Errors are the spec's `{"errors": [{code, message}]}`; the body also carries twd's `code`
+  (`forbidden`, `not_found`, `bad_request`) and `Twd-Error`.
+
+### `GET /v2/` — OCI API version check
+
+`RegistryBase` · role **admin\|host** · audited: no
+
+`200 {}` with `Docker-Distribution-API-Version: registry/2.0` (clients probe it before pushing or pulling). Authentication is WhoIs on the connection: there is no token challenge.
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | — | The registry speaks the distribution API and admits the caller. |
+| 401 | `Error` | No identity on the connection (WhoIs failed), or the local-dev socket was used without `Twd-Host-Token`. |
+
+### `POST /v2/{name}/blobs/uploads/` — Start a blob upload (or a monolithic upload, or a mount)
+
+`RegistryStartUpload` · role **admin** · audited: no
+
+`202` with `Location: /v2/{name}/blobs/uploads/{uuid}`. With `?digest=` and a body: a
+monolithic upload (`201`). With `?mount=<digest>&from=<repo>`: links the blob from `from`
+(`201`) only when `from` is in the same namespace and has it; otherwise a fresh upload
+(`202`), so another tenant's content is never borrowed. Upload sessions are files under
+mgmt's registry dir (any replica sharing it can continue one).
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `digest` | query | string | no |  |
+| `mount` | query | string | no |  |
+| `from` | query | string | no |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 201 | — | Monolithic upload or mount done. |
+| 202 | — | Upload started; `Location`, `Docker-Upload-UUID`, `Range: 0-0`. |
+| 403 | — | `DENIED`. |
+
+### `GET /v2/{name}/blobs/uploads/{uuid}` — Upload progress
+
+`RegistryUploadStatus` · role **admin** · audited: no
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `uuid` | path | string | yes |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 204 | — | `Range: 0-<last byte>`. |
+| 404 | — | `BLOB_UPLOAD_UNKNOWN` (also for another repository's session). |
+
+### `PUT /v2/{name}/blobs/uploads/{uuid}` — Finish an upload (`?digest=` required; optional final chunk as the body)
+
+`RegistryFinishUpload` · role **admin** · audited: no
+
+The whole upload must hash to `digest` (`400 DIGEST_INVALID`, and nothing is linked).
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `uuid` | path | string | yes |  |
+| `digest` | query | string | yes |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 201 | — | Stored and linked into the repository; `Location`, `Docker-Content-Digest`. |
+| 400 | — | `DIGEST_INVALID`. |
+
+### `PATCH /v2/{name}/blobs/uploads/{uuid}` — Upload a chunk
+
+`RegistryUploadChunk` · role **admin** · audited: no
+
+`Content-Range: <start>-<end>` is optional; when given, `start` must equal the bytes received so far (`416` otherwise).
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `uuid` | path | string | yes |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 202 | — | Accepted; `Range: 0-<last byte>`. |
+| 416 | — | `BLOB_UPLOAD_INVALID`: out-of-order chunk. |
+
+### `DELETE /v2/{name}/blobs/uploads/{uuid}` — Cancel an upload
+
+`RegistryCancelUpload` · role **admin** · audited: no
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `uuid` | path | string | yes |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 204 | — | Cancelled. |
+
+### `GET /v2/{name}/blobs/{digest}` — Pull a blob (Range supported)
+
+`RegistryGetBlob` · role **admin\|host** · audited: no
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `digest` | path | string | yes |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | — | The content; it hashes to `digest`. |
+| 403 | — | `DENIED`. |
+| 404 | — | `BLOB_UNKNOWN`: not in this repository (whether or not another namespace has it). |
+
+### `GET /v2/{name}/manifests/{reference}` — Pull a manifest or index (by tag or digest)
+
+`RegistryGetManifest` · role **admin\|host** · audited: no
+
+`Content-Type` is the manifest's media type; `Docker-Content-Digest` its digest. `HEAD` answers the same headers without the body.
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `reference` | path | string | yes | A tag or a `sha256:` digest. |
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | — | The manifest bytes |
+| 403 | — | `DENIED`: a host pulling a tenant namespace it serves no deployment of. |
+| 404 | — | `MANIFEST_UNKNOWN`. |
+
+### `PUT /v2/{name}/manifests/{reference}` — Push a manifest or index (by tag or digest)
+
+`RegistryPutManifest` · role **admin** · audited: yes
+
+Image manifests (OCI and Docker v2 schema 2) and indexes (multi-arch). Every blob (config,
+layers) or child manifest it references must already be in **this** repository
+(`400 MANIFEST_BLOB_UNKNOWN`). A digest reference must match the body's digest. Audited
+(`kind: image_push`).
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `reference` | path | string | yes | A tag or a `sha256:` digest. |
+
+| Status | Body | Description |
+|---|---|---|
+| 201 | — | Stored; `Location` and `Docker-Content-Digest` name it. |
+| 400 | — | `MANIFEST_INVALID`, `MANIFEST_BLOB_UNKNOWN`, `DIGEST_INVALID`, `TAG_INVALID`. |
+| 403 | — | `DENIED` (hosts never push). |
+
+### `GET /v2/{name}/tags/list` — List a repository's tags (`?n=` / `?last=` paging)
+
+`RegistryListTags` · role **admin\|host** · audited: no
+
+| Parameter | In | Type | Required | Description |
+|---|---|---|---|---|
+| `name` | path | string | yes | A repository: `<tenantID>/<path>` or `public/<path>` (OCI name grammar; may contain `/`). |
+| `n` | query | integer | no |  |
+| `last` | query | string | no |  |
+
+| Status | Body | Description |
+|---|---|---|
+| 200 | — | `{name, tags}`. |
+
 ## Operational
 
 Health, status, identity, maintenance.
@@ -1044,6 +1403,12 @@ identity + WhoIs, and the `:80` listener is tailnet-only plaintext.
 
 ### Schemas
 
+#### `Arch`
+
+A Go GOARCH. Container images must match their host's.
+
+Enum: `amd64`, `arm64`
+
 #### `Assignment`
 
 What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
@@ -1051,6 +1416,7 @@ What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `bundleURL` | string (uri-reference) | yes |  |
+| `containers` | array of `ContainerClass` | no | The workload's container classes as mgmt resolved them at deploy (ADR-032 D3): the image refs `ctx.container` sees and their per-arch pins. hostd starts a container only from the pin for its own arch, pulled by digest from twd's registry. |
 | `controlURL` | string (uri) | no |  |
 | `createdAt` | integer (int64) | yes |  |
 | `deploymentID` | string | yes |  |
@@ -1090,13 +1456,17 @@ Extends `Page`.
 #### `AuditKind`
 
 Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-`principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+`principal`, `tenant_note` (source `tenant`, unverified),
+`container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
 `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-`preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+`preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`,
+`container_reserve`, `container_release`, `image_push` (a manifest pushed to the registry),
+`image_pin` (a deploy resolved its container images to digests, mirroring external ones),
+`image_public` (a public base image added or removed).
 
-Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`, `credential`, `obo_root`, `object_update`
+Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `container_start`, `container_stop`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`, `credential`, `obo_root`, `object_update`, `container_reserve`, `container_release`, `image_push`, `image_pin`, `image_public`
 
 #### `AuditPage`
 
@@ -1124,7 +1494,7 @@ written, no HTML escaping. `seq` and `chain` are assigned by mgmt.
 | `grant` | string | no |  |
 | `hash` | string | yes |  |
 | `hostSig` | string | no | base64 ed25519 over utf8(hash); host chains only. |
-| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`. |
+| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified), `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`, `container_reserve`, `container_release`, `image_push` (a manifest pushed to the registry), `image_pin` (a deploy resolved its container images to digests, mirroring external ones), `image_public` (a public base image added or removed). |
 | `objectID` | string | no |  |
 | `prevHash` | string | yes | `""` for the first record of a chain. |
 | `seq` | integer (int64) | no | (read-only) |
@@ -1172,6 +1542,87 @@ One DO namespace from `twd.jsonc` `tailnet.objects`.
 | `tags` | array of string | yes |  |
 | `ttl` | string | no | `10m`-style duration or seconds. |
 
+#### `ContainerClass`
+
+A container class of a deployment (a wrangler `containers` entry plus twd.jsonc overrides) and its pinned images.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `arch` | string: `amd64` \| `arm64` | no |  |
+| `class` | string | yes |  |
+| `custom` | `ContainerResources` | no | What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`). |
+| `image` | string | no | The default image reference `start()` runs. |
+| `imageSources` | object | no | Named images twd deploy builds: name → the wrangler Dockerfile, as written. |
+| `images` | object | no | Named images (`ctx.container.images`): name → reference. |
+| `instanceType` | string | no |  |
+| `maxInstances` | integer | no |  |
+| `pins` | array of `ContainerImagePin` | no |  |
+| `source` | string | no | The wrangler `image` as written (a ref, or a Dockerfile path). |
+
+#### `ContainerImagePin`
+
+One image reference of a container class, resolved once at deploy for one arch (ADR-032 D3):
+hosts pull exactly `repository@digest` from twd's registry and nothing else. Retagging the
+upstream ref later changes nothing until the next deploy.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `arch` | string: `amd64` \| `arm64` | yes |  |
+| `digest` | string | yes | The linux/`arch` image manifest (never an index). |
+| `from` | string | no | What was resolved: `<upstream ref>@<digest>` (mirrored), `alias <ref>`, `public <ref>`, or the twd.local ref. |
+| `name` | string | no | The class's image name (wrangler `images` key); absent for the default image. |
+| `ref` | string | yes | The reference as `ctx.container` sees it (the wrangler image, or the `twd.local/<tenant>/…@sha256:…` ref `twd deploy` built). |
+| `repository` | string | yes | `<tenantID>/…` (the tenant's builds and mirrors) or `public/…` (public bases, alias targets). |
+
+#### `ContainerImages`
+
+Images `twd deploy` built and pushed, by class: `{"<Class>": {"image": ref, "images": {name: ref}}}`
+with `twd.local/<tenantID>/<repo>@sha256:…` refs (an index when built for several arches). They
+replace the class's Dockerfile `image` / `images` entries; every ref is then pinned like any other.
+
+#### `ContainerReservation`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `class` | string | yes |  |
+| `createdAt` | integer (int64) | yes | unix ms (store clock) |
+| `host` | string | yes |  |
+| `object` | string | yes |  |
+| `renewedAt` | integer (int64) | yes | unix ms of the last reserve or heartbeat that reported it (store clock) |
+| `reservationID` | string | yes |  |
+| `resources` | `ContainerResources` | yes | What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`). |
+| `tenantID` | string | yes |  |
+| `workload` | string | yes |  |
+
+#### `ContainerReservationCreate`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `class` | string | yes | The DO class (a wrangler `containers[].class_name`). |
+| `epoch` | integer (int64) | yes | The workload's lease epoch the host holds. |
+| `object` | string | yes | The DO instance (its name or hex ID): one container per instance. |
+| `resources` | `ContainerResources` | yes | What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`). |
+| `tenantID` | string | yes |  |
+| `workload` | string | yes |  |
+
+#### `ContainerReservationPage`
+
+Extends `Page`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `items` | array of `ContainerReservation` | no |  |
+
+#### `ContainerResources`
+
+What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`).
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `diskMiB` | integer | yes |  |
+| `memMiB` | integer | yes |  |
+| `vcpu` | number | yes |  |
+
 #### `Credential`
 
 A single-use auth key. Never logged; `String()` redacts it in Go.
@@ -1190,6 +1641,7 @@ A single-use auth key. Never logged; `String()` redacts it in Go.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `containers` | array of `ContainerClass` | no | The bundle's container classes with the images pinned at deploy (ADR-032 D3): what hosts pull, by digest. |
 | `createdAt` | integer (int64) | yes |  |
 | `deployedBy` | string | no | The actor who deployed (see Conventions). |
 | `deploymentID` | string | yes |  |
@@ -1212,6 +1664,7 @@ A single-use auth key. Never logged; `String()` redacts it in Go.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `bundle` | string | yes | tar (optionally gzipped) of the built worker + `twd.jsonc` + `wrangler.jsonc`. |
+| `containerImages` | `ContainerImages` | no | Images `twd deploy` built and pushed, by class: `{"<Class>": {"image": ref, "images": {name: ref}}}` with `twd.local/<tenantID>/<repo>@sha256:…` refs (an index when built for several arches). They replace the class's Dockerfile `image` / `images` entries; every ref is then pinned like any other. |
 | `forceTakeover` | boolean | no | Confirm that the workload's current host, which has stopped heartbeating, is gone for good, so a stateful workload may move off it (ADR-028 §3). Without it such a move is refused with `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`). |
 | `host` | string | no | Pin a host. |
 | `namespaces` | array of `ClassConfig` | no | Override the classes read from `twd.jsonc` (tests). |
@@ -1265,7 +1718,7 @@ is policy HuJSON to paste when a grant is missing; `doc_url` is
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `code` | `ErrorCode` | yes | The catalog. Status in parentheses. \| code \| status \| when \| \|---\|---\|---\| \| `bad_request` \| 400 \| malformed body, parameter or filter \| \| `bad_cursor` \| 400 \| `cursor` does not decode \| \| `bad_bundle` \| 400 \| bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` \| \| `immutable_field` \| 400 \| PATCH touches a field the caller may not change \| \| `no_identity` \| 401 \| WhoIs failed for the connection \| \| `host_token_required` \| 401 \| local-dev socket without `Twd-Host-Token` \| \| `host_token_invalid` \| 403 \| local-dev socket, wrong token \| \| `not_admin` \| 403 \| tailnet caller without `twd.dev/cap/admin` (`snippet` given) \| \| `forbidden` \| 403 \| role ok, but outside the caller's records / namespaces \| \| `host_not_registered` \| 403 \| `tag:twd-host` node that never did `PUT /v1/hosts/{id}` \| \| `host_identity_mismatch` \| 403 \| host ID bound to another node \| \| `delegation_invalid` \| 403 \| child tag not owned by the parent's, parent unknown (404) or dead (410) \| \| `delegation_exceeds_parent` \| 403 \| spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) \| \| `policy_missing_tag_owners` \| 403 \| the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) \| \| `not_found` \| 404 \| — \| \| `unknown_tenant` \| 404 \| — \| \| `unknown_namespace` \| 404 \| `(workload, class)` not declared \| \| `exists` \| 409 \| create of an existing ID \| \| `lease_lost` \| 409 \| epoch/holder fence failed \| \| `lease_held` \| 409 \| another host holds the lease \| \| `store_unavailable` \| 503 \| the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` \| \| `tier_unavailable` \| 409 \| the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier \| \| `takeover_unconfirmed` \| 409 \| the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` \| \| `already_joined` \| 409 \| credential for an object that has a node \| \| `identity_conflict` \| 409 \| object ID collision across identities \| \| `namespace_ambiguous` \| 409 \| class declared by several workloads, `workload` missing \| \| `not_ready` \| 409 \| certificate requested before `ready` \| \| `superseded` \| 409 \| undeploy of a non-latest deployment \| \| `tenant_has_live_objects` \| 409 \| tenant delete without `force` \| \| `host_holds_leases` \| 409 \| host delete without `drain` \| \| `killed` \| 410 \| tombstone (`TombstoneError`) \| \| `precondition_failed` \| 412 \| `If-Match` mismatch \| \| `object_quota_exceeded` \| 429 \| tenant `maxObjects` \| \| `spawn_budget_exceeded` \| 429 \| `maxLive` / `maxDepth` \| \| `bootstrap_failed` \| 502 \| control plane refused the mint \| \| `host_token_unconfigured` \| 503 \| local-dev mgmt without a token (fail closed) \| \| `identity_pending` \| 503 \| mint still queued (`Retry-After: 1`) \| \| `no_host` \| 503 \| no live host for the deployment \| \| `policy_unavailable` \| 503 \| mgmt cannot read the tenant policy \| \| `internal` \| 500 \| — \| |
+| `code` | `ErrorCode` | yes | The catalog. Status in parentheses. \| code \| status \| when \| \|---\|---\|---\| \| `bad_request` \| 400 \| malformed body, parameter or filter \| \| `bad_cursor` \| 400 \| `cursor` does not decode \| \| `bad_bundle` \| 400 \| bundle has no `twd.jsonc`, or neither `tailnet.tags` nor `tailnet.objects` \| \| `immutable_field` \| 400 \| PATCH touches a field the caller may not change \| \| `no_identity` \| 401 \| WhoIs failed for the connection \| \| `host_token_required` \| 401 \| local-dev socket without `Twd-Host-Token` \| \| `host_token_invalid` \| 403 \| local-dev socket, wrong token \| \| `not_admin` \| 403 \| tailnet caller without `twd.dev/cap/admin` (`snippet` given) \| \| `forbidden` \| 403 \| role ok, but outside the caller's records / namespaces \| \| `host_not_registered` \| 403 \| `tag:twd-host` node that never did `PUT /v1/hosts/{id}` \| \| `host_identity_mismatch` \| 403 \| host ID bound to another node \| \| `delegation_invalid` \| 403 \| child tag not owned by the parent's, parent unknown (404) or dead (410) \| \| `delegation_exceeds_parent` \| 403 \| spawn caps ⊄ parent (`missing: {src, dst, cap, field}`) \| \| `policy_missing_tag_owners` \| 403 \| the control plane refused to mint a key for twd's own tags (`snippet` gives the tagOwners to add) \| \| `not_found` \| 404 \| — \| \| `unknown_tenant` \| 404 \| — \| \| `unknown_namespace` \| 404 \| `(workload, class)` not declared \| \| `exists` \| 409 \| create of an existing ID \| \| `lease_lost` \| 409 \| epoch/holder fence failed \| \| `lease_held` \| 409 \| another host holds the lease \| \| `store_unavailable` \| 503 \| the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` \| \| `tier_unavailable` \| 409 \| the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers \| \| `takeover_unconfirmed` \| 409 \| the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` \| \| `already_joined` \| 409 \| credential for an object that has a node \| \| `identity_conflict` \| 409 \| object ID collision across identities \| \| `namespace_ambiguous` \| 409 \| class declared by several workloads, `workload` missing \| \| `not_ready` \| 409 \| certificate requested before `ready` \| \| `superseded` \| 409 \| undeploy of a non-latest deployment \| \| `tenant_has_live_objects` \| 409 \| tenant delete without `force` \| \| `host_holds_leases` \| 409 \| host delete without `drain` \| \| `killed` \| 410 \| tombstone (`TombstoneError`) \| \| `precondition_failed` \| 412 \| `If-Match` mismatch \| \| `object_quota_exceeded` \| 429 \| tenant `maxObjects` \| \| `spawn_budget_exceeded` \| 429 \| `maxLive` / `maxDepth` \| \| `container_quota_exceeded` \| 429 \| tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) \| \| `image_unavailable` \| 502 \| a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) \| \| `registry_unavailable` \| 409 \| this twd-mgmt serves no OCI registry (`-registry-dir off`) \| \| `mirror_disabled` \| 409 \| this twd-mgmt does not mirror external images (`-no-mirror`) \| \| `bootstrap_failed` \| 502 \| control plane refused the mint \| \| `host_token_unconfigured` \| 503 \| local-dev mgmt without a token (fail closed) \| \| `identity_pending` \| 503 \| mint still queued (`Retry-After: 1`) \| \| `no_host` \| 503 \| no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) \| \| `policy_unavailable` \| 503 \| mgmt cannot read the tenant policy \| \| `internal` \| 500 \| — \| |
 | `doc_url` | string (uri) | yes |  |
 | `message` | string | yes |  |
 | `missing` | object | no | What is missing. Shape depends on `code` (e.g. `{src, dst, cap, field}` for `delegation_invalid`). |
@@ -1299,7 +1752,7 @@ The catalog. Status in parentheses.
 | `lease_lost` | 409 | epoch/holder fence failed |
 | `lease_held` | 409 | another host holds the lease |
 | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
-| `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+| `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers |
 | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 | `already_joined` | 409 | credential for an object that has a node |
 | `identity_conflict` | 409 | object ID collision across identities |
@@ -1312,14 +1765,18 @@ The catalog. Status in parentheses.
 | `precondition_failed` | 412 | `If-Match` mismatch |
 | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+| `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
+| `image_unavailable` | 502 | a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) |
+| `registry_unavailable` | 409 | this twd-mgmt serves no OCI registry (`-registry-dir off`) |
+| `mirror_disabled` | 409 | this twd-mgmt does not mirror external images (`-no-mirror`) |
 | `bootstrap_failed` | 502 | control plane refused the mint |
 | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
-| `no_host` | 503 | no live host for the deployment |
+| `no_host` | 503 | no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) |
 | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
 | `internal` | 500 | — |
 
-Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity`, `host_token_required`, `host_token_invalid`, `not_admin`, `forbidden`, `host_not_registered`, `host_identity_mismatch`, `delegation_invalid`, `delegation_exceeds_parent`, `policy_missing_tag_owners`, `not_found`, `unknown_tenant`, `unknown_namespace`, `exists`, `lease_lost`, `lease_held`, `takeover_unconfirmed`, `tier_unavailable`, `store_unavailable`, `already_joined`, `identity_conflict`, `namespace_ambiguous`, `not_ready`, `superseded`, `tenant_has_live_objects`, `host_holds_leases`, `killed`, `precondition_failed`, `object_quota_exceeded`, `spawn_budget_exceeded`, `bootstrap_failed`, `host_token_unconfigured`, `identity_pending`, `no_host`, `policy_unavailable`, `internal`
+Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity`, `host_token_required`, `host_token_invalid`, `not_admin`, `forbidden`, `host_not_registered`, `host_identity_mismatch`, `delegation_invalid`, `delegation_exceeds_parent`, `policy_missing_tag_owners`, `not_found`, `unknown_tenant`, `unknown_namespace`, `exists`, `lease_lost`, `lease_held`, `takeover_unconfirmed`, `tier_unavailable`, `store_unavailable`, `already_joined`, `identity_conflict`, `namespace_ambiguous`, `not_ready`, `superseded`, `tenant_has_live_objects`, `host_holds_leases`, `killed`, `precondition_failed`, `object_quota_exceeded`, `spawn_budget_exceeded`, `container_quota_exceeded`, `bootstrap_failed`, `host_token_unconfigured`, `identity_pending`, `no_host`, `policy_unavailable`, `image_unavailable`, `registry_unavailable`, `mirror_disabled`, `internal`
 
 #### `Health`
 
@@ -1331,7 +1788,9 @@ Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `arch` | `Arch` | no | A Go GOARCH. Container images must match their host's. |
 | `auditPubKey` | string | no | base64 ed25519; verifies `hostSig`. |
+| `capacity` | `HostCapacity` | no | The capacity vector a host registers (ADR-032 D9). `nodes` is tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO instances and containers alike): their count, guest memory (all, and the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit` for scheduling) and scratch disk. A host without a microVM backend reports 0 for every VM dimension. |
 | `capacityNodes` | integer | yes |  |
 | `createdAt` | integer (int64) | yes |  |
 | `dnsName` | string | no | `twd-host-<hostID>.<tailnet>`. |
@@ -1343,8 +1802,28 @@ Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity
 | `pool` | string | no |  |
 | `push` | `HostPush` | no | Where mgmt pushes kills and assignment changes. Over the tailnet, `port` names hostd's push listener on **its own tsnet node** (the WhoIs node; mgmt never pushes anywhere else). `url` is accepted only on the local-dev socket and only as `unix:///…`. |
 | `status` | `HostStatusEnum` | yes | `pending`: created by `twd host add`, never registered. `live`: heartbeated within 10 s. `stale`: registered, no recent heartbeat. `draining`: being deleted. |
-| `tiers` | array of `Tier` | yes |  |
+| `tiers` | array of `HostTier` | yes |  |
 | `updatedAt` | integer (int64) | yes |  |
+| `usage` | `HostUsage` | no | Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`). |
+
+#### `HostCapacity`
+
+The capacity vector a host registers (ADR-032 D9). `nodes` is
+tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO
+instances and containers alike): their count, guest memory (all, and
+the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit`
+for scheduling) and scratch disk. A host without a microVM backend
+reports 0 for every VM dimension.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `hugeMemMiB` | integer | yes |  |
+| `nodes` | integer | yes |  |
+| `scratchMiB` | integer | yes |  |
+| `vcpuOvercommit` | number | yes |  |
+| `vcpus` | integer | yes |  |
+| `vmMemMiB` | integer | yes |  |
+| `vms` | integer | yes |  |
 
 #### `HostCreate`
 
@@ -1353,7 +1832,7 @@ Enum: `bad_request`, `bad_cursor`, `bad_bundle`, `immutable_field`, `no_identity
 | `hostID` | string | yes |  |
 | `pool` | string | no |  |
 | `tenantID` | string | no | The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own). |
-| `tiers` | array of `Tier` | no |  |
+| `tiers` | array of `HostTier` | no |  |
 
 #### `HostDeleteResult`
 
@@ -1402,11 +1881,13 @@ on the local-dev socket and only as `unix:///…`.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `arch` | `Arch` | no | A Go GOARCH. Container images must match their host's. |
 | `auditPubKey` | string | no |  |
+| `capacity` | `HostCapacity` | no | The capacity vector a host registers (ADR-032 D9). `nodes` is tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO instances and containers alike): their count, guest memory (all, and the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit` for scheduling) and scratch disk. A host without a microVM backend reports 0 for every VM dimension. |
 | `capacityNodes` | integer | yes |  |
 | `pool` | string | no |  |
 | `push` | `HostPush` | no | Where mgmt pushes kills and assignment changes. Over the tailnet, `port` names hostd's push listener on **its own tsnet node** (the WhoIs node; mgmt never pushes anywhere else). `url` is accepted only on the local-dev socket and only as `unix:///…`. |
-| `tiers` | array of `Tier` | yes |  |
+| `tiers` | array of `HostTier` | yes |  |
 
 #### `HostStatus`
 
@@ -1414,9 +1895,11 @@ The heartbeat body.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `containers` | array of `RunningContainer` | no | Every container running on this host (reservation reconciliation, ADR-032 D9): a reported reservation is renewed; a host's reservation left out for 30 s after its creation is released; a reported container with no reservation is adopted if this host holds the workload's lease (it runs; mgmt records it, over quota or not, audited `container_reserve` with `adopted`), else ignored. |
 | `deployments` | array of `DeploymentReport` | no |  |
 | `leases` | array of `Lease` | yes |  |
 | `liveNodes` | integer | yes |  |
+| `usage` | `HostUsage` | no | Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`). |
 
 #### `HostStatusEnum`
 
@@ -1431,6 +1914,40 @@ Enum: `pending`, `live`, `stale`, `draining`
 | `assignmentsChanged` | boolean | no | A hint to re-list assignments (set when a push could not be delivered). |
 | `revoke` | array of string | yes | Lease entries that are no longer held. |
 | `revokeObjects` | array of string | yes | Object IDs killed in the last 10 min in namespaces this host holds; kill idempotently. |
+
+#### `HostTier`
+
+What a host offers: the isolation tiers (`process`, `microvm`) and `containers` (ADR-032: it can run containers and code sandboxes, one microVM each, for images of its `arch`).
+
+Enum: `process`, `microvm`, `containers`
+
+#### `HostUsage`
+
+Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`).
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `containers` | integer | yes |  |
+| `hugeMemMiB` | integer | yes |  |
+| `nodes` | integer | yes |  |
+| `scratchMiB` | integer | yes |  |
+| `vcpus` | number | yes |  |
+| `vmMemMiB` | integer | yes |  |
+| `vms` | integer | yes |  |
+
+#### `ImageAlias`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `arch` | string | no | "" = every arch. |
+| `from` | string | yes |  |
+| `to` | string | yes |  |
+
+#### `ImageAliasList`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `items` | array of `ImageAlias` | yes |  |
 
 #### `JWKS`
 
@@ -1624,11 +2141,58 @@ the last page.
 | `tagOwnersSnippet` | string | no |  |
 | `unchecked` | array of string | no | `tailnet.connects` entries that are names, not tags. |
 
+#### `PublicImage`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `arch` | string: `amd64` \| `arm64` | yes |  |
+| `createdAt` | integer (int64) | yes |  |
+| `createdBy` | string | no |  |
+| `digest` | string | yes | The linux/`arch` image manifest. |
+| `id` | string | yes |  |
+| `ref` | string | yes | The normalised upstream ref (or twd.local ref) deploys match. |
+| `repository` | string | yes | `public/…` |
+| `sourceDigest` | string | yes | The upstream top-level digest (index or manifest) at add time. |
+
+#### `PublicImageCreate`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `arches` | array of string: `amd64` \| `arm64` | no | Default every linux amd64/arm64 image the ref has. |
+| `ref` | string | yes |  |
+
+#### `PublicImageList`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `items` | array of `PublicImage` | yes |  |
+
+#### `PublicImagePage`
+
+Extends `Page`.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `items` | array of `PublicImage` | no |  |
+
 #### `PurgeResult`
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `purged` | array of string | yes | Object IDs forgotten. |
+
+#### `RunningContainer`
+
+One running container in a heartbeat.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `class` | string | yes |  |
+| `object` | string | yes |  |
+| `reservationID` | string | no | The reservation it runs under (absent: started without one, e.g. a restart while mgmt was unreachable). |
+| `resources` | `ContainerResources` | yes | What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`). |
+| `tenantID` | string | yes |  |
+| `workload` | string | yes |  |
 
 #### `SelfInfo`
 
@@ -1685,6 +2249,9 @@ The mgmt replica registry (replicas sharing this store). `ok` is false (and the 
 | `apiKeyFile` | string | no | `apikey` mode: absolute path, read at use; the key is never stored or returned. |
 | `controlURL` | string (uri) | no | Non-default control plane (testcontrol, headscale). |
 | `createdAt` | integer (int64) | yes |  |
+| `maxContainerMemMiB` | integer | no | Total guest memory of the tenant's running containers. |
+| `maxContainerVCPU` | number | no | Total vCPUs of the tenant's running containers (fractional: `lite` is 1/16). |
+| `maxContainers` | integer | no | Running containers (ADR-032), across the tenant's workloads. Not objects: they don't count against `maxObjects`. |
 | `maxObjects` | integer | yes |  |
 | `mintMode` | `MintMode` | yes | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
 | `oauthClientFile` | string | no | `oauth` mode: absolute path of the 0600 file with `TS_OAUTH_CLIENT_ID=…` / `TS_OAUTH_CLIENT_SECRET=tskey-client-…`, read at use on the mgmt host (a looser mode is refused). |
@@ -1706,6 +2273,9 @@ The mgmt replica registry (replicas sharing this store). `ok` is false (and the 
 |---|---|---|---|
 | `apiKeyFile` | string | no |  |
 | `controlURL` | string (uri) | no |  |
+| `maxContainerMemMiB` | integer | no |  |
+| `maxContainerVCPU` | number | no |  |
+| `maxContainers` | integer | no |  |
 | `maxObjects` | integer | no |  |
 | `mintMode` | `MintMode` | yes | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
 | `oauthClientFile` | string | no |  |
@@ -1743,6 +2313,9 @@ JSON Merge Patch over the updatable fields. `null` clears an optional field.
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `apiKeyFile` | string \| null | no |  |
+| `maxContainerMemMiB` | integer | no |  |
+| `maxContainerVCPU` | number | no |  |
+| `maxContainers` | integer | no |  |
 | `maxObjects` | integer | no |  |
 | `mintMode` | `MintMode` | no | `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key). |
 | `oauthClientFile` | string \| null | no |  |

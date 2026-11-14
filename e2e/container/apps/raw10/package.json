@@ -1,0 +1,8 @@
+{
+  "name": "twd-e2e-raw10",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/sandbox": "1.0.1"
+  }
+}

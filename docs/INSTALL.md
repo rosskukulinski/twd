@@ -651,11 +651,16 @@ Unsupported hosts (bonus rows; `TestUnsupportedHost`):
 On Linux with KVM, twd can run each workload in its own **Firecracker
 microVM** instead of a host process. Every tailnet identity (node keys,
 auth keys) stays in twd-hostd on the host; the guest gets only plaintext
-DO storage and workerd. A linux-arm64 release **built with the microVM
-assets** ships everything the tier needs in `~/.twd/share/twd/vm/`: the
-guest kernel (`vmlinux`), the read-only guest image (`rootfs.ext4`,
-reproducible; `manifest.json` has its hashes), Firecracker and its jailer
-(v1.17), plus `bin/twd-vmhelper`.
+DO storage and workerd. A linux-arm64 or linux-amd64 release **built with
+the microVM assets** ships everything the tier needs in
+`~/.twd/share/twd/vm/`, for its arch: the guest kernel (`vmlinux`, Linux
+6.1 LTS with Firecracker's CI config plus erofs/overlayfs; `kernel.json` has
+its hashes), the read-only guest image (`rootfs.ext4`, reproducible;
+`manifest.json` has its hashes and arch), Firecracker and its jailer
+(v1.17), plus `bin/twd-vmhelper`. Every input is pinned in
+`guest/inputs.sh`; `make vm-assets GUEST_ARCH=amd64|arm64` builds either
+arch on either. A guest of the wrong arch is refused (`twd doctor`:
+`microvm_tier warn … is arm64, this host is amd64`).
 
 > **Check your tarball.** The guest image can only be built on Linux.
 > `make release` includes it when it runs on Linux or when Lima `twd-dev`
@@ -670,8 +675,12 @@ reproducible; `manifest.json` has its hashes), Firecracker and its jailer
 
 ### What you need
 
-- Linux arm64 with `/dev/kvm` (bare metal, or a VM with nested
-  virtualization), cgroups v2 and systemd. Tested on Ubuntu 24.04 arm64.
+- Linux arm64 or amd64 (x86_64) with `/dev/kvm` (bare metal, or a VM with
+  nested virtualization), cgroups v2 and systemd. Tested end to end on
+  Ubuntu 24.04 arm64. amd64: the assets are built and the guest boots to
+  workerd, but the only x86 test host so far (nested KVM in a QEMU VM on an
+  AMD Zen 1 NAS, whose TSC it reports unstable) stalls its guests in an
+  interrupt storm, so the amd64 tier is not yet verified end to end.
 - `cryptsetup`, `losetup`, `mkfs.ext4`, `ip` (Ubuntu/Debian cloud images
   have them; else `apt-get install cryptsetup-bin util-linux e2fsprogs iproute2`).
 
@@ -703,7 +712,7 @@ twd doctor                                     # "microvm_tier: ok"
 After that **twd runs as you**: `twd up …` as usual. `twd up` prints
 `tiers: process [Landlock+seccomp, landlock (ABI 4)], microvm [Firecracker,
 jailed, via twd-vmhelper; "tier": "microvm" in twd.jsonc]`. Without the
-setup, `"tier": "microvm"` falls back to the process tier with a warning,
+setup the host offers the process tier only: mgmt places `"tier": "microvm"` on a host that offers it (`503 no_host` if none), and a host that cannot run it refuses it (`tier_unavailable`), never running it in the process tier;
 and `twd doctor` says why (`microvm_tier: warn … fix: sudo
 ~/.twd/bin/twd host setup --microvm`).
 

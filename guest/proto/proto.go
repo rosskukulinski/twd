@@ -6,7 +6,20 @@
 // the guest gets workerd's config and bundle, a per-instance egress MAC key
 // (platform attribution, not a tailnet credential), and its network
 // addresses. Node keys and auth keys stay in host netd.
+//
+// The one credential is guest-internal: GuestConfig.CtlToken, a random
+// per-boot token that authenticates guestd's control connections to the
+// host (so a process in the guest other than guestd can't open, take over
+// or forge the control channel), and the per-exec Msg.Token that does the
+// same for an exec's stdio stream. Neither is worth anything outside that
+// one VM's boot.
 package proto
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
 
 // Config drive layout (/dev/vdb): a plain ustar stream (no filesystem), padded
 // to a 4 KiB multiple. guestd extracts it into AppDir.
@@ -20,6 +33,12 @@ const (
 	DODir = "/run/twd/do"
 	// VolumeDev is the persistent volume's device (the third drive).
 	VolumeDev = "/dev/vdc"
+
+	// Container guests (ADR-032) have no DO volume: the third drive is the
+	// image (erofs, read-only) and the fourth the instance's scratch disk
+	// (ext4, made fresh on the host for every boot; the overlay upper).
+	ImageDev   = "/dev/vdc"
+	ScratchDev = "/dev/vdd"
 )
 
 // Defaults for the guest network (every VM lives in its own network
@@ -57,15 +76,127 @@ type GuestConfig struct {
 	// Volume is the block device holding DO storage (ext4, created and
 	// decrypted on the host), mounted at DODir. "" = tmpfs (not persistent).
 	Volume string `json:"volume,omitempty"`
+	// VolumeFormat: Volume is blank and the guest formats it (ext4) before
+	// mounting it. The vz backend (macOS) has no mkfs.ext4 on the host and
+	// decrypts on the host (an encrypted disk image), so the guest formats
+	// plaintext it already sees; under Firecracker the host formats it.
+	VolumeFormat bool `json:"volumeFormat,omitempty"`
+	// Rosetta is the virtiofs tag of a Rosetta for Linux share (vz on Apple
+	// silicon): guestd mounts it read-only at RosettaDir and registers it
+	// with binfmt_misc, so x86_64 ELF binaries run in the arm64 guest.
+	Rosetta string `json:"rosetta,omitempty"`
+	// CtlToken authenticates guestd to the host: the first line of every
+	// control connection ("hello") carries it, and the host refuses a
+	// connection without it (random per boot; guestd keeps it in memory,
+	// and container processes can't read the config drive).
+	CtlToken string `json:"ctlToken,omitempty"`
+	// Container, if set, makes this a container guest: no workerd; guestd
+	// mounts the image + scratch as an overlay root and runs the image's
+	// entrypoint in it as a supervised child.
+	Container *ContainerConfig `json:"container,omitempty"`
 }
+
+// ContainerConfig is a container guest's process and filesystem config:
+// the OCI image config with the start() overrides already applied by the
+// host.
+type ContainerConfig struct {
+	Image   string   `json:"image"`   // block device with the erofs image
+	Scratch string   `json:"scratch"` // block device with the fresh ext4 scratch ("" = tmpfs upper)
+	Argv    []string `json:"argv"`    // ENTRYPOINT + CMD (or the start() entrypoint)
+	Env     []string `json:"env"`     // KEY=VALUE, image env then start() env
+	Cwd     string   `json:"cwd,omitempty"`
+	User    string   `json:"user,omitempty"` // "", "name", "uid", "uid:gid", "name:group"
+	// Pids is pids.max of the container's cgroup in the guest (0 = 4096).
+	Pids     int    `json:"pids,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+	// DNS is the container's nameserver (the gateway, answered by the
+	// host's sandbox egress proxy); "" = no DNS (an empty resolv.conf).
+	DNS string `json:"dns,omitempty"`
+	// CACert is the PEM certificate of the container's HTTPS-intercept CA
+	// (ADR-032 D4), installed at CACertPath and appended to the image's
+	// trust bundles. Its key never enters the guest.
+	CACert string `json:"caCert,omitempty"`
+	// Canary is held in guestd's memory as the no-keys scan's positive
+	// control (it is not a secret).
+	Canary string `json:"canary,omitempty"`
+	// ScratchFormat: Scratch is a blank device the guest formats itself
+	// (vz: macOS has no mkfs.ext4; Firecracker's helper makes it instead).
+	ScratchFormat bool `json:"scratchFormat,omitempty"`
+	// CPUQuotaUS, if > 0, is cpu.max (µs per 100 ms) of the guest's
+	// container cgroup: the fractional-vCPU cap where the host can't cap
+	// the VMM itself (vz). Firecracker caps the VMM's cgroup instead.
+	CPUQuotaUS int `json:"cpuQuotaUs,omitempty"`
+}
+
+// CACertPath is where a container finds its HTTPS-intercept CA certificate
+// (Cloudflare's path).
+const CACertPath = "/etc/cloudflare/certs/cloudflare-containers-ca.crt"
+
+// CATrustBundles are the image trust stores the CA is appended to, where
+// they exist (Debian/Ubuntu/Alpine, RHEL/Fedora, and the OpenSSL default).
+var CATrustBundles = []string{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/cert.pem"}
+
+// Container-mode stream framing.
+const (
+	// ExecStreamHello is the Type of the first line a guest sends on a new
+	// vsock connection that carries one exec's stdio (Msg.Exec names the
+	// exec, Msg.Token is the stream token the host issued in the exec op)
+	// instead of the control channel.
+	ExecStreamHello = "stream"
+
+	// Exec stream frames: a 1-byte kind, a 4-byte big-endian length, then
+	// the payload. guest → host: FrameStdout, FrameStderr, FrameExit (int32
+	// big-endian exit code; the last frame). host → guest: FrameStdin,
+	// FrameStdinEOF (half-close; empty).
+	FrameStdin    = 0
+	FrameStdout   = 1
+	FrameStderr   = 2
+	FrameExit     = 3
+	FrameStdinEOF = 4
+	// MaxFrame bounds one frame's payload.
+	MaxFrame = 1 << 20
+)
+
+// ExecSpec is an "exec" op's process (container guests).
+type ExecSpec struct {
+	Argv []string `json:"argv"`
+	Env  []string `json:"env,omitempty"` // KEY=VALUE, over the container's env
+	Cwd  string   `json:"cwd,omitempty"`
+	User string   `json:"user,omitempty"`
+	// Stdin: the host streams stdin (else /dev/null).
+	Stdin bool `json:"stdin,omitempty"`
+	// Stdout "pipe" (default) | "ignore"; Stderr "pipe" (default) |
+	// "ignore" | "combined" (into stdout).
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
+	// PTY runs it on a pseudo-terminal (stdout carries the terminal's
+	// output; there is no separate stderr).
+	PTY  bool `json:"pty,omitempty"`
+	Cols int  `json:"cols,omitempty"`
+	Rows int  `json:"rows,omitempty"`
+}
+
+// RosettaDir is where the Rosetta share is mounted in the guest.
+const RosettaDir = "/run/rosetta"
 
 // Msg is one control-channel message (either direction).
 //
-// guest → host: Type "boot" (once, on connect), "ready" (workerd healthy),
+// guest → host: Type "hello" (the first line of a control connection;
+// Token = GuestConfig.CtlToken), "boot" (once), "ready" (workerd healthy),
 // "workerd-exit", "log", or "resp" (answer to an op, same ID).
 // host → guest: Op "probe", "stats", "fsscan", "ping", "shutdown" (stop
 // workerd, sync and unmount the volume: the host may then release it),
-// "fsbench" (write+fsync latency on the DO volume).
+// "fsbench" (write+fsync latency on the DO volume), and in debug mode
+// "run" (run Argv from AppDir, return its output and exit code: platform
+// tests such as the Rosetta check, not a tenant exec API).
+//
+// Container guests: guest → host Type "ctr-ready" (the entrypoint runs:
+// PID), "ctr-exit" (it exited: ExitCode, 128+n for signal n), "exec-exit"
+// (Exec, ExitCode). host → guest Op "exec" (Exec id + ExecSpec + Token: the
+// guest first opens the exec's stdio stream, naming Exec and Token, then
+// answers with the PID),
+// "signal" (Signal to the entrypoint, or to Exec's process if set),
+// "resize" (Exec, Cols, Rows) and "status" (Running, PID, Exited, ExitCode).
 type Msg struct {
 	Type string `json:"type,omitempty"`
 	ID   int64  `json:"id,omitempty"`
@@ -90,9 +221,55 @@ type Msg struct {
 	N     int    `json:"n,omitempty"`
 	Bench *Bench `json:"bench,omitempty"`
 
+	// run (debug): argv; the answer's Text is stdout+stderr (capped)
+	Argv []string `json:"argv,omitempty"`
+
 	// fsscan: files whose name looks like tailscale state
 	Found   []string `json:"found,omitempty"`
 	Scanned int      `json:"scanned,omitempty"`
+
+	// hello: GuestConfig.CtlToken; exec / ExecStreamHello: the exec's
+	// stream token (random per exec, issued by the host)
+	Token string `json:"token,omitempty"`
+
+	// container guests
+	Exec     string    `json:"exec,omitempty"`
+	ExecSpec *ExecSpec `json:"execSpec,omitempty"`
+	PID      int       `json:"pid,omitempty"`
+	Signal   int       `json:"signal,omitempty"`
+	Cols     int       `json:"cols,omitempty"`
+	Rows     int       `json:"rows,omitempty"`
+	Running  bool      `json:"running,omitempty"`
+	Exited   bool      `json:"exited,omitempty"`
+}
+
+// WriteFrame writes one exec stream frame.
+func WriteFrame(w io.Writer, kind byte, p []byte) error {
+	var h [5]byte
+	h[0] = kind
+	binary.BigEndian.PutUint32(h[1:], uint32(len(p)))
+	if _, err := w.Write(append(h[:], p...)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadFrame reads one exec stream frame (payloads over MaxFrame are an
+// error).
+func ReadFrame(r io.Reader) (kind byte, p []byte, err error) {
+	var h [5]byte
+	if _, err := io.ReadFull(r, h[:]); err != nil {
+		return 0, nil, err
+	}
+	n := binary.BigEndian.Uint32(h[1:])
+	if n > MaxFrame {
+		return 0, nil, fmt.Errorf("exec stream frame of %d bytes", n)
+	}
+	p = make([]byte, n)
+	if _, err := io.ReadFull(r, p); err != nil {
+		return 0, nil, err
+	}
+	return h[0], p, nil
 }
 
 // ProbeResult is the outcome of one TCP connect from inside the guest.

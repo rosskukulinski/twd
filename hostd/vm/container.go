@@ -1,0 +1,434 @@
+//go:build darwin || linux
+
+package vm
+
+// The host side of a container guest (ADR-032 D8), shared by both
+// backends (Firecracker: container_linux.go, vz: container_darwin.go):
+// guestd's container events, exec stdio streams (guest/proto frames on
+// their own vsock connection), signals, ports and stop/kill. A backend
+// only boots the VM with the image and scratch disks and sets
+// agent.onEvent/onStream to ctrState.event and Machine.attachStream.
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/rosskukulinski/twd/guest/proto"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
+)
+
+// writeGuestJSON writes a config drive holding only guest.json.
+func writeGuestJSON(path string, gc proto.GuestConfig) error {
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	gb, _ := json.Marshal(gc)
+	if err := tw.WriteHeader(&tar.Header{Name: proto.GuestConfigFile, Mode: 0o600, Size: int64(len(gb)), Typeflag: tar.TypeReg}); err != nil {
+		return err
+	}
+	tw.Write(gb)
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	if pad := buf.Len() % 4096; pad != 0 {
+		buf.Write(make([]byte, 4096-pad))
+	}
+	return os.WriteFile(path, buf.Bytes(), 0o600)
+}
+
+// ctrState is a container guest's host-side state (Machine.ctr).
+type ctrState struct {
+	m *Machine
+
+	mu       sync.Mutex
+	mainPID  int
+	exited   chan struct{}
+	exitOnce sync.Once
+	exitCode int
+	streams  map[string]*pendingStream // exec id -> the stream it waits for
+	log      *tailBuf
+}
+
+// pendingStream is an exec waiting for its stdio stream: only a connection
+// that names the exec and carries its token (issued in the exec op, random
+// per exec) is it.
+type pendingStream struct {
+	token string
+	ch    chan net.Conn
+}
+
+func newCtrState() *ctrState {
+	return &ctrState{exited: make(chan struct{}), streams: map[string]*pendingStream{}, log: &tailBuf{max: 64 << 10}}
+}
+
+// event consumes container messages from the control channel.
+func (s *ctrState) event(msg proto.Msg) bool {
+	switch msg.Type {
+	case "ctr-ready":
+		s.mu.Lock()
+		s.mainPID = msg.PID
+		s.mu.Unlock()
+		m := s.m
+		m.info.Ready = time.Since(m.start)
+		m.info.GuestUptimeAtReady = time.Duration(msg.UptimeMS) * time.Millisecond
+		if m.readyOK.CompareAndSwap(false, true) {
+			close(m.ready)
+		}
+		return true
+	case "ctr-exit":
+		s.exitOnce.Do(func() {
+			s.mu.Lock()
+			s.exitCode = msg.ExitCode
+			s.mu.Unlock()
+			if msg.Error != "" {
+				s.log.Write([]byte("twd: " + msg.Error + "\n"))
+				s.m.mu.Lock()
+				s.m.lastErr = msg.Error
+				s.m.mu.Unlock()
+			}
+			close(s.exited)
+		})
+		// A start failure ends the boot wait at once (Boot returns the
+		// error) instead of waiting for the ready timeout.
+		if !s.m.readyOK.Load() {
+			s.m.log.Warn("container entrypoint failed to start", "err", msg.Error)
+			s.m.stopped.Store(true)
+			go s.m.Kill()
+		}
+		return true
+	case "log":
+		s.log.Write([]byte(msg.Text + "\n"))
+		s.m.log.Debug("container output", "line", msg.Text)
+		return true
+	case "exec-exit", "hello":
+		return true
+	}
+	return false
+}
+
+func (m *Machine) attachStream(id, token string, c net.Conn) {
+	if m.ctr == nil {
+		c.Close()
+		return
+	}
+	m.ctr.attach(id, token, c)
+}
+
+// attach hands an exec stream connection to the exec waiting for it, if
+// its token is that exec's (constant-time compare). A connection with a
+// wrong token is closed and the exec keeps waiting for the real one.
+func (s *ctrState) attach(id, token string, c net.Conn) {
+	s.mu.Lock()
+	p := s.streams[id]
+	ok := p != nil && tokenEqual(token, p.token)
+	if ok {
+		delete(s.streams, id)
+	}
+	s.mu.Unlock()
+	if !ok {
+		if s.m != nil && p != nil {
+			s.m.log.Warn("refused an exec stream with a wrong token", "exec", id)
+		}
+		c.Close() // nobody asked for this exec, or not with this token
+		return
+	}
+	p.ch <- c
+}
+
+// ctrVM implements sandbox.Container.
+type ctrVM struct {
+	m *Machine
+	s *ctrState
+}
+
+func newExecID() string {
+	var b [8]byte
+	rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func (c *ctrVM) Exec(ctx context.Context, es sandbox.ExecSpec) (sandbox.Exec, error) {
+	select {
+	case <-c.s.exited:
+		return nil, errors.New("the container is not running")
+	default:
+	}
+	id, token := newExecID(), newToken()
+	ch := make(chan net.Conn, 1)
+	c.s.mu.Lock()
+	c.s.streams[id] = &pendingStream{token: token, ch: ch}
+	c.s.mu.Unlock()
+	drop := func() {
+		c.s.mu.Lock()
+		delete(c.s.streams, id)
+		c.s.mu.Unlock()
+		select {
+		case cn := <-ch:
+			cn.Close()
+		default:
+		}
+	}
+	r, err := c.m.Op(ctx, proto.Msg{Op: "exec", Exec: id, Token: token, ExecSpec: &proto.ExecSpec{Argv: es.Argv, Env: es.Env, Cwd: es.Cwd, User: es.User,
+		Stdin: es.Stdin, Stdout: es.Stdout, Stderr: es.Stderr, PTY: es.PTY, Cols: es.Cols, Rows: es.Rows}})
+	if err != nil {
+		drop()
+		return nil, err
+	}
+	var conn net.Conn
+	select {
+	case conn = <-ch:
+	case <-time.After(10 * time.Second):
+		drop()
+		return nil, errors.New("exec stream did not arrive")
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
+	e := &fcExec{c: c, id: id, pid: r.PID, conn: conn, done: make(chan struct{})}
+	if es.Stdout != "ignore" || es.PTY {
+		e.outR, e.outW = io.Pipe()
+	}
+	if !es.PTY && es.Stderr != "ignore" && es.Stderr != "combined" {
+		e.errR, e.errW = io.Pipe()
+	}
+	if es.Stdin {
+		e.stdin = &execStdin{e: e}
+	}
+	go e.demux()
+	return e, nil
+}
+
+// fcExec is one exec's host side: frames on its vsock stream.
+type fcExec struct {
+	c    *ctrVM
+	id   string
+	pid  int
+	conn net.Conn
+
+	wmu        sync.Mutex
+	stdin      *execStdin
+	outR, errR *io.PipeReader
+	outW, errW *io.PipeWriter
+	done       chan struct{}
+	code       int
+	err        error
+}
+
+func (e *fcExec) ID() string { return e.id }
+func (e *fcExec) PID() int   { return e.pid }
+func (e *fcExec) Stdin() io.WriteCloser {
+	if e.stdin == nil {
+		return nil
+	}
+	return e.stdin
+}
+
+func (e *fcExec) Stdout() io.Reader {
+	if e.outR == nil {
+		return nil
+	}
+	return e.outR
+}
+
+func (e *fcExec) Stderr() io.Reader {
+	if e.errR == nil {
+		return nil
+	}
+	return e.errR
+}
+
+func (e *fcExec) demux() {
+	defer close(e.done)
+	finish := func(err error) {
+		for _, w := range []*io.PipeWriter{e.outW, e.errW} {
+			if w != nil {
+				w.CloseWithError(err)
+			}
+		}
+		e.conn.Close()
+	}
+	for {
+		kind, p, err := proto.ReadFrame(e.conn)
+		if err != nil {
+			e.code, e.err = -1, fmt.Errorf("exec stream: %w", err)
+			finish(e.err)
+			return
+		}
+		switch kind {
+		case proto.FrameStdout:
+			if e.outW != nil {
+				e.outW.Write(p)
+			}
+		case proto.FrameStderr:
+			if e.errW != nil {
+				e.errW.Write(p)
+			}
+		case proto.FrameExit:
+			if len(p) == 4 {
+				e.code = int(int32(binary.BigEndian.Uint32(p)))
+			}
+			finish(nil)
+			return
+		}
+	}
+}
+
+func (e *fcExec) Wait(ctx context.Context) (int, error) {
+	select {
+	case <-e.done:
+		return e.code, e.err
+	case <-ctx.Done():
+		return -1, ctx.Err()
+	case <-e.c.m.done:
+		<-e.done // the stream dies with the VM
+		return e.code, e.err
+	}
+}
+
+func (e *fcExec) Signal(sig int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := e.c.m.Op(ctx, proto.Msg{Op: "signal", Exec: e.id, Signal: sig})
+	return err
+}
+
+func (e *fcExec) Resize(cols, rows int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := e.c.m.Op(ctx, proto.Msg{Op: "resize", Exec: e.id, Cols: cols, Rows: rows})
+	return err
+}
+
+type execStdin struct {
+	e      *fcExec
+	closed bool
+}
+
+func (s *execStdin) Write(p []byte) (int, error) {
+	s.e.wmu.Lock()
+	defer s.e.wmu.Unlock()
+	if s.closed {
+		return 0, io.ErrClosedPipe
+	}
+	n := 0
+	for len(p) > 0 {
+		k := min(len(p), 64<<10)
+		if err := proto.WriteFrame(s.e.conn, proto.FrameStdin, p[:k]); err != nil {
+			return n, err
+		}
+		n += k
+		p = p[k:]
+	}
+	return n, nil
+}
+
+func (s *execStdin) Close() error {
+	s.e.wmu.Lock()
+	defer s.e.wmu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return proto.WriteFrame(s.e.conn, proto.FrameStdinEOF, nil)
+}
+
+func (c *ctrVM) Signal(sig int) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := c.m.Op(ctx, proto.Msg{Op: "signal", Signal: sig})
+	return err
+}
+
+func (c *ctrVM) DialPort(ctx context.Context, port uint16) (net.Conn, error) {
+	return c.m.vn.dialGuest(ctx, port)
+}
+
+func (c *ctrVM) Exited() <-chan struct{} { return c.s.exited }
+
+func (c *ctrVM) ExitCode() int {
+	c.s.mu.Lock()
+	defer c.s.mu.Unlock()
+	return c.s.exitCode
+}
+
+func (c *ctrVM) Done() <-chan struct{} { return c.m.done }
+
+// Stop: SIGTERM to the entrypoint, up to grace for it to exit, then the
+// VMM is SIGKILLed and the jail torn down (the helper session closes).
+func (c *ctrVM) Stop(grace time.Duration) {
+	select {
+	case <-c.s.exited:
+	case <-c.m.done:
+	default:
+		if grace > 0 && c.Signal(15) == nil {
+			select {
+			case <-c.s.exited:
+			case <-c.m.done:
+			case <-time.After(grace):
+			}
+		}
+	}
+	c.m.stopped.Store(true)
+	c.m.Kill()
+	select {
+	case <-c.m.done:
+	case <-time.After(15 * time.Second):
+		c.m.log.Warn("container VM did not exit after kill")
+	}
+	c.m.teardown()
+	if os.Getenv("TWD_KEEP_INSTANCES") == "" {
+		os.RemoveAll(c.m.dir)
+	}
+}
+
+func (c *ctrVM) Kill() {
+	c.m.stopped.Store(true)
+	c.m.Kill()
+}
+
+// MemoryDump, Disks and Op serve the no-keys scan (hostd ContainerCheck).
+func (c *ctrVM) MemoryDump(ctx context.Context, dir string) (string, error) {
+	return c.m.MemoryDump(ctx, dir)
+}
+func (c *ctrVM) Disks() []string { return c.m.Disks() }
+func (c *ctrVM) Op(ctx context.Context, msg proto.Msg) (proto.Msg, error) {
+	return c.m.Op(ctx, msg)
+}
+
+func (c *ctrVM) Info() sandbox.Info { return c.m.info }
+func (c *ctrVM) RSSKB() int64       { return c.m.RSSKB() }
+func (c *ctrVM) Log() string        { return c.s.log.String() }
+
+// tailBuf keeps the last max bytes written.
+type tailBuf struct {
+	mu  sync.Mutex
+	max int
+	b   []byte
+}
+
+func (t *tailBuf) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.b = append(t.b, p...)
+	if len(t.b) > t.max {
+		t.b = append([]byte(nil), t.b[len(t.b)-t.max:]...)
+	}
+	return len(p), nil
+}
+
+func (t *tailBuf) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.b)
+}

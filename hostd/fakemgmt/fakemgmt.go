@@ -33,8 +33,12 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/container"
 	"github.com/rosskukulinski/twd/internal/nodecert"
+	"github.com/rosskukulinski/twd/internal/oci"
+	"github.com/rosskukulinski/twd/internal/registry"
 	"github.com/rosskukulinski/twd/internal/tsapi"
+	"github.com/rosskukulinski/twd/mgmt"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -57,7 +61,16 @@ type Config struct {
 	// NoPush disables the v0.1 push extension, so kills reach hosts only via
 	// heartbeat revokeObjects (what M2's twd-mgmt does).
 	NoPush bool
-	Logger *slog.Logger
+	// MaxContainers is every tenant's container quota (default 10).
+	MaxContainers int
+	// RegistryDir, if set, serves twd's OCI registry at /v2/ (internal/registry
+	// with in-memory metadata) and pins container images at deploy the way
+	// twd-mgmt does (registry.Resolver), so hostd pulls by digest. Callers
+	// with Twd-Host-ID get the host rules (pull only, own tenants + public).
+	RegistryDir      string
+	RegistryUpstream func(host string) *oci.Client
+	ImageAliases     []registry.Alias
+	Logger           *slog.Logger
 }
 
 // Server is the fake mgmt.
@@ -84,6 +97,19 @@ type Server struct {
 	VolumeKeyCalls       int
 	leaseLostCredentials int // next N credential calls fail with lease_lost
 	credentialCalls      int
+	reservations         map[string]*mgmtapi.ContainerReservation // container reservations by ID
+	reservationsDown     bool
+	heartbeatsDown       bool
+	reg                  *registry.Registry
+	resolver             *registry.Resolver
+}
+
+// SetHeartbeatsDown makes host heartbeats fail with 503 (tests: a host
+// partitioned from mgmt self-fences after FenceAfter, ADR-028).
+func (s *Server) SetHeartbeatsDown(down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heartbeatsDown = down
 }
 
 // SetLeaseLostCredentials makes the next n credential calls fail with
@@ -113,6 +139,8 @@ type host struct {
 	created     time.Time
 	lastSeen    time.Time
 	liveNodes   int
+	usage       *mgmtapi.HostUsage
+	running     []mgmtapi.RunningContainer // the last heartbeat's containers
 	leases      []mgmtapi.Lease
 	deployments map[string]mgmtapi.DeploymentStatus
 	kills       []mgmtapi.KillOrder
@@ -128,6 +156,8 @@ type deployment struct {
 	epoch      int64
 	superseded bool
 	created    time.Time
+	fence      bool              // stateful (ADR-028 §3): mgmt.BundleStateful
+	containers []container.Class // pinned (RegistryDir)
 }
 
 type lease struct {
@@ -158,7 +188,8 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(),
 		tenants: map[string]*tenant{}, hosts: map[string]*host{}, deployments: map[string]*deployment{},
 		leases: map[string]*lease{}, objects: map[string]*object{}, byName: map[string]string{},
-		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}, oboKey: priv, certDenied: map[string]bool{}}
+		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}, oboKey: priv, certDenied: map[string]bool{},
+		reservations: map[string]*mgmtapi.ContainerReservation{}}
 	m := s.mux
 	m.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) })
 	m.HandleFunc("GET /v1/certificates/{nodeID}", s.nodeCert)
@@ -178,9 +209,16 @@ func New(cfg Config) *Server {
 	m.HandleFunc("POST /v1/objects/{id}/credentials", s.credential)
 	m.HandleFunc("PATCH /v1/objects/{id}", s.ready)
 	m.HandleFunc("POST /v1/volumes/{id}/keys", s.volumeKey)
+	m.HandleFunc("POST /v1/container-reservations", s.reserveContainer)
+	m.HandleFunc("DELETE /v1/container-reservations/{id}", s.releaseContainer)
 	m.HandleFunc("DELETE /v1/objects/{id}", s.kill)
 	m.HandleFunc("POST /v1/audit", s.postAudit)
 	m.HandleFunc("GET /v1/audit", s.getAudit)
+	if cfg.RegistryDir != "" {
+		s.reg = &registry.Registry{Dir: cfg.RegistryDir, Meta: &registry.MemMeta{}, Authorize: s.regAuthorize}
+		s.resolver = &registry.Resolver{Reg: s.reg, Aliases: cfg.ImageAliases, Upstream: cfg.RegistryUpstream}
+		m.Handle("/v2/", s.reg)
+	}
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, mgmtapi.CodeNotFound, r.Method+" "+r.URL.Path+" is not a /v1 route")
 	})
@@ -313,6 +351,15 @@ func (s *Server) hostView(h *host) map[string]any {
 	if h.AuditPubKey != "" {
 		v["auditPubKey"] = h.AuditPubKey
 	}
+	if h.Arch != "" {
+		v["arch"] = h.Arch
+	}
+	if h.Capacity != nil {
+		v["capacity"] = h.Capacity
+	}
+	if h.usage != nil {
+		v["usage"] = h.usage
+	}
 	return v
 }
 
@@ -355,12 +402,17 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.heartbeatsDown {
+		writeErr(w, 503, "store_unavailable", "mgmt is partitioned from this host (test)")
+		return
+	}
 	h := s.hosts[id]
 	if h == nil {
 		writeErr(w, 404, mgmtapi.CodeNotFound, "host not registered")
 		return
 	}
 	h.lastSeen, h.liveNodes, h.leases = time.Now(), req.LiveNodes, req.Leases
+	h.usage, h.running = req.Usage, req.Containers
 	for _, d := range req.Deployments {
 		h.deployments[d.DeploymentID] = d
 		if dep := s.deployments[d.DeploymentID]; dep != nil && !dep.superseded {
@@ -397,7 +449,7 @@ func (s *Server) assignments(w http.ResponseWriter, r *http.Request) {
 		out = append(out, mgmtapi.Assignment{DeploymentID: d.DeploymentID, TenantID: d.tenantID, Workload: d.workload,
 			BundleURL: "/v1/deployments/" + d.DeploymentID + "/bundle", Namespaces: d.namespaces, Epoch: d.epoch,
 			WorkloadTags: d.wlTags, Lease: mgmtapi.LeaseName(d.tenantID, d.workload),
-			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created)})
+			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created), Fence: &d.fence, Containers: d.containers})
 	}
 	s.mu.Unlock()
 	writeJSON(w, 200, page(out))
@@ -463,6 +515,19 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "no_host", "no host registered")
 		return
 	}
+	// Pin container images (twd-mgmt's Resolver) for the host's arch, outside
+	// the lock (mirroring may reach an upstream).
+	arch := s.hosts[hostID].Arch
+	s.mu.Unlock()
+	ctrs, err := s.pinContainers(r.Context(), req.TenantID, app, req.ContainerImages, arch)
+	if _, bad := err.(badBuilt); bad {
+		writeErr(w, 400, "bad_request", err.Error())
+		return
+	} else if err != nil {
+		writeErr(w, 502, "image_unavailable", err.Error())
+		return
+	}
+	s.mu.Lock()
 	// Acquire the namespace leases: epoch+1 for the workload and its classes.
 	// One lease per (tenant, workload), named "<tenantID>/<workload>".
 	var epoch int64
@@ -487,7 +552,8 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d := &deployment{tenantID: req.TenantID, workload: req.Workload, bundle: req.Bundle, namespaces: nss,
-		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now()}
+		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now(), containers: ctrs}
+	d.fence, _ = mgmt.BundleStateful(req.Bundle)
 	d.DeploymentID, d.Host, d.Status = newID("dp"), hostID, "assigned"
 	s.deployments[d.DeploymentID] = d
 	push := s.hosts[hostID].PushURL
@@ -870,6 +936,107 @@ func (s *Server) getObject(w http.ResponseWriter, r *http.Request) {
 
 // volumeKey releases a workload's DO volume key to the lease holder at
 // the lease's epoch (mgmt.VolumeKey's contract).
+// ---- container reservations (ADR-032 D9; the fake checks the lease and
+// maxContainers only, without the store clock) ----
+
+// SetReservationsDown makes the reservation API answer 503 (tests: mgmt
+// unreachable for containers).
+func (s *Server) SetReservationsDown(down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reservationsDown = down
+}
+
+// HostReport is what host id last registered and reported: its
+// registration (arch, tiers, capacity), usage and running containers.
+func (s *Server) HostReport(id string) (mgmtapi.RegisterRequest, *mgmtapi.HostUsage, []mgmtapi.RunningContainer, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h := s.hosts[id]
+	if h == nil {
+		return mgmtapi.RegisterRequest{}, nil, nil, false
+	}
+	return h.RegisterRequest, h.usage, append([]mgmtapi.RunningContainer(nil), h.running...), true
+}
+
+// Reservations returns the reservations held, by ID.
+func (s *Server) Reservations() map[string]mgmtapi.ContainerReservation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]mgmtapi.ContainerReservation{}
+	for id, r := range s.reservations {
+		out[id] = *r
+	}
+	return out
+}
+
+func (s *Server) reserveContainer(w http.ResponseWriter, r *http.Request) {
+	var req mgmtapi.ContainerReservationRequest
+	if err := decode(r, &req); err != nil || req.TenantID == "" || req.Workload == "" || req.Class == "" || req.Object == "" {
+		writeErr(w, 400, "bad_request", "tenantID, workload, class and object are required")
+		return
+	}
+	host := r.Header.Get("Twd-Host-ID")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reservationsDown {
+		writeErr(w, 503, "store_unavailable", "reservations are down (test)")
+		return
+	}
+	if l := s.leases[mgmtapi.LeaseName(req.TenantID, req.Workload)]; l == nil || l.epoch != req.Epoch || l.host != host {
+		writeErr(w, 409, mgmtapi.CodeLeaseLost, "the workload's lease is not held by "+host)
+		return
+	}
+	n := 0
+	for _, x := range s.reservations {
+		if x.TenantID == req.TenantID && x.Workload == req.Workload && x.Class == req.Class && x.Object == req.Object {
+			x.Host, x.RenewedAt = host, ms(time.Now())
+			writeJSON(w, 200, x)
+			return
+		}
+		if x.TenantID == req.TenantID {
+			n++
+		}
+	}
+	max := s.cfg.MaxContainers
+	if max == 0 {
+		max = 10
+	}
+	if n+1 > max {
+		w.Header().Set("Twd-Error", "container_quota_exceeded")
+		writeJSON(w, 429, map[string]any{"code": "container_quota_exceeded", "message": fmt.Sprintf("tenant %s runs %d containers (maxContainers %d)", req.TenantID, n, max),
+			"missing": map[string]any{"quota": "maxContainers", "limit": max, "used": n, "requested": 1}, "doc_url": "https://twd.dev/errors/container_quota_exceeded", "trace_id": "fake"})
+		return
+	}
+	b := make([]byte, 6)
+	rand.Read(b)
+	x := &mgmtapi.ContainerReservation{ReservationID: "cr_" + hex.EncodeToString(b), TenantID: req.TenantID, Workload: req.Workload, Class: req.Class,
+		Object: req.Object, Host: host, Resources: req.Resources, CreatedAt: ms(time.Now()), RenewedAt: ms(time.Now())}
+	s.reservations[x.ReservationID] = x
+	w.Header().Set("Location", "/v1/container-reservations/"+x.ReservationID)
+	writeJSON(w, 201, x)
+}
+
+func (s *Server) releaseContainer(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reservationsDown {
+		writeErr(w, 503, "store_unavailable", "reservations are down (test)")
+		return
+	}
+	x := s.reservations[r.PathValue("id")]
+	if x == nil {
+		writeErr(w, 404, mgmtapi.CodeNotFound, "no such reservation")
+		return
+	}
+	if host := r.Header.Get("Twd-Host-ID"); host != "" && host != x.Host {
+		writeErr(w, 403, "forbidden", "held by another host")
+		return
+	}
+	delete(s.reservations, x.ReservationID)
+	w.WriteHeader(204)
+}
+
 func (s *Server) volumeKey(w http.ResponseWriter, r *http.Request) {
 	epoch, _ := strconv.ParseInt(r.URL.Query().Get("epoch"), 10, 64)
 	tenantID, workload, ok := strings.Cut(r.PathValue("id"), ":")
@@ -1218,6 +1385,17 @@ func (s *Server) NodeIDs() map[string]string {
 	out := map[string]string{}
 	for k, v := range s.nodeIDs {
 		out[k] = v
+	}
+	return out
+}
+
+// HostTiers returns the tiers each host registered with.
+func (s *Server) HostTiers() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string][]string{}
+	for id, h := range s.hosts {
+		out[id] = append([]string(nil), h.Tiers...)
 	}
 	return out
 }

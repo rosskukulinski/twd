@@ -24,6 +24,10 @@ var errStatus = map[string]int{
 	"lease_lost": 409, "namespace_conflict": 409, "spawn_budget_exceeded": 429, "bootstrap_failed": 502,
 	"cap_missing": 403, "delegation_exceeds_parent": 403, "delegation_invalid": 403,
 	"forbidden_destination": 403, "peer_not_visible": 403, "acl_denied": 403,
+	// Containers (ADR-032): local capacity, the tenant quota (mgmt), mgmt
+	// unreachable (fail closed), a second start of a running container.
+	"capacity_exhausted": 503, "container_quota_exceeded": 429, "quota_unavailable": 503, "container_running": 409,
+	"tier_unavailable": 409,
 }
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {
@@ -223,6 +227,10 @@ func objView(o *object) map[string]any {
 // platform (TailnetApi props); nil means the workload itself.
 func (h *Host) hostAPI(inst *instance) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/container") {
+			h.containerAPI(inst, w, r) // ctx.container (containers.go)
+			return
+		}
 		var req apiReq
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 			writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})
@@ -417,6 +425,20 @@ func (h *Host) pushAPI() http.Handler {
 	// socket is the user's (0700 dir); answers carry no key material.
 	m.HandleFunc("POST /v1/vm/check", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
+		if ct := q.Get("container"); ct != "" { // <Class>/<name>: that object's container guest
+			cls, name, ok := strings.Cut(ct, "/")
+			if !ok || q.Get("keyscan") != "1" {
+				writeAPIError(w, &apiError{Code: "bad_request", Detail: "container=<Class>/<name> needs keyscan=1"})
+				return
+			}
+			rep, err := h.ContainerCheck(r.Context(), q.Get("tenant"), q.Get("workload"), cls, name)
+			if err != nil {
+				writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})
+				return
+			}
+			writeJSON(w, 200, rep)
+			return
+		}
 		rep, err := h.VMCheck(r.Context(), q.Get("tenant"), q.Get("workload"), q.Get("keyscan") == "1")
 		if err != nil {
 			writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})
@@ -501,14 +523,17 @@ type StatusView struct {
 	Workloads []WorkloadStatus
 	// InsecureSharedHost echoes Config.InsecureSharedHost.
 	InsecureSharedHost bool `json:",omitempty"`
+	// Containers are this host's containers (ADR-032), running and stopped.
+	Containers []ContainerStatus `json:",omitempty"`
+	// ImageCacheBytes is the converted container image cache on disk.
+	ImageCacheBytes int64 `json:",omitempty"`
 }
 
 // Status returns a snapshot.
 func (h *Host) Status() StatusView {
 	h.mu.Lock()
-	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo(), Tiers: []string{"process"}, InsecureSharedHost: h.cfg.InsecureSharedHost}
+	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo(), Tiers: h.tiers(), InsecureSharedHost: h.cfg.InsecureSharedHost}
 	if h.cfg.VM != nil {
-		v.Tiers = append(v.Tiers, "microvm")
 		if vv, ok := h.cfg.VM.(interface{ Via() string }); ok {
 			v.VMVia = vv.Via()
 		}
@@ -558,6 +583,12 @@ func (h *Host) Status() StatusView {
 		v.Workloads = append(v.Workloads, ws)
 	}
 	sort.Slice(v.Objects, func(i, j int) bool { return v.Objects[i].Hostname < v.Objects[j].Hostname })
+	if h.ctr != nil {
+		v.Containers = h.Containers()
+	}
+	if h.cfg.Images != nil {
+		v.ImageCacheBytes = h.cfg.Images.CacheBytes()
+	}
 	sort.Slice(v.Workloads, func(i, j int) bool { return v.Workloads[i].Workload < v.Workloads[j].Workload })
 	return v
 }

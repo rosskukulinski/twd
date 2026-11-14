@@ -1,0 +1,17 @@
+{
+  "name": "ctr",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "containers": [
+    { "class_name": "Box", "image": "./Dockerfile", "instance_type": "lite", "max_instances": 4 },
+    { "class_name": "PBox", "image": "./Dockerfile", "instance_type": "basic" },
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "BOX", "class_name": "Box" },
+      { "name": "PBOX", "class_name": "PBox" },
+      { "name": "PLAIN", "class_name": "Plain" },
+    ],
+  },
+}
