@@ -675,6 +675,22 @@ func (a *v1api) ReportHostStatus(w http.ResponseWriter, r *http.Request, id v1.H
 	writeJSON(w, 200, resp)
 }
 
+func (a *v1api) ReportHostPaths(w http.ResponseWriter, r *http.Request, id v1.HostID) {
+	var req struct {
+		Tenants []PathReport `json:"tenants"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	n, err := a.s.M.ReportHostPaths(r.Context(), id, req.Tenants)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, 200, map[string]int{"stored": n})
+}
+
 type assignmentView struct {
 	Assignment
 	CreatedAt int64 `json:"createdAt"`

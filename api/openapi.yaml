@@ -593,6 +593,51 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         default: { $ref: "#/components/responses/Error" }
 
+  /v1/hosts/{id}/paths:
+    parameters:
+      - $ref: "#/components/parameters/hostID"
+    put:
+      tags: [hosts]
+      operationId: ReportHostPaths
+      summary: Report measured tailnet paths (smart placement)
+      description: |
+        Smart placement (ADR-029). The host reports, per tenant, the path
+        from that tenant's nodes on this host to each target its workloads
+        declare (`placementTargets` in its assignments): `direct` WireGuard,
+        `peer-relay`, `derp`, or `unresolved` / `unreachable`, with the RTT.
+        Each listed tenant's stored rows for this host are **replaced**.
+        `ageMs` is how long ago the host measured (its monotonic clock);
+        mgmt stamps `measuredAt` with the store clock, and placement ignores
+        measurements older than 5 min. A host may report only for tenants it
+        runs a workload of (`403` otherwise). Bounds: 64 tenants, 32 targets
+        each. Hosts send it at most once a minute, and only while they have
+        targets. Not audited (telemetry); the placement decision it feeds is
+        recorded with the deploy.
+      x-twd-role: host
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/HostPathReport" }
+      responses:
+        "200":
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stored]
+                properties:
+                  stored: { type: integer, description: Targets stored. }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: The host never registered (`host_not_registered`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        default: { $ref: "#/components/responses/Error" }
+
   /v1/hosts/{id}/assignments:
     parameters:
       - $ref: "#/components/parameters/hostID"
@@ -626,14 +671,39 @@ paths:
         the shallowest `twd.jsonc`): `tailnet.tags` (the `_workload` entry
         node), `tailnet.objects.<Class>.{tags, agent, ttl, node}`,
         `tailnet.spawn.{maxLive ≤ 64, maxDepth ≤ 3}`, `tailnet.connects`,
-        `tier`. A bundle with neither `tailnet.tags` nor `tailnet.objects` is
-        `400 bad_bundle`.
+        `tier`, `runtime`, `placement.{mode, targets, aggregate}` (or
+        wrangler's `placement`). A bundle with neither `tailnet.tags` nor
+        `tailnet.objects` is `400 bad_bundle`.
 
-        **Deploy** (`dryRun` absent or false): picks a host (`host` pins one),
-        acquires the `(tenant, workload)` lease at `epoch+1`, stores the
-        bundle, pushes the assignment to the host and answers `202` with
+        **Deploy** (`dryRun` absent or false): picks a host, acquires the
+        `(tenant, workload)` lease at `epoch+1`, stores the bundle, pushes
+        the assignment to the host and answers `202` with
         `Location: /v1/deployments/{id}`. Poll it until `status` is `active`
         or `failed`.
+
+        **Placement** (ADR-029; the answer's `placement` says why):
+        1. Eligible hosts are live, in the tenant's pool, offer the
+           workload's tier (`microvm` needs a host with KVM; `503 no_host`
+           otherwise), and have free capacity.
+        2. `host` pins one (it must still be eligible; a pinned host without
+           the tier is `409 tier_unavailable`).
+        3. Otherwise the current live lease holder is kept (placement is
+           sticky; a better host appearing never moves a running workload).
+           A holder without the tier the workload now asks for is
+           `409 tier_unavailable` (or, with `replace`, the workload moves).
+        4. Otherwise, with smart placement (the default when the workload
+           declares `tailnet.connects` or `placement.targets`): the best
+           measured path to the targets wins (direct > peer relay > DERP >
+           unmeasured, then RTT; `placement.aggregate` "worst" (default) or
+           "sum" over several targets). Hosts without a fresh measurement are
+           asked to probe (≤ 2 s). Free capacity breaks ties, then host ID.
+
+        `replace: true` (`twd deploy --replace`) re-places a running workload:
+        it moves only if an eligible host is clearly better (a better path
+        class, or ≥ 2 ms and ≥ 20 % lower RTT), and the lease moves to it at
+        `epoch+1` in one conditional write. A stateful workload's move also
+        needs `forceTakeover` (`409 move_unconfirmed`): its Durable Object
+        storage stays on the old host.
 
         **Preflight** (`dryRun=true`): the same body and parser, but mgmt
         only checks the policy: every src tag must be in `tagOwners`, and
@@ -1843,6 +1913,8 @@ components:
         | `lease_held` | 409 | another host holds the lease |
         | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
         | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+        | `move_unconfirmed` | 409 | `replace` would move a stateful workload off its live host, leaving its DO storage behind; confirm with `forceTakeover` |
+        | `lease_changed` | 409 | the workload's lease changed while `replace` was moving it (a concurrent deploy); retry |
         | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
         | `already_joined` | 409 | credential for an object that has a node |
         | `identity_conflict` | 409 | object ID collision across identities |
@@ -1884,6 +1956,8 @@ components:
         - lease_held
         - takeover_unconfirmed
         - tier_unavailable
+        - move_unconfirmed
+        - lease_changed
         - store_unavailable
         - already_joined
         - identity_conflict
@@ -2165,6 +2239,86 @@ components:
         namespace: { type: string, description: "Lease name `<tenantID>/<workload>` (a workload or DO class name is also accepted on input)." }
         epoch: { type: integer, format: int64 }
         expiresAt: { type: integer, format: int64 }
+    HostPathReport:
+      type: object
+      required: [tenants]
+      properties:
+        tenants:
+          type: array
+          maxItems: 64
+          items: { $ref: "#/components/schemas/PathReport" }
+      additionalProperties: false
+    PathReport:
+      type: object
+      required: [tenantID, targets]
+      properties:
+        tenantID: { type: string }
+        targets:
+          type: array
+          maxItems: 32
+          items: { $ref: "#/components/schemas/PathSample" }
+      additionalProperties: false
+    PathSample:
+      type: object
+      required: [target, path, ageMs]
+      properties:
+        target: { type: string, maxLength: 255, description: "A `tailnet.connects` entry: a tag or a peer name." }
+        peer: { type: string, maxLength: 255, description: The netmap peer measured (the best one when a tag matches several). }
+        path: { $ref: "#/components/schemas/PathClass" }
+        rttMs: { type: number, minimum: 0 }
+        derpRegion: { type: string, maxLength: 64 }
+        ageMs: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    PathClass:
+      type: string
+      enum: [direct, peer-relay, derp, unresolved, unreachable, unmeasured]
+      description: >-
+        How a host reaches a target: direct WireGuard, a Tailscale peer relay, or DERP; `unresolved` (no
+        netmap peer matches the target), `unreachable` (no ping answered), `unmeasured` (no fresh
+        measurement; placement only).
+    PlacementDecision:
+      type: object
+      description: Why a deployment is on its host (smart placement, ADR-029).
+      required: [host, reason, mode, summary]
+      properties:
+        host: { type: string }
+        reason:
+          type: string
+          enum: [pinned, sticky, smart, capacity]
+          description: >-
+            pinned: `host` was given; sticky: kept on the current lease holder; smart: the best measured
+            path; capacity: no measured path decided, so the most free capacity.
+        mode: { type: string, enum: [smart, "off"] }
+        targets: { type: array, items: { type: string } }
+        aggregate: { type: string, enum: [worst, sum] }
+        summary: { type: string, examples: ["placed on h2: tag:db direct 1.8 ms (h1: relayed 24 ms, h3: unmeasured)"] }
+        hosts:
+          type: array
+          maxItems: 8
+          description: The candidates, eligible ones best first.
+          items:
+            type: object
+            required: [host, eligible, free]
+            properties:
+              host: { type: string }
+              eligible: { type: boolean }
+              why: { type: string, description: Why the host is not eligible. }
+              free: { type: integer }
+              path: { $ref: "#/components/schemas/PathClass" }
+              rttMs: { type: number }
+              targets:
+                type: array
+                items:
+                  type: object
+                  required: [target, path]
+                  properties:
+                    target: { type: string }
+                    path: { $ref: "#/components/schemas/PathClass" }
+                    detail: { type: string }
+                    rttMs: { type: number }
+                    peer: { type: string }
+                    derpRegion: { type: string }
+                    ageSeconds: { type: integer, format: int64 }
     DeploymentReport:
       type: object
       required: [deploymentID, status]
@@ -2237,6 +2391,7 @@ components:
         maxDepth: { type: integer }
         endpoint: { $ref: "#/components/schemas/Endpoint" }
         deployedBy: { type: string, description: The actor who deployed (see Conventions). }
+        placement: { $ref: "#/components/schemas/PlacementDecision" }
         createdAt: { type: integer, format: int64 }
         updatedAt: { type: integer, format: int64 }
     DeploymentCreate:
@@ -2252,7 +2407,13 @@ components:
           description: >-
             Confirm that the workload's current host, which has stopped heartbeating, is gone for good, so a
             stateful workload may move off it (ADR-028 §3). Without it such a move is refused with
-            `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`).
+            `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`). With `replace`, it also confirms
+            moving a stateful workload off a live host (its DO storage stays there).
+        replace:
+          type: boolean
+          description: >-
+            Re-place a running workload (smart placement, ADR-029): move it to a clearly better eligible
+            host, or to `host` when pinned. Audited (`movedFrom`, `replace`).
         namespaces:
           type: array
           description: Override the classes read from `twd.jsonc` (tests).
@@ -2280,6 +2441,11 @@ components:
         tailnet: { type: string }
         controlURL: { type: string, format: uri }
         tier: { $ref: "#/components/schemas/Tier" }
+        placementTargets:
+          type: array
+          maxItems: 16
+          description: Smart placement targets the host should measure paths to (`PUT /v1/hosts/{id}/paths`).
+          items: { type: string }
         maxLive: { type: integer }
         maxDepth: { type: integer }
         createdAt: { type: integer, format: int64 }

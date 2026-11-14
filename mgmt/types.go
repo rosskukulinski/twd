@@ -123,6 +123,10 @@ type Deployment struct {
 	// and stopped) last reported; shared by every replica (F13, H08).
 	HostStatus string `json:"-"`
 	HostError  string `json:"-"`
+	// Placement is why the deployment is on its host (nil for deployments
+	// that predate smart placement). Its Targets are what the host
+	// measures for this workload.
+	Placement *PlacementDecision `json:"placement,omitempty"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per

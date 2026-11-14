@@ -101,6 +101,16 @@ type Store interface {
 	RenewLease(ctx context.Context, name, holder string, epoch int64, ttl time.Duration, now time.Time) (Lease, error)
 	ReleaseLease(ctx context.Context, name, holder string, epoch int64) error
 	GetLease(ctx context.Context, name string) (Lease, error)
+	// MoveLease hands a held lease from (from, epoch) to to at epoch+1 in
+	// one conditional write (ErrLeaseLost if from no longer holds it at
+	// epoch): an explicit re-place of a running workload (ADR-029).
+	MoveLease(ctx context.Context, name, from string, epoch int64, to string, ttl time.Duration, now time.Time) (Lease, error)
+
+	// Smart placement (ADR-029): PutHostPaths replaces a host's measured
+	// paths for one tenant; HostPaths reads every host's paths to the
+	// given targets of a tenant.
+	PutHostPaths(ctx context.Context, hostID, tenantID string, ms []PathMeasurement, now time.Time) error
+	HostPaths(ctx context.Context, tenantID string, targets []string) ([]PathMeasurement, error)
 
 	// AppendAudit appends to rec.Chain. If rec.Hash is empty the store
 	// links (PrevHash = chain head) and hashes it; otherwise the record is
