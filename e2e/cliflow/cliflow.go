@@ -935,3 +935,7 @@ func RunPrefixes(def, run string) (testPrefix, twdPrefix, label string) {
 	}
 	return "ttest-" + label + "-" + run + "-", "twd-" + label + "-" + run + "-", label
 }
+
+// UpCommand is the `twd up` command line Run uses (for scenarios that run
+// their own flow after up, e.g. e2e-public).
+func (e *Env) UpCommand() []string { return e.upArgs() }
