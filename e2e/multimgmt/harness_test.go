@@ -29,10 +29,12 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-const (
-	pgContainer = "twd-mm-pg"
-	pgPassword  = "twdmm"
-)
+const pgPassword = "twdmm"
+
+// pgContainer is the throwaway Postgres container's name. TWD_MM_PG_NAME
+// (with TWD_MM_PG_PORT) isolates concurrent runs from other worktrees,
+// which would otherwise remove each other's container mid-scenario.
+var pgContainer = env("TWD_MM_PG_NAME", "twd-mm-pg")
 
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
