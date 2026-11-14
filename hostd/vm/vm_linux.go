@@ -20,6 +20,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,7 +48,7 @@ type Config struct {
 	MemMiB      int    // guest memory (default 512)
 	VCPUs       int    // default 2 (1 vCPU: workerd's threads contend; p50 latency ~30 ms nested)
 	MTU         int    // default 1500
-	BootArgs    string // kernel cmdline (default below)
+	BootArgs    string // kernel cmdline (default: DefaultBootArgs for this arch)
 	// HugePages backs guest memory with 2 MiB pages (needs free hugetlbfs
 	// pages on the host: vm.nr_hugepages). Far fewer stage-2 faults, which
 	// dominate workerd start-up under nested virtualization (measured in
@@ -58,10 +59,6 @@ type Config struct {
 	ReadyTimeout time.Duration
 	Log          *slog.Logger
 }
-
-// DefaultBootArgs: serial console, no PCI probing, panic → reboot (which
-// Firecracker turns into a VM exit), twd-guestd as init, read-only root.
-const DefaultBootArgs = "console=ttyS0 reboot=k panic=1 quiet ro rootfstype=ext4 init=/sbin/twd-guestd"
 
 // Backend is the Firecracker microVM backend.
 type Backend struct {
@@ -86,6 +83,9 @@ func Available(cfg Config) error {
 		if _, err := os.Stat(p); err != nil {
 			return err
 		}
+	}
+	if err := CheckArch(cfg.Kernel, cfg.Rootfs, runtime.GOARCH); err != nil {
+		return err
 	}
 	if cfg.Helper != "" {
 		r, err := helperapi.Ping(cfg.Helper)
@@ -121,7 +121,7 @@ func New(cfg Config) (*Backend, error) {
 		cfg.MTU = 1500
 	}
 	if cfg.BootArgs == "" {
-		cfg.BootArgs = DefaultBootArgs
+		cfg.BootArgs = DefaultBootArgs(runtime.GOARCH)
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 30 * time.Second
@@ -594,9 +594,10 @@ func (m *Machine) Kill() {
 
 // Stop implements sandbox.VM. With a volume, the guest first stops workerd
 // and unmounts it (so every write is on the host), then the VMM is killed
-// (arm64 Firecracker has no ACPI shutdown) and the helper releases the
-// volume, which can then be attached to the next VM. Stop returns after
-// that release.
+// and the helper releases the volume, which can then be attached to the
+// next VM. Stop returns after that release. The same on both arches: arm64
+// Firecracker has no ACPI shutdown, and x86_64's SendCtrlAltDel (i8042)
+// would add nothing after the vsock shutdown has done the clean part.
 func (m *Machine) Stop() {
 	if m.volume && m.readyOK.Load() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

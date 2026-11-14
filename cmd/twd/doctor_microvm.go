@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd"
+	"github.com/rosskukulinski/twd/hostd/vm"
 	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
 )
 
@@ -27,6 +29,9 @@ func doctorMicroVM(s *state) (string, string, string) {
 		if !isFile(filepath.Join(share, a)) {
 			return "warn", "this release has no microVM guest (" + filepath.Join(share, a) + " missing): process tier only", "install a linux release built with the microVM assets"
 		}
+	}
+	if err := vm.CheckArch(filepath.Join(share, "vmlinux"), filepath.Join(share, "rootfs.ext4"), runtime.GOARCH); err != nil {
+		return "warn", err.Error() + ": process tier only", "install the linux-" + runtime.GOARCH + " release"
 	}
 	r, err := helperapi.Ping(helperapi.DefaultSocket)
 	if err != nil {
