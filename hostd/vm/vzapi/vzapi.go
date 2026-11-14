@@ -41,7 +41,9 @@ type Config struct {
 	Cmdline string `json:"cmdline"`
 	CPUs    int    `json:"cpus"`
 	MemMiB  int    `json:"memMiB"`
-	// Disks are attached in order as virtio-blk (/dev/vda, vdb, ...).
+	// Disks are attached in order as virtio-blk (/dev/vda, vdb, ...):
+	// the rootfs, the per-VM config drive (Disks[ConfigDisk]), then a
+	// container guest's image (vdc) and scratch (vdd).
 	Disks []Disk `json:"disks"`
 	// Volume attaches fd FDVolume as the next disk.
 	Volume bool `json:"volume,omitempty"`
@@ -55,6 +57,11 @@ type Config struct {
 	// binfmt_misc to run x86_64 binaries).
 	Rosetta bool `json:"rosetta,omitempty"`
 }
+
+// ConfigDisk is the index in Config.Disks of the VM's config drive: the
+// one disk no other VM has open (the VMM finds its VM service by it; a
+// container image is shared read-only by every VM that runs it).
+const ConfigDisk = 1
 
 // RosettaTag is the virtiofs tag of the Rosetta directory share.
 const RosettaTag = "rosetta"
