@@ -48,7 +48,7 @@ test-sdk: deps
 ## crane (CRANE=<path>, default: crane on PATH; go install github.com/google/go-containerregistry/cmd/crane@v0.20.6).
 CRANE ?= $(shell command -v crane)
 test-images:
-	TWD_TEST_DOCKER=1 TWD_CRANE="$(CRANE)" $(GO) test -count=1 -v -run 'TestBuildAndPush|TestCraneConformance' ./internal/imagebuild/ ./internal/registry/
+	TWD_TEST_DOCKER=1 TWD_CRANE="$(CRANE)" $(GO) test -count=1 -v -run 'TestBuildAndPush|TestCraneConformance|TestCLIImages' ./internal/imagebuild/ ./internal/registry/ ./cmd/twd/
 
 ## test-pg: the mgmt Store tests against Postgres 17 in OrbStack docker (throwaway container).
 PG_CTX  ?= orbstack

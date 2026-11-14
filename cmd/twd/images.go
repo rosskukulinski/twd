@@ -123,18 +123,36 @@ func buildArches(ctx context.Context, mc *mgmtapi.Client, tenantID, platforms st
 // ---- twd image ----
 
 func cmdImage(args []string) error {
-	if len(args) == 0 || isHelpFlag(args[0]) {
-		return fail("bad_request", "twd image public add <ref> [--arch amd64,arm64] | public ls | public rm <id> | push <oci-layout|docker-save.tar> twd.local/<name>:<tag>", "usage: twd "+usageOf("image"))
+	// Global flags (--state-dir X, --json) may precede the subcommands:
+	// pull the positional words out, keep the rest for the flag parser.
+	var words, rest []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		switch {
+		case (a == "--state-dir" || a == "-state-dir") && i+1 < len(args):
+			rest = append(rest, a, args[i+1])
+			i++
+		case strings.HasPrefix(a, "-"):
+			rest = append(rest, a)
+		case len(words) < 2 && (len(words) == 0 || words[0] == "public"):
+			words = append(words, a)
+		default:
+			rest = append(rest, a)
+		}
 	}
-	switch args[0] {
+	if len(words) == 0 {
+		return fail("bad_request", "twd image needs a subcommand: public add|ls|rm, push", "usage: twd "+usageOf("image"))
+	}
+	switch words[0] {
 	case "public":
-		if len(args) < 2 {
+		if len(words) < 2 {
 			return fail("bad_request", "twd image public add|ls|rm", "usage: twd "+usageOf("image"))
 		}
-		return cmdImagePublic(args[1], args[2:])
+		return cmdImagePublic(words[1], rest)
 	case "push":
-		return cmdImagePush(args[1:])
+		return cmdImagePush(rest)
 	}
+	args = words
 	return fail("bad_request", "unknown twd image subcommand "+args[0], "usage: twd "+usageOf("image"))
 }
 
