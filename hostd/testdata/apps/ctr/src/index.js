@@ -21,6 +21,7 @@ async function handle(self, req) {
       const opts = { env: { GREETING: "hi" } };
       if (q.has("entrypoint")) opts.entrypoint = arg("entrypoint");
       if (q.has("internet")) opts.enableInternet = q.get("internet") === "1";
+      if (q.has("instance")) opts.instance = arg("instance");
       if (q.has("image")) opts.image = q.get("image");
       c.start(opts);
       // start() returns at once; running is true right away.
@@ -66,6 +67,11 @@ async function handle(self, req) {
         rest += dec.decode(value);
       }
       return J({ first: dec.decode(first.value), tFirst, rest, code: await p.exitCode, tTotal: Date.now() - t0 });
+    }
+    case "tail": {
+      // An endless exec streamed straight to the caller.
+      const p = await c.exec(["sh", "-c", "while true; do echo tick; sleep 0.1; done"]);
+      return new Response(p.stdout, { headers: { "content-type": "text/plain" } });
     }
     case "kill": {
       const p = await c.exec(["sleep", "30"]);
