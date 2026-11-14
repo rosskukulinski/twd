@@ -2603,6 +2603,11 @@ components:
         `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
         `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
         `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+        Public ingress (ADR-029), host chain: `public_request` (one per public
+        request), `public_rejected` (per-minute summary of requests the limits
+        refused), `public_object_created` (a name admitted for a public create);
+        `expose_on` / `expose_off` on both chains (mgmt: the operator's change;
+        host: the listener opened/closed).
       enum:
         - allow
         - deny
@@ -2631,6 +2636,11 @@ components:
         - credential
         - obo_root
         - object_update
+        - public_request
+        - public_rejected
+        - public_object_created
+        - expose_on
+        - expose_off
     AuditSource:
       type: string
       description: "`mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content)."

@@ -228,35 +228,45 @@ func TestPublicIngress(t *testing.T) {
 		t.Fatalf("512 B body: %d %v", code, r)
 	}
 
-	// 5. Audit: every public request, path without its query string.
-	recs := e.Audit(ps.ObjectID).Items
-	var n int
-	for _, rec := range recs {
-		if rec.Kind == "public_request" {
+	// 5. Audit: every public request (incl. refusals by route or by the
+	// create guard), path without its query string. hostd ships audit
+	// records asynchronously, so poll.
+	var n, created int
+	var sawBob bool
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		n, created, sawBob = 0, 0, false
+		for _, rec := range e.Audit(ps.ObjectID).Items {
+			if rec.Kind != "public_request" {
+				continue
+			}
 			n++
-			if strings.Contains(string(rec.Detail), "secret") || strings.Contains(string(rec.Detail), "token=") {
-				t.Fatalf("query string in audit: %s", rec.Detail)
+			d := string(rec.Detail)
+			if strings.Contains(d, "secret") || strings.Contains(d, "token=") {
+				t.Fatalf("query string in audit: %s", d)
+			}
+			if rec.ActingFor != hostd.OriginPublic {
+				t.Fatalf("public_request actingFor %q", rec.ActingFor)
+			}
+			if strings.Contains(d, `"/agents/room/bob"`) && strings.Contains(d, `"status":403`) {
+				sawBob = true
 			}
 		}
-	}
-	if n < 10 {
-		t.Fatalf("only %d public_request audit records", n)
-	}
-	created := 0
-	for _, rec := range e.Audit(wl.ID).Items {
-		if rec.Kind == "public_object_created" {
-			created++
+		for _, rec := range e.Audit(wl.ID).Items {
+			if rec.Kind == "public_object_created" {
+				created++
+				if rec.ActingFor != hostd.OriginPublic {
+					t.Fatalf("public_object_created actingFor %q", rec.ActingFor)
+				}
+			}
+		}
+		if n >= 13 && created == 2 && sawBob {
+			break
 		}
 	}
-	if created != 2 {
-		t.Fatalf("%d public_object_created records, want 2", created)
+	if n < 13 || created != 2 || !sawBob {
+		t.Fatalf("audit: %d public_request records (want ≥ 13), %d public_object_created (want 2), refused room/bob audited: %v", n, created, sawBob)
 	}
 	_ = alice
-	for _, rec := range e.Audit(wl.ID).Items {
-		if rec.Kind == "public_object_created" && rec.ActingFor != hostd.OriginPublic {
-			t.Fatalf("public_object_created actingFor %q", rec.ActingFor)
-		}
-	}
 
 	// 6. Per-IP rate limit (ipRps 2, burst 40): a burst gets 429 + Retry-After.
 	got429 := false
@@ -315,9 +325,16 @@ func TestPublicIngress(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+	// hostd ships audit records asynchronously: poll.
 	kinds := map[string]bool{}
-	for _, rec := range e.Audit(ps.ObjectID).Items {
-		kinds[rec.Kind] = true
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+		kinds = map[string]bool{}
+		for _, rec := range e.Audit(ps.ObjectID).Items {
+			kinds[rec.Kind] = true
+		}
+		if kinds["expose_off"] && kinds["expose_on"] {
+			break
+		}
 	}
 	if !kinds["expose_off"] || !kinds["expose_on"] {
 		t.Fatalf("expose audit records missing: %v", kinds)

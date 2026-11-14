@@ -195,6 +195,7 @@ func UnixUpstream(path string) http.Handler {
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Host = pr.In.Host
+			KeepForwarded(pr)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if r.Context().Err() != nil {
@@ -202,5 +203,17 @@ func UnixUpstream(path string) http.Handler {
 			}
 			WriteError(w, newErr(CodeUpstreamUnavailable, "upstream: "+err.Error()))
 		},
+	}
+}
+
+// KeepForwarded copies X-Forwarded-For/-Proto/-Host from the inbound to the
+// outbound request of a Rewrite-style httputil.ReverseProxy (which drops
+// them by default). Safe only behind netd: netd strips every client copy
+// on both listeners and sets them itself for public requests (ADR-029).
+func KeepForwarded(pr *httputil.ProxyRequest) {
+	for _, k := range []string{"X-Forwarded-For", "X-Forwarded-Proto", "X-Forwarded-Host"} {
+		if v := pr.In.Header.Values(k); len(v) > 0 {
+			pr.Out.Header[k] = append([]string(nil), v...)
+		}
 	}
 }

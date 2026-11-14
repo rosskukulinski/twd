@@ -20,33 +20,38 @@ import (
 
 // Defines values for AuditKind.
 const (
-	AuditKindAllow        AuditKind = "allow"
-	AuditKindCreate       AuditKind = "create"
-	AuditKindCredential   AuditKind = "credential"
-	AuditKindDeny         AuditKind = "deny"
-	AuditKindDeploy       AuditKind = "deploy"
-	AuditKindDeviceDelete AuditKind = "device_delete"
-	AuditKindEgress       AuditKind = "egress"
-	AuditKindHostAdd      AuditKind = "host_add"
-	AuditKindHostDelete   AuditKind = "host_delete"
-	AuditKindHostRegister AuditKind = "host_register"
-	AuditKindKill         AuditKind = "kill"
-	AuditKindMint         AuditKind = "mint"
-	AuditKindObjectUpdate AuditKind = "object_update"
-	AuditKindOboRoot      AuditKind = "obo_root"
-	AuditKindPreflight    AuditKind = "preflight"
-	AuditKindPrincipal    AuditKind = "principal"
-	AuditKindPurge        AuditKind = "purge"
-	AuditKindReady        AuditKind = "ready"
-	AuditKindReap         AuditKind = "reap"
-	AuditKindRemint       AuditKind = "remint"
-	AuditKindSpawn        AuditKind = "spawn"
-	AuditKindTenantCreate AuditKind = "tenant_create"
-	AuditKindTenantDelete AuditKind = "tenant_delete"
-	AuditKindTenantNote   AuditKind = "tenant_note"
-	AuditKindTenantUpdate AuditKind = "tenant_update"
-	AuditKindUndeploy     AuditKind = "undeploy"
-	AuditKindVolumeKey    AuditKind = "volume_key"
+	AuditKindAllow               AuditKind = "allow"
+	AuditKindCreate              AuditKind = "create"
+	AuditKindCredential          AuditKind = "credential"
+	AuditKindDeny                AuditKind = "deny"
+	AuditKindDeploy              AuditKind = "deploy"
+	AuditKindDeviceDelete        AuditKind = "device_delete"
+	AuditKindEgress              AuditKind = "egress"
+	AuditKindExposeOff           AuditKind = "expose_off"
+	AuditKindExposeOn            AuditKind = "expose_on"
+	AuditKindHostAdd             AuditKind = "host_add"
+	AuditKindHostDelete          AuditKind = "host_delete"
+	AuditKindHostRegister        AuditKind = "host_register"
+	AuditKindKill                AuditKind = "kill"
+	AuditKindMint                AuditKind = "mint"
+	AuditKindObjectUpdate        AuditKind = "object_update"
+	AuditKindOboRoot             AuditKind = "obo_root"
+	AuditKindPreflight           AuditKind = "preflight"
+	AuditKindPrincipal           AuditKind = "principal"
+	AuditKindPublicObjectCreated AuditKind = "public_object_created"
+	AuditKindPublicRejected      AuditKind = "public_rejected"
+	AuditKindPublicRequest       AuditKind = "public_request"
+	AuditKindPurge               AuditKind = "purge"
+	AuditKindReady               AuditKind = "ready"
+	AuditKindReap                AuditKind = "reap"
+	AuditKindRemint              AuditKind = "remint"
+	AuditKindSpawn               AuditKind = "spawn"
+	AuditKindTenantCreate        AuditKind = "tenant_create"
+	AuditKindTenantDelete        AuditKind = "tenant_delete"
+	AuditKindTenantNote          AuditKind = "tenant_note"
+	AuditKindTenantUpdate        AuditKind = "tenant_update"
+	AuditKindUndeploy            AuditKind = "undeploy"
+	AuditKindVolumeKey           AuditKind = "volume_key"
 )
 
 // Valid indicates whether the value is a known member of the AuditKind enum.
@@ -66,6 +71,10 @@ func (e AuditKind) Valid() bool {
 		return true
 	case AuditKindEgress:
 		return true
+	case AuditKindExposeOff:
+		return true
+	case AuditKindExposeOn:
+		return true
 	case AuditKindHostAdd:
 		return true
 	case AuditKindHostDelete:
@@ -83,6 +92,12 @@ func (e AuditKind) Valid() bool {
 	case AuditKindPreflight:
 		return true
 	case AuditKindPrincipal:
+		return true
+	case AuditKindPublicObjectCreated:
+		return true
+	case AuditKindPublicRejected:
+		return true
+	case AuditKindPublicRequest:
 		return true
 	case AuditKindPurge:
 		return true
@@ -640,6 +655,11 @@ type AuditBatch struct {
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
 // `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+// Public ingress (ADR-029), host chain: `public_request` (one per public
+// request), `public_rejected` (per-minute summary of requests the limits
+// refused), `public_object_created` (a name admitted for a public create);
+// `expose_on` / `expose_off` on both chains (mgmt: the operator's change;
+// host: the listener opened/closed).
 type AuditKind string
 
 // AuditPage defines model for AuditPage.
@@ -680,6 +700,11 @@ type AuditRecord struct {
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
 	// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+	// Public ingress (ADR-029), host chain: `public_request` (one per public
+	// request), `public_rejected` (per-minute summary of requests the limits
+	// refused), `public_object_created` (a name admitted for a public create);
+	// `expose_on` / `expose_off` on both chains (mgmt: the operator's change;
+	// host: the listener opened/closed).
 	Kind     AuditKind `json:"kind"`
 	ObjectID *string   `json:"objectID,omitempty"`
 
