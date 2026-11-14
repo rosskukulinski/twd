@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container test-images
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container test-images e2e-container-build e2e-container-registry
 
 all: build
 
@@ -120,6 +120,22 @@ e2e-container: deps guest-image $(VM_KERNEL_DEP)
 	$(GO) test -c -tags e2econtainer -o bin/e2econtainer.test ./e2e/container
 	sudo env $(CTR_ENV) bin/vmsmoke.test -test.v -test.count=1 -test.run TestContainerSmoke
 	cd e2e/container && sudo env $(CTR_ENV) ../../bin/e2econtainer.test -test.v -test.count=1 -test.timeout 20m
+
+## e2e-container-build (developer machine, docker buildx) then e2e-container-registry (Lima):
+## ADR-032 D3 end to end. twd deploy's builder builds the acceptance examples' own Dockerfiles
+## (alias map as BuildKit named contexts) into CTR_BUILT; in Lima they are pushed through twd's
+## registry, pinned by digest at deploy, pulled by hostd (no other image source) and booted.
+## CTR_APPS must hold the prepared examples on the build machine (scripts/e2e-container-prep.sh).
+CTR_BUILT ?= $(CURDIR)/.scratch/ctr-built
+e2e-container-build:
+	TWD_CTR_APPS="$(CTR_APPS)" TWD_CTR_BUILT="$(CTR_BUILT)" $(GO) test -count=1 -tags e2eimages -v -run TestBuildExampleImages ./e2e/container/
+e2e-container-registry: deps guest-image $(VM_KERNEL_DEP)
+	@[ "$$(uname -s)" = Linux ] || { echo "e2e-container-registry: Linux only; run it inside Lima twd-dev"; exit 1; }
+	@[ -f "$(CTR_BUILT)/built.json" ] || { echo "e2e-container-registry: no $(CTR_BUILT)/built.json (make e2e-container-build on the Mac)"; exit 1; }
+	@[ "$$(cat /proc/sys/vm/nr_hugepages)" -ge $(VM_HUGEPAGES) ] || sudo sysctl -qw vm.nr_hugepages=$(VM_HUGEPAGES)
+	@[ -f "$(CTR_APPS)/unmodified.txt" ] || scripts/e2e-container-prep.sh $(CTR_APPS)
+	$(GO) test -c -tags e2econtainer -o bin/e2econtainer.test ./e2e/container
+	cd e2e/container && sudo env $(CTR_ENV) TWD_CTR_BUILT="$(CTR_BUILT)" ../../bin/e2econtainer.test -test.v -test.count=1 -test.timeout 20m -test.run TestE2EContainerRegistry
 
 ## vm-assets: the microVM guest for the linux-$(GUEST_ARCH) release (Linux only; Lima twd-dev
 ## builds both arches): the guest image, the kernel (TWD_VM_KERNEL, + its kernel.json) and
@@ -311,6 +327,7 @@ lint: api-check
 	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/... ./cmd/twd-vmhelper/... ./cmd/twd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	GOOS=linux $(GO) vet -tags e2econtainer ./e2e/container/...
+	$(GO) vet -tags e2eimages ./e2e/container/...
 	GOOS=darwin $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
