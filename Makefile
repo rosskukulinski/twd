@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container test-images
 
 all: build
 
@@ -42,6 +42,13 @@ test-js:
 ## apps on twd-hostd + stock workerd over testcontrol + local DERP; mock LLM, no keys.
 test-sdk: deps
 	$(GO) test -tags sdk -count=1 -v -timeout 10m ./e2e/sdk/...
+
+## test-images: ADR-032 D3 on the developer machine: twd deploy's image builder for real (docker
+## buildx, both arches, alias contexts from twd's registry) and the registry conformance run with
+## crane (CRANE=<path>, default: crane on PATH; go install github.com/google/go-containerregistry/cmd/crane@v0.20.6).
+CRANE ?= $(shell command -v crane)
+test-images:
+	TWD_TEST_DOCKER=1 TWD_CRANE="$(CRANE)" $(GO) test -count=1 -v -run 'TestBuildAndPush|TestCraneConformance' ./internal/imagebuild/ ./internal/registry/
 
 ## test-pg: the mgmt Store tests against Postgres 17 in OrbStack docker (throwaway container).
 PG_CTX  ?= orbstack

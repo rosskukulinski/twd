@@ -509,6 +509,10 @@ type StatusView struct {
 	Workloads []WorkloadStatus
 	// InsecureSharedHost echoes Config.InsecureSharedHost.
 	InsecureSharedHost bool `json:",omitempty"`
+	// Containers are this host's containers (ADR-032), running and stopped.
+	Containers []ContainerStatus `json:",omitempty"`
+	// ImageCacheBytes is the converted container image cache on disk.
+	ImageCacheBytes int64 `json:",omitempty"`
 }
 
 // Status returns a snapshot.
@@ -565,6 +569,12 @@ func (h *Host) Status() StatusView {
 		v.Workloads = append(v.Workloads, ws)
 	}
 	sort.Slice(v.Objects, func(i, j int) bool { return v.Objects[i].Hostname < v.Objects[j].Hostname })
+	if h.ctr != nil {
+		v.Containers = h.Containers()
+	}
+	if h.cfg.Images != nil {
+		v.ImageCacheBytes = h.cfg.Images.CacheBytes()
+	}
 	sort.Slice(v.Workloads, func(i, j int) bool { return v.Workloads[i].Workload < v.Workloads[j].Workload })
 	return v
 }
