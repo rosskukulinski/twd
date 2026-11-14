@@ -170,13 +170,37 @@ func Generate(app *bundle.App, o Options) (*Result, error) {
 	// Facet main module.
 	var fs strings.Builder
 	fmt.Fprintf(&fs, "import * as T from %s;\nimport { wrapFacetClass } from \"./__twd_rt.js\";\nconst B = %s;\n", jsq(mainImport), bjs)
+	// ctx.container (ADR-032) for classes with a wrangler "containers" entry.
+	ctrOpt := func(c string) string {
+		cc := app.Containers[c]
+		if cc == nil {
+			return ""
+		}
+		imgs := map[string]string{}
+		for n, r := range cc.Images {
+			if r == "" {
+				r = "unbuilt:" + c + "/" + n // twd deploy has not built and pinned it; start() fails clearly
+			}
+			imgs[n] = r
+		}
+		b, _ := json.Marshal(map[string]any{"image": cc.Image, "images": imgs})
+		return string(b)
+	}
 	for _, c := range facets {
+		if o := ctrOpt(c); o != "" {
+			fmt.Fprintf(&fs, "export const %s = wrapFacetClass(T[%s], %s, B, { container: %s });\n", c, jsq(c), jsq(c), o)
+			continue
+		}
 		fmt.Fprintf(&fs, "export const %s = wrapFacetClass(T[%s], %s, B);\n", c, jsq(c), jsq(c))
 	}
 	// Tenant service main module.
 	var ms strings.Builder
 	fmt.Fprintf(&ms, "import * as T from %s;\nimport { wrapHandler, wrapPlainClass } from \"./__twd_rt.js\";\nconst B = %s;\nexport * from %s;\nexport default wrapHandler(T.default, B);\n", jsq(mainImport), bjs, jsq(mainImport))
 	for _, c := range plains {
+		if o := ctrOpt(c); o != "" {
+			fmt.Fprintf(&ms, "export const %s = wrapPlainClass(T[%s], %s, B, { node: %v, container: %s });\n", c, jsq(c), jsq(c), app.Classes[c].Node, o)
+			continue
+		}
 		fmt.Fprintf(&ms, "export const %s = wrapPlainClass(T[%s], %s, B, { node: %v });\n", c, jsq(c), jsq(c), app.Classes[c].Node)
 	}
 
@@ -208,8 +232,9 @@ func Generate(app *bundle.App, o Options) (*Result, error) {
 
 	// twd-config.json
 	type classCfg struct {
-		Mode string `json:"mode"`
-		Node bool   `json:"node"`
+		Mode      string `json:"mode"`
+		Node      bool   `json:"node"`
+		Container bool   `json:"container,omitempty"`
 	}
 	type bindCfg struct {
 		Name  string `json:"name"`
@@ -235,7 +260,7 @@ func Generate(app *bundle.App, o Options) (*Result, error) {
 		if app.Classes[c].Facet() {
 			m = "facet"
 		}
-		cfg.Classes[c] = classCfg{m, app.Classes[c].Node}
+		cfg.Classes[c] = classCfg{m, app.Classes[c].Node, app.Containers[c] != nil}
 	}
 	cfgb, _ := json.MarshalIndent(cfg, "", "  ")
 

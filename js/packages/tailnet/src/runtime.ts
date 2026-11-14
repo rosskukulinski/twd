@@ -8,6 +8,7 @@
 // workload is calling, so tenant code cannot act as another object.
 
 import { TailnetError, fromResponse } from "./errors.js";
+import { createContainer, defineContainer, type ContainerSpec } from "./container.js";
 
 /** The platform's TailnetApi stub (RPC). */
 export interface TailnetApiStub {
@@ -171,7 +172,7 @@ function installAlarmShim(ctx: any, tw: TailnetApiStub) {
 }
 
 /** wrapFacetClass wraps a tenant DO class run as a facet (per-object egress). */
-export function wrapFacetClass(C: any, name: string, bindings: BindingMap) {
+export function wrapFacetClass(C: any, name: string, bindings: BindingMap, opts: { container?: ContainerSpec } = {}) {
   if (typeof C !== "function") throw new Error(`twd: durable_objects class ${name} is not exported by the main module`);
   const W = {
     [name]: class extends C {
@@ -181,6 +182,8 @@ export function wrapFacetClass(C: any, name: string, bindings: BindingMap) {
         delete e.__TWD;
         define(ctx, createTailnetContext(tw, e, bindings));
         installAlarmShim(ctx, tw);
+        // ctx.container: the object is attested by the platform (props).
+        if (tw && opts.container) defineContainer(ctx, createContainer(tw, ctx, name, opts.container));
         super(ctx, e);
       }
       // Called by the Host DO when the delegated alarm fires.
@@ -198,7 +201,7 @@ export function wrapFacetClass(C: any, name: string, bindings: BindingMap) {
  * "workload"): alarms work, egress leaves as the workload node. The wrapper
  * tells hostd the object exists (so its node comes up) and enforces kill.
  */
-export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts: { node: boolean }) {
+export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts: { node: boolean; container?: ContainerSpec }) {
   if (typeof C !== "function") throw new Error(`twd: durable_objects class ${name} is not exported by the main module`);
   const proto = C.prototype;
   const killedResponse = (reason: string) =>
@@ -209,6 +212,7 @@ export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts:
         const tw = env?.__TWD;
         const oname = ctx?.id?.name;
         if (tw && oname) define(ctx, createTailnetContext(tw, env, bindings, { class: name, name: oname }));
+        if (tw && oname && opts.container) defineContainer(ctx, createContainer(tw, ctx, name, opts.container, { class: name, name: oname }));
         super(ctx, env);
         if (tw && oname && opts.node) {
           const p = tw.call("ensure", { as: { class: name, name: oname } }).catch(() => {});
