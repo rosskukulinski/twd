@@ -70,6 +70,21 @@ check below runs in both.
 | `WorkflowAgent` / Workflow SDK | ❌ | — | `node:vm` (ADR-022: Node process tier, branch m9) |
 | `HarnessAgent`, Sandbox, hosted Vercel services | ❌ | — | client-only or process tier |
 
+## Public routes (Funnel, ADR-029)
+
+Cloudflare Workers are public by default; twd workloads are tailnet-only
+unless `twd.jsonc` lists `public.routes` ([public-ingress.md](public-ingress.md)).
+
+| Cloudflare expectation | On twd public routes |
+|---|---|
+| `request.headers.get("CF-Connecting-IP")` | ✅ the client IP Funnel reports (client copies stripped) |
+| `X-Forwarded-For` / `X-Forwarded-Proto` | ✅ single value / `https` (set by netd) |
+| `request.cf.country`, `asn`, `city`… | ❌ absent (no GeoIP in v1) |
+| Caller identity | `getRequester(req)` → `{kind:"public", ip}`; `getCaller(req)` throws `public_request` |
+| `env.NS.getByName(newName)` from a public request | ❌ `public_create_denied` unless the class sets `"public": {"create": true, "maxObjects": N}` |
+| Custom domains, bring-your-own front door | ❌ `*.ts.net` only (Funnel) |
+| `email()` handler | ❌ (Funnel has no port 25; use a provider's inbound webhook to a public route) |
+
 ## twd behaviour found by this suite
 
 - **Facet alarms** (fixed): workerd throws "Facets currently cannot set

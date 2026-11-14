@@ -103,6 +103,8 @@ twd kill <object-id> --cascade                 # cut it (and its sub-agents) off
   - A separate developer laptop: `twd link`.
   - Adding hosts: `twd host add`.
   - The Linux microVM tier (Firecracker).
+- **Serve chosen paths to the public internet** (webhooks, OAuth callbacks)
+  over Funnel: [docs/public-ingress.md](docs/public-ingress.md).
 - **Run an app locally with no tailnet at all:** `twd dev`.
 - **What runs and what doesn't:** [docs/COMPAT.md](docs/COMPAT.md)
   (Agents SDK, MCP, Vercel AI SDK) and [docs/node-tier.md](docs/node-tier.md)
