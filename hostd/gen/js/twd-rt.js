@@ -22,7 +22,16 @@ var CATALOG = Object.freeze({
   unknown_object: { status: 404, title: "no such object" },
   dial_failed: { status: 502, title: "the tailnet dial failed" },
   upstream_unavailable: { status: 503, title: "the platform upstream is unavailable" },
-  hostd_unavailable: { status: 503, title: "the host agent is unavailable" }
+  hostd_unavailable: { status: 503, title: "the host agent is unavailable" },
+  public_request: { status: 403, title: "a public (Funnel) request reached code that needs a tailnet caller; use getRequester()" },
+  public_create_denied: { status: 403, title: "a public request may not create a new object (or spawn); only existing objects, or classes with public.create" },
+  public_ingress_not_allowed: { status: 403, title: "the tenant does not allow public ingress (operator setting publicIngress)" },
+  public_name_taken: { status: 409, title: "the workload's public node name is taken on the tailnet (MagicDNS would rename it)" },
+  rate_limited: { status: 429, title: "too many public requests (per workload or per client IP)" },
+  payload_too_large: { status: 413, title: "the public request body is above the workload's limit" },
+  header_too_large: { status: 431, title: "the public request headers are above the workload's limit" },
+  not_public: { status: 404, title: "this path is not one of the workload's public routes" },
+  upgrade_not_allowed: { status: 403, title: "connection upgrades (WebSocket) are not allowed on this public route" }
 });
 var BRAND = /* @__PURE__ */ Symbol.for("twd.TailnetError");
 var TailnetError = class _TailnetError extends Error {
@@ -72,6 +81,9 @@ var TailnetError = class _TailnetError extends Error {
     return new _TailnetError(code, detail ?? message ?? code, { ...rest, missing, snippet, docUrl: doc_url, traceId: trace_id, status });
   }
 };
+function isTailnetError(e) {
+  return !!e && typeof e === "object" && (e[BRAND] === true || e.name === "TailnetError");
+}
 async function fromResponse(r) {
   const code = r.headers.get("twd-error");
   if (!code) return null;
@@ -245,6 +257,97 @@ function wrapPlainClass(C, name, bindings, opts) {
   }
   return W;
 }
+function isPublicReq(req) {
+  return req?.cf?.tailscale?.requester?.kind === "public";
+}
+var ADMIT_CACHE_MAX = 1e4;
+var admitted = /* @__PURE__ */ new Map();
+function remember(key) {
+  if (admitted.size >= ADMIT_CACHE_MAX) {
+    const first = admitted.keys().next().value;
+    if (first !== void 0) admitted.delete(first);
+  }
+  admitted.set(key, true);
+}
+async function admit(tw, cls, name) {
+  const key = cls + "\n" + name;
+  if (admitted.has(key)) return;
+  if (!tw || typeof tw.call !== "function") throw new TailnetError("public_create_denied", "twd platform binding missing; refusing a public object access");
+  const r = await tw.call("admit", { class: cls, name });
+  if (!r || !r.ok) throw TailnetError.from(r?.error ?? { code: "public_create_denied", message: "admit refused" });
+  remember(key);
+}
+function denied(msg) {
+  throw new TailnetError("public_create_denied", msg);
+}
+function guardStub(tw, cls, name, real) {
+  return new Proxy(
+    {},
+    {
+      get(_t, p) {
+        if (p === "then") return void 0;
+        if (p === "id" || p === "name") return real[p];
+        if (typeof p === "symbol") return real[p];
+        return async (...args) => {
+          await admit(tw, cls, name);
+          return real[p](...args);
+        };
+      }
+    }
+  );
+}
+function guardNamespace(tw, cls, ns) {
+  return Object.freeze({
+    getByName(name) {
+      const n = String(name);
+      return guardStub(tw, cls, n, ns.getByName(n));
+    },
+    idFromName(name) {
+      return ns.idFromName(name);
+    },
+    idFromString(s) {
+      return ns.idFromString(s);
+    },
+    get(id, opts) {
+      const n = id?.name;
+      if (typeof n !== "string" || !n) denied(`a public request may only address ${cls} objects by name (idFromName/getByName)`);
+      return guardStub(tw, cls, n, ns.get(id, opts));
+    },
+    newUniqueId() {
+      denied(`a public request may not create a new ${cls} object (newUniqueId)`);
+    },
+    jurisdiction(j) {
+      return guardNamespace(tw, cls, ns.jurisdiction(j));
+    }
+  });
+}
+function publicEnv(env, bindings) {
+  if (!env || typeof env !== "object") return env;
+  const tw = env.__TWD;
+  const out = { ...env };
+  for (const [k, cls] of Object.entries(bindings)) {
+    if (env[k]) out[k] = guardNamespace(tw, cls, env[k]);
+  }
+  return out;
+}
+function publicTailnet(tn) {
+  return Object.freeze({
+    ...tn,
+    spawn() {
+      return Promise.reject(new TailnetError("public_create_denied", "a public request may not spawn objects"));
+    },
+    kill() {
+      return Promise.reject(new TailnetError("public_request", "a public request may not kill objects"));
+    }
+  });
+}
+function asResponse(e) {
+  const m = String(e?.message ?? e);
+  const i = m.indexOf("[killed]");
+  if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+  if (isTailnetError(e) && (e.code === "public_create_denied" || e.code === "public_request")) return e.toResponse();
+  return null;
+}
 function wrapHandler(H, bindings) {
   if (!H) {
     return {
@@ -252,26 +355,53 @@ function wrapHandler(H, bindings) {
     };
   }
   if (typeof H === "function") {
-    return {
-      [H.name || "Default"]: class extends H {
-        constructor(ctx, env) {
-          define(ctx, createTailnetContext(env?.__TWD, env, bindings));
-          super(ctx, env);
-        }
+    const C = class extends H {
+      constructor(ctx, env) {
+        define(ctx, createTailnetContext(env?.__TWD, env, bindings));
+        super(ctx, env);
       }
-    }[H.name || "Default"];
+    };
+    if (typeof H.prototype?.fetch === "function") {
+      const f = H.prototype.fetch;
+      C.prototype.fetch = async function(req) {
+        if (isPublicReq(req)) {
+          const raw = this.env;
+          this.env = publicEnv(raw, bindings);
+          if (this.ctx?.tailnet) define(this.ctx, publicTailnet(this.ctx.tailnet));
+        }
+        try {
+          return await f.call(this, req);
+        } catch (e) {
+          const r = asResponse(e);
+          if (r) return r;
+          throw e;
+        }
+      };
+    }
+    return { [H.name || "Default"]: C }[H.name || "Default"];
   }
   const out = { ...H };
   for (const k of Object.keys(H)) {
     if (typeof H[k] !== "function") continue;
     out[k] = function(a, env, ctx) {
-      if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
-      const r = H[k].call(H, a, env, ctx);
+      const pub = k === "fetch" && isPublicReq(a);
+      if (pub) {
+        const tn = env?.__TWD ? createTailnetContext(env.__TWD, env, bindings) : null;
+        env = publicEnv(env, bindings);
+        if (ctx && tn) define(ctx, publicTailnet(tn));
+      } else if (ctx && env?.__TWD && !("tailnet" in ctx)) define(ctx, createTailnetContext(env.__TWD, env, bindings));
+      let r;
+      try {
+        r = H[k].call(H, a, env, ctx);
+      } catch (e) {
+        const resp = k === "fetch" ? asResponse(e) : null;
+        if (resp) return resp;
+        throw e;
+      }
       if (k !== "fetch") return r;
       return Promise.resolve(r).catch((e) => {
-        const m = String(e?.message ?? e);
-        const i = m.indexOf("[killed]");
-        if (i >= 0) return new TailnetError("killed", m.slice(i + 8).trim()).toResponse();
+        const resp = asResponse(e);
+        if (resp) return resp;
         throw e;
       });
     };
@@ -280,6 +410,7 @@ function wrapHandler(H, bindings) {
 }
 export {
   createTailnetContext,
+  publicEnv,
   wrapFacetClass,
   wrapHandler,
   wrapPlainClass

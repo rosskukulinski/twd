@@ -21,7 +21,17 @@ const json = (status, body, extra = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store", ...extra } });
 
 const DOC = "https://github.com/rosskukulinski/twd/blob/main/docs/errors.md#";
-const STATUS = { killed: 410, no_identity: 401, bad_request: 400, unknown_object: 404, identity_pending: 503, hostd_unavailable: 503 };
+const STATUS = {
+  killed: 410, no_identity: 401, bad_request: 400, unknown_object: 404, identity_pending: 503, hostd_unavailable: 503,
+  public_create_denied: 403, public_request: 403, not_public: 404,
+};
+
+// isPublic: netd delivered this request over Funnel (ADR-029). Only netd
+// sets cf.tailscale.requester (the ingress socket's cfBlobHeader; client
+// copies are stripped), so this cannot be forged from headers.
+function isPublic(req) {
+  return req?.cf?.tailscale?.requester?.kind === "public";
+}
 function errBody(code, message, extra = {}) {
   return { code, message, doc_url: DOC + code, ...extra };
 }
@@ -32,6 +42,7 @@ function errResponse(code, message, extra = {}) {
 // principalOf names who a request acts for (audit "actingFor"): the human
 // login for an untagged caller, else the calling node's name.
 function principalOf(req) {
+  if (isPublic(req)) return "public"; // never a caller name, whatever else cf holds
   const c = req?.cf?.tailscale?.caller;
   if (!c) return "";
   const user = typeof c.user === "string" ? c.user : c.user?.login;
@@ -97,6 +108,15 @@ export default {
   async fetch(req, env, ctx) {
     const t = req.cf?.twd;
     if (!t || typeof t !== "object") return errResponse("no_identity", "request did not come through netd/hostd");
+    if (isPublic(req)) {
+      // A public node only fronts its workload's default export; the
+      // platform's /_twd/... addressing is never public (netd refuses it
+      // too: defense in depth).
+      if (t.kind !== "workload") return errResponse("public_request", "a public request may only reach its workload's entry point");
+      const p = new URL(req.url).pathname;
+      if (p === "/_twd" || p.startsWith("/_twd/")) return errResponse("not_public", "/_twd is never public");
+      return env.TENANT.fetch(req);
+    }
     switch (t.kind) {
       case "admin":
         return admin(req, env, ctx, t);
@@ -129,6 +149,7 @@ function makeHost(cls) {
       this.__f = null;
       this.__ensured = null;
       this.__actingFor = ""; // own property: the Proxy would answer unknown names with an RPC forwarder
+      this.__publicOK = null; // own property, same reason (public-request admission, ADR-029)
       this.__killed = ctx.storage.kv.get("__twd_killed") ?? null;
       const self = this;
       return new Proxy(this, {
@@ -194,8 +215,29 @@ function makeHost(cls) {
       }
       return this.__f;
     }
+    // __ensurePublic (ADR-029 D5): before a public request touches the
+    // facet, hostd must confirm the object exists or was admitted
+    // (public.create under its cap); otherwise no facet, no node.
+    __ensurePublic() {
+      if (!this.__publicOK) {
+        this.__publicOK = hostd(this.env, "ensure", { as: { class: cls, name: this.ctx.id.name }, public: true }).catch((e) => {
+          this.__publicOK = null;
+          throw e;
+        });
+      }
+      return this.__publicOK;
+    }
     async fetch(req) {
       if (this.__killed) return errResponse("killed", "object " + cls + "/" + this.ctx.id.name + " was killed: " + this.__killed);
+      if (isPublic(req)) {
+        if (!this.ctx.id.name) return errResponse("public_create_denied", "a public request may only reach objects addressed by name");
+        try {
+          await this.__ensurePublic();
+        } catch (e) {
+          const b = e.body ?? errBody("public_create_denied", String(e));
+          return errResponse(b.code ?? "public_create_denied", b.message ?? String(e));
+        }
+      }
       // Internal fetches (e.g. partyserver's set-name) carry no caller.
       const who = principalOf(req);
       if (who && !this.__actingFor) {
@@ -350,6 +392,18 @@ export class TailnetApi extends WorkerEntrypoint {
       } catch (e) {
         const m = String(e?.message ?? e);
         return { ok: false, error: errBody(m.includes("[killed]") ? "killed" : "bad_request", m) };
+      }
+    }
+    if (op === "admit") {
+      // Public-request admission (ADR-029 D5): may a public request reach
+      // (or create) class/name? hostd decides; nothing is created here.
+      if (typeof args.class !== "string" || !CFG.classes[args.class] || typeof args.name !== "string" || !args.name) {
+        return { ok: false, error: errBody("public_create_denied", "admit: unknown class or empty name") };
+      }
+      try {
+        return { ok: true, value: await hostd(this.env, "admit", { class: args.class, name: args.name }) };
+      } catch (e) {
+        return { ok: false, error: e.body ?? errBody("hostd_unavailable", String(e)) };
       }
     }
     if (!["ensure", "spawn", "ready", "kill", "audit", "self"].includes(op)) return { ok: false, error: errBody("bad_request", "unknown op " + op) };
