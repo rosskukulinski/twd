@@ -3,6 +3,8 @@ package mgmt
 import (
 	"context"
 	"time"
+
+	"github.com/rosskukulinski/twd/internal/registry"
 )
 
 // Store is twd-mgmt's durable state (ADR-011: leases are conditional writes
@@ -35,6 +37,14 @@ type Store interface {
 	// one that grows, must fit q (else *ContainerQuotaError) and fence must
 	// hold (ErrLeaseLost), both in the transaction that writes it.
 	ReserveContainer(ctx context.Context, r ContainerReservation, q ContainerQuota, fence *Fence) (ContainerReservation, bool, error)
+
+	// The OCI registry's metadata (ADR-032 D3): which repository sees which
+	// blob or manifest, and tags. Blob content lives on disk (Config.RegistryDir).
+	registry.Meta
+	// Operator-marked public base images, by (normalised ref, arch).
+	PutPublicImage(ctx context.Context, p PublicImage) error
+	ListPublicImages(ctx context.Context) ([]PublicImage, error)
+	DeletePublicImage(ctx context.Context, id string) error
 	GetContainerReservation(ctx context.Context, id string) (ContainerReservation, error)
 	// ReleaseContainer deletes reservation id if hostID holds it (else ErrNotFound).
 	ReleaseContainer(ctx context.Context, id, hostID string) error

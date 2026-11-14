@@ -202,6 +202,15 @@ type DeployRequest struct {
 	TenantID string `json:"tenantID"`
 	Workload string `json:"workload"`
 	Bundle   []byte `json:"bundle"` // base64 in JSON
+	// ContainerImages are images twd deploy built and pushed, by class:
+	// {"<Class>": {"image": ref, "images": {name: ref}}} (ADR-032 D3).
+	ContainerImages map[string]BuiltImages `json:"containerImages,omitempty"`
+}
+
+// BuiltImages are one class's built image refs (twd.local/<tenant>/…@sha256).
+type BuiltImages struct {
+	Image  string            `json:"image,omitempty"`
+	Images map[string]string `json:"images,omitempty"`
 }
 
 type Endpoint struct {
@@ -249,6 +258,9 @@ type Assignment struct {
 	// Fence (F9, ADR-028 §3): stop serving this workload when mgmt is
 	// unreachable for FenceAfter. nil (an older mgmt) means true.
 	Fence *bool `json:"fence,omitempty"`
+	// Containers are the workload's container classes with the images mgmt
+	// pinned at deploy (ADR-032 D3); they replace the bundle's classes.
+	Containers []container.Class `json:"containers,omitempty"`
 }
 
 type ObjectRef struct {

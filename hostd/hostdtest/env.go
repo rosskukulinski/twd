@@ -117,6 +117,13 @@ func Start(t testing.TB, o Options) *Env {
 		t.Fatal(err)
 	}
 	hc, _ := mgmtapi.NewClient("unix://" + sock)
+	if o.Images != nil && o.Images.Puller == nil && o.Fake.RegistryDir != "" {
+		// hostd pulls pinned images as host h1 (the fake applies the host
+		// rules to callers naming a host).
+		pc, _ := mgmtapi.NewClient("unix://" + sock)
+		pc.HostID = "h1"
+		o.Images.Puller = image.RegistryPuller{Client: pc.OCI()}
+	}
 	if o.HeartbeatEvery == 0 {
 		o.HeartbeatEvery = 200 * time.Millisecond
 	}
@@ -208,6 +215,15 @@ func (e *Env) DeployNode(appDir, workload string, vars map[string]string) string
 		e.T.Fatal(err)
 	}
 	return e.DeployFiles(files, workload)
+}
+
+// DeployBuilt deploys bundle files with images twd deploy built and pushed
+// (DeployRequest.ContainerImages); mgmt's refusal is returned.
+func (e *Env) DeployBuilt(files map[string][]byte, workload string, built map[string]mgmtapi.BuiltImages) (string, error) {
+	var resp mgmtapi.DeployResponse
+	err := e.Mgmt.Do(context.Background(), "POST", "/v1/deployments",
+		mgmtapi.DeployRequest{TenantID: e.TenantID, Workload: workload, Bundle: MustTar(files), ContainerImages: built}, &resp)
+	return resp.DeploymentID, err
 }
 
 // DeployFiles deploys already-built bundle files as workload.

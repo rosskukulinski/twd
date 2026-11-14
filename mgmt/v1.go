@@ -1386,7 +1386,26 @@ func (s *Server) Handler() http.Handler {
 		},
 	})
 	// Anything else (there is no /v0) is a typed 404 from the gate.
-	return s.roleGate(roles, mux)
+	gate := s.roleGate(roles, mux)
+	// The OCI distribution API (/v2/, ADR-032 D3) is an external spec:
+	// api/openapi.yaml documents its routes and roles (tag "registry",
+	// excluded from code generation); the registry enforces them.
+	reg := s.M.Registry()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/") {
+			if reg == nil {
+				writeErr(w, r, errf(404, "registry_unavailable", "this twd-mgmt serves no registry (start it with -registry-dir)"))
+				return
+			}
+			if principalOf(r.Context()).Kind == "" {
+				writeErr(w, r, errf(401, "no_identity", "unauthenticated"))
+				return
+			}
+			reg.ServeHTTP(w, r)
+			return
+		}
+		gate.ServeHTTP(w, r)
+	})
 }
 
 // pendingIDs lists objects whose device delete is scheduled.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -282,6 +283,7 @@ func cmdDeploy(args []string) error {
 	allowMissing := f.Bool("allow-missing-grants", false, "deploy even if tailnet.connects grants are missing")
 	noWait := f.Bool("no-wait", false, "return once mgmt accepted the deploy")
 	forceTakeover := f.Bool("force-takeover", false, "the workload's current host is gone for good: move its Durable Objects anyway (audited; see takeover_unconfirmed)")
+	platform := f.String("platform", "", "containers: arches to build Dockerfile images for (linux/amd64,linux/arm64; default: the arches of the tenant pool's container hosts)")
 	wait := f.Duration("wait", 3*time.Minute, "how long to wait for ready")
 	tenantF := tenantFlag(f)
 	vars := varFlags{}
@@ -369,9 +371,24 @@ func cmdDeploy(args []string) error {
 		}
 		fmt.Printf("✓ build      %s %.1f KB (esbuild) · bundle %.1f KB\n", main, float64(jsBytes)/1024, float64(len(tb))/1024)
 	}
+	// Containers (ADR-032 D3): build the Dockerfile images here and push them
+	// to twd's registry; mgmt pins every image to a digest at deploy.
+	var ilog io.Writer = os.Stdout
+	if *f.json {
+		ilog = os.Stderr
+	}
+	bctx, bcancel := context.WithTimeout(context.Background(), 60*time.Minute)
+	builtImages, err := buildContainerImages(bctx, mc, a, tb, tn.TenantID, *platform, ilog)
+	bcancel()
+	if err != nil {
+		return err
+	}
 	ds := time.Now()
 	var dr mgmt.DeployResponse
 	body := map[string]any{"tenantID": tn.TenantID, "workload": a.Name, "bundle": tb}
+	if len(builtImages) > 0 {
+		body["containerImages"] = builtImages
+	}
 	if *forceTakeover {
 		body["forceTakeover"] = true
 	}

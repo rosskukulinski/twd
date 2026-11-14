@@ -91,8 +91,9 @@ func run() error {
 		ctrOff     = flag.Bool("no-containers", false, "don't offer containers (ctx.container) even with a microVM backend")
 		ctrKernel  = flag.String("vm-container-kernel", "", "containers: guest kernel with erofs (guest/build-kernel.sh; default -vm-kernel)")
 		ctrCache   = flag.String("container-image-cache", "", "containers: converted image cache (default <data-dir>/images)")
-		ctrImages  = flag.String("container-image-dir", "", "containers: dir of image tarballs with an images.json index (until the mgmt registry pull)")
-		ctrPublic  = flag.String("container-public-images", "", "containers: comma-separated image refs cached once for all tenants (public bases)")
+		ctrImages  = flag.String("container-image-dir", "", "containers: dir of image tarballs with an images.json index (tests and hosts without a registry; deployments with pinned images pull from mgmt's registry instead)")
+		ctrPublic  = flag.String("container-public-images", "", "containers: comma-separated image refs cached once for all tenants (public bases; -container-image-dir only: pinned images take their scope from the pin)")
+		ctrCacheMB = flag.Int64("container-image-cache-max-mib", 0, "containers: cap on the converted image cache; past it the least recently used images not in use are removed (0 = no cap)")
 		ctrIdle    = flag.Duration("container-idle", hostd.DefaultContainerIdle, "containers: default inactivity timeout (setInactivityTimeout overrides, ≤ 6 h)")
 		ctrMaxLife = flag.Duration("container-max-lifetime", hostd.DefaultContainerMaxLife, "containers: hard max lifetime of a container")
 		ctrGrace   = flag.Duration("container-stop-grace", hostd.DefaultContainerGrace, "containers: cap on destroy()'s SIGTERM → SIGKILL grace")
@@ -179,7 +180,10 @@ func run() error {
 	// Containers (ADR-032) run on the microVM backend; without it this host
 	// offers none (start() fails with tier_unavailable, no fallback).
 	if cb, ok := hcfg.VM.(sandbox.ContainerBackend); ok && hcfg.VM != nil && !*ctrOff {
-		st := &image.Store{Dir: *ctrCache, Aliases: image.DefaultAliases, Public: map[string]bool{}}
+		// Images pinned at deploy are pulled from mgmt's registry over the
+		// same connection as the API (ADR-032 D3: never from Docker Hub).
+		st := &image.Store{Dir: *ctrCache, Aliases: image.DefaultAliases, Public: map[string]bool{},
+			Puller: image.RegistryPuller{Client: mc.OCI()}, MaxBytes: *ctrCacheMB << 20}
 		if *ctrCache == "" {
 			st.Dir = filepath.Join(*dataDir, "images")
 		}

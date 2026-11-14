@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/internal/container"
+	"github.com/rosskukulinski/twd/internal/oci"
+	"github.com/rosskukulinski/twd/internal/registry"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 )
 
@@ -65,6 +67,18 @@ type Config struct {
 	OperatorTailnet string
 	// OperatorControlURL is passed to hosts with their join key.
 	OperatorControlURL string
+	// Registry (ADR-032 D3): RegistryDir holds the OCI registry's blobs
+	// ("" = no registry: container images are not pinned at deploy).
+	// RegistryUpstream returns the client mgmt mirrors an external image
+	// through (nil: oci.RegistryBase over HTTPS for every host, except the
+	// RegistryInsecure hosts, over plain HTTP). NoMirror refuses external
+	// images (only twd.local refs and public bases deploy). ImageAliases
+	// default to registry.DefaultAliases.
+	RegistryDir      string
+	RegistryUpstream func(host string) *oci.Client
+	RegistryInsecure []string
+	NoMirror         bool
+	ImageAliases     []registry.Alias
 }
 
 // Mgmt is twd-mgmt's core: tenants, deployments, objects, the mint broker
@@ -90,6 +104,9 @@ type Mgmt struct {
 	spawnMu      map[string]*sync.Mutex // per tenant: serialises budget checks
 	pushURLs     map[string]string      // hostID → unix:// push socket (in memory; hosts re-register)
 	pending      map[string]*pendingDelete
+	// reg is the OCI registry (nil without Config.RegistryDir).
+	reg      *registry.Registry
+	resolver *registry.Resolver
 	// noDeviceScope: tenants whose credential got a 403 on a device delete
 	// (an OAuth client without devices:core); kills then warn up front.
 	noDeviceScope map[string]bool
@@ -144,6 +161,11 @@ func New(cfg Config) (*Mgmt, error) {
 	}
 	m.policies = &PolicyCache{Fetch: src, MaxAge: cfg.PolicyMaxAge, Clock: cfg.Clock}
 	m.ctx, m.cancel = context.WithCancel(context.Background())
+	if cfg.RegistryDir != "" {
+		if err := m.initRegistry(); err != nil {
+			return nil, err
+		}
+	}
 	return m, nil
 }
 
@@ -300,6 +322,9 @@ func (m *Mgmt) CreateTenant(ctx context.Context, r TenantRequest) (Tenant, error
 		RegistrationsPerMinute: r.RegistrationsPerMinute, MaxObjects: r.MaxObjects, CreatedAt: m.now().UnixMilli(),
 		MaxContainers: r.MaxContainers, MaxContainerMemMiB: r.MaxContainerMemMiB, MaxContainerVCPU: r.MaxContainerVCPU}
 	t.containerDefaults()
+	if t.ID == registry.PublicNamespace {
+		return Tenant{}, errf(400, "bad_request", "tenant ID %q is reserved (the registry's operator namespace)", t.ID)
+	}
 	if t.ID == "" {
 		t.ID = newID("tn_")[:11]
 	}
@@ -589,6 +614,9 @@ func (m *Mgmt) resolveLease(ctx context.Context, hostID, ns string) string {
 // DeployRequest is POST /v0/deployments. Namespaces and Host are additions
 // to the v0 contract: explicit class config (instead of twd.jsonc in the
 // bundle) and an explicit host choice.
+// BuiltImages are one class's images built by twd deploy.
+type BuiltImages = registry.Built
+
 type DeployRequest struct {
 	TenantID   string        `json:"tenantID"`
 	Workload   string        `json:"workload"`
@@ -599,6 +627,10 @@ type DeployRequest struct {
 	// stopped heartbeating, is really gone, so a stateful workload may move
 	// off it (ADR-028 §3). Audited.
 	ForceTakeover bool `json:"forceTakeover,omitempty"`
+	// ContainerImages are the images twd deploy built and pushed, by class
+	// (twd.local/<tenant>/…@sha256 refs): they replace the class's Dockerfile
+	// image / images before every ref is pinned (ADR-032 D3).
+	ContainerImages map[string]BuiltImages `json:"containerImages,omitempty"`
 	// By is the deployer (set by the API layer from the principal, never
 	// from the request body): a WhoIs login over the tailnet, the local
 	// actor on the unix socket.
@@ -684,6 +716,15 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		}
 		need.Containers = len(ctrs) > 0
 	}
+	if ctrs, err = registry.ApplyBuilt(t.ID, ctrs, r.ContainerImages); err != nil {
+		return resp, errf(400, "bad_request", "%v", err)
+	}
+	// Pin every image to a digest once, now (ADR-032 D3), for the arches of
+	// the tenant's container hosts; placement then needs one of the arches
+	// every image resolved for.
+	if ctrs, need.Arches, err = m.pinContainers(ctx, t, ctrs, need.Arch, r.By); err != nil {
+		return resp, err
+	}
 	host, err := m.pickHost(ctx, t, r.Workload, r.Host, need)
 	if err != nil {
 		return resp, err
@@ -757,7 +798,9 @@ type DeploymentView struct {
 	Namespaces   []ClassConfig `json:"namespaces"`
 	DeployedBy   string        `json:"deployedBy,omitempty"`
 	CreatedAt    int64         `json:"createdAt"`
-	Endpoint     struct {
+	// Containers are the container classes and their pinned images.
+	Containers []container.Class `json:"containers,omitempty"`
+	Endpoint   struct {
 		ObjectID string `json:"objectID,omitempty"`
 		Node     string `json:"node"`
 		MagicDNS string `json:"magicDNS"`
@@ -776,6 +819,7 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 	}
 	v.DeploymentID, v.TenantID, v.Workload, v.Host, v.Epoch, v.Namespaces, v.CreatedAt = d.ID, d.TenantID, d.Workload, d.HostID, d.Epoch, d.Namespaces, d.CreatedAt
 	v.DeployedBy = d.DeployedBy
+	v.Containers = d.Containers
 	v.Status, v.Error = m.deploymentStatus(ctx, d)
 	if o, err := m.store.GetObjectByName(ctx, d.TenantID, d.Workload, WorkloadNamespace, d.Workload); err == nil {
 		v.Endpoint.ObjectID, v.Endpoint.MagicDNS, v.Endpoint.Status = o.ID, o.MagicDNS, o.Status
@@ -887,13 +931,17 @@ type placementNeed struct {
 	Tier       string
 	Containers bool
 	Arch       string
+	// Arches, when set, are the arches the deploy's images were pinned for
+	// (the host's arch must be one of them).
+	Arches []string
 }
 
 func (h Host) offers(n placementNeed) bool {
 	if !h.offersTier(n.Tier) {
 		return false
 	}
-	return !n.Containers || slices.Contains(h.Tiers, CapContainers) && (n.Arch == "" || h.Arch == n.Arch)
+	return !n.Containers || slices.Contains(h.Tiers, CapContainers) && (n.Arch == "" || h.Arch == n.Arch) &&
+		(len(n.Arches) == 0 || slices.Contains(n.Arches, h.Arch))
 }
 
 // String names the need in errors: `the "microvm" tier`, `containers
@@ -907,6 +955,8 @@ func (n placementNeed) String() string {
 		c := "containers"
 		if n.Arch != "" {
 			c += " (" + n.Arch + " images)"
+		} else if len(n.Arches) > 0 {
+			c += " (" + strings.Join(n.Arches, " or ") + " images: the arches every image was pinned for)"
 		}
 		parts = append(parts, c)
 	}
@@ -1007,6 +1057,9 @@ type Assignment struct {
 	// Fence: stop serving this workload when mgmt is unreachable for
 	// FenceAfter (stateful). Hosts treat a missing field as true.
 	Fence bool `json:"fence"`
+	// Containers are the container classes with their pinned images
+	// (ADR-032 D3): hosts pull only these digests.
+	Containers []container.Class `json:"containers,omitempty"`
 }
 
 func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, error) {
@@ -1019,7 +1072,7 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 		t, _ := m.store.GetTenant(ctx, d.TenantID)
 		a := Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
 			BundleURL: "/v1/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
-			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}, Fence: d.Fence}
+			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}, Fence: d.Fence, Containers: d.Containers}
 		for _, c := range d.Namespaces {
 			if c.Class == WorkloadNamespace {
 				a.WorkloadTags = c.Tags
@@ -2386,7 +2439,8 @@ const (
 // PrivilegedKinds are the kinds a tenant may never submit (RT-02).
 var PrivilegedKinds = map[string]bool{"allow": true, "deny": true, "egress": true, "spawn": true, "kill": true,
 	"create": true, "mint": true, "ready": true, "credential": true, "principal": true, "device_delete": true,
-	"tenant": true, "deploy": true, "obo_root": true, "container_start": true, "container_stop": true}
+	"tenant": true, "deploy": true, "obo_root": true, "container_start": true, "container_stop": true,
+	"image_push": true, "image_pin": true, "image_public": true}
 
 // checkAuditSource enforces the provenance contract on a host-submitted
 // record: a "tenant" source may only carry a tenant_note, and a tenant_note

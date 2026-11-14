@@ -33,7 +33,10 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/internal/container"
 	"github.com/rosskukulinski/twd/internal/nodecert"
+	"github.com/rosskukulinski/twd/internal/oci"
+	"github.com/rosskukulinski/twd/internal/registry"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/mgmt"
 	"github.com/rosskukulinski/twd/netd"
@@ -60,7 +63,14 @@ type Config struct {
 	NoPush bool
 	// MaxContainers is every tenant's container quota (default 10).
 	MaxContainers int
-	Logger        *slog.Logger
+	// RegistryDir, if set, serves twd's OCI registry at /v2/ (internal/registry
+	// with in-memory metadata) and pins container images at deploy the way
+	// twd-mgmt does (registry.Resolver), so hostd pulls by digest. Callers
+	// with Twd-Host-ID get the host rules (pull only, own tenants + public).
+	RegistryDir      string
+	RegistryUpstream func(host string) *oci.Client
+	ImageAliases     []registry.Alias
+	Logger           *slog.Logger
 }
 
 // Server is the fake mgmt.
@@ -90,6 +100,8 @@ type Server struct {
 	reservations         map[string]*mgmtapi.ContainerReservation // container reservations by ID
 	reservationsDown     bool
 	heartbeatsDown       bool
+	reg                  *registry.Registry
+	resolver             *registry.Resolver
 }
 
 // SetHeartbeatsDown makes host heartbeats fail with 503 (tests: a host
@@ -145,6 +157,7 @@ type deployment struct {
 	superseded bool
 	created    time.Time
 	fence      bool // stateful (ADR-028 §3): mgmt.BundleStateful
+	containers []container.Class // pinned (RegistryDir)
 }
 
 type lease struct {
@@ -201,6 +214,11 @@ func New(cfg Config) *Server {
 	m.HandleFunc("DELETE /v1/objects/{id}", s.kill)
 	m.HandleFunc("POST /v1/audit", s.postAudit)
 	m.HandleFunc("GET /v1/audit", s.getAudit)
+	if cfg.RegistryDir != "" {
+		s.reg = &registry.Registry{Dir: cfg.RegistryDir, Meta: &registry.MemMeta{}, Authorize: s.regAuthorize}
+		s.resolver = &registry.Resolver{Reg: s.reg, Aliases: cfg.ImageAliases, Upstream: cfg.RegistryUpstream}
+		m.Handle("/v2/", s.reg)
+	}
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, mgmtapi.CodeNotFound, r.Method+" "+r.URL.Path+" is not a /v1 route")
 	})
@@ -431,7 +449,7 @@ func (s *Server) assignments(w http.ResponseWriter, r *http.Request) {
 		out = append(out, mgmtapi.Assignment{DeploymentID: d.DeploymentID, TenantID: d.tenantID, Workload: d.workload,
 			BundleURL: "/v1/deployments/" + d.DeploymentID + "/bundle", Namespaces: d.namespaces, Epoch: d.epoch,
 			WorkloadTags: d.wlTags, Lease: mgmtapi.LeaseName(d.tenantID, d.workload),
-			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created), Fence: &d.fence})
+			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created), Fence: &d.fence, Containers: d.containers})
 	}
 	s.mu.Unlock()
 	writeJSON(w, 200, page(out))
@@ -497,6 +515,19 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 503, "no_host", "no host registered")
 		return
 	}
+	// Pin container images (twd-mgmt's Resolver) for the host's arch, outside
+	// the lock (mirroring may reach an upstream).
+	arch := s.hosts[hostID].Arch
+	s.mu.Unlock()
+	ctrs, err := s.pinContainers(r.Context(), req.TenantID, app, req.ContainerImages, arch)
+	if _, bad := err.(badBuilt); bad {
+		writeErr(w, 400, "bad_request", err.Error())
+		return
+	} else if err != nil {
+		writeErr(w, 502, "image_unavailable", err.Error())
+		return
+	}
+	s.mu.Lock()
 	// Acquire the namespace leases: epoch+1 for the workload and its classes.
 	// One lease per (tenant, workload), named "<tenantID>/<workload>".
 	var epoch int64
@@ -521,7 +552,7 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	d := &deployment{tenantID: req.TenantID, workload: req.Workload, bundle: req.Bundle, namespaces: nss,
-		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now()}
+		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now(), containers: ctrs}
 	d.fence, _ = mgmt.BundleStateful(req.Bundle)
 	d.DeploymentID, d.Host, d.Status = newID("dp"), hostID, "assigned"
 	s.deployments[d.DeploymentID] = d

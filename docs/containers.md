@@ -117,6 +117,83 @@ the host's own key/token/credential files, and the run's HTTPS-intercept CA
 private key. Each needle kind must exist on the host (positive control),
 and a per-run canary held in guestd's memory must be found in the dump.
 
+## Images: build, registry, pinning, host pull (ADR-032 D3)
+
+```
+developer machine            twd-mgmt (tsnet, WhoIs)                       host (twd-hostd)
+twd deploy                    /v2/  OCI registry                            no container engine
+  docker buildx (per arch) ─▶   <tenant>/<workload>-<class>  ◀─ pull by digest ─ image.Store.GetPinned
+  alias contexts              public/…  (operator bases)                      verify, flatten, mkfs.erofs
+  push over your tailnet  ─▶  POST /v1/deployments {containerImages}          cache: <tenant>/ or public/
+                              pin every ref → per-arch digest (mirror external refs)
+```
+
+- **Build (`twd deploy`, `internal/imagebuild`).** A class whose wrangler
+  `image` is a Dockerfile (or build dir), or whose `images.<name>` has a
+  `dockerfile`, is built **on the developer's machine** with `docker buildx`,
+  once per target arch (`--platform`, default: the arches of the live hosts in
+  the tenant's pool that offer containers), into an OCI layout, and pushed to
+  `twd.local/<tenantID>/<workload>-<class>[-<name>]` over the CLI's own mgmt
+  connection (a linked developer: their own Tailscale connection; WhoIs). The
+  result (`…@sha256:…`, an index for several arches) goes to mgmt in
+  `DeployRequest.containerImages`; it must be in the deploying tenant's
+  namespace. The app's Dockerfile is used as written: the **alias map**
+  (`GET /v1/images/aliases`; default `cloudflare/sandbox:0.12.14/1.0.0/1.0.1`
+  → twd's arm64 rebuilds on arm64) becomes BuildKit named contexts
+  (`--build-context docker.io/cloudflare/sandbox:0.12.14=oci-layout://…`) for
+  every form the Dockerfile writes the ref in (FROM, `COPY --from=`, an ARG
+  default), fetched from twd's registry (`public/`) or else from the local
+  Docker store. (A `docker-image://` context naming a `twd.local` ref makes
+  BuildKit try the network first: 100 s of timeouts, measured.)
+- **Registry (`internal/registry`, served by twd-mgmt at `/v2/`).** The OCI
+  distribution push/pull subset on mgmt's own listeners (tsnet `:80`/`:443`,
+  and the local-dev socket), behind the `/v1` WhoIs gate: admins push and pull
+  every namespace; hosts only pull, and only `public/…` and the namespaces of
+  tenants they hold a deployment of; a host never pushes. One namespace per
+  tenant (`<tenantID>/…`; no tenant may be called `public`). Blobs are
+  content-addressed files under `<state-dir>/registry/blobs` (`-registry-dir`;
+  replicas serving the registry must share it), stored once, but **visible
+  only through a repository they were pushed or mirrored into**: the store's
+  `registry_links` (SQLite or Postgres, metadata only) say which. Another
+  namespace's `HEAD`/`GET` of the same digest is `404 BLOB_UNKNOWN`, a
+  cross-namespace mount is refused (a fresh upload instead), and a manifest may
+  only reference content already in its own repository. Manifest pushes are
+  audited (`image_push`). Routes and roles are documented in
+  `api/openapi.yaml` (tag `registry`, excluded from generation).
+- **Pinning (deploy).** mgmt resolves every image reference of every class to
+  a **linux/arch image manifest digest, once**, for the arches of the pool's
+  container hosts, and records the pins in the deployment
+  (`ContainerClass.pins`, in `Assignment.containers` and
+  `GET /v1/deployments/{id}`); placement is then limited to arches every image
+  resolved for (an amd64-only image in a mixed pool lands on an amd64 host).
+  `twd.local/<tenant>/…` refs resolve in the tenant's namespace,
+  `twd.local/<other>` only ever in `public/`. An **external ref**
+  (`docker.io/…`) is mirrored now into `<tenant>/mirror/<registry>/<repo>`
+  through **mgmt's own egress** (anonymous bearer tokens for Docker Hub;
+  `-no-mirror` refuses external refs; `-registry-insecure` lists plain-HTTP
+  upstreams for tests), unless it is a public base. The alias map applies per
+  arch. Retagging the upstream after the deploy changes nothing that runs; the
+  next deploy picks the new digest. Audited (`image_pin`, with every pin).
+- **Public bases.** `twd image public add <ref> [--arch …]` mirrors an
+  upstream image into `public/<registry>/<repo>` (or names a `twd.local` ref
+  already in `public/`) and marks its per-arch digests public; deploys of every
+  tenant then pin those, so hosts cache it once. `twd image push <layout|tar>
+  twd.local/<name>:<tag>` is how the operator puts twd's arm64 rebuilds (the
+  alias targets) into `public/`. Unmarking (`rm`) leaves pinned deployments as
+  they are.
+- **Host pull (`hostd/image`).** hostd starts a container only from the pin
+  for its own arch, pulled as a host from twd's registry over the API's own
+  connection (`mgmtapi.Client.OCI`: never Docker Hub, no container engine),
+  every manifest and blob verified against its digest as it arrives. The cache
+  scope comes from the pin's repository, not from the tenant: `public/` is
+  shared, the tenant's own namespace is its alone, any other namespace is
+  refused before anything is fetched; so a cache hit never tells one tenant
+  which images another runs. Pinned entries are keyed by manifest digest.
+  `-container-image-cache-max-mib` caps the converted cache (least recently
+  used first; images of running containers are held). `-container-image-dir`
+  (a directory of tarballs) remains for tests and hosts without a registry.
+- **Signing** (cosign) is deferred (ADR-032).
+
 ## Lifecycle
 
 | event | effect |
@@ -149,7 +226,7 @@ trust domain), never a facet object's and never another workload's.
 
 `getTcpPort().connect()`, WebSocket upgrades to container ports,
 `snapshotContainer`, directory snapshots, preview URLs (`exposePort`,
-`not_supported`), the registry pull (images come from `image.DirSource`), a
+`not_supported`), image signing (cosign), registry garbage collection, a
 tenant exit-node or gateway path for `enableInternet`.
 
 A host advertises the `containers` tier (and mgmt places container bundles

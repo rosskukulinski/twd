@@ -191,6 +191,14 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 			c.Tags = ns.Tags
 		}
 	}
+	// Container classes as mgmt resolved them at deploy (ADR-032 D3): the
+	// image refs the polyfill passes and their per-arch pins. A class the
+	// bundle doesn't declare is ignored.
+	for _, c := range a.Containers {
+		if _, ok := app.Containers[c.Class]; ok {
+			app.Containers[c.Class] = c
+		}
+	}
 	w.mu.Lock()
 	w.tenant, w.epoch = t, a.Epoch
 	if w.app == nil {

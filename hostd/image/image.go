@@ -4,8 +4,8 @@
 // directory, user).
 //
 // The host never runs a container engine. An image arrives as a file (a
-// `docker save` tarball or an OCI image layout; the mgmt registry pull
-// comes later), its layers are flattened here in Go (whiteouts, opaque
+// `docker save` tarball or an OCI image layout, or an image pinned at deploy
+// and pulled by digest from twd's registry: pinned.go), its layers are flattened here in Go (whiteouts, opaque
 // directories, replaced subtrees, hard links), and mkfs.erofs writes the
 // filesystem from the merged tar without root, keeping every owner, mode
 // and xattr from the layers.
@@ -44,6 +44,8 @@ type Image struct {
 	SizeB  int64
 	// ConvertMS is the conversion time; 0 on a cache hit.
 	ConvertMS int64
+	// PullMS is the registry pull time (pinned images; 0 on a cache hit).
+	PullMS int64
 }
 
 // Store converts and caches images.
@@ -61,6 +63,16 @@ type Store struct {
 	Aliases []Alias
 	// Public lists refs (after aliasing) shared across tenants.
 	Public map[string]bool
+	// Puller fetches images pinned at deploy from twd's registry
+	// (GetPinned; nil: pinned images are unavailable).
+	Puller Puller
+	// MaxBytes caps the converted images on disk (0 = no cap): past it the
+	// least recently used ones not in use (Hold) are removed.
+	MaxBytes int64
+	// Evicted counts images GC removed.
+	Evicted int
+
+	held map[string]int
 
 	mu       sync.Mutex
 	inflight map[string]*call
@@ -212,16 +224,21 @@ func (s *Store) Get(ctx context.Context, tenant, ref string) (*Image, error) {
 	c := &call{done: make(chan struct{})}
 	s.inflight[key] = c
 	s.mu.Unlock()
-	c.img, c.err = s.convert(r, scope, src)
+	c.img, c.err = s.convert(r, scope, src, "")
 	close(c.done)
 	s.mu.Lock()
 	delete(s.inflight, key)
 	s.mu.Unlock()
+	if c.err == nil {
+		s.gc()
+	}
 	return c.img, c.err
 }
 
 // convert converts src into the scope's cache (a no-op on a hit).
-func (s *Store) convert(ref, scope, src string) (*Image, error) {
+// key names the cache entry ("" = the config digest; pinned images use their
+// manifest digest, which also covers the layers).
+func (s *Store) convert(ref, scope, src, key string) (*Image, error) {
 	st := time.Now()
 	a, err := openArchive(src, s.arch())
 	if err != nil {
@@ -245,10 +262,15 @@ func (s *Store) convert(ref, scope, src string) (*Image, error) {
 	}
 	os.Chmod(s.Dir, 0o700)
 	hx := strings.TrimPrefix(a.digest, "sha256:")
+	if key != "" {
+		hx = key
+	}
 	out := filepath.Join(dir, hx+".erofs")
 	img := &Image{Ref: ref, Digest: a.digest, Scope: scope, Path: out, Config: cfg}
 	if fi, err := os.Stat(out); err == nil {
 		img.SizeB = fi.Size()
+		now := time.Now()
+		os.Chtimes(out, now, now) // LRU
 		return img, nil
 	}
 	tmp := out + fmt.Sprintf(".tmp%d", os.Getpid())
