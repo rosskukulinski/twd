@@ -77,8 +77,9 @@ twd tenant set <tenant> --public-ingress allow   # or deny
   HTTPS Certificates).
 - **No new OAuth scopes:** `auth_keys` with tag `tag:twd` already lets twd
   mint `tag:twd-public` nodes.
-- **twd never adds `funnel` to any other tag**, apart from `tag:twd-mgmt`
-  for the WIF issuer (`internal/policy.Check` refuses it).
+- **twd never adds `funnel` to any other tag**, apart from `tag:twd-issuer`,
+  the WIF issuer's own node. mgmt's node (`tag:twd-mgmt`) is never
+  Funnel-capable (`internal/policy.Check` refuses it).
 
 ### Deploying
 
