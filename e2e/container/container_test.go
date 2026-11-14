@@ -1,10 +1,12 @@
-//go:build e2econtainer && linux
+//go:build e2econtainer && (linux || darwin)
 
 // Package container is E2E-CONTAINER (ADR-032 v1 acceptance): Cloudflare's
-// container API on twd's microVM tier, in Lima (arm64, nested KVM).
-// Hermetic: testcontrol + local DERP/STUN, fakemgmt, real twd-hostd, real
-// workerd (the parent DOs, process tier) and one real Firecracker VM per
-// container (jailer, own uid/netns/cgroup, erofs image + scratch overlay).
+// container API on twd's microVM tier. Hermetic: testcontrol + local
+// DERP/STUN, fakemgmt, real twd-hostd, real workerd (the parent DOs,
+// process tier) and one real VM per container (erofs image + scratch
+// overlay): Firecracker on Linux (jailer, own uid/netns/cgroup; Lima arm64
+// or an x86-64 KVM host with the stock images) or Virtualization.framework
+// on macOS (backend_darwin_test.go; with Rosetta, the stock amd64 images).
 //
 //	(a) the Sandbox SDK 0.x examples/minimal (v0 branch) and
 //	(b) the 1.0 flow (examples/minimal at @cloudflare/sandbox@1.0.1, and the
@@ -14,8 +16,9 @@
 // against the upstream git blob), plus the lifecycle and isolation checks
 // on hostd/testdata/apps/ctr booted on a real image.
 //
-// Run with `make e2e-container` inside Lima (needs root, KVM, the guest
-// image + erofs kernel, and the images from guest/images/build-sandbox-images.sh).
+// Run with `make e2e-container` on Linux (needs root, KVM, the guest image
+// + erofs kernel, and the images from guest/images/build-sandbox-images.sh)
+// or `make e2e-vz-container` on a Mac (no sudo).
 package container
 
 import (
@@ -28,6 +31,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -39,7 +43,6 @@ import (
 	"github.com/rosskukulinski/twd/hostd/hostdtest"
 	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
-	"github.com/rosskukulinski/twd/hostd/vm"
 	"github.com/rosskukulinski/twd/netd/nettest"
 	"tailscale.com/tailcfg"
 )
@@ -51,18 +54,18 @@ func pct(ds []time.Duration, q float64) time.Duration {
 }
 
 func TestE2EContainer(t *testing.T) {
-	kernel, ckernel, rootfs := os.Getenv("TWD_VM_KERNEL"), os.Getenv("TWD_VM_CONTAINER_KERNEL"), os.Getenv("TWD_VM_ROOTFS")
 	imgs, apps := os.Getenv("TWD_CTR_IMAGES"), os.Getenv("TWD_CTR_APPS")
-	if kernel == "" || ckernel == "" || rootfs == "" || imgs == "" || apps == "" {
-		t.Skip("TWD_VM_KERNEL, TWD_VM_CONTAINER_KERNEL, TWD_VM_ROOTFS, TWD_CTR_IMAGES and TWD_CTR_APPS must be set (make e2e-container)")
+	if imgs == "" || apps == "" {
+		t.Skip("TWD_CTR_IMAGES and TWD_CTR_APPS must be set (make e2e-container / e2e-vz-container)")
 	}
-	be, err := vm.New(vm.Config{Kernel: kernel, ContainerKernel: ckernel, Rootfs: rootfs, HugePages: os.Getenv("TWD_VM_HUGEPAGES"), Helper: os.Getenv("TWD_VM_HELPER")})
-	if err != nil {
-		t.Fatalf("microVM backend unavailable: %v", err)
-	}
-	t.Cleanup(func() { be.Close() })
+	be, emulated := newBackend(t)
+	// The store as twd-hostd builds it: the arm64 alias map, unless the
+	// backend runs amd64 images itself (vz + Rosetta: stock images, no alias).
 	store := &image.Store{Dir: filepath.Join(t.TempDir(), "images"), Sources: []image.Source{image.DirSource{Dir: imgs}}, Aliases: image.DefaultAliases,
-		Public: map[string]bool{"twd.local/cloudflare-sandbox:0.12.14-arm64": true}}
+		Public: map[string]bool{"twd.local/cloudflare-sandbox:0.12.14-arm64": true, "docker.io/cloudflare/sandbox:0.12.14": true}}
+	if len(emulated) > 0 {
+		store.Emulated, store.Aliases = emulated, nil
+	}
 	if b, err := os.ReadFile(filepath.Join(apps, "unmodified.txt")); err == nil {
 		t.Logf("example sources (checked against upstream git blobs):\n%s", b)
 	} else {
@@ -132,14 +135,19 @@ func TestE2EContainer(t *testing.T) {
 		}
 	}()
 
-	// The alias map (ADR-032 D3): on arm64 the stock ref is twd's rebuild.
+	// The alias map (ADR-032 D3): on arm64 the stock ref is twd's rebuild;
+	// on amd64 (and under Rosetta) it is the stock image itself.
+	wantRef, wantArch, machine := "twd.local/cloudflare-sandbox:0.12.14-arm64", "arm64", "aarch64"
+	if runtime.GOARCH == "amd64" || len(emulated) > 0 {
+		wantRef, wantArch, machine = "cloudflare/sandbox:0.12.14", "amd64", "x86_64"
+	}
 	if img, err := store.Get(ctx, e.TenantID, "cloudflare/sandbox:0.12.14"); err != nil {
 		t.Fatal(err)
-	} else if img.Ref != "twd.local/cloudflare-sandbox:0.12.14-arm64" || img.Config.Architecture != "arm64" ||
+	} else if img.Ref != wantRef || img.Config.Architecture != wantArch ||
 		strings.Join(img.Config.Config.Entrypoint, " ") != "/container-server/sandbox" || img.Scope != image.PublicScope {
-		t.Fatalf("alias: %+v", img)
+		t.Fatalf("cloudflare/sandbox:0.12.14 resolved to %+v, want %s (linux/%s)", img, wantRef, wantArch)
 	} else {
-		set("alias_cloudflare_sandbox_0.12.14", map[string]any{"ref": img.Ref, "digest": img.Digest, "erofs_mib": img.SizeB >> 20, "convert_ms": img.ConvertMS})
+		set("image_cloudflare_sandbox_0.12.14", map[string]any{"ref": img.Ref, "arch": img.Config.Architecture, "digest": img.Digest, "erofs_mib": img.SizeB >> 20, "convert_ms": img.ConvertMS})
 	}
 
 	ctrFiles := build(hostdtest.Fixture("ctr"))
@@ -176,7 +184,7 @@ func TestE2EContainer(t *testing.T) {
 		set("a_exec_via_sdk_p95_ms", pct(lat, .95).Milliseconds())
 		for _, c := range e.Host.Containers() {
 			if c.Workload == "sbx0" {
-				set("a_container", map[string]any{"ready_ms": c.ReadyMS, "rss_kb": c.RSSKB, "image": c.Image, "jail_uid": c.Jail.UID, "cpu_max": c.Jail.CPUMax})
+				set("a_container", map[string]any{"ready_ms": c.ReadyMS, "rss_kb": c.RSSKB, "image": c.Image, "jail": c.Jail})
 			}
 		}
 	})
@@ -186,7 +194,7 @@ func TestE2EContainer(t *testing.T) {
 		code, b, d := do("POST", base+"/exec", []byte(`{"argv":["sh","-c","echo hi from $(uname -m); exit 0"]}`))
 		var r map[string]any
 		json.Unmarshal(b, &r)
-		if code != 200 || r["stdout"] != "hi from aarch64\n" || r["exitCode"] != float64(0) {
+		if code != 200 || r["stdout"] != "hi from "+machine+"\n" || r["exitCode"] != float64(0) {
 			t.Fatalf("exec: %d %s", code, b)
 		}
 		set("b_min_first_exec_ms (boot + exec)", d.Milliseconds())
@@ -257,10 +265,7 @@ func TestE2EContainer(t *testing.T) {
 		}
 		return ctrOf("Box", name), time.Since(st)
 	}
-	vmGone := func(pid int) bool {
-		_, err := os.Stat(fmt.Sprintf("/proc/%d", pid))
-		return os.IsNotExist(err)
-	}
+	vmGone := func(pid int) bool { return processGone(pid) }
 
 	t.Run("Lifecycle", func(t *testing.T) {
 		st := time.Now()
@@ -273,9 +278,7 @@ func TestE2EContainer(t *testing.T) {
 		c := ctrOf("Box", "a")
 		set("ctr_boot_ready_ms (hostd BootContainer)", c.ReadyMS)
 		set("ctr_rss_kb_after_python (lite: 256 MiB guest)", c.RSSKB)
-		if c.Jail == nil || c.Jail.UID < 1000 || !strings.HasPrefix(c.Jail.CPUMax, "6250 ") {
-			t.Fatalf("lite container not jailed / cpu.max 1/16: %+v", c.Jail)
-		}
+		checkConfinement(t, c.Jail, "6250 ") // lite: cpu.max 1/16
 		if r := call("/f/a/exec", "argv", `["sh","-c","echo out; echo err >&2; exit 3"]`); r["exitCode"] != float64(3) || r["stdout"] != "out\n" || r["stderr"] != "err\n" {
 			t.Fatalf("exit/stderr: %v", r)
 		}
