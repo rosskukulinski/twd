@@ -20,7 +20,7 @@ func ctrSmokeBackend(t *testing.T) (sandbox.ContainerBackend, []string) {
 	if kernel == "" || rootfs == "" {
 		t.Skip("TWD_VM_CONTAINER_KERNEL / TWD_VM_ROOTFS not set")
 	}
-	b, err := New(Config{Kernel: kernel, ContainerKernel: kernel, Rootfs: rootfs, HugePages: os.Getenv("TWD_VM_HUGEPAGES"), Helper: os.Getenv("TWD_VM_HELPER")})
+	b, err := New(Config{Kernel: kernel, ContainerKernel: kernel, Rootfs: rootfs, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES"), Helper: os.Getenv("TWD_VM_HELPER")})
 	if err != nil {
 		t.Skip(err)
 	}

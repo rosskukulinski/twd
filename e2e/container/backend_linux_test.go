@@ -19,7 +19,7 @@ func newBackend(t *testing.T) (sandbox.ContainerBackend, []string) {
 	if kernel == "" || ckernel == "" || rootfs == "" {
 		t.Skip("TWD_VM_KERNEL, TWD_VM_CONTAINER_KERNEL and TWD_VM_ROOTFS must be set (make e2e-container)")
 	}
-	be, err := vm.New(vm.Config{Kernel: kernel, ContainerKernel: ckernel, Rootfs: rootfs, HugePages: os.Getenv("TWD_VM_HUGEPAGES"), Helper: os.Getenv("TWD_VM_HELPER")})
+	be, err := vm.New(vm.Config{Kernel: kernel, ContainerKernel: ckernel, Rootfs: rootfs, BootArgs: os.Getenv("TWD_VM_BOOTARGS"), HugePages: os.Getenv("TWD_VM_HUGEPAGES"), Helper: os.Getenv("TWD_VM_HELPER")})
 	if err != nil {
 		t.Fatalf("microVM backend unavailable: %v", err)
 	}
