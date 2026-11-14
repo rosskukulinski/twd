@@ -26,6 +26,37 @@ DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
   re-exec in a new mount namespace that `pivot_root`s into the overlay and
   detaches the old root, so no container process sees guestd or its config.
 
+## Platforms
+
+- **Linux/KVM (Firecracker):** as above, on arm64 and amd64. On amd64 the
+  stock `docker.io/cloudflare/sandbox` images run as published (the alias
+  map only applies on arm64). To build the image set on a developer
+  machine: `PLATFORM=linux/amd64 guest/images/build-sandbox-images.sh DIR`.
+- **macOS (Virtualization.framework, `hostd/vm/container_darwin.go`):** the
+  same guest rootfs, guestd container mode and protocol, one `twd-vz` VMM
+  per container. A Mac host advertises `containers` when the vz kernel has
+  erofs and `mkfs.erofs` is installed (`brew install erofs-utils`).
+  macOS has no jailer, cgroups or `mkfs.ext4`, so:
+  - the scratch disk is a sparse file the guest formats
+    (`ContainerConfig.ScratchFormat`);
+  - fractional vCPUs are `cpu.max` on the guest's container cgroup
+    (`ContainerConfig.CPUQuotaUS`). The VM's whole vCPU count is the hard
+    cap. A container can't escape the cap unless it can reach guest root's
+    cgroupfs;
+  - `pids.max` is enforced in the guest only. There is one VMM process and no
+    host cgroup.
+- **Rosetta for Linux (Apple silicon, `twd-hostd -vm-rosetta`, opt-in):**
+  guestd registers Rosetta with binfmt_misc using the `F` flag, so it works
+  in every container mount namespace. The backend reports `amd64` as an
+  emulated arch, and hostd then accepts linux/amd64 images and drops the
+  arm64 alias map, so the stock images run unchanged. Without
+  `-vm-rosetta`, a Mac uses the arm64 rebuilds through the alias map, as
+  Linux arm64 does.
+- **Egress is the same on both backends:** each takes the container NIC's
+  host services from `containerHandlers` (`hostd/vm/container.go`). In v1
+  that function returns nothing, so every flow is refused. It is the one
+  hook for the sandbox egress proxy.
+
 ## Host ⇄ guest protocol (guest/proto)
 
 - Control: the existing vsock NDJSON channel (guest → host port 1024). New
