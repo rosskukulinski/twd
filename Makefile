@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm e2e-container guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -29,7 +29,7 @@ js-build: $(WORKERD)
 test: deps test-go test-js
 
 test-go:
-	$(GO) test -race -count=1 ./netd/... ./internal/... ./cmd/... ./mgmt/... ./hostd/... ./security/...
+	$(GO) test -race -count=1 ./netd/... ./internal/... ./cmd/... ./mgmt/... ./hostd/... ./security/... ./guest/...
 
 test-js:
 	npm test --silent
@@ -74,6 +74,26 @@ e2e-vm: deps guest-image
 	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
 	sudo env $(VM_ENV) bin/vmsmoke.test -test.v -test.count=1
 	cd e2e/vm && sudo env $(VM_ENV) ../../bin/e2evm.test -test.v -test.count=1 -test.timeout 15m
+## e2e-container: ADR-032 acceptance on Firecracker (Linux + KVM, in Lima twd-dev; needs sudo):
+## the Sandbox SDK 0.x examples/minimal and the 1.0 flow run unmodified through hostd + workerd
+## + one jailed VM per container, plus lifecycle/isolation checks and measurements.
+## CTR_IMAGES is the dir guest/images/build-sandbox-images.sh wrote (run that on the Mac first);
+## the erofs guest kernel is built by guest/build-kernel.sh if missing.
+CTR_IMAGES ?= $(CURDIR)/guest/out/images
+CTR_KERNEL ?= $(CURDIR)/$(GUEST_OUT)/kernel/vmlinux
+CTR_APPS   ?= /tmp/twd-e2e-container-apps
+CTR_ENV = $(VM_ENV) TWD_VM_CONTAINER_KERNEL="$(CTR_KERNEL)" TWD_CTR_IMAGES="$(CTR_IMAGES)" TWD_CTR_APPS="$(CTR_APPS)"
+e2e-container: deps guest-image
+	@[ "$$(uname -s)" = Linux ] || { echo "e2e-container: Linux only; run it inside Lima twd-dev"; exit 1; }
+	@[ -f "$(CTR_IMAGES)/images.json" ] || { echo "e2e-container: no $(CTR_IMAGES)/images.json (run guest/images/build-sandbox-images.sh on the Mac)"; exit 1; }
+	@[ -f "$(CTR_KERNEL)" ] || guest/build-kernel.sh $(dir $(CTR_KERNEL))
+	@[ "$$(cat /proc/sys/vm/nr_hugepages)" -ge $(VM_HUGEPAGES) ] || sudo sysctl -qw vm.nr_hugepages=$(VM_HUGEPAGES)
+	@[ -f "$(CTR_APPS)/unmodified.txt" ] || scripts/e2e-container-prep.sh $(CTR_APPS)
+	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
+	$(GO) test -c -tags e2econtainer -o bin/e2econtainer.test ./e2e/container
+	sudo env $(CTR_ENV) bin/vmsmoke.test -test.v -test.count=1 -test.run TestContainerSmoke
+	cd e2e/container && sudo env $(CTR_ENV) ../../bin/e2econtainer.test -test.v -test.count=1 -test.timeout 20m
+
 ## vm-assets: the microVM guest for the linux release (Linux only, in Lima twd-dev): the guest
 ## image, the kernel (TWD_VM_KERNEL) and Firecracker + jailer (FC_BIN_DIR) in VM_ASSETS.
 FC_BIN_DIR ?= /usr/local/bin
