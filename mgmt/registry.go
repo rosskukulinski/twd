@@ -3,7 +3,6 @@ package mgmt
 import (
 	"context"
 	"fmt"
-	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -246,55 +245,6 @@ func (m *Mgmt) ImageAliases() []registry.Alias {
 		return a
 	}
 	return m.resolver.Aliases
-}
-
-// applyBuiltImages puts the images twd deploy built (DeployRequest.
-// ContainerImages) into the classes. A built ref must be in the tenant's
-// own namespace of twd's registry (twd.local/<tenantID>/…), so a deploy can
-// never point a class at another tenant's image.
-func applyBuiltImages(tenant string, ctrs []container.Class, built map[string]BuiltImages) ([]container.Class, error) {
-	if len(built) == 0 {
-		return ctrs, nil
-	}
-	own := func(class, ref string) error {
-		r, err := oci.ParseRef(ref)
-		if err != nil {
-			return errf(400, "bad_request", "containerImages.%s: %v", class, err)
-		}
-		if r.Registry != registry.LocalRegistry || registry.Namespace(r.Repository) != tenant {
-			return errf(400, "bad_request", "containerImages.%s: %q is not in this tenant's registry namespace (want %s/%s/…)", class, ref, registry.LocalRegistry, tenant)
-		}
-		return nil
-	}
-	out := slices.Clone(ctrs)
-	for class, b := range built {
-		i := slices.IndexFunc(out, func(c container.Class) bool { return c.Class == class })
-		if i < 0 {
-			return nil, errf(400, "bad_request", "containerImages.%s: the bundle declares no such container class", class)
-		}
-		c := out[i]
-		if b.Image != "" {
-			if err := own(class, b.Image); err != nil {
-				return nil, err
-			}
-			c.Image = b.Image
-		}
-		if len(b.Images) > 0 {
-			ims := maps.Clone(c.Images)
-			for n, ref := range b.Images {
-				if _, ok := ims[n]; !ok {
-					return nil, errf(400, "bad_request", "containerImages.%s.images.%s: the class has no image %q", class, n, n)
-				}
-				if err := own(class, ref); err != nil {
-					return nil, err
-				}
-				ims[n] = ref
-			}
-			c.Images = ims
-		}
-		out[i] = c
-	}
-	return out, nil
 }
 
 // containerArches are the arches deploys pin images for: those of the

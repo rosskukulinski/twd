@@ -612,10 +612,7 @@ func (m *Mgmt) resolveLease(ctx context.Context, hostID, ns string) string {
 // to the v0 contract: explicit class config (instead of twd.jsonc in the
 // bundle) and an explicit host choice.
 // BuiltImages are one class's images built by twd deploy.
-type BuiltImages struct {
-	Image  string            `json:"image,omitempty"`
-	Images map[string]string `json:"images,omitempty"`
-}
+type BuiltImages = registry.Built
 
 type DeployRequest struct {
 	TenantID   string        `json:"tenantID"`
@@ -716,8 +713,8 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 		}
 		need.Containers = len(ctrs) > 0
 	}
-	if ctrs, err = applyBuiltImages(t.ID, ctrs, r.ContainerImages); err != nil {
-		return resp, err
+	if ctrs, err = registry.ApplyBuilt(t.ID, ctrs, r.ContainerImages); err != nil {
+		return resp, errf(400, "bad_request", "%v", err)
 	}
 	// Pin every image to a digest once, now (ADR-032 D3), for the arches of
 	// the tenant's container hosts; placement then needs one of the arches

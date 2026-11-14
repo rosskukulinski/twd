@@ -20,6 +20,7 @@ import (
 	"time"
 
 	v1 "github.com/rosskukulinski/twd/hostd/mgmtapi/v1"
+	"github.com/rosskukulinski/twd/internal/oci"
 )
 
 // Client talks to twd-mgmt's /v1 API over HTTP(S) (normal operation: the
@@ -175,6 +176,17 @@ func (c *Client) V1() *v1.ClientWithResponses {
 		}))
 	})
 	return c.v1c
+}
+
+// OCI returns a client for mgmt's OCI registry (/v2/, ADR-032 D3) over
+// the same transport and identity headers. It has no overall timeout
+// (image blobs are large); callers bound it with their context.
+func (c *Client) OCI() *oci.Client {
+	var tr http.RoundTripper
+	if c.HTTP != nil {
+		tr = c.HTTP.Transport
+	}
+	return &oci.Client{Base: c.Base, HTTP: &http.Client{Transport: tr}, Edit: c.setHeaders}
 }
 
 // setHeaders adds the host identity and the local-dev token.

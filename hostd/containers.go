@@ -258,11 +258,28 @@ func (m *ctrManager) start(ctx context.Context, inst *instance, k ctrKey, cc *co
 		return fail(err)
 	}
 	release := func() { slot.Release(context.WithoutCancel(ctx)) }
-	img, err := m.images.Get(ctx, k.tenant, ref)
+	var img *image.Image
+	if len(cc.Pins) > 0 {
+		// Pinned at deploy (ADR-032 D3): only this arch's pin of this ref,
+		// pulled by digest from twd's registry. Nothing else is fetched.
+		p := cc.PinFor(ref, m.images.HostArch())
+		if p == nil {
+			release()
+			return fail(ctrError("image_unavailable", "image %q of class %s has no pin for linux/%s (deploy pinned %s); redeploy so mgmt pins it for this host's arch",
+				ref, k.class, m.images.HostArch(), pinArches(cc.Pins, ref)))
+		}
+		img, err = m.images.GetPinned(ctx, k.tenant, *p)
+	} else {
+		img, err = m.images.Get(ctx, k.tenant, ref)
+	}
 	if err != nil {
 		release()
 		return fail(ctrError("image_unavailable", "%v", err))
 	}
+	unhold := m.images.Hold(img.Path)
+	release = func(slotRelease func()) func() {
+		return func() { unhold(); slotRelease() }
+	}(release)
 	ic := img.Config.Config
 	argv, env, err := sandbox.ContainerProcess(ic.Entrypoint, ic.Cmd, ic.Env, r.Entrypoint, r.Env)
 	if err != nil {
@@ -1054,4 +1071,18 @@ func (m *ctrManager) classLiveLocked(k ctrKey) int {
 		c.mu.Unlock()
 	}
 	return n
+}
+
+// pinArches lists the arches ref was pinned for.
+func pinArches(ps []container.Pin, ref string) string {
+	var out []string
+	for _, p := range ps {
+		if p.Ref == ref {
+			out = append(out, p.Arch)
+		}
+	}
+	if len(out) == 0 {
+		return "no arch"
+	}
+	return strings.Join(out, ", ")
 }

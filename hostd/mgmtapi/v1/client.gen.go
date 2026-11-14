@@ -260,11 +260,13 @@ const (
 	ErrorCodeHostTokenUnconfigured   ErrorCode = "host_token_unconfigured"
 	ErrorCodeIdentityConflict        ErrorCode = "identity_conflict"
 	ErrorCodeIdentityPending         ErrorCode = "identity_pending"
+	ErrorCodeImageUnavailable        ErrorCode = "image_unavailable"
 	ErrorCodeImmutableField          ErrorCode = "immutable_field"
 	ErrorCodeInternal                ErrorCode = "internal"
 	ErrorCodeKilled                  ErrorCode = "killed"
 	ErrorCodeLeaseHeld               ErrorCode = "lease_held"
 	ErrorCodeLeaseLost               ErrorCode = "lease_lost"
+	ErrorCodeMirrorDisabled          ErrorCode = "mirror_disabled"
 	ErrorCodeNamespaceAmbiguous      ErrorCode = "namespace_ambiguous"
 	ErrorCodeNoHost                  ErrorCode = "no_host"
 	ErrorCodeNoIdentity              ErrorCode = "no_identity"
@@ -275,6 +277,7 @@ const (
 	ErrorCodePolicyMissingTagOwners  ErrorCode = "policy_missing_tag_owners"
 	ErrorCodePolicyUnavailable       ErrorCode = "policy_unavailable"
 	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
+	ErrorCodeRegistryUnavailable     ErrorCode = "registry_unavailable"
 	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
 	ErrorCodeStoreUnavailable        ErrorCode = "store_unavailable"
 	ErrorCodeSuperseded              ErrorCode = "superseded"
@@ -324,6 +327,8 @@ func (e ErrorCode) Valid() bool {
 		return true
 	case ErrorCodeIdentityPending:
 		return true
+	case ErrorCodeImageUnavailable:
+		return true
 	case ErrorCodeImmutableField:
 		return true
 	case ErrorCodeInternal:
@@ -333,6 +338,8 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodeLeaseHeld:
 		return true
 	case ErrorCodeLeaseLost:
+		return true
+	case ErrorCodeMirrorDisabled:
 		return true
 	case ErrorCodeNamespaceAmbiguous:
 		return true
@@ -353,6 +360,8 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodePolicyUnavailable:
 		return true
 	case ErrorCodePreconditionFailed:
+		return true
+	case ErrorCodeRegistryUnavailable:
 		return true
 	case ErrorCodeSpawnBudgetExceeded:
 		return true
@@ -870,6 +879,9 @@ type ContainerClass struct {
 	// Image The default image reference `start()` runs.
 	Image *string `json:"image,omitempty"`
 
+	// ImageSources Named images twd deploy builds: name → the wrangler Dockerfile, as written.
+	ImageSources *map[string]string `json:"imageSources,omitempty"`
+
 	// Images Named images (`ctx.container.images`): name → reference.
 	Images       *map[string]string   `json:"images,omitempty"`
 	InstanceType *string              `json:"instanceType,omitempty"`
@@ -1116,6 +1128,9 @@ type Error struct {
 	// | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 	// | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
 	// | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
+	// | `image_unavailable` | 502 | a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) |
+	// | `registry_unavailable` | 409 | this twd-mgmt serves no OCI registry (`-registry-dir off`) |
+	// | `mirror_disabled` | 409 | this twd-mgmt does not mirror external images (`-no-mirror`) |
 	// | `bootstrap_failed` | 502 | control plane refused the mint |
 	// | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 	// | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
@@ -1173,6 +1188,9 @@ type Error struct {
 // | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 // | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
 // | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
+// | `image_unavailable` | 502 | a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) |
+// | `registry_unavailable` | 409 | this twd-mgmt serves no OCI registry (`-registry-dir off`) |
+// | `mirror_disabled` | 409 | this twd-mgmt does not mirror external images (`-no-mirror`) |
 // | `bootstrap_failed` | 502 | control plane refused the mint |
 // | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 // | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
@@ -1967,6 +1985,9 @@ type TombstoneError struct {
 	// | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 	// | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
 	// | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
+	// | `image_unavailable` | 502 | a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) |
+	// | `registry_unavailable` | 409 | this twd-mgmt serves no OCI registry (`-registry-dir off`) |
+	// | `mirror_disabled` | 409 | this twd-mgmt does not mirror external images (`-no-mirror`) |
 	// | `bootstrap_failed` | 502 | control plane refused the mint |
 	// | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 	// | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |

@@ -74,6 +74,9 @@ type Class struct {
 	// Images are the named images (Sandbox SDK 1.0 ctx.container images,
 	// wrangler "images"), name -> reference ("" = not built yet).
 	Images map[string]string `json:"images,omitempty"`
+	// ImageSources are the named images twd deploy builds: name -> the
+	// wrangler Dockerfile (or build dir), as written.
+	ImageSources map[string]string `json:"imageSources,omitempty"`
 	// InstanceType is a named type ("" = DefaultInstanceType) or "custom".
 	InstanceType string     `json:"instanceType,omitempty"`
 	Custom       *Resources `json:"custom,omitempty"`
@@ -335,8 +338,17 @@ func (c *Class) setImages(src string, raw json.RawMessage, fromWrangler map[stri
 				return fmt.Errorf("%s: containers.%s: bad image name %q", src, c.Class, n)
 			}
 			c.Images[n] = ""
-			if im.Image != "" && !IsBuildSource(im.Image) {
+			switch {
+			case im.Image != "" && !IsBuildSource(im.Image):
 				c.Images[n] = im.Image
+			case im.Dockerfile != "" || im.Image != "":
+				if c.ImageSources == nil {
+					c.ImageSources = map[string]string{}
+				}
+				c.ImageSources[n] = im.Dockerfile
+				if c.ImageSources[n] == "" {
+					c.ImageSources[n] = im.Image
+				}
 			}
 		}
 		return nil

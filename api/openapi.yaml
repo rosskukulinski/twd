@@ -2268,6 +2268,9 @@ components:
         | `object_quota_exceeded` | 429 | tenant `maxObjects` |
         | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
         | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
+        | `image_unavailable` | 502 | a container image could not be pinned at deploy (not in twd's registry, no image for any of the pool's arches, or the upstream mirror failed) |
+        | `registry_unavailable` | 409 | this twd-mgmt serves no OCI registry (`-registry-dir off`) |
+        | `mirror_disabled` | 409 | this twd-mgmt does not mirror external images (`-no-mirror`) |
         | `bootstrap_failed` | 502 | control plane refused the mint |
         | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
         | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
@@ -2315,6 +2318,9 @@ components:
         - identity_pending
         - no_host
         - policy_unavailable
+        - image_unavailable
+        - registry_unavailable
+        - mirror_disabled
         - internal
     TombstoneError:
       description: "`410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`)."
@@ -3139,6 +3145,7 @@ components:
         source: { type: string, description: "The wrangler `image` as written (a ref, or a Dockerfile path)." }
         image: { type: string, description: The default image reference `start()` runs. }
         images: { type: object, additionalProperties: { type: string }, description: "Named images (`ctx.container.images`): name → reference." }
+        imageSources: { type: object, additionalProperties: { type: string }, description: "Named images twd deploy builds: name → the wrangler Dockerfile, as written." }
         instanceType: { type: string }
         custom: { $ref: "#/components/schemas/ContainerResources" }
         maxInstances: { type: integer, minimum: 0 }
