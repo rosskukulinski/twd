@@ -29,29 +29,29 @@ func internetStandIn(t *testing.T) (*hostd.ContainerInternet, func() []string) {
 	var mu sync.Mutex
 	var dialed []string
 	return &hostd.ContainerInternet{
-			Resolve: func(_ context.Context, h string) ([]netip.Addr, error) {
-				switch h {
-				case "allowed.test":
-					return []netip.Addr{netip.MustParseAddr("203.0.113.7")}, nil
-				case "rebind.test":
-					return []netip.Addr{netip.MustParseAddr("10.0.0.5")}, nil
-				}
-				return nil, fmt.Errorf("no such host %s", h)
-			},
-			Dial: func(ctx context.Context, n, a string) (net.Conn, error) {
-				mu.Lock()
-				dialed = append(dialed, a)
-				mu.Unlock()
-				if a != "203.0.113.7:80" {
-					return nil, fmt.Errorf("unreachable")
-				}
-				return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
-			},
-		}, func() []string {
+		Resolve: func(_ context.Context, h string) ([]netip.Addr, error) {
+			switch h {
+			case "allowed.test":
+				return []netip.Addr{netip.MustParseAddr("203.0.113.7")}, nil
+			case "rebind.test":
+				return []netip.Addr{netip.MustParseAddr("10.0.0.5")}, nil
+			}
+			return nil, fmt.Errorf("no such host %s", h)
+		},
+		Dial: func(ctx context.Context, n, a string) (net.Conn, error) {
 			mu.Lock()
-			defer mu.Unlock()
-			return append([]string(nil), dialed...)
-		}
+			dialed = append(dialed, a)
+			mu.Unlock()
+			if a != "203.0.113.7:80" {
+				return nil, fmt.Errorf("unreachable")
+			}
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+	}, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), dialed...)
+	}
 }
 
 // probeScript tries every target from inside the container: "ok",
