@@ -1,0 +1,17 @@
+# twd container guests (ADR-032 D3/D8): on top of the Firecracker CI
+# microvm config (microvm-6.1-<arch>.base.config, which already has
+# OVERLAY_FS, CGROUP_PIDS, VSOCK and SQUASHFS), add the read-only image
+# filesystem (erofs, incl. compressed images and xattrs, which OCI layers
+# carry for file capabilities) and the overlay features twd's container
+# root needs.
+CONFIG_EROFS_FS=y
+CONFIG_EROFS_FS_XATTR=y
+CONFIG_EROFS_FS_POSIX_ACL=y
+CONFIG_EROFS_FS_SECURITY=y
+CONFIG_EROFS_FS_ZIP=y
+CONFIG_EROFS_FS_ZIP_LZMA=y
+CONFIG_OVERLAY_FS=y
+CONFIG_OVERLAY_FS_REDIRECT_ALWAYS_FOLLOW=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_UNIX98_PTYS=y
+CONFIG_DEVPTS_MULTIPLE_INSTANCES=y

@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/internal/procsb"
@@ -141,6 +142,25 @@ type Config struct {
 	// The unix push socket (local-dev) is always served too.
 	PushListener net.Listener
 	PushPort     int
+
+	// Containers boots container guests (ADR-032; hostd/vm on Linux +
+	// KVM). Nil: this host offers no containers, and ctx.container.start()
+	// fails with tier_unavailable (no fallback, D5).
+	Containers sandbox.ContainerBackend
+	// Images converts and caches container images (hostd/image).
+	Images *image.Store
+	// ContainerCapacity optionally bounds this host's running containers
+	// further, on top of the capacity vector (Capacity) they share with
+	// microVM DO instances (0 = no extra bound).
+	ContainerCapacity ContainerCapacity
+	// ContainerIdle is the default inactivity timeout (DefaultContainerIdle);
+	// setInactivityTimeout changes it per container, up to 6 h.
+	ContainerIdle time.Duration
+	// ContainerMaxLife is the operator's hard max lifetime of a container
+	// (DefaultContainerMaxLife, 24 h).
+	ContainerMaxLife time.Duration
+	// ContainerGrace caps destroy()'s SIGTERM → SIGKILL grace (10 s).
+	ContainerGrace time.Duration
 }
 
 // Host is a running twd-hostd.
@@ -175,6 +195,7 @@ type Host struct {
 	audit       *auditLog
 	wg          sync.WaitGroup
 	runDirOwned bool
+	ctr         *ctrManager
 }
 
 // DefaultFenceAfter rides out typical mgmt restarts and database failovers;
@@ -239,6 +260,7 @@ func New(cfg Config) (*Host, error) {
 		tenants: map[string]*tenant{}, workloads: map[string]*workload{}, objects: map[string]*object{},
 		byNetd: map[string]*object{}, byKey: map[string]*object{}, creating: map[string]*createCall{},
 		syncNow: make(chan struct{}, 1), quota: cfg.ContainerQuota, containers: containerLedger{held: map[ContainerKey]*ctrEntry{}}}
+	h.ctr = newCtrManager(h)
 	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, err
 	}
@@ -347,6 +369,7 @@ func (h *Host) Close() error {
 		ts = append(ts, t)
 	}
 	h.mu.Unlock()
+	h.ctr.destroyWhere(func(ctrKey) bool { return true }, "host shutdown", 0)
 	for _, w := range wls {
 		w.stopAll()
 	}

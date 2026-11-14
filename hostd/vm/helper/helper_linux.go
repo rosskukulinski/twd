@@ -256,7 +256,7 @@ func (s *Server) serveConn(c *net.UnixConn) {
 		case "ping":
 			closeAll(fds)
 			helperapi.WriteResponse(c, helperapi.Response{Re: "ping", OK: true, Version: helperapi.Version, UID: uid,
-				Jailer: s.cfg.Jailer, Crypt: "dm-crypt (LUKS2, aes-xts-plain64)"})
+				Jailer: s.cfg.Jailer, Crypt: "dm-crypt (LUKS2, aes-xts-plain64)", Features: []string{helperapi.FeatureContainer}})
 		case "start":
 			if vm != nil || req.Start == nil {
 				closeAll(fds)
@@ -295,6 +295,18 @@ func (s *Server) serveConn(c *net.UnixConn) {
 			}
 			helperapi.WriteResponse(c, helperapi.Response{Re: "memdump", OK: true}, fd)
 			unix.Close(fd)
+		case "cpu":
+			closeAll(fds)
+			if vm == nil {
+				helperapi.WriteResponse(c, helperapi.Response{Re: "cpu", Code: helperapi.CodeBadRequest, Error: "no VM"})
+				continue
+			}
+			cpuMax, err := vm.lowerCPU(req.CPUQuotaUS)
+			if err != nil {
+				helperapi.WriteResponse(c, errResp("cpu", err))
+				continue
+			}
+			helperapi.WriteResponse(c, helperapi.Response{Re: "cpu", OK: true, Jail: &helperapi.Jail{CPUMax: cpuMax}})
 		default:
 			closeAll(fds)
 			helperapi.WriteResponse(c, helperapi.Response{Re: req.Op, Code: helperapi.CodeBadRequest, Error: "unknown op " + req.Op})
@@ -351,6 +363,8 @@ func (s *Server) setupCgroup() (string, error) {
 		if err := os.WriteFile(filepath.Join(base, "cgroup.subtree_control"), []byte("+cpu +memory"), 0o644); err != nil {
 			return "", fmt.Errorf("enable cpu, memory in %s: %w", base, err)
 		}
+		// pids for container VMMs (ADR-032 D5), where delegated.
+		os.WriteFile(filepath.Join(base, "cgroup.subtree_control"), []byte("+pids"), 0o644)
 		if err := os.MkdirAll(filepath.Join(base, "vms"), 0o755); err != nil {
 			return "", err
 		}
@@ -422,6 +436,34 @@ func (s *Server) cleanupStale() {
 			}
 		}
 	}
+}
+
+// ---- container guests ----
+
+// makeScratch creates a sparse ext4 of sizeMiB at p (no journal: it is
+// thrown away with the VM), owned by the jail uid.
+func makeScratch(p string, sizeMiB, uid int) error {
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	err = f.Truncate(int64(sizeMiB) << 20)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := runStdin(nil, "mkfs.ext4", "-q", "-F", "-O", "^has_journal", "-E", "lazy_itable_init=1,nodiscard", "-m", "0", "-L", "twd-scratch", p); err != nil {
+		return err
+	}
+	return os.Chown(p, uid, uid)
+}
+
+// pidsController reports whether the VM cgroups can take pids.max.
+func (s *Server) pidsController() bool {
+	b, err := os.ReadFile("/sys/fs/cgroup/cgroup.controllers")
+	return err == nil && slices.Contains(strings.Fields(string(b)), "pids")
 }
 
 // ---- small utilities ----

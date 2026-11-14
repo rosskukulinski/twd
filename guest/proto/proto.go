@@ -8,6 +8,12 @@
 // addresses. Node keys and auth keys stay in host netd.
 package proto
 
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+)
+
 // Config drive layout (/dev/vdb): a plain ustar stream (no filesystem), padded
 // to a 4 KiB multiple. guestd extracts it into AppDir.
 const (
@@ -20,6 +26,12 @@ const (
 	DODir = "/run/twd/do"
 	// VolumeDev is the persistent volume's device (the third drive).
 	VolumeDev = "/dev/vdc"
+
+	// Container guests (ADR-032) have no DO volume: the third drive is the
+	// image (erofs, read-only) and the fourth the instance's scratch disk
+	// (ext4, made fresh on the host for every boot; the overlay upper).
+	ImageDev   = "/dev/vdc"
+	ScratchDev = "/dev/vdd"
 )
 
 // Defaults for the guest network (every VM lives in its own network
@@ -57,6 +69,64 @@ type GuestConfig struct {
 	// Volume is the block device holding DO storage (ext4, created and
 	// decrypted on the host), mounted at DODir. "" = tmpfs (not persistent).
 	Volume string `json:"volume,omitempty"`
+	// Container, if set, makes this a container guest: no workerd; guestd
+	// mounts the image + scratch as an overlay root and runs the image's
+	// entrypoint in it as a supervised child.
+	Container *ContainerConfig `json:"container,omitempty"`
+}
+
+// ContainerConfig is a container guest's process and filesystem config:
+// the OCI image config with the start() overrides already applied by the
+// host.
+type ContainerConfig struct {
+	Image   string   `json:"image"`   // block device with the erofs image
+	Scratch string   `json:"scratch"` // block device with the fresh ext4 scratch ("" = tmpfs upper)
+	Argv    []string `json:"argv"`    // ENTRYPOINT + CMD (or the start() entrypoint)
+	Env     []string `json:"env"`     // KEY=VALUE, image env then start() env
+	Cwd     string   `json:"cwd,omitempty"`
+	User    string   `json:"user,omitempty"` // "", "name", "uid", "uid:gid", "name:group"
+	// Pids is pids.max of the container's cgroup in the guest (0 = 4096).
+	Pids     int    `json:"pids,omitempty"`
+	Hostname string `json:"hostname,omitempty"`
+}
+
+// Container-mode stream framing.
+const (
+	// ExecStreamHello is the Type of the first line a guest sends on a new
+	// vsock connection that carries one exec's stdio (Msg.Exec names the
+	// exec) instead of the control channel.
+	ExecStreamHello = "stream"
+
+	// Exec stream frames: a 1-byte kind, a 4-byte big-endian length, then
+	// the payload. guest → host: FrameStdout, FrameStderr, FrameExit (int32
+	// big-endian exit code; the last frame). host → guest: FrameStdin,
+	// FrameStdinEOF (half-close; empty).
+	FrameStdin    = 0
+	FrameStdout   = 1
+	FrameStderr   = 2
+	FrameExit     = 3
+	FrameStdinEOF = 4
+	// MaxFrame bounds one frame's payload.
+	MaxFrame = 1 << 20
+)
+
+// ExecSpec is an "exec" op's process (container guests).
+type ExecSpec struct {
+	Argv []string `json:"argv"`
+	Env  []string `json:"env,omitempty"` // KEY=VALUE, over the container's env
+	Cwd  string   `json:"cwd,omitempty"`
+	User string   `json:"user,omitempty"`
+	// Stdin: the host streams stdin (else /dev/null).
+	Stdin bool `json:"stdin,omitempty"`
+	// Stdout "pipe" (default) | "ignore"; Stderr "pipe" (default) |
+	// "ignore" | "combined" (into stdout).
+	Stdout string `json:"stdout,omitempty"`
+	Stderr string `json:"stderr,omitempty"`
+	// PTY runs it on a pseudo-terminal (stdout carries the terminal's
+	// output; there is no separate stderr).
+	PTY  bool `json:"pty,omitempty"`
+	Cols int  `json:"cols,omitempty"`
+	Rows int  `json:"rows,omitempty"`
 }
 
 // Msg is one control-channel message (either direction).
@@ -66,6 +136,13 @@ type GuestConfig struct {
 // host → guest: Op "probe", "stats", "fsscan", "ping", "shutdown" (stop
 // workerd, sync and unmount the volume: the host may then release it),
 // "fsbench" (write+fsync latency on the DO volume).
+//
+// Container guests: guest → host Type "ctr-ready" (the entrypoint runs:
+// PID), "ctr-exit" (it exited: ExitCode, 128+n for signal n), "exec-exit"
+// (Exec, ExitCode). host → guest Op "exec" (Exec id + ExecSpec: the guest
+// first opens the exec's stdio stream, then answers with the PID),
+// "signal" (Signal to the entrypoint, or to Exec's process if set),
+// "resize" (Exec, Cols, Rows) and "status" (Running, PID, Exited, ExitCode).
 type Msg struct {
 	Type string `json:"type,omitempty"`
 	ID   int64  `json:"id,omitempty"`
@@ -93,6 +170,45 @@ type Msg struct {
 	// fsscan: files whose name looks like tailscale state
 	Found   []string `json:"found,omitempty"`
 	Scanned int      `json:"scanned,omitempty"`
+
+	// container guests
+	Exec     string    `json:"exec,omitempty"`
+	ExecSpec *ExecSpec `json:"execSpec,omitempty"`
+	PID      int       `json:"pid,omitempty"`
+	Signal   int       `json:"signal,omitempty"`
+	Cols     int       `json:"cols,omitempty"`
+	Rows     int       `json:"rows,omitempty"`
+	Running  bool      `json:"running,omitempty"`
+	Exited   bool      `json:"exited,omitempty"`
+}
+
+// WriteFrame writes one exec stream frame.
+func WriteFrame(w io.Writer, kind byte, p []byte) error {
+	var h [5]byte
+	h[0] = kind
+	binary.BigEndian.PutUint32(h[1:], uint32(len(p)))
+	if _, err := w.Write(append(h[:], p...)); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ReadFrame reads one exec stream frame (payloads over MaxFrame are an
+// error).
+func ReadFrame(r io.Reader) (kind byte, p []byte, err error) {
+	var h [5]byte
+	if _, err := io.ReadFull(r, h[:]); err != nil {
+		return 0, nil, err
+	}
+	n := binary.BigEndian.Uint32(h[1:])
+	if n > MaxFrame {
+		return 0, nil, fmt.Errorf("exec stream frame of %d bytes", n)
+	}
+	p = make([]byte, n)
+	if _, err := io.ReadFull(r, p); err != nil {
+		return 0, nil, err
+	}
+	return h[0], p, nil
 }
 
 // ProbeResult is the outcome of one TCP connect from inside the guest.

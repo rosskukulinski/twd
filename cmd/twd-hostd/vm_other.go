@@ -9,8 +9,8 @@ import (
 )
 
 type vmOptions struct {
-	kernel, rootfs, firecracker, jailer, helper, hugePages string
-	memMiB, vcpus                                          int
+	kernel, rootfs, firecracker, jailer, helper, hugePages, containerKernel string
+	memMiB, vcpus                                                           int
 }
 
 // vmBackend: the microVM tier needs Linux + KVM; on this OS every workload

@@ -1,278 +1,275 @@
-package hostd
+package hostd_test
 
 import (
-	"context"
-	"errors"
 	"fmt"
-	"sync"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/rosskukulinski/twd/hostd/mgmtapi"
-	"github.com/rosskukulinski/twd/internal/container"
+	"github.com/rosskukulinski/twd/hostd"
+	"github.com/rosskukulinski/twd/hostd/fakemgmt"
+	"github.com/rosskukulinski/twd/hostd/hostdtest"
+	"github.com/rosskukulinski/twd/hostd/sandbox/sandboxtest"
+	"github.com/rosskukulinski/twd/netd/nettest"
+	"tailscale.com/tailcfg"
 )
 
-// fakeQuota is mgmt's reservation API: reachable or down, granting up to
-// max reservations (a 429 past that), idempotent per key.
-type fakeQuota struct {
-	mu       sync.Mutex
-	down     bool
-	max      int
-	byKey    map[string]*mgmtapi.ContainerReservation
-	reserves []mgmtapi.ContainerReservationRequest
-	released []string
-}
-
-func newFakeQuota() *fakeQuota {
-	return &fakeQuota{max: 100, byKey: map[string]*mgmtapi.ContainerReservation{}}
-}
-
-var errUnreachable = errors.New("dial unix mgmt.sock: connection refused")
-
-func (q *fakeQuota) Reserve(_ context.Context, r mgmtapi.ContainerReservationRequest) (*mgmtapi.ContainerReservation, error) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	q.reserves = append(q.reserves, r)
-	if q.down {
-		return nil, errUnreachable
-	}
-	k := r.TenantID + "|" + r.Workload + "|" + r.Class + "|" + r.Object
-	if x := q.byKey[k]; x != nil {
-		return x, nil
-	}
-	if len(q.byKey) >= q.max {
-		return nil, &mgmtapi.Error{Status: 429, Code: "container_quota_exceeded", Message: "maxContainers reached",
-			Missing: []byte(`{"quota":"maxContainers","limit":1,"used":1,"requested":1}`)}
-	}
-	x := &mgmtapi.ContainerReservation{ReservationID: fmt.Sprintf("cr_%d", len(q.reserves)), TenantID: r.TenantID, Workload: r.Workload,
-		Class: r.Class, Object: r.Object, Resources: r.Resources}
-	q.byKey[k] = x
-	return x, nil
-}
-
-func (q *fakeQuota) Release(_ context.Context, id string) error {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.down {
-		return errUnreachable
-	}
-	q.released = append(q.released, id)
-	for k, x := range q.byKey {
-		if x.ReservationID == id {
-			delete(q.byKey, k)
-		}
-	}
-	return nil
-}
-
-func (q *fakeQuota) setDown(d bool) { q.mu.Lock(); q.down = d; q.mu.Unlock() }
-func (q *fakeQuota) calls() int     { q.mu.Lock(); defer q.mu.Unlock(); return len(q.reserves) }
-
-// ctrHost is a Host with a (fake) microVM backend, the given capacity, the
-// fake quota and one workload "tn/w" at epoch 7.
-func ctrHost(t *testing.T, vm bool, capVec mgmtapi.HostCapacity) (*Host, *fakeQuota) {
-	t.Helper()
-	q := newFakeQuota()
-	mc, _ := mgmtapi.NewClient("unix:///nonexistent")
-	cfg := Config{HostID: "h1", Mgmt: mc, DataDir: t.TempDir(), RunDir: t.TempDir(), WorkerdBin: "/bin/true", ContainerQuota: q, Capacity: &capVec}
-	if vm {
-		cfg.VM = fakeBackend{}
-	}
-	h, err := New(cfg)
+// TestContainerPolyfill drives Cloudflare's ctx.container API from real
+// workerd (the generated platform wrapper's polyfill) through hostd's
+// container manager, on the fake process backend (sandboxtest: no
+// isolation; the microVM backend is e2e/container in Lima). Facet and
+// plain-DO classes both.
+func TestContainerPolyfill(t *testing.T) {
+	procs := &sandboxtest.Procs{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "port server: %s %s?%s as=%q probe=%q", r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("x-twd-as"), r.Header.Get("x-probe"))
+	}))
+	defer srv.Close()
+	procs.Ports = map[uint16]string{8080: srv.Listener.Addr().String()}
+	st, err := sandboxtest.ImageStore(t.TempDir(), []string{"sleep", "3600"}, "twd.test/box:1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.workloads["tn/w"] = &workload{h: h, tenantID: "tn", name: "w", epoch: 7}
-	return h, q
-}
-
-var roomy = mgmtapi.HostCapacity{VMs: 10, VMMemMiB: 1 << 20, VCPUs: 64, VCPUOvercommit: 1, ScratchMiB: 1 << 20}
-
-func key(obj string) ContainerKey {
-	return ContainerKey{TenantID: "tn", Workload: "w", Class: "Sandbox", Object: obj}
-}
-
-var lite, basic = container.InstanceTypes["lite"], container.InstanceTypes["basic"]
-
-func wantCode(t *testing.T, err error, code string) {
-	t.Helper()
-	var ae *apiError
-	if !errors.As(err, &ae) || ae.Code != code {
-		t.Fatalf("err = %v, want %s", err, code)
+	s := startSuiteCapsOpts(t, fakemgmt.Config{}, tailcfg.PeerCapMap{nettest.TestCap: []tailcfg.RawMessage{nettest.TestCapValue}}, func(o *hostdtest.Options) {
+		o.Containers, o.Images, o.ContainerGrace = procs, st, 2*time.Second
+	})
+	e := s.e
+	dep := e.Deploy(hostdtest.Fixture("ctr"), "ctr", nil)
+	wl := e.WaitActive("ctr", dep, 60*time.Second)
+	s.waitPeer(wl.IP)
+	base := "http://" + wl.IP
+	call := func(path string, q ...string) map[string]any {
+		t.Helper()
+		v := url.Values{}
+		for i := 0; i+1 < len(q); i += 2 {
+			v.Set(q[i], q[i+1])
+		}
+		u := base + path
+		if len(v) > 0 {
+			u += "?" + v.Encode()
+		}
+		code, m := s.getJSON(u)
+		if code == 0 {
+			t.Fatalf("%s: %v", path, m)
+		}
+		return m
 	}
-	if st := errStatus[code]; st == 0 {
-		t.Fatalf("%s has no HTTP status", code)
-	}
-}
-
-// A host without a container backend refuses (never runs a container
-// another way), before it asks mgmt for anything.
-func TestContainerNeedsBackend(t *testing.T) {
-	h, q := ctrHost(t, false, roomy)
-	_, err := h.AcquireContainer(context.Background(), key("a"), lite)
-	wantCode(t, err, "tier_unavailable")
-	if q.calls() != 0 {
-		t.Fatal("reserved quota for a container this host can't run")
-	}
-}
-
-// Local capacity is checked before mgmt is asked: over any dimension is 503
-// capacity_exhausted (no spill), and a released slot frees its room.
-func TestContainerCapacity(t *testing.T) {
-	ctx := context.Background()
-	for _, tc := range []struct {
-		name  string
-		cap   mgmtapi.HostCapacity
-		fits  int
-		res   container.Resources
-		which string
-	}{
-		{"vms", mgmtapi.HostCapacity{VMs: 2, VMMemMiB: 1 << 20, VCPUs: 64, VCPUOvercommit: 1, ScratchMiB: 1 << 20}, 2, lite, "vms"},
-		{"memory", mgmtapi.HostCapacity{VMs: 10, VMMemMiB: 2048, VCPUs: 64, VCPUOvercommit: 1, ScratchMiB: 1 << 20}, 2, basic, "vmMemMiB"},
-		{"vcpus with overcommit", mgmtapi.HostCapacity{VMs: 10, VMMemMiB: 1 << 20, VCPUs: 1, VCPUOvercommit: 0.5, ScratchMiB: 1 << 20}, 2, basic, "vcpus"},
-		{"scratch", mgmtapi.HostCapacity{VMs: 10, VMMemMiB: 1 << 20, VCPUs: 64, VCPUOvercommit: 1, ScratchMiB: 9000}, 2, basic, "scratchMiB"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h, q := ctrHost(t, true, tc.cap)
-			var slots []*ContainerSlot
-			for i := range tc.fits {
-				s, err := h.AcquireContainer(ctx, key(fmt.Sprint("o", i)), tc.res)
-				if err != nil {
-					t.Fatalf("container %d: %v", i, err)
-				}
-				slots = append(slots, s)
+	ctrOf := func(class, name string) hostd.ContainerStatus {
+		for _, c := range e.Host.Containers() {
+			if c.Class == class && c.Object == name {
+				return c
 			}
-			n := q.calls()
-			_, err := h.AcquireContainer(ctx, key("over"), tc.res)
-			wantCode(t, err, "capacity_exhausted")
-			if ae := asAPIError(err); fmt.Sprint(ae.Extra["missing"].(map[string]any)["capacity"]) != tc.which {
-				t.Fatalf("refused on %v, want %s", ae.Extra, tc.which)
+		}
+		return hostd.ContainerStatus{}
+	}
+	waitState := func(class, name, state string) hostd.ContainerStatus {
+		t.Helper()
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			c := ctrOf(class, name)
+			if c.State == state || time.Now().After(deadline) {
+				return c
 			}
-			if q.calls() != n {
-				t.Fatal("asked mgmt for quota for a container the host has no room for")
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+
+	t.Run("PresentOnlyOnContainerClasses", func(t *testing.T) {
+		if r := call("/f/a/has"); r["has"] != true {
+			t.Fatalf("facet class: %v", r)
+		}
+		if r := call("/p/a/has"); r["has"] != true {
+			t.Fatalf("plain class: %v", r)
+		}
+		if r := call("/n/a/has"); r["has"] != false {
+			t.Fatalf("class without containers: %v", r)
+		}
+	})
+
+	t.Run("StartExecOutput", func(t *testing.T) {
+		if r := call("/f/a/running"); r["running"] != false {
+			t.Fatal(r)
+		}
+		if r := call("/f/a/start"); r["running"] != true {
+			t.Fatalf("running must be true right after start(): %v", r)
+		}
+		// exec waits for the start; no shell; only PATH is inherited (the
+		// start() env GREETING and the image env are not).
+		r := call("/f/a/exec", "argv", `["sh","-c","echo [$GREETING][$IMAGE_ENV]; echo out; echo err >&2; exit 3"]`)
+		if r["exitCode"] != float64(3) || r["stdout"] != "[][]\nout\n" || r["stderr"] != "err\n" {
+			t.Fatalf("exec: %v", r)
+		}
+		r = call("/f/a/exec", "argv", `["sh","-c","echo $X; echo e >&2"]`, "env", `{"X":"y"}`, "stderr", "combined")
+		if r["exitCode"] != float64(0) || !strings.Contains(r["stdout"].(string), "y\n") || !strings.Contains(r["stdout"].(string), "e\n") || r["hasStderr"] != false {
+			t.Fatalf("combined/env: %v", r)
+		}
+		if r := call("/f/a/exec", "argv", `["no-such-binary-twd"]`); r["error"] == nil {
+			t.Fatalf("a missing binary must fail: %v", r)
+		}
+		if c := ctrOf("Box", "a"); c.State != "running" || c.Image != "twd.test/box:1" {
+			t.Fatalf("hostd view: %+v", c)
+		}
+	})
+
+	t.Run("StreamingStdinKill", func(t *testing.T) {
+		r := call("/f/a/stream")
+		if r["first"] != "first\n" || r["rest"] != "second\n" || r["code"] != float64(7) {
+			t.Fatalf("stream: %v", r)
+		}
+		if r["tFirst"].(float64) > 800 || r["tTotal"].(float64) < 950 {
+			t.Fatalf("not streamed: first after %vms, total %vms", r["tFirst"], r["tTotal"])
+		}
+		body := strings.Repeat("abcdefghij", 20000)
+		code, _, b := s.do("POST", base+"/f/a/stdin", []byte(body))
+		if code != 200 || !strings.Contains(string(b), `"exitCode":0`) || !strings.Contains(string(b), body[:1000]) || len(b) < len(body) {
+			t.Fatalf("stdin: %d %.200s", code, b)
+		}
+		if r := call("/f/a/kill"); r["code"] != float64(137) {
+			t.Fatalf("kill(9): %v", r)
+		}
+		if r := call("/f/a/abort"); r["code"] != float64(137) {
+			t.Fatalf("AbortSignal: %v", r)
+		}
+	})
+
+	t.Run("OnlyItsOwnContainer", func(t *testing.T) {
+		// b has no container: it sees none, and its exec doesn't reach a's.
+		if r := call("/f/b/running"); r["running"] != false {
+			t.Fatalf("b sees a's container: %v", r)
+		}
+		if r := call("/f/b/exec", "argv", `["true"]`); r["error"] == nil {
+			t.Fatalf("b exec ran: %v", r)
+		}
+		// The facet keeps no platform binding in env, and a plain-DO object
+		// (the workload's trust domain) can't claim a facet object.
+		if r := call("/f/a/envtwd"); r["hasTWD"] != false {
+			t.Fatalf("facet env leaks __TWD: %v", r)
+		}
+		for _, op := range []string{"destroy", "status", "signal"} {
+			r := call("/p/z/forge", "target", "a", "op", op)
+			if r["ok"] != false {
+				t.Fatalf("plain object drove facet a's container (%s): %v", op, r)
 			}
-			slots[0].Release(ctx)
-			if _, err := h.AcquireContainer(ctx, key("over"), tc.res); err != nil {
-				t.Fatalf("after a release: %v", err)
+		}
+		if c := ctrOf("Box", "a"); c.State != "running" {
+			t.Fatalf("a after forgery attempts: %+v", c)
+		}
+	})
+
+	t.Run("GetTcpPort", func(t *testing.T) {
+		r := call("/f/a/port", "p", "8080")
+		if r["status"] != float64(200) || !strings.Contains(r["body"].(string), "GET /hello?x=1") || !strings.Contains(r["body"].(string), `as=""`) ||
+			!strings.Contains(r["body"].(string), `probe="1"`) {
+			t.Fatalf("port fetch: %v", r)
+		}
+		r = call("/f/a/port", "p", "8081")
+		if !strings.Contains(fmt.Sprint(r["error"]), "the container is not listening") {
+			t.Fatalf("closed port: %v", r)
+		}
+		for _, p := range []string{"8080", "8081"} {
+			r = call("/f/a/portsig", "p", p)
+			if p == "8080" && r["status"] != float64(200) || p == "8081" && !strings.Contains(fmt.Sprint(r["error"]), "the container is not listening") || r["ms"].(float64) > 2500 {
+				t.Fatalf("fetch with an AbortSignal, port %s: %v", p, r)
 			}
-		})
-	}
-}
+		}
+		if r := call("/f/a/inspect"); fmt.Sprint(get(r, "info", "image")) != "twd.test/box:1" {
+			t.Fatalf("inspect: %v", r)
+		}
+		if r := call("/f/a/intercept"); r["ok"] != true {
+			t.Fatalf("intercept: %v", r)
+		}
+	})
 
-// Concurrent starts never overrun local capacity.
-func TestContainerCapacityConcurrent(t *testing.T) {
-	h, _ := ctrHost(t, true, mgmtapi.HostCapacity{VMs: 3, VMMemMiB: 1 << 20, VCPUs: 64, VCPUOvercommit: 1, ScratchMiB: 1 << 20})
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	ok := 0
-	for i := range 20 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if _, err := h.AcquireContainer(context.Background(), key(fmt.Sprint("o", i)), lite); err == nil {
-				mu.Lock()
-				ok++
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	if ok != 3 || h.usage().Containers != 3 {
-		t.Fatalf("%d started (usage %d), capacity 3", ok, h.usage().Containers)
-	}
-}
+	t.Run("MonitorAndRestart", func(t *testing.T) {
+		call("/f/m/start", "entrypoint", `["sh","-c","sleep 0.5; exit 5"]`)
+		r := call("/f/m/monitor")
+		if !strings.Contains(fmt.Sprint(r["rejected"]), "unexpected exit code: 5") || r["exitCode"] != float64(5) || r["running"] != false {
+			t.Fatalf("monitor on exit 5: %v", r)
+		}
+		call("/f/m/start", "entrypoint", `["sh","-c","sleep 0.3"]`)
+		if r := call("/f/m/monitor"); r["resolved"] != true {
+			t.Fatalf("monitor on exit 0: %v", r)
+		}
+		if c := ctrOf("Box", "m"); c.Gen != 2 || c.State != "stopped" {
+			t.Fatalf("%+v", c)
+		}
+	})
 
-// mgmt's quota decides: a 429 is passed on typed, and the local capacity it
-// held is given back. The reservation is for the workload's lease epoch.
-func TestContainerQuotaRefused(t *testing.T) {
-	ctx := context.Background()
-	h, q := ctrHost(t, true, roomy)
-	q.max = 1
-	if _, err := h.AcquireContainer(ctx, key("a"), lite); err != nil {
-		t.Fatal(err)
-	}
-	if q.reserves[0].Epoch != 7 {
-		t.Fatalf("reserved at epoch %d, want the workload's 7", q.reserves[0].Epoch)
-	}
-	_, err := h.AcquireContainer(ctx, key("b"), lite)
-	wantCode(t, err, "container_quota_exceeded")
-	if asAPIError(err).Extra["missing"] == nil {
-		t.Fatal("the quota refusal lost its missing{}")
-	}
-	if u := h.usage(); u.Containers != 1 {
-		t.Fatalf("a refused container holds capacity: %+v", u)
-	}
-	_, err = h.AcquireContainer(ctx, key("a"), lite)
-	wantCode(t, err, "container_running")
-	if _, err := h.AcquireContainer(ctx, ContainerKey{TenantID: "tn", Workload: "other", Class: "S", Object: "x"}, lite); err == nil {
-		t.Fatal("a container of a workload this host doesn't run was admitted")
-	}
-}
+	t.Run("DestroyThenStart", func(t *testing.T) {
+		live := procs.Live()
+		if r := call("/f/a/destroy"); r["running"] != false {
+			t.Fatal(r)
+		}
+		if c := ctrOf("Box", "a"); c.State != "stopped" || procs.Live() != live-1 {
+			t.Fatalf("after destroy: %+v live %d", c, procs.Live())
+		}
+		if r := call("/f/a/exec", "argv", `["true"]`); r["error"] == nil {
+			t.Fatalf("exec after destroy: %v", r)
+		}
+		call("/f/a/start")
+		if r := call("/f/a/exec", "argv", `["echo","again"]`); r["stdout"] != "again\n" {
+			t.Fatalf("after restart: %v", r)
+		}
+		if r := call("/f/t/startTwice"); !strings.Contains(fmt.Sprint(r["second"]), "already running") {
+			t.Fatalf("start() twice: %v", r)
+		}
+	})
 
-// Fail closed: with mgmt unreachable no container starts, except a restart
-// of one whose reservation this host still holds (the same or a smaller
-// container). Once mgmt acknowledges the release, the exception is gone.
-func TestContainerFailClosedAndRestart(t *testing.T) {
-	ctx := context.Background()
-	h, q := ctrHost(t, true, roomy)
-	q.setDown(true)
-	_, err := h.AcquireContainer(ctx, key("new"), lite)
-	wantCode(t, err, "quota_unavailable")
-	if u := h.usage(); u.Containers != 0 || len(h.containers.running()) != 0 {
-		t.Fatalf("a refused start holds capacity or is reported: %+v", u)
-	}
+	t.Run("PlainMode", func(t *testing.T) {
+		call("/p/q/start")
+		if r := call("/p/q/exec", "argv", `["echo","plain"]`); r["stdout"] != "plain\n" {
+			t.Fatalf("plain-DO exec: %v", r)
+		}
+		if c := ctrOf("PBox", "q"); c.State != "running" || c.Class != "PBox" {
+			t.Fatalf("%+v", c)
+		}
+		if sp := procs.Specs[len(procs.Specs)-1]; sp.MemMiB != 1024 || sp.CPUMax != 0.25 {
+			t.Fatalf("basic instance shape: %+v", sp)
+		}
+	})
 
-	q.setDown(false)
-	s, err := h.AcquireContainer(ctx, key("a"), basic)
-	if err != nil || s.ReservationID == "" || s.Restarted {
-		t.Fatalf("start a: %+v %v", s, err)
-	}
-	if rs := h.containers.running(); len(rs) != 1 || rs[0].ReservationID != s.ReservationID || rs[0].Object != "a" {
-		t.Fatalf("heartbeat report: %+v", rs)
-	}
-	q.setDown(true)
-	s.Release(ctx) // mgmt doesn't hear it: the reservation stays held
-	if rs := h.containers.running(); len(rs) != 0 {
-		t.Fatalf("a stopped container is reported running: %+v", rs)
-	}
-	_, err = h.AcquireContainer(ctx, key("a"), container.InstanceTypes["standard-1"])
-	wantCode(t, err, "quota_unavailable") // bigger than what it holds
-	_, err = h.AcquireContainer(ctx, key("b"), lite)
-	wantCode(t, err, "quota_unavailable") // another key holds nothing
-	r, err := h.AcquireContainer(ctx, key("a"), lite)
-	if err != nil || !r.Restarted || r.ReservationID != s.ReservationID {
-		t.Fatalf("restart within the held reservation: %+v %v", r, err)
-	}
-	r.Release(ctx)
+	t.Run("InactivityTimeout", func(t *testing.T) {
+		call("/f/i/start")
+		call("/f/i/idle", "ms", "800")
+		c := waitState("Box", "i", "stopped")
+		if c.State != "stopped" || c.ExitReason != "inactivity timeout" {
+			t.Fatalf("idle container: %+v", c)
+		}
+		if r := call("/f/i/running"); r["running"] != false {
+			t.Fatalf("running after the inactivity stop: %v", r)
+		}
+	})
 
-	// mgmt is back: the release goes through after a good heartbeat, and the
-	// exception with it.
-	q.setDown(false)
-	h.retryReleases(ctx)
-	if len(q.released) != 1 || q.released[0] != s.ReservationID {
-		t.Fatalf("released %v", q.released)
-	}
-	q.setDown(true)
-	_, err = h.AcquireContainer(ctx, key("a"), lite)
-	wantCode(t, err, "quota_unavailable")
-}
+	t.Run("KillCascades", func(t *testing.T) {
+		call("/f/k/start")
+		if c := waitState("Box", "k", "running"); c.State != "running" {
+			t.Fatal(c)
+		}
+		e.WaitObject("ctr", "Box", "k", 60*time.Second)
+		st := time.Now()
+		call("/f/k/selfkill")
+		c := waitState("Box", "k", "stopped")
+		if c.State != "stopped" || !strings.HasPrefix(c.ExitReason, "object killed") {
+			t.Fatalf("container survived its object's kill: %+v", c)
+		}
+		t.Logf("kill → container stopped in %v", time.Since(st))
+	})
 
-// The capacity vector: VM dimensions only with a microVM backend; nodes
-// are capacityNodes; usage counts DO microVMs and containers.
-func TestCapacityVector(t *testing.T) {
-	h, _ := ctrHost(t, false, roomy)
-	if c := h.capacity(); c.VMs != 0 || c.VMMemMiB != 0 || c.Nodes != 1000 {
-		t.Fatalf("no backend: %+v", c)
-	}
-	h, _ = ctrHost(t, true, roomy)
-	if c := h.capacity(); c.VMs != 10 || c.Nodes != 1000 {
-		t.Fatalf("with a backend: %+v", c)
-	}
-	h.workloads["tn/w"].active = &instance{tier: "microvm"}
-	if _, err := h.AcquireContainer(context.Background(), key("a"), basic); err != nil {
-		t.Fatal(err)
-	}
-	u := h.usage()
-	if u.VMs != 2 || u.Containers != 1 || u.VMMemMiB != 512+1024 || u.VCPUs != 2.25 || u.ScratchMiB != basic.DiskMiB {
-		t.Fatalf("usage: %+v", u)
-	}
+	t.Run("SurvivesRedeploy", func(t *testing.T) {
+		call("/f/r/start")
+		gen := ctrOf("Box", "r").Gen
+		dep2 := e.Deploy(hostdtest.Fixture("ctr"), "ctr", nil)
+		e.WaitActive("ctr", dep2, 60*time.Second)
+		// The new code sees the same container (Cloudflare's durable_object
+		// policy: the new version decides).
+		if r := call("/f/r/running"); r["running"] != true {
+			t.Fatalf("after redeploy: %v", r)
+		}
+		if r := call("/f/r/exec", "argv", `["echo","still"]`); r["stdout"] != "still\n" || ctrOf("Box", "r").Gen != gen {
+			t.Fatalf("after redeploy exec: %v", r)
+		}
+	})
 }

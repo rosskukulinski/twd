@@ -1,0 +1,11 @@
+# The image of the raw ctx.container acceptance flow (ADR-032 D1, Sandbox
+# SDK 1.0): Cloudflare's examples use cloudflare/debian-trixie, which is not
+# public; this is the stand-in: Debian trixie + python3, plus the 1.0.1
+# sandbox-shim for the Files helper.
+FROM docker.io/cloudflare/sandbox:1.0.1 AS sandbox-tools
+
+FROM docker.io/library/debian:trixie
+RUN apt-get update && apt-get install -y --no-install-recommends python3 ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=sandbox-tools /usr/local/bin/sandbox-shim /usr/local/bin/sandbox-shim
+RUN mkdir -p /workspace
+CMD ["sleep", "infinity"]

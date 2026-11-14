@@ -25,7 +25,7 @@ func TestParse(t *testing.T) {
 		t.Fatalf("default type: %+v", r)
 	}
 	s := cs[2]
-	if s.Image != "./Dockerfile" || s.MaxInstances != 1 || s.Arch != "amd64" || s.Resources() != InstanceTypes["basic"] {
+	if s.Source != "./Dockerfile" || s.Image != "" || s.MaxInstances != 1 || s.Arch != "amd64" || s.Resources() != InstanceTypes["basic"] {
 		t.Fatalf("twd.jsonc override: %+v", s)
 	}
 	if a, err := Arch(cs); err != nil || a != "amd64" {

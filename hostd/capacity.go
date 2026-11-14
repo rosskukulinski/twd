@@ -1,12 +1,7 @@
 package hostd
 
 import (
-	"bufio"
-	"bytes"
-	"os"
 	"runtime"
-	"strconv"
-	"strings"
 	"syscall"
 
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
@@ -37,7 +32,7 @@ func (h *Host) capacity() mgmtapi.HostCapacity {
 		switch {
 		case h.cfg.Capacity != nil:
 			c = *h.cfg.Capacity
-		case h.cfg.VM != nil && !h.cfg.ForceProcessTier:
+		case h.hasVMs():
 			total, huge := memInfo()
 			c = mgmtapi.HostCapacity{VMs: DefaultMaxVMs, VMMemMiB: int(float64(total) * defaultVMMemShare), HugeMemMiB: huge,
 				VCPUs: runtime.NumCPU(), VCPUOvercommit: DefaultVCPUOvercommit, ScratchMiB: int(float64(freeMiB(h.cfg.DataDir)) * defaultScratchShare)}
@@ -45,7 +40,7 @@ func (h *Host) capacity() mgmtapi.HostCapacity {
 				c.VMMemMiB = c.HugeMemMiB // huge pages are reserved for guests already
 			}
 		}
-		if h.cfg.VM == nil || h.cfg.ForceProcessTier {
+		if !h.hasVMs() {
 			c = mgmtapi.HostCapacity{}
 		}
 		if c.VCPUOvercommit == 0 && c.VCPUs > 0 {
@@ -55,6 +50,12 @@ func (h *Host) capacity() mgmtapi.HostCapacity {
 		h.capVec = c
 	})
 	return h.capVec
+}
+
+// hasVMs: this host boots microVMs (DO instances or containers; both are
+// Firecracker or vz guests sharing the VM dimensions).
+func (h *Host) hasVMs() bool {
+	return (h.cfg.VM != nil || h.cfg.Containers != nil) && !h.cfg.ForceProcessTier
 }
 
 // usage is the live usage: ready nodes, microVM DO instances (at the
@@ -101,32 +102,9 @@ func (h *Host) vmUsage() mgmtapi.HostUsage {
 	return u
 }
 
-// memInfo returns MemTotal and the huge page pool (HugePages_Total ×
-// Hugepagesize) in MiB from /proc/meminfo (0, 0 where there is none).
-func memInfo() (totalMiB, hugeMiB int) {
-	b, err := os.ReadFile("/proc/meminfo")
-	if err != nil {
-		return 0, 0
-	}
-	var pages, pageKB int
-	sc := bufio.NewScanner(bytes.NewReader(b))
-	for sc.Scan() {
-		f := strings.Fields(sc.Text())
-		if len(f) < 2 {
-			continue
-		}
-		n, _ := strconv.Atoi(f[1])
-		switch f[0] {
-		case "MemTotal:":
-			totalMiB = n / 1024
-		case "HugePages_Total:":
-			pages = n
-		case "Hugepagesize:":
-			pageKB = n
-		}
-	}
-	return totalMiB, pages * pageKB / 1024
-}
+// memInfo returns the host's RAM and huge page pool in MiB (per OS:
+// capacity_linux.go, capacity_other.go).
+func memInfo() (totalMiB, hugeMiB int) { return osMemInfo() }
 
 // freeMiB is the space available to this user under dir.
 func freeMiB(dir string) int {

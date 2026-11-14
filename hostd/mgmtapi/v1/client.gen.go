@@ -41,6 +41,8 @@ const (
 	AuditKindAllow            AuditKind = "allow"
 	AuditKindContainerRelease AuditKind = "container_release"
 	AuditKindContainerReserve AuditKind = "container_reserve"
+	AuditKindContainerStart   AuditKind = "container_start"
+	AuditKindContainerStop    AuditKind = "container_stop"
 	AuditKindCreate           AuditKind = "create"
 	AuditKindCredential       AuditKind = "credential"
 	AuditKindDeny             AuditKind = "deny"
@@ -77,6 +79,10 @@ func (e AuditKind) Valid() bool {
 	case AuditKindContainerRelease:
 		return true
 	case AuditKindContainerReserve:
+		return true
+	case AuditKindContainerStart:
+		return true
+	case AuditKindContainerStop:
 		return true
 	case AuditKindCreate:
 		return true
@@ -656,7 +662,8 @@ type AuditBatch struct {
 }
 
 // AuditKind Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-// `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+// `principal`, `tenant_note` (source `tenant`, unverified),
+// `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
 // `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
@@ -697,7 +704,8 @@ type AuditRecord struct {
 	HostSig *string `json:"hostSig,omitempty"`
 
 	// Kind Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-	// `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+	// `principal`, `tenant_note` (source `tenant`, unverified),
+	// `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
 	// `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,

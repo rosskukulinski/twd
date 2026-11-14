@@ -54,13 +54,22 @@ const (
 
 // Request is one client → helper message.
 type Request struct {
-	Op    string        `json:"op"` // ping | start | kill | memdump
+	Op    string        `json:"op"` // ping | start | kill | memdump | cpu
 	Start *StartRequest `json:"start,omitempty"`
+	// CPUQuotaUS (op "cpu", FeatureContainer): lower the running VM's
+	// cpu.max quota per 100 ms period. A container guest boots at its
+	// whole vCPUs and is then capped to its fraction (ADR-032 D5).
+	CPUQuotaUS int `json:"cpuQuotaUs,omitempty"`
 }
 
+// FeatureContainer: the helper boots container guests (StartRequest.Image,
+// ScratchMiB, CPUQuotaUS, Pids; ADR-032). Advertised in ping's Features.
+const FeatureContainer = "container"
+
 // StartRequest boots one VM. File descriptors, in order: kernel (r),
-// rootfs (r), config drive (r), console log (w, append), and the volume
-// image (rw) if Volume is set.
+// rootfs (r), config drive (r), console log (w, append), then the volume
+// image (rw) if Volume is set, or the container image (r, erofs) if Image
+// is set (never both).
 type StartRequest struct {
 	Name      string  `json:"name"` // caller's short VM name (logs only)
 	MemMiB    int     `json:"memMiB"`
@@ -72,6 +81,17 @@ type StartRequest struct {
 	GuestCID  int     `json:"guestCID"`
 	VsockPort int     `json:"vsockPort"` // host port the guest connects to
 	Volume    *Volume `json:"volume,omitempty"`
+
+	// Container guests (FeatureContainer). Image: a read-only erofs fd
+	// follows the console fd (the guest's /dev/vdc). ScratchMiB: the helper
+	// makes a fresh sparse ext4 of this size inside the jail (/dev/vdd),
+	// gone with the jail. CPUQuotaUS: cpu.max quota per 100 ms period for
+	// a fractional vCPU (0 = VCPUs × 100 ms). Pids: the VMM cgroup's
+	// pids.max (0 = unset).
+	Image      bool `json:"image,omitempty"`
+	ScratchMiB int  `json:"scratchMiB,omitempty"`
+	CPUQuotaUS int  `json:"cpuQuotaUs,omitempty"`
+	Pids       int  `json:"pids,omitempty"`
 }
 
 // Volume is a persistent, encrypted block device for the guest (/dev/vdc).
@@ -105,10 +125,11 @@ type Response struct {
 	Error string `json:"error,omitempty"`
 
 	// ping
-	Version int    `json:"version,omitempty"`
-	UID     int    `json:"uid,omitempty"` // the caller's uid, as the helper sees it
-	Jailer  string `json:"jailer,omitempty"`
-	Crypt   string `json:"crypt,omitempty"`
+	Version  int      `json:"version,omitempty"`
+	UID      int      `json:"uid,omitempty"` // the caller's uid, as the helper sees it
+	Jailer   string   `json:"jailer,omitempty"`
+	Crypt    string   `json:"crypt,omitempty"`
+	Features []string `json:"features,omitempty"`
 
 	// start
 	PID       int                `json:"pid,omitempty"`       // firecracker (in the jail)

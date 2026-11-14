@@ -227,6 +227,10 @@ func objView(o *object) map[string]any {
 // platform (TailnetApi props); nil means the workload itself.
 func (h *Host) hostAPI(inst *instance) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/v1/container") {
+			h.containerAPI(inst, w, r) // ctx.container (containers.go)
+			return
+		}
 		var req apiReq
 		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 			writeAPIError(w, &apiError{Code: "bad_request", Detail: err.Error()})

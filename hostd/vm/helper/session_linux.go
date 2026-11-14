@@ -42,6 +42,7 @@ type session struct {
 	stopOnce sync.Once
 	cleaned  sync.Once
 	stopped  bool
+	quota    int // the cpu.max quota (per 100 ms) the VM runs under
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -62,11 +63,19 @@ func (s *Server) start(c *net.UnixConn, uid int, req *helperapi.StartRequest, fd
 		}
 	}()
 	want := 4
-	if req.Volume != nil {
+	if req.Volume != nil && req.Image {
+		return nil, resp, nil, herr(helperapi.CodeBadRequest, "a VM has a DO volume or a container image, not both")
+	}
+	if req.Volume != nil || req.Image {
 		want = 5
 	}
 	if len(files) != want {
 		return nil, resp, nil, herr(helperapi.CodeBadRequest, "start needs %d file descriptors, got %d", want, len(files))
+	}
+	if req.ScratchMiB < 0 || req.ScratchMiB > 1<<20 || req.ScratchMiB > 0 && !req.Image ||
+		req.CPUQuotaUS < 0 || req.CPUQuotaUS > req.VCPUs*100000 || req.CPUQuotaUS > 0 && req.CPUQuotaUS < 1000 ||
+		req.Pids < 0 || req.Pids > 1<<20 {
+		return nil, resp, nil, herr(helperapi.CodeBadRequest, "bad container config")
 	}
 	if req.MemMiB < 128 || req.MemMiB > 32768 || req.VCPUs < 1 || req.VCPUs > 32 || req.MTU < 576 || req.MTU > 9000 {
 		return nil, resp, nil, herr(helperapi.CodeBadRequest, "bad machine config")
@@ -153,6 +162,22 @@ func (s *Server) start(c *net.UnixConn, uid int, req *helperapi.StartRequest, fd
 	out = append(out, vsFD)
 	os.Chown(vsPath, sess.jailID, sess.jailID)
 	os.Chmod(vsPath, 0o600)
+	// Container guests: the image (read-only, bind-mounted when the jail
+	// uid may read it) and a scratch disk made here, owned by the jail uid
+	// and removed with the jail: nothing of one instance's writes survives
+	// it, and the host-side file is never one a client named.
+	if req.Image {
+		if err := sess.place(files[4], "image.erofs", false); err != nil {
+			return nil, resp, nil, fmt.Errorf("jail image: %w", err)
+		}
+	}
+	if req.ScratchMiB > 0 {
+		st := time.Now()
+		if err := makeScratch(filepath.Join(sess.chroot, "scratch.ext4"), req.ScratchMiB, sess.jailID); err != nil {
+			return nil, resp, nil, fmt.Errorf("scratch disk: %w", err)
+		}
+		tm["scratch"] = ms(time.Since(st))
+	}
 	tm["jail"] = ms(time.Since(t0))
 
 	// 3. The volume: LUKS2 → dm-crypt on the host; the jail gets the
@@ -191,12 +216,20 @@ func (s *Server) start(c *net.UnixConn, uid int, req *helperapi.StartRequest, fd
 	if !hp {
 		memMax += int64(req.MemMiB) << 20
 	}
-	cpuMax := fmt.Sprintf("%d 100000", req.VCPUs*100000)
+	quota := req.VCPUs * 100000
+	if req.CPUQuotaUS > 0 {
+		quota = req.CPUQuotaUS // a fractional vCPU (ADR-032 D5: lite = 1/16)
+	}
+	cpuMax := fmt.Sprintf("%d 100000", quota)
+	sess.quota = quota
 	args := []string{"--id", sess.id, "--exec-file", s.cfg.Firecracker, "--uid", fmt.Sprint(sess.jailID), "--gid", fmt.Sprint(sess.jailID),
 		"--chroot-base-dir", s.cfg.JailBase, "--netns", "/var/run/netns/" + sess.id,
 		"--cgroup-version", "2", "--parent-cgroup", s.cgroup,
-		"--cgroup", "cpu.max=" + cpuMax, "--cgroup", fmt.Sprintf("memory.max=%d", memMax),
-		"--", "--api-sock", "/api.sock", "--level", "Warning"}
+		"--cgroup", "cpu.max=" + cpuMax, "--cgroup", fmt.Sprintf("memory.max=%d", memMax)}
+	if req.Pids > 0 && s.pidsController() {
+		args = append(args, "--cgroup", fmt.Sprintf("pids.max=%d", req.Pids))
+	}
+	args = append(args, "--", "--api-sock", "/api.sock", "--level", "Warning")
 	sess.cmd = exec.Command(s.cfg.Jailer, args...)
 	sess.cmd.Stdout, sess.cmd.Stderr = files[3], files[3]
 	sess.cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -230,6 +263,18 @@ func (s *Server) start(c *net.UnixConn, uid int, req *helperapi.StartRequest, fd
 		{"/boot-source", map[string]any{"kernel_image_path": "/vmlinux", "boot_args": req.BootArgs}},
 		{"/drives/rootfs", map[string]any{"drive_id": "rootfs", "path_on_host": "/rootfs.ext4", "is_root_device": true, "is_read_only": true}},
 		{"/drives/config", map[string]any{"drive_id": "config", "path_on_host": "/config.tar", "is_root_device": false, "is_read_only": true}},
+	}
+	if req.Image {
+		calls = append(calls, struct {
+			path string
+			body any
+		}{"/drives/image", map[string]any{"drive_id": "image", "path_on_host": "/image.erofs", "is_root_device": false, "is_read_only": true}})
+	}
+	if req.ScratchMiB > 0 {
+		calls = append(calls, struct {
+			path string
+			body any
+		}{"/drives/scratch", map[string]any{"drive_id": "scratch", "path_on_host": "/scratch.ext4", "is_root_device": false, "is_read_only": false}})
 	}
 	if sess.vol != nil {
 		// Writeback: the guest's flushes (fsync) reach the host as fsync
@@ -412,4 +457,18 @@ func (sess *session) memdump() (int, error) {
 		return -1, err
 	}
 	return unix.Open(filepath.Join(sess.chroot, "mem"), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+}
+
+// lowerCPU lowers the VM's cpu.max quota (never raises it: a client can
+// only take CPU away from its own VM).
+func (sess *session) lowerCPU(quota int) (string, error) {
+	if quota < 1000 || quota > sess.quota {
+		return "", herr(helperapi.CodeBadRequest, "cpu quota %d outside [1000, %d]", quota, sess.quota)
+	}
+	v := fmt.Sprintf("%d 100000", quota)
+	if err := os.WriteFile(filepath.Join("/sys/fs/cgroup", sess.cgroup, "cpu.max"), []byte(v), 0o644); err != nil {
+		return "", err
+	}
+	sess.quota = quota
+	return v, nil
 }

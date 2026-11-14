@@ -1,0 +1,9 @@
+{
+  "name": "raw10",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": { "bindings": [{ "name": "SANDBOX", "class_name": "Sandbox" }] },
+  "containers": [{ "class_name": "Sandbox", "image": "twd.local/debian-trixie-python:1", "instance_type": "basic" }],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Sandbox"] }],
+}

@@ -8,8 +8,10 @@ import (
 	"testing"
 
 	"github.com/rosskukulinski/twd/hostd/bundle"
+	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
+	"github.com/rosskukulinski/twd/hostd/sandbox/sandboxtest"
 )
 
 type fakeBackend struct{}
@@ -77,16 +79,21 @@ func TestDefaultMicroVMNeedsBackend(t *testing.T) {
 	}
 }
 
-// The registered and reported tiers follow the backend (containers run in
-// microVMs); ForceProcessTier advertises neither.
+// The registered and reported tiers follow the backends: "containers" only
+// with a usable container backend and image store (they run in microVMs);
+// ForceProcessTier advertises neither.
 func TestHostTiers(t *testing.T) {
 	for _, c := range []struct {
-		vm, force bool
-		want      string
-	}{{false, false, "process"}, {true, false, "process,microvm,containers"}, {true, true, "process"}} {
+		vm, ctr, force bool
+		want           string
+	}{{false, false, false, "process"}, {true, false, false, "process,microvm"}, {true, true, false, "process,microvm,containers"},
+		{true, true, true, "process"}} {
 		h := &Host{cfg: Config{ForceProcessTier: c.force}}
 		if c.vm {
 			h.cfg.VM = fakeBackend{}
+		}
+		if c.ctr {
+			h.cfg.Containers, h.cfg.Images = &sandboxtest.Procs{}, &image.Store{}
 		}
 		if got := strings.Join(h.tiers(), ","); got != c.want {
 			t.Errorf("%+v: %s", c, got)

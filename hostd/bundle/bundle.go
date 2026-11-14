@@ -51,8 +51,8 @@ type App struct {
 	// Node is the Node process tier app (Runtime == RuntimeNode).
 	Node *NodeApp
 	// Containers are the container classes (wrangler "containers", with
-	// twd.jsonc "containers" overriding by class), by DO class: each
-	// instance of the class may run one container (ADR-032).
+	// twd.jsonc "containers" overriding or pinning by class), by DO class:
+	// each instance of the class may run one container (ADR-032).
 	Containers map[string]container.Class
 }
 
@@ -123,8 +123,10 @@ type twdConfig struct {
 		Health string            `json:"health"`
 		Args   []string          `json:"args"`
 	} `json:"node"`
-	// Containers is parsed by internal/container (only its presence here).
-	Containers []json.RawMessage `json:"containers"`
+	// Containers is parsed by internal/container (only its presence here):
+	// an array like wrangler's, or {"<Class>": {"image", "images"}}, the
+	// pins twd deploy writes once it has built them (ADR-032 D3).
+	Containers json.RawMessage `json:"containers"`
 	Tailnet    struct {
 		Tags     []string `json:"tags"`
 		Connects []string `json:"connects"`
@@ -300,7 +302,7 @@ func parseNode(files map[string][]byte, t *twdConfig) (*App, error) {
 	if len(t.Tailnet.Objects) > 0 {
 		return nil, errors.New("bundle: runtime \"node\" has one tailnet identity per process (ADR-022); tailnet.objects is not supported")
 	}
-	if len(t.Containers) > 0 {
+	if c := bytes.TrimSpace(t.Containers); len(c) > 0 && string(c) != "null" && string(c) != "[]" && string(c) != "{}" {
 		return nil, errors.New("bundle: runtime \"node\" has no Durable Objects, so no containers (a container belongs to a Durable Object class)")
 	}
 	switch a.Tier {

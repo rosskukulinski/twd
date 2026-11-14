@@ -26,7 +26,9 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/hostd"
+	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/hostd/vm/helperapi"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd"
@@ -84,6 +86,17 @@ func run() error {
 		nodeBin    = flag.String("node", "", "Node process tier (runtime \"node\"): node binary (default: $TWD_NODE, or node on PATH)")
 		tokenFile  = flag.String("mgmt-token-file", filepath.Join(home, ".twd", "hostd", "mgmt.token"), "per-host token file minted by twd-mgmt (sent as Twd-Host-Token on the unix socket; \"\" = none)")
 		siblings   = flag.Bool("allow-sibling-egress", false, "let objects reach other objects hosted here over the tailnet (hairpin; single-host tests/demos)")
+		ctrOff     = flag.Bool("no-containers", false, "don't offer containers (ctx.container) even with a microVM backend")
+		ctrKernel  = flag.String("vm-container-kernel", "", "containers: guest kernel with erofs (guest/build-kernel.sh; default -vm-kernel)")
+		ctrCache   = flag.String("container-image-cache", "", "containers: converted image cache (default <data-dir>/images)")
+		ctrImages  = flag.String("container-image-dir", "", "containers: dir of image tarballs with an images.json index (until the mgmt registry pull)")
+		ctrPublic  = flag.String("container-public-images", "", "containers: comma-separated image refs cached once for all tenants (public bases)")
+		ctrIdle    = flag.Duration("container-idle", hostd.DefaultContainerIdle, "containers: default inactivity timeout (setInactivityTimeout overrides, ≤ 6 h)")
+		ctrMaxLife = flag.Duration("container-max-lifetime", hostd.DefaultContainerMaxLife, "containers: hard max lifetime of a container")
+		ctrGrace   = flag.Duration("container-stop-grace", hostd.DefaultContainerGrace, "containers: cap on destroy()'s SIGTERM → SIGKILL grace")
+		ctrMax     = flag.Int("container-max", 0, "containers: max running on this host (0 = unlimited)")
+		ctrMemMiB  = flag.Int("container-mem-mib", 0, "containers: max total guest memory on this host (0 = unlimited)")
+		ctrVCPU    = flag.Float64("container-vcpu", 0, "containers: max total vCPU on this host (0 = unlimited)")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -157,7 +170,31 @@ func run() error {
 		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH, AllowSiblingEgress: *siblings,
 		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB, VMMemMiB: *vmMem, VMVCPUs: *vmCPUs,
 		VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, jailer: *vmJailer, helper: *vmHelper,
-			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge}, log)}
+			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge, containerKernel: *ctrKernel}, log),
+		ContainerIdle: *ctrIdle, ContainerMaxLife: *ctrMaxLife, ContainerGrace: *ctrGrace,
+		ContainerCapacity: hostd.ContainerCapacity{Max: *ctrMax, MemMiB: *ctrMemMiB, VCPU: *ctrVCPU}}
+	// Containers (ADR-032) run on the microVM backend; without it this host
+	// offers none (start() fails with tier_unavailable, no fallback).
+	if cb, ok := hcfg.VM.(sandbox.ContainerBackend); ok && hcfg.VM != nil && !*ctrOff {
+		st := &image.Store{Dir: *ctrCache, Aliases: image.DefaultAliases, Public: map[string]bool{}}
+		if *ctrCache == "" {
+			st.Dir = filepath.Join(*dataDir, "images")
+		}
+		if *ctrImages != "" {
+			st.Sources = append(st.Sources, image.DirSource{Dir: *ctrImages})
+		}
+		for _, r := range splitList(*ctrPublic) {
+			st.Public[image.NormalizeRef(r)] = true
+		}
+		// Offer containers only when they can actually run here (the host
+		// advertises the "containers" tier from this; ADR-032 D5).
+		if err := containersUsable(cb, st); err != nil {
+			log.Info("containers unavailable on this host; not offered", "reason", err)
+		} else {
+			hcfg.Containers, hcfg.Images = cb, st
+			log.Info("containers available", "image_cache", st.Dir, "image_dir", *ctrImages, "idle", *ctrIdle, "max_life", *ctrMaxLife)
+		}
+	}
 	if pushLn != nil {
 		hcfg.PushListener, hcfg.PushPort = pushLn, *pushPort
 	}
@@ -320,4 +357,15 @@ func splitList(s string) []string {
 		}
 	}
 	return out
+}
+
+// containersUsable: the container backend can boot guests here (helper,
+// kernel with erofs) and the image store can convert images (mkfs.erofs).
+func containersUsable(cb sandbox.ContainerBackend, st *image.Store) error {
+	if u, ok := cb.(interface{ ContainersUsable() error }); ok {
+		if err := u.ContainersUsable(); err != nil {
+			return err
+		}
+	}
+	return st.Check()
 }

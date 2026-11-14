@@ -13,6 +13,7 @@ import (
 
 	"github.com/rosskukulinski/twd/hostd"
 	"github.com/rosskukulinski/twd/hostd/fakemgmt"
+	"github.com/rosskukulinski/twd/hostd/image"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/hostd/sandbox"
 	"github.com/rosskukulinski/twd/internal/procsb"
@@ -44,6 +45,14 @@ type Options struct {
 	HostSockets func() procsb.HostSockets
 	// AllowSiblingEgress is passed to hostd (same-host object hairpins).
 	AllowSiblingEgress bool
+	// Containers, Images and the Container* limits are passed to hostd
+	// (ADR-032 ctx.container).
+	Containers        sandbox.ContainerBackend
+	Images            *image.Store
+	ContainerIdle     time.Duration
+	ContainerGrace    time.Duration
+	ContainerCapacity hostd.ContainerCapacity
+	ContainerQuota    hostd.ContainerQuota
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -112,6 +121,8 @@ func Start(t testing.TB, o Options) *Env {
 		WorkerdBin: wd, HeartbeatEvery: o.HeartbeatEvery, Ephemeral: o.Ephemeral, ControlURL: o.ControlURL,
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
 		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, HostSockets: o.HostSockets, AllowSiblingEgress: o.AllowSiblingEgress,
+		Containers: o.Containers, Images: o.Images, ContainerIdle: o.ContainerIdle, ContainerGrace: o.ContainerGrace,
+		ContainerCapacity: o.ContainerCapacity, ContainerQuota: o.ContainerQuota,
 	})
 	if err != nil {
 		t.Fatal(err)

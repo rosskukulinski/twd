@@ -1,0 +1,18 @@
+{
+  "name": "ctr",
+  "containers": {
+    // what `twd deploy` writes once it has built and pinned ./Dockerfile
+    "Box": { "image": "twd.test/box:1" },
+    "PBox": { "image": "twd.test/box:1" },
+  },
+  "tailnet": {
+    "tags": ["tag:ttest"],
+    "objects": {
+      "Box": { "tags": ["tag:ttest"] },
+      // plain-DO mode
+      "PBox": { "tags": ["tag:ttest"], "egress": "workload" },
+      // no container: ctx.container must be absent
+      "Plain": { "egress": "workload", "node": false },
+    },
+  },
+}
