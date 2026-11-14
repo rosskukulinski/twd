@@ -57,7 +57,19 @@ type GuestConfig struct {
 	// Volume is the block device holding DO storage (ext4, created and
 	// decrypted on the host), mounted at DODir. "" = tmpfs (not persistent).
 	Volume string `json:"volume,omitempty"`
+	// VolumeFormat: Volume is blank and the guest formats it (ext4) before
+	// mounting it. The vz backend (macOS) has no mkfs.ext4 on the host and
+	// decrypts on the host (an encrypted disk image), so the guest formats
+	// plaintext it already sees; under Firecracker the host formats it.
+	VolumeFormat bool `json:"volumeFormat,omitempty"`
+	// Rosetta is the virtiofs tag of a Rosetta for Linux share (vz on Apple
+	// silicon): guestd mounts it read-only at RosettaDir and registers it
+	// with binfmt_misc, so x86_64 ELF binaries run in the arm64 guest.
+	Rosetta string `json:"rosetta,omitempty"`
 }
+
+// RosettaDir is where the Rosetta share is mounted in the guest.
+const RosettaDir = "/run/rosetta"
 
 // Msg is one control-channel message (either direction).
 //
@@ -65,7 +77,9 @@ type GuestConfig struct {
 // "workerd-exit", "log", or "resp" (answer to an op, same ID).
 // host → guest: Op "probe", "stats", "fsscan", "ping", "shutdown" (stop
 // workerd, sync and unmount the volume: the host may then release it),
-// "fsbench" (write+fsync latency on the DO volume).
+// "fsbench" (write+fsync latency on the DO volume), and in debug mode
+// "run" (run Argv from AppDir, return its output and exit code: platform
+// tests such as the Rosetta check, not a tenant exec API).
 type Msg struct {
 	Type string `json:"type,omitempty"`
 	ID   int64  `json:"id,omitempty"`
@@ -89,6 +103,9 @@ type Msg struct {
 	// fsbench: N writes of 4 KiB + fdatasync on DODir
 	N     int    `json:"n,omitempty"`
 	Bench *Bench `json:"bench,omitempty"`
+
+	// run (debug): argv; the answer's Text is stdout+stderr (capped)
+	Argv []string `json:"argv,omitempty"`
 
 	// fsscan: files whose name looks like tailscale state
 	Found   []string `json:"found,omitempty"`

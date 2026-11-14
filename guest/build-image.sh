@@ -10,6 +10,9 @@
 #   - glibc: the shared libraries workerd needs, copied from the base Ubuntu
 #     24.04 rootfs (BASE_ROOTFS, a directory: the Firecracker CI rootfs,
 #     extracted; default ~/fc/rootfs). glibc 2.39 >= workerd's 2.35 floor.
+#   - mke2fs (e2fsprogs) and its libraries, from the same base rootfs: the
+#     macOS (vz) backend has the guest format a new DO volume (the host has
+#     no mkfs.ext4; it decrypts, the guest sees plaintext either way).
 #
 # The image is an ext4 without a journal, every mtime is SOURCE_DATE_EPOCH,
 # owners are 0:0, and the UUID and hash seed are fixed. It is mounted
@@ -47,13 +50,14 @@ mkdir -p "$OUT"
 (cd "$ROOT" && CGO_ENABLED=0 GOOS=linux GOARCH=$(go env GOARCH) GOFLAGS=-mod=mod \
   $GO build -trimpath -buildvcs=false -ldflags "-s -w -buildid=" -o "$STAGE/sbin/twd-guestd" ./guest/twd-guestd)
 
-mkdir -p "$STAGE"/{usr/bin,usr/lib/$LIBDIR,dev,proc,sys,run,tmp,etc}
+mkdir -p "$STAGE"/{usr/bin,usr/sbin,usr/lib/$LIBDIR,dev,proc,sys,run,tmp,etc}
 ln -s usr/lib "$STAGE/lib"
 ln -s usr/bin "$STAGE/bin"
 install -m 0755 "$WORKERD" "$STAGE/usr/bin/workerd"
+install -m 0755 "$BASE_ROOTFS/usr/sbin/mke2fs" "$STAGE/usr/sbin/mke2fs"
 
-# The shared libraries workerd links (glibc only), from the base rootfs.
-for lib in $(readelf -d "$WORKERD" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p') $LDSO; do
+# The shared libraries workerd and mke2fs link, from the base rootfs.
+for lib in $( (readelf -d "$WORKERD"; readelf -d "$STAGE/usr/sbin/mke2fs") | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p' | sort -u) $LDSO; do
   src=$BASE_ROOTFS/usr/lib/$LIBDIR/$lib
   [ -e "$src" ] || { echo "missing $lib in $BASE_ROOTFS" >&2; exit 1; }
   cp -L "$src" "$STAGE/usr/lib/$LIBDIR/$lib"
