@@ -122,7 +122,10 @@ type Config struct {
 	// to mgmt at registration so pushes go to the WhoIs node's address.
 	// The unix push socket (local-dev) is always served too.
 	PushListener net.Listener
-	PushPort     int
+	// ServiceCheckEvery is how often a workload with a Tailscale Service is
+	// health-probed (advertised only while healthy). 0 = 2 s.
+	ServiceCheckEvery time.Duration
+	PushPort          int
 }
 
 // Host is a running twd-hostd.
@@ -259,8 +262,9 @@ func (h *Host) Start(ctx context.Context) error {
 	h.mu.Lock()
 	h.lastHB = time.Now()
 	h.mu.Unlock()
-	h.wg.Add(1)
+	h.wg.Add(2)
 	go h.loop()
+	go h.serviceLoop()
 	return nil
 }
 

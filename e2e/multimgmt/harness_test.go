@@ -325,6 +325,7 @@ type cluster struct {
 	repMu     sync.Mutex       // guards replica process state (chaos runs start/stop concurrently with calls)
 	jsonc     string           // twd.jsonc for setupTenant ("" = twdJSONC)
 	env       map[int][]string // extra environment per replica
+	argsFor   map[int][]string // extra flags per replica (after extraArgs)
 	clients   map[int]*http.Client
 }
 
@@ -383,6 +384,7 @@ func (c *cluster) start(i int) {
 	args := append([]string{"-local-dev", "-socket", rp.sock, "-host-token-file", c.tokenFile, "-state-dir", rp.dir,
 		"-db", viaProxy(c.t, c.dsn, rp.pg.addr()), "-custody", "setec", "-setec-url", c.setec.URL, "-tsapi-url", c.ts.srv.URL, "-reap-interval", "2s",
 		"-no-loopback"}, c.extraArgs...)
+	args = append(args, c.argsFor[i]...)
 	cmd := exec.Command(mgmtBinary(c.t), args...)
 	cmd.Env = append(os.Environ(), c.env[i]...)
 	cmd.Stdout, cmd.Stderr = lf, lf

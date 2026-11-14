@@ -199,6 +199,8 @@ const (
 	ErrorCodePolicyMissingTagOwners  ErrorCode = "policy_missing_tag_owners"
 	ErrorCodePolicyUnavailable       ErrorCode = "policy_unavailable"
 	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
+	ErrorCodeServiceAPIFailed        ErrorCode = "service_api_failed"
+	ErrorCodeServiceConflict         ErrorCode = "service_conflict"
 	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
 	ErrorCodeStoreUnavailable        ErrorCode = "store_unavailable"
 	ErrorCodeSuperseded              ErrorCode = "superseded"
@@ -275,6 +277,10 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodePolicyUnavailable:
 		return true
 	case ErrorCodePreconditionFailed:
+		return true
+	case ErrorCodeServiceAPIFailed:
+		return true
+	case ErrorCodeServiceConflict:
 		return true
 	case ErrorCodeSpawnBudgetExceeded:
 		return true
@@ -573,16 +579,19 @@ type Assignment struct {
 	Epoch        int64   `json:"epoch"`
 
 	// Fence Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s): it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true.
-	Fence        *bool         `json:"fence,omitempty"`
-	Lease        string        `json:"lease"`
-	MaxDepth     *int          `json:"maxDepth,omitempty"`
-	MaxLive      *int          `json:"maxLive,omitempty"`
-	Namespaces   []ClassConfig `json:"namespaces"`
-	Tailnet      string        `json:"tailnet"`
-	TenantID     string        `json:"tenantID"`
-	Tier         *Tier         `json:"tier,omitempty"`
-	Workload     string        `json:"workload"`
-	WorkloadTags *[]string     `json:"workloadTags,omitempty"`
+	Fence      *bool         `json:"fence,omitempty"`
+	Lease      string        `json:"lease"`
+	MaxDepth   *int          `json:"maxDepth,omitempty"`
+	MaxLive    *int          `json:"maxLive,omitempty"`
+	Namespaces []ClassConfig `json:"namespaces"`
+
+	// Service The Tailscale Service the workload entry node advertises while the deployment is active and healthy; the host withdraws it on drain, undeploy, fencing, kill, or failed health checks.
+	Service      *string   `json:"service,omitempty"`
+	Tailnet      string    `json:"tailnet"`
+	TenantID     string    `json:"tenantID"`
+	Tier         *Tier     `json:"tier,omitempty"`
+	Workload     string    `json:"workload"`
+	WorkloadTags *[]string `json:"workloadTags,omitempty"`
 }
 
 // AssignmentPage defines model for AssignmentPage.
@@ -700,9 +709,12 @@ type ChainStatus struct {
 
 // ClassConfig One DO namespace from `twd.jsonc` `tailnet.objects`.
 type ClassConfig struct {
-	Agent *bool    `json:"agent,omitempty"`
-	Class string   `json:"class"`
-	Tags  []string `json:"tags"`
+	Agent *bool  `json:"agent,omitempty"`
+	Class string `json:"class"`
+
+	// Service `_workload` only: the Tailscale Service the workload entry node hosts (`twd.jsonc` `tailnet.service`).
+	Service *string  `json:"service,omitempty"`
+	Tags    []string `json:"tags"`
 
 	// TTL `10m`-style duration or seconds.
 	TTL *string `json:"ttl,omitempty"`
@@ -800,6 +812,9 @@ type Endpoint struct {
 	Node     string  `json:"node"`
 	ObjectID *string `json:"objectID,omitempty"`
 
+	// Service A workload's Tailscale Service: a stable name and VIPs that survive the workload node being re-minted or moving host. Callers need a grant to the `svc:` name; control routes it to the workload node only when policy `autoApprovers.services` lets the workload tags host it.
+	Service *ServiceEndpoint `json:"service,omitempty"`
+
 	// Status `pending` → `minted` → `ready`; terminal: `killed` (tombstone, `410`), `failed`.
 	Status ObjectStatus `json:"status"`
 }
@@ -835,6 +850,8 @@ type Error struct {
 	// | `lease_held` | 409 | another host holds the lease |
 	// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
 	// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+	// | `service_conflict` | 409 | `tailnet.service` names a Service that exists and isn't managed by twd for this tenant and workload |
+	// | `service_api_failed` | 502 | mgmt can't read or create the Service definition (an OAuth client needs Services › Write) |
 	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
@@ -891,6 +908,8 @@ type Error struct {
 // | `lease_held` | 409 | another host holds the lease |
 // | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
 // | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+// | `service_conflict` | 409 | `tailnet.service` names a Service that exists and isn't managed by twd for this tenant and workload |
+// | `service_api_failed` | 502 | mgmt can't read or create the Service definition (an OAuth client needs Services › Write) |
 // | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 // | `already_joined` | 409 | credential for an object that has a node |
 // | `identity_conflict` | 409 | object ID collision across identities |
@@ -1291,6 +1310,15 @@ type PreflightResult struct {
 	MissingTagOwners []string           `json:"missingTagOwners"`
 	Ok               bool               `json:"ok"`
 
+	// Service The Tailscale Service the workload node would host (`tailnet.service`).
+	Service *string `json:"service,omitempty"`
+
+	// ServiceSnippet The `autoApprovers` entry to add (HuJSON).
+	ServiceSnippet *string `json:"serviceSnippet,omitempty"`
+
+	// ServiceUnapproved The policy's `autoApprovers.services` doesn't let the workload tags host `service`: the node would advertise it but control would never route it. `ok` is false.
+	ServiceUnapproved *bool `json:"serviceUnapproved,omitempty"`
+
 	// SrcTags The tags checked (workload + object tags from the bundle).
 	SrcTags          *[]string `json:"srcTags,omitempty"`
 	TagOwnersSnippet *string   `json:"tagOwnersSnippet,omitempty"`
@@ -1315,6 +1343,18 @@ type SelfInfo struct {
 
 	// Transport `tsnet` in normal operation; `local-dev` when the unix socket is serving.
 	Transport *Transport `json:"transport,omitempty"`
+}
+
+// ServiceEndpoint A workload's Tailscale Service: a stable name and VIPs that survive the workload node being re-minted or moving host. Callers need a grant to the `svc:` name; control routes it to the workload node only when policy `autoApprovers.services` lets the workload tags host it.
+type ServiceEndpoint struct {
+	// Addrs The Service VIPs (on create).
+	Addrs *[]string `json:"addrs,omitempty"`
+
+	// MagicDNS Examples: support.tail1234.ts.net
+	MagicDNS string `json:"magicDNS"`
+
+	// Name Examples: svc:support
+	Name string `json:"name"`
 }
 
 // Status defines model for Status.
@@ -1530,6 +1570,8 @@ type TombstoneError struct {
 	// | `lease_held` | 409 | another host holds the lease |
 	// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
 	// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+	// | `service_conflict` | 409 | `tailnet.service` names a Service that exists and isn't managed by twd for this tenant and workload |
+	// | `service_api_failed` | 502 | mgmt can't read or create the Service definition (an OAuth client needs Services › Write) |
 	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |

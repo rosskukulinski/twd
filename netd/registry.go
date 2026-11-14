@@ -13,10 +13,12 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"sync"
 	"time"
 
+	"github.com/rosskukulinski/twd/internal/tssvc"
 	"tailscale.com/client/local"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -224,6 +226,14 @@ type Object struct {
 	upDone   chan struct{}
 	tr       *http.Transport
 	flows    map[*flow]struct{}
+	// svc hosts Tailscale Services on this node (in-process delivery, so
+	// WhoIs sees the real caller); svcLn feeds those flows to svcHTTP (the
+	// same handler as httpSrv; its own server so a withdraw can stop
+	// keep-alives on Service connections only).
+	svc      *tssvc.Host
+	svcLn    *tssvc.ConnListener
+	svcHTTP  *http.Server
+	services []string // Services this node advertises
 }
 
 // ObjectInfo is a snapshot of an object, safe to serialize.
@@ -240,7 +250,9 @@ type ObjectInfo struct {
 	Rejoined  bool     `json:"rejoined"`
 	Reminted  bool     `json:"reminted,omitempty"`
 	JoinMS    float64  `json:"joinMs,omitempty"`
-	Flows     int      `json:"flows"`
+	// Services are the Tailscale Services this node advertises.
+	Services []string `json:"services,omitempty"`
+	Flows    int      `json:"flows"`
 }
 
 // objectMeta is persisted next to the tsnet state so Rejoin can restore it.
@@ -457,6 +469,15 @@ func (o *Object) start(ctx context.Context) error {
 	}
 	o.ln = &trackedListener{Listener: ln, o: o}
 	o.httpSrv, o.tr = hs, tr
+	// Tailscale Services: flows to a Service VIP on the ingress port reach
+	// the same attributed ingress (WhoIs on the real source address).
+	o.svc, o.services = tssvc.NewHost(srv, lc), nil // tsnet.Up cleared any old advertisement
+	o.svcLn = tssvc.NewConnListener(tssvc.Addr{Name: "service:" + o.hostname})
+	o.svc.Route(uint16(r.cfg.IngressPort), o.svcLn.Deliver)
+	svcLn := &trackedListener{Listener: o.svcLn, o: o}
+	o.svcHTTP = &http.Server{Handler: hs.Handler, ReadHeaderTimeout: hs.ReadHeaderTimeout, ErrorLog: hs.ErrorLog}
+	o.svcHTTP.SetKeepAlivesEnabled(false) // until a Service is advertised
+	svcHS := o.svcHTTP
 	o.state = StateReady
 	close(o.ready)
 	o.mu.Unlock()
@@ -469,6 +490,7 @@ func (o *Object) start(ctx context.Context) error {
 	}
 	r.mu.Unlock()
 	go hs.Serve(o.ln)
+	go svcHS.Serve(svcLn)
 	r.log.Info("object ready", "object", o.id, "hostname", o.hostname, "ip", ip4.String(),
 		"node", string(o.nodeID), "join_ms", joinDur.Milliseconds(), "rejoined", rejoin, "reminted", reminted)
 	return nil
@@ -612,10 +634,14 @@ func (o *Object) teardown() {
 		}
 	}
 	o.mu.Lock()
-	srv, hs, tr, ts := o.srv, o.httpSrv, o.tr, o.tombSrv
+	srv, hs, tr, ts, shs := o.srv, o.httpSrv, o.tr, o.tombSrv, o.svcHTTP
+	o.services = nil // a closed node advertises nothing
 	o.mu.Unlock()
 	if hs != nil {
 		hs.Close()
+	}
+	if shs != nil {
+		shs.Close()
 	}
 	if ts != nil {
 		ts.Close()
@@ -707,7 +733,7 @@ func (o *Object) Info() ObjectInfo {
 	defer o.mu.Unlock()
 	in := ObjectInfo{ID: o.id, Hostname: o.hostname, State: o.state, NodeID: string(o.nodeID),
 		DNSName: o.dnsName, Tags: o.tags, Ephemeral: o.ephemeral, Rejoined: o.rejoined, Reminted: o.reminted,
-		JoinMS: float64(o.joinDur.Microseconds()) / 1000, Flows: len(o.flows)}
+		JoinMS: float64(o.joinDur.Microseconds()) / 1000, Flows: len(o.flows), Services: slices.Clone(o.services)}
 	if o.err != nil {
 		in.Error = Redact(o.err.Error())
 	}

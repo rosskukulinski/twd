@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/rosskukulinski/twd/internal/tsapi"
+	"github.com/rosskukulinski/twd/internal/tssvc"
 	"github.com/rosskukulinski/twd/mgmt"
 	"github.com/rosskukulinski/twd/netd"
 	"tailscale.com/ipn"
@@ -62,6 +63,7 @@ func run() error {
 		tsControl    = flag.String("tsnet-control-url", "", "operator tailnet control URL (required with -tsnet-hostname)")
 		tsAuthFile   = flag.String("tsnet-authkey-file", "", "file with the operator-tailnet auth key for the first join (TS_AUTHKEY=…); without it the node state must already be logged in (twd up does the interactive login)")
 		tsTags       = flag.String("tsnet-tags", mgmt.MgmtTag, "comma-separated tags the mgmt node advertises")
+		tsService    = flag.String("tsnet-service", "", "also host this Tailscale Service (e.g. svc:twd-mgmt) on :80, advertised only while this replica's store answers: point every host at http://<label>.<tailnet> and run each replica with its own -tsnet-hostname (e.g. twd-mgmt-1). Policy needs autoApprovers.services for the mgmt tag and grants to the svc: name")
 		tsTLS        = flag.Bool("tsnet-tls", true, "also serve the API on :443 with the node's HTTPS certificate when the tailnet has HTTPS enabled (plain :80 is always served)")
 		admins       = flag.String("admins", "", "comma-separated tailnet logins admitted as admins even without the "+mgmt.AdminCap+" capability (override; the normal path is the cap, granted to "+mgmt.MgmtTag+")")
 		custodyKind  = flag.String("custody", "file", "custody backend: file (AES-GCM in <state-dir>/custody) or setec")
@@ -142,6 +144,17 @@ func run() error {
 	// Operator-tailnet node (optional).
 	var ts *tsnet.Server
 	self := mgmt.SelfInfo{}
+	if *tsService != "" {
+		if *tsHostname == "" {
+			return errors.New("-tsnet-service needs -tsnet-hostname")
+		}
+		if err := tssvc.Validate(*tsService); err != nil {
+			return fmt.Errorf("-tsnet-service: %w", err)
+		}
+		if strings.EqualFold(tssvc.Label(*tsService), *tsHostname) {
+			return fmt.Errorf("-tsnet-service %s has the same MagicDNS name as this replica's node (-tsnet-hostname %s); MagicDNS answers the node first, so name each replica differently (e.g. %s-1)", *tsService, *tsHostname, *tsHostname)
+		}
+	}
 	if *tsHostname != "" {
 		if *tsControl == "" {
 			return errors.New("-tsnet-hostname needs an explicit -tsnet-control-url")
@@ -231,6 +244,7 @@ func run() error {
 		return srv
 	}
 	var servers []*http.Server
+	var gate *mgmt.ServiceGate
 	loopbackPath := filepath.Join(*stateDir, "loopback.json")
 	os.Remove(loopbackPath)
 	if *localDev && *socket != "" {
@@ -276,6 +290,22 @@ func run() error {
 		th := api.TailnetHandler(whois, api.Handler())
 		api.Listeners = append(api.Listeners, "tsnet:80")
 		servers = append(servers, serve("tsnet", ln, th))
+		if *tsService != "" {
+			// The replica VIP (H12): flows to the Service reach the same
+			// WhoIs-authenticated handler (tssvc delivers them in-process,
+			// so WhoIs sees the real caller).
+			sh := tssvc.NewHost(ts, lc)
+			sl := tssvc.NewConnListener(tssvc.Addr{Name: *tsService})
+			sh.Route(80, sl.Deliver)
+			api.Listeners = append(api.Listeners, "service:"+*tsService)
+			ssrv := serve("service", sl, th)
+			ssrv.SetKeepAlivesEnabled(false) // until advertised
+			servers = append(servers, ssrv)
+			gate = &mgmt.ServiceGate{Adv: sh, Name: *tsService, Ports: []uint16{80}, Log: log,
+				Check:    func(ctx context.Context) error { _, err := m.Status(ctx); return err },
+				OnChange: ssrv.SetKeepAlivesEnabled}
+			go gate.Run(ctx)
+		}
 		if !*noLoopback {
 			// The operator console: the twd CLI on this machine dials mgmt's
 			// own tailnet IP through the node's SOCKS5 loopback proxy, so
@@ -370,6 +400,13 @@ func run() error {
 	}
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if gate != nil {
+		// Withdraw before closing listeners: control stops routing callers
+		// to this replica while its in-flight requests finish.
+		if err := gate.Close(sctx); err != nil {
+			log.Warn("service withdraw on shutdown failed", "service", gate.Name, "err", err)
+		}
+	}
 	for _, s := range servers {
 		s.Shutdown(sctx)
 	}

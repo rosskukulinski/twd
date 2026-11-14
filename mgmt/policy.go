@@ -19,6 +19,11 @@ import (
 type Policy struct {
 	TagOwners map[string][]string `json:"tagOwners"`
 	Grants    []Grant             `json:"grants"`
+	// AutoApprovers.Services: Service name → tags/users that may host it
+	// without an admin approving each node.
+	AutoApprovers struct {
+		Services map[string][]string `json:"services"`
+	} `json:"autoApprovers"`
 }
 
 // Grant is one policy grant.

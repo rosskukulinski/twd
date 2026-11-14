@@ -28,6 +28,9 @@ type TwdConfig struct {
 	Tailnet struct {
 		// Tags are the workload entry node's tags (the "_workload" namespace).
 		Tags []string `json:"tags"`
+		// Service: true ("svc:<workload>"), or a Service name the workload
+		// entry node hosts (Tailscale Services); see ServiceName.
+		Service json.RawMessage `json:"service"`
 		// Connects are declared dependencies (tags or names), preflighted by twd deploy.
 		Connects []string `json:"connects"`
 		Objects  map[string]struct {

@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-svc e2e-mm-svc e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
 
 all: build
 
@@ -104,6 +104,24 @@ e2e-linux-reboot:
 	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
 		echo "e2e-linux-reboot: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
 	TWD_E2E_RUN=TestE2ELinuxReboot TS_CREDS="$(TS_CREDS)" TAILNET1="$(TAILNET1)" sh scripts/e2e-linux-vm.sh $(LINUX_VM)
+
+## e2e-svc: Tailscale Services on tailnet 1 (docs/services.md): the tssvc mechanism, then a workload with
+## tailnet.service via the twd CLI (deploy → VIP with caller identity → redeploy → kill → down).
+e2e-svc: deps
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
+		echo "e2e-svc: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2ereal -count=1 -v -run TestRealService ./internal/tssvc/ && \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags e2esvc -count=1 -v -timeout 20m ./e2e/svc/...
+
+## e2e-mm-svc: H12 on tailnet 1: two twd-mgmt replicas hosting svc:ttest-mgmt. Needs TWD_MM_PG_DSN: a
+## Postgres of its own (never the multimgmt suite's twd-mm-pg container, which other runs may be using).
+e2e-mm-svc:
+	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ] || [ -z "$$TWD_MM_PG_DSN" ]; then \
+		echo "e2e-mm-svc: SKIPPED (needs $(TS_CREDS)/tailnet1_api.env and TWD_MM_PG_DSN)"; exit 0; fi; \
+	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
+		$(GO) test -tags 'e2emultimgmt e2ereal' -run TestRealMgmtService -count=1 -v -timeout 20m ./e2e/multimgmt/
 
 ## e2e-mac: E2E-MAC via the twd CLI on tailnet 1 (twd up → deploy agent+mcp → checks a–f → twd down → zero leftovers).
 e2e-mac: deps
@@ -225,6 +243,9 @@ lint: api-check
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
+	$(GO) vet -tags e2esvc ./e2e/svc/...
+	$(GO) vet -tags 'e2emultimgmt e2ereal' ./e2e/multimgmt/...
+	$(GO) vet -tags e2ereal ./internal/tssvc/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...
 	$(GO) vet -tags e2ekeyless ./e2e/keyless/...
 	$(GO) vet -tags e2eoauth ./e2e/oauth/...

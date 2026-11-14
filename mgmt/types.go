@@ -96,6 +96,9 @@ type ClassConfig struct {
 	Tags  []string `json:"tags"`
 	Agent bool     `json:"agent,omitempty"`
 	TTL   string   `json:"ttl,omitempty"`
+	// Service (the _workload namespace only) is the Tailscale Service the
+	// workload entry node hosts (twd.jsonc tailnet.service).
+	Service string `json:"service,omitempty"`
 }
 
 // Deployment is one deploy of a workload.
