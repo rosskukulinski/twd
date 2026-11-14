@@ -42,6 +42,7 @@ type session struct {
 	stopOnce sync.Once
 	cleaned  sync.Once
 	stopped  bool
+	quota    int // the cpu.max quota (per 100 ms) the VM runs under
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -220,6 +221,7 @@ func (s *Server) start(c *net.UnixConn, uid int, req *helperapi.StartRequest, fd
 		quota = req.CPUQuotaUS // a fractional vCPU (ADR-032 D5: lite = 1/16)
 	}
 	cpuMax := fmt.Sprintf("%d 100000", quota)
+	sess.quota = quota
 	args := []string{"--id", sess.id, "--exec-file", s.cfg.Firecracker, "--uid", fmt.Sprint(sess.jailID), "--gid", fmt.Sprint(sess.jailID),
 		"--chroot-base-dir", s.cfg.JailBase, "--netns", "/var/run/netns/" + sess.id,
 		"--cgroup-version", "2", "--parent-cgroup", s.cgroup,
@@ -455,4 +457,18 @@ func (sess *session) memdump() (int, error) {
 		return -1, err
 	}
 	return unix.Open(filepath.Join(sess.chroot, "mem"), unix.O_RDONLY|unix.O_CLOEXEC, 0)
+}
+
+// lowerCPU lowers the VM's cpu.max quota (never raises it: a client can
+// only take CPU away from its own VM).
+func (sess *session) lowerCPU(quota int) (string, error) {
+	if quota < 1000 || quota > sess.quota {
+		return "", herr(helperapi.CodeBadRequest, "cpu quota %d outside [1000, %d]", quota, sess.quota)
+	}
+	v := fmt.Sprintf("%d 100000", quota)
+	if err := os.WriteFile(filepath.Join("/sys/fs/cgroup", sess.cgroup, "cpu.max"), []byte(v), 0o644); err != nil {
+		return "", err
+	}
+	sess.quota = quota
+	return v, nil
 }

@@ -295,6 +295,18 @@ func (s *Server) serveConn(c *net.UnixConn) {
 			}
 			helperapi.WriteResponse(c, helperapi.Response{Re: "memdump", OK: true}, fd)
 			unix.Close(fd)
+		case "cpu":
+			closeAll(fds)
+			if vm == nil {
+				helperapi.WriteResponse(c, helperapi.Response{Re: "cpu", Code: helperapi.CodeBadRequest, Error: "no VM"})
+				continue
+			}
+			cpuMax, err := vm.lowerCPU(req.CPUQuotaUS)
+			if err != nil {
+				helperapi.WriteResponse(c, errResp("cpu", err))
+				continue
+			}
+			helperapi.WriteResponse(c, helperapi.Response{Re: "cpu", OK: true, Jail: &helperapi.Jail{CPUMax: cpuMax}})
 		default:
 			closeAll(fds)
 			helperapi.WriteResponse(c, helperapi.Response{Re: req.Op, Code: helperapi.CodeBadRequest, Error: "unknown op " + req.Op})

@@ -54,8 +54,12 @@ const (
 
 // Request is one client → helper message.
 type Request struct {
-	Op    string        `json:"op"` // ping | start | kill | memdump
+	Op    string        `json:"op"` // ping | start | kill | memdump | cpu
 	Start *StartRequest `json:"start,omitempty"`
+	// CPUQuotaUS (op "cpu", FeatureContainer): lower the running VM's
+	// cpu.max quota per 100 ms period. A container guest boots at its
+	// whole vCPUs and is then capped to its fraction (ADR-032 D5).
+	CPUQuotaUS int `json:"cpuQuotaUs,omitempty"`
 }
 
 // FeatureContainer: the helper boots container guests (StartRequest.Image,

@@ -60,7 +60,7 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 	}
 	req := &helperapi.StartRequest{Name: s.ID, MemMiB: s.MemMiB, VCPUs: s.VCPUs, HugePages: b.cfg.HugePages,
 		BootArgs: b.cfg.BootArgs, MTU: b.cfg.MTU, GuestMAC: guestMAC, GuestCID: 3, VsockPort: proto.VsockPort,
-		Image: true, ScratchMiB: s.ScratchMiB, CPUQuotaUS: quota, Pids: pids + 64}
+		Image: true, ScratchMiB: s.ScratchMiB, Pids: pids + 64}
 	kernel := b.cfg.ContainerKernel
 	if kernel == "" {
 		kernel = b.cfg.Kernel
@@ -86,6 +86,20 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 	m, err := b.launch(ctx, l)
 	if err != nil {
 		return nil, err
+	}
+	// The guest boots on its whole vCPUs (a 1/16 vCPU kernel boot takes
+	// seconds) and is capped to its fraction once the entrypoint runs. If
+	// the cap can't be applied, the VM doesn't run uncapped.
+	if quota > 0 {
+		resp, _, err := m.conn.Do(helperapi.Request{Op: "cpu", CPUQuotaUS: quota}, nil, 10*time.Second)
+		if err != nil {
+			c := &ctrVM{m: m, s: cs}
+			c.Stop(0)
+			return nil, fmt.Errorf("cap the container's CPU: %w", err)
+		}
+		if m.info.Jail != nil && resp.Jail != nil {
+			m.info.Jail.CPUMax = resp.Jail.CPUMax
+		}
 	}
 	return &ctrVM{m: m, s: cs}, nil
 }
