@@ -42,12 +42,80 @@ DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
 `getTcpPort(p).fetch()` dials the guest's TCP port `p` through the VM's
 existing userspace network stack (gVisor, `vnet.dialGuest`), exactly how
 hostd reaches a DO guest's workerd. It needs no guest-side forwarder and no
-new listener on the host; the stack has **no handlers** for a container
-VM, so every flow the guest starts (gateway platform ports, the host, the
-internet) is refused: deny-all egress until the phase-B egress proxy. A
+new listener on the host. Nothing else can reach a container port: the
+container has no tailnet node and no address outside its own VM's stack,
+so only its parent object (through hostd, attested) gets in. A
 server must listen on `0.0.0.0` (as on Cloudflare). Not listening →
 Cloudflare's error string `the container is not listening`, which
 `@cloudflare/containers` relies on.
+
+## Egress: the sandbox egress proxy (ADR-032 D4)
+
+A container guest's NIC ends at a per-run proxy in hostd's process
+(`netd/sbxnet`), not at any tsnet server: it has no tailnet identity, no
+egress MAC key, and none of the gateway services a DO guest gets (attributed
+egress, workload egress, host API). The guest's `resolv.conf` names the
+gateway; that is the only DNS server it has.
+
+- **Deny-all by default.** DNS answers only names the container may reach;
+  each gets a synthetic address from `198.18.0.0/15`, so the proxy knows the
+  name of every flow without trusting a `Host` header or SNI. Every other
+  name is NXDOMAIN and every other TCP flow is reset before its handshake
+  completes. UDP (other than DNS), ICMP and IPv6 aren't served.
+- **`interceptOutboundHttp(addr, fetcher)` / `interceptAllOutboundHttp` /
+  `interceptOutboundHttps`.** `addr` is a host, `host:port`, an IP,
+  `ip:port`, or `*.suffix` (no port: any port); at most **128** per
+  container (Cloudflare's limit; re-registering a key replaces it). A
+  matching request is delivered to the **parent object**: hostd sends it
+  through the workload's current instance to the platform wrapper
+  (`cf.twd.kind = "intercept"`, which only hostd can set), which calls the
+  object's `__twd_intercept`; the polyfill runs it through the handler
+  registered under that key. So whatever the handler fetches leaves with the
+  object's own identity, egress policy and `lim` (facet mode: the object's
+  node; plain-DO mode: the workload node). The request URL is what the
+  container connected to; its `x-twd*`/`twd-*`/`cf-*` headers are dropped;
+  the rest is untrusted input. Handlers live in the object's memory: one
+  registered before the object restarted answers `502
+  intercept_unavailable` until it is registered again
+  (`@cloudflare/containers` re-registers on wake).
+- **HTTPS interception** terminates TLS with a **per-container ephemeral
+  CA** (ECDSA P-256, made at `start()`, valid for the run plus margin).
+  Its key stays in hostd's memory and is dropped with the run; only the
+  certificate enters the guest, at
+  `/etc/cloudflare/certs/cloudflare-containers-ca.crt` (Cloudflare's path)
+  and appended to the image's trust bundles where they exist
+  (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+  `/etc/ssl/cert.pem`, resolved inside the container root). Another
+  container's CA does not verify it, and a client that doesn't trust it sees
+  the interception. `interceptAllOutboundHttp` is HTTP only; TLS to a host
+  with no HTTPS intercept is never terminated.
+- **`enableInternet: true`** reaches only hosts on the workload's
+  `tailnet.egress.internet` allowlist (names, `*.suffix`, IPs or CIDRs),
+  spliced as raw TCP (TLS stays end to end). The name is resolved on the
+  host and refused if **any** address is forbidden (ADR-019: loopback,
+  private and link-local/metadata ranges, `100.64/10` and the tailnet IPv6
+  range, NAT64/6to4/Teredo, the synthetic pool, the host's own addresses).
+  Every first flow per destination is audited `egress` with `actingFor:
+  "sandbox-of <object>"`; refusals are audited `deny` (the first 32 per run)
+  and listed in `twd-hostd`'s `ContainerStatus.Refused`. twd has no tenant
+  exit-node or gateway path yet (RFC §4.8), so the path is the host's own
+  network (`twd-hostd -container-internet=direct`, the default) or none
+  (`off`).
+- **Preview URLs** (`exposePort`, `proxyToSandbox`) need public ingress
+  (ADR-029): on a container class `exposePort()` throws `not_supported`,
+  and a Sandbox SDK preview-proxy request (`x-sandbox-preview-proxy`) gets
+  `501 not_supported`.
+
+## No keys in a sandbox
+
+`twd host vmcheck <workload> --container <Class>/<name>` scans the running
+container guest's disks (config drive, image, scratch when readable), its
+files and a full RAM dump for: `tskey-`, every node/machine private key on
+the host, the parent's egress MAC keys (instance root and the object's
+derived key), every volume key (DEK) of the tenant's workloads on the host,
+the host's own key/token/credential files, and the run's HTTPS-intercept CA
+private key. Each needle kind must exist on the host (positive control),
+and a per-run canary held in guestd's memory must be found in the dump.
 
 ## Lifecycle
 
@@ -80,9 +148,9 @@ trust domain), never a facet object's and never another workload's.
 ## Not in v1 (ADR-032 deferred)
 
 `getTcpPort().connect()`, WebSocket upgrades to container ports,
-`snapshotContainer`, directory snapshots, preview URLs (`exposePort`), egress
-enforcement (`enableInternet`, `intercept*` are recorded; the guest has no
-egress at all), the registry pull (images come from `image.DirSource`).
+`snapshotContainer`, directory snapshots, preview URLs (`exposePort`,
+`not_supported`), the registry pull (images come from `image.DirSource`), a
+tenant exit-node or gateway path for `enableInternet`.
 
 A host advertises the `containers` tier (and mgmt places container bundles
 on it) only when containers can actually run there: a microVM backend whose
