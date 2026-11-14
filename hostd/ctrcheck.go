@@ -177,7 +177,16 @@ func (h *Host) ContainerCheck(ctx context.Context, tenantID, wlName, class, obje
 	st := time.Now()
 	mem, err := sc.MemoryDump(ctx, dir)
 	if err != nil {
-		return nil, fmt.Errorf("memory dump: %w", err)
+		// vz: Virtualization.framework refuses to save these VMs' state
+		// (as for DO guests). The disk and file scans stand; the report
+		// says RAM was not scanned, and its positive control fails, so
+		// `twd host vmcheck --container` still exits keys_in_guest.
+		ks.Control = "FAILED: guest RAM not scanned: " + err.Error()
+		if ks.Found == nil {
+			ks.Found = []string{}
+		}
+		sort.Strings(ks.Found)
+		return &ContainerCheckReport{Workload: wlName, Class: class, Object: object, PID: vm.Info().PID, RSSKB: vm.RSSKB(), KeyScan: ks}, nil
 	}
 	ks.MemdumpMS = time.Since(st).Milliseconds()
 	if fi, err := os.Stat(mem); err == nil {

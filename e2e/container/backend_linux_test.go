@@ -12,6 +12,10 @@ import (
 	"github.com/rosskukulinski/twd/hostd/vm"
 )
 
+// memoryDumpRequired: the strict keyscan must cover guest RAM (Firecracker
+// snapshots it).
+const memoryDumpRequired = true
+
 // newBackend is Firecracker: one jailed VM per container.
 func newBackend(t *testing.T) (sandbox.ContainerBackend, []string) {
 	t.Helper()

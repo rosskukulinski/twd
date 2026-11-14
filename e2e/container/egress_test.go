@@ -217,6 +217,10 @@ func testEgress(t *testing.T, ev *egressEnv, set func(string, any)) {
 		if len(k.Found) != 0 || len(k.GuestStateF) != 0 {
 			t.Fatalf("key material in the container guest: %v %v", k.Found, k.GuestStateF)
 		}
+		if !memoryDumpRequired && strings.Contains(k.Control, "guest RAM not scanned") {
+			t.Logf("%d needles: none in %d guest files or %d disks; guest RAM NOT scanned on this backend: %s", k.Needles, k.GuestFiles, len(k.Disks), k.Control)
+			return
+		}
 		if !strings.HasPrefix(k.Control, "guest canary found") || k.MemoryMiB < 128 {
 			t.Fatalf("positive control: %s (%d MiB)", k.Control, k.MemoryMiB)
 		}

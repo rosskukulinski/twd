@@ -14,6 +14,11 @@ import (
 	"github.com/rosskukulinski/twd/hostd/vm"
 )
 
+// memoryDumpRequired: Virtualization.framework refuses to save a VM's
+// state (DO guests too, e2e/vm), so on vz the strict keyscan covers the
+// disks and the guest's files, not its RAM.
+const memoryDumpRequired = false
+
 // newBackend is vz (Virtualization.framework, no sudo): one twd-vz VMM
 // per container. TWD_VM_ROSETTA shares Rosetta for Linux into the guests,
 // and then TWD_CTR_IMAGES is the stock amd64 set.
