@@ -18,6 +18,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+
+	"github.com/rosskukulinski/twd/hostd/sandbox"
 )
 
 // dgramPair returns a connected AF_UNIX SOCK_DGRAM pair sized for an
@@ -39,13 +41,14 @@ func dgramPair() (host, vmm *os.File, err error) {
 
 // newDgramVnet builds the host stack on a datagram socket whose every
 // datagram is one ethernet frame (f is the host end of dgramPair; it is
-// owned by the vnet from here on and closed with it).
-func newDgramVnet(f *os.File, mtu uint32, gwMAC net.HardwareAddr, gw, guest netip.Addr, prefix int, handlers map[uint16]http.Handler) (*vnet, error) {
+// owned by the vnet from here on and closed with it). gnet is a container
+// guest's sandbox egress proxy (nil: none, as for a DO guest).
+func newDgramVnet(f *os.File, mtu uint32, gwMAC net.HardwareAddr, gw, guest netip.Addr, prefix int, handlers map[uint16]http.Handler, gnet sandbox.ContainerNet) (*vnet, error) {
 	ep, closeLink, err := newDgramLink(f, mtu, gwMAC)
 	if err != nil {
 		return nil, err
 	}
-	v, err := newVnetOn(ep, gw, guest, prefix, handlers, nil, closeLink)
+	v, err := newVnetOn(ep, gw, guest, prefix, handlers, gnet, closeLink)
 	if err != nil {
 		closeLink()
 		return nil, err

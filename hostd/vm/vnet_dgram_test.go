@@ -41,7 +41,7 @@ func fakeGuest(t *testing.T) (*vnet, *stack.Stack, map[uint16]*atomic.Int64) {
 			fmt.Fprintf(w, "gateway:%d %s", port, r.URL.Path)
 		})
 	}
-	v, err := newDgramVnet(hostF, 1500, gwMAC, gatewayIP, guestIP, proto.PrefixLen, handlers)
+	v, err := newDgramVnet(hostF, 1500, gwMAC, gatewayIP, guestIP, proto.PrefixLen, handlers, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

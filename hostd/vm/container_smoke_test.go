@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux || darwin
 
 package vm
 
@@ -6,12 +6,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -58,28 +62,40 @@ func runExec(t *testing.T, c sandbox.Container, es sandbox.ExecSpec, stdin strin
 	return execResult{ob.String(), eb.String(), code}
 }
 
-// TestContainerSmoke boots a container guest from a real image (needs
-// root, KVM, TWD_VM_CONTAINER_KERNEL (erofs), TWD_VM_ROOTFS and
-// TWD_CTR_IMAGES, a dir from guest/images/build-sandbox-images.sh) and
-// checks what a hostile tenant inside it can and can't do.
-func TestContainerSmoke(t *testing.T) {
-	kernel, rootfs, imgs := os.Getenv("TWD_VM_CONTAINER_KERNEL"), os.Getenv("TWD_VM_ROOTFS"), os.Getenv("TWD_CTR_IMAGES")
-	if kernel == "" || rootfs == "" || imgs == "" {
-		t.Skip("TWD_VM_CONTAINER_KERNEL / TWD_VM_ROOTFS / TWD_CTR_IMAGES not set")
-	}
-	b, err := New(Config{Kernel: kernel, ContainerKernel: kernel, Rootfs: rootfs, HugePages: os.Getenv("TWD_VM_HUGEPAGES"), Helper: os.Getenv("TWD_VM_HELPER")})
+// checkCPUShare: the busy loop's CPU share must show the fractional cap
+// where the guest's own clock can see it (vz: cpu.max on the guest
+// cgroup). Under Firecracker the cap throttles the VMM, which the guest
+// may count as its own CPU time, so there it is only logged.
+func checkCPUShare(t *testing.T, s string) {
+	t.Helper()
+	f, err := strconv.ParseFloat(s, 64)
 	if err != nil {
-		t.Skip(err)
+		t.Fatalf("busy loop: %q", s)
 	}
-	defer b.Close()
-	st := &image.Store{Dir: filepath.Join(t.TempDir(), "cache"), Sources: []image.Source{image.DirSource{Dir: imgs}}}
+	if guestSeesCPUCap && f > 0.5 {
+		t.Fatalf("a basic (1/4 vCPU) container used %.2f of a CPU", f)
+	}
+}
+
+// TestContainerSmoke boots a container guest from a real image on this
+// OS's backend (Linux: root, KVM, TWD_VM_CONTAINER_KERNEL (erofs),
+// TWD_VM_ROOTFS; macOS: vz, see ctrSmokeBackend) and TWD_CTR_IMAGES (a dir
+// from guest/images/build-sandbox-images.sh for the arch the backend runs),
+// and checks what a hostile tenant inside it can and can't do.
+func TestContainerSmoke(t *testing.T) {
+	imgs := os.Getenv("TWD_CTR_IMAGES")
+	if imgs == "" {
+		t.Skip("TWD_CTR_IMAGES not set")
+	}
+	b, emulated := ctrSmokeBackend(t)
+	st := &image.Store{Dir: filepath.Join(t.TempDir(), "cache"), Sources: []image.Source{image.DirSource{Dir: imgs}}, Emulated: emulated}
 	ctx := context.Background()
 	t0 := time.Now()
 	img, err := st.Get(ctx, "smoke", "twd.local/debian-trixie-python:1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("image %s %s %d MiB, convert %v", img.Ref, img.Digest, img.SizeB>>20, time.Since(t0))
+	t.Logf("image %s %s (linux/%s) %d MiB, convert %v", img.Ref, img.Digest, img.Config.Architecture, img.SizeB>>20, time.Since(t0))
 	argv, env, err := sandbox.ContainerProcess(img.Config.Config.Entrypoint, img.Config.Config.Cmd, img.Config.Config.Env, nil, map[string]string{"TWD_TEST": "1"})
 	if err != nil {
 		t.Fatal(err)
@@ -94,11 +110,24 @@ func TestContainerSmoke(t *testing.T) {
 	}
 	defer c.Stop(0)
 	t.Logf("boot → ready %v; info %+v; rss %d kB", time.Since(t1), c.Info(), c.RSSKB())
-	if j := c.Info().Jail; j == nil || j.UID < 1000 || !strings.HasPrefix(j.CPUMax, "25000 ") {
-		t.Fatalf("jail/cpu.max: %+v", j)
-	}
+	checkCtrConfinement(t, c.Info(), "25000 ") // basic: 1/4 vCPU
 
-	r := runExec(t, c, sandbox.ExecSpec{Argv: []string{"python3", "-c", "print(2 + 2)"}}, "")
+	// The fractional vCPU holds: a busy loop gets about a quarter of one
+	// CPU (no more than half) over a second of wall time.
+	r := runExec(t, c, sandbox.ExecSpec{Argv: []string{"python3", "-c", `
+import time
+w=time.monotonic(); c=time.process_time()
+while time.monotonic()-w < 1.5: pass
+print(round((time.process_time()-c)/(time.monotonic()-w), 3))
+`}}, "")
+	t.Logf("busy loop CPU share (basic, cpu.max 1/4): %s", strings.TrimSpace(r.out))
+	checkCPUShare(t, strings.TrimSpace(r.out))
+
+	// The guest image's arch, as the container sees it (x86_64 under Rosetta).
+	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "uname -m; python3 -c 'import platform; print(platform.machine())'"}}, "")
+	t.Logf("uname -m / python platform.machine() in the container: %q", r.out)
+
+	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"python3", "-c", "print(2 + 2)"}}, "")
 	if r.out != "4\n" || r.code != 0 {
 		t.Fatalf("python: %+v", r)
 	}
@@ -147,6 +176,45 @@ for a in [("192.168.72.1",3128),("192.168.72.1",3130),("192.168.72.1",22),("10.0
 		t.Fatalf("egress allowed:\n%s", r.out)
 	}
 	t.Logf("egress probes:\n%s", r.out)
+	// Nor the host itself: a canary listening on every host address gets
+	// no connection from the guest, by IP or by name (there is no DNS).
+	canary, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer canary.Close()
+	var hits atomic.Int32
+	go func() {
+		for {
+			cn, err := canary.Accept()
+			if err != nil {
+				return
+			}
+			hits.Add(1)
+			cn.Close()
+		}
+	}()
+	port := canary.Addr().(*net.TCPAddr).Port
+	targets := []string{fmt.Sprintf(`("127.0.0.1",%d)`, port), fmt.Sprintf(`("localhost",%d)`, port), `("example.com",443)`}
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ip, ok := a.(*net.IPNet); ok && ip.IP.To4() != nil && !ip.IP.IsLoopback() {
+			targets = append(targets, fmt.Sprintf(`(%q,%d)`, ip.IP.String(), port))
+		}
+	}
+	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"python3", "-c", `
+import socket
+for a in [` + strings.Join(targets, ",") + `]:
+    s=socket.socket(); s.settimeout(2)
+    try:
+        s.connect(a); print("CONNECTED", a)
+    except Exception as e:
+        print("refused", a, type(e).__name__)
+`}}, "")
+	t.Logf("host canary probes (%d host addresses):\n%s", len(targets)-3, r.out)
+	if strings.Contains(r.out, "CONNECTED") || hits.Load() != 0 {
+		t.Fatalf("the guest reached the host (canary hits %d):\n%s", hits.Load(), r.out)
+	}
 	// pids.max: a process storm stops at the cgroup limit.
 	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "for i in $(seq 1 200); do sleep 3 & done; echo all-200-started"}}, "")
 	t.Logf("pids storm (pids.max 64): %q %q code %d", r.out, r.err, r.code)

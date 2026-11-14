@@ -128,8 +128,8 @@ func run(cfg *vzapi.Config, c *ctl, ctlConn net.Conn) error {
 	}
 	go relayVsock(ln, vsockOut.(*net.UnixConn))
 	st := vzapi.Ctl{Event: "started", PID: os.Getpid(), StartMS: time.Since(t0).Milliseconds()}
-	if n := len(cfg.Disks); n > 0 {
-		st.ServicePID = vmServicePID(cfg.Disks[n-1].Path) // the config drive: this VM's alone
+	if len(cfg.Disks) > vzapi.ConfigDisk {
+		st.ServicePID = vmServicePID(cfg.Disks[vzapi.ConfigDisk].Path) // the config drive: this VM's alone
 	}
 	if cfg.Rosetta {
 		st.Rosetta = rosettaState()

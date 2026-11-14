@@ -1,4 +1,4 @@
-//go:build e2econtainer && linux
+//go:build e2econtainer && (linux || darwin)
 
 package container
 

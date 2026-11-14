@@ -107,6 +107,13 @@ type ContainerConfig struct {
 	// Canary is held in guestd's memory as the no-keys scan's positive
 	// control (it is not a secret).
 	Canary string `json:"canary,omitempty"`
+	// ScratchFormat: Scratch is a blank device the guest formats itself
+	// (vz: macOS has no mkfs.ext4; Firecracker's helper makes it instead).
+	ScratchFormat bool `json:"scratchFormat,omitempty"`
+	// CPUQuotaUS, if > 0, is cpu.max (µs per 100 ms) of the guest's
+	// container cgroup: the fractional-vCPU cap where the host can't cap
+	// the VMM itself (vz). Firecracker caps the VMM's cgroup instead.
+	CPUQuotaUS int `json:"cpuQuotaUs,omitempty"`
 }
 
 // CACertPath is where a container finds its HTTPS-intercept CA certificate

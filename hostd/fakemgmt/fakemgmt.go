@@ -156,7 +156,7 @@ type deployment struct {
 	epoch      int64
 	superseded bool
 	created    time.Time
-	fence      bool // stateful (ADR-028 §3): mgmt.BundleStateful
+	fence      bool              // stateful (ADR-028 §3): mgmt.BundleStateful
 	containers []container.Class // pinned (RegistryDir)
 }
 

@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container test-images e2e-container-build e2e-container-registry
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container test-images e2e-container-build e2e-container-registry e2e-vz-container
 
 all: build
 
@@ -176,6 +176,22 @@ e2e-vz: deps build vz-assets
 		$(GO) test -count=1 -v -run 'TestVZ|TestDgram' ./hostd/vm
 	cd e2e/vm && $(VZ_ENV) $(GO) test -tags e2evm -count=1 -v -timeout 15m .
 
+## e2e-vz-container: ADR-032 acceptance on this Mac (vz; no sudo; needs mkfs.erofs:
+## brew install erofs-utils): TestContainerSmoke, then E2E-CONTAINER. VZ_ROSETTA=1 (the
+## default when Rosetta for Linux is installed) runs the STOCK linux/amd64 images under Rosetta,
+## built with PLATFORM=linux/amd64 guest/images/build-sandbox-images.sh into CTR_IMAGES_AMD64;
+## VZ_ROSETTA=0 runs the arm64 set (CTR_IMAGES) through the alias map.
+CTR_IMAGES_AMD64 ?= $(CURDIR)/guest/out/images-amd64
+VZ_ROSETTA ?= $(shell bin/twd-vz -check $(VZ_ASSETS)/vmlinux 2>/dev/null | grep -q rosetta=installed && echo 1 || echo 0)
+VZ_CTR_IMAGES = $(if $(filter 1,$(VZ_ROSETTA)),$(CTR_IMAGES_AMD64),$(CTR_IMAGES))
+VZ_CTR_ENV = $(VZ_ENV) TWD_VM_ROSETTA=$(filter 1,$(VZ_ROSETTA)) TWD_CTR_IMAGES="$(VZ_CTR_IMAGES)" TWD_CTR_APPS="$(CTR_APPS)"
+e2e-vz-container: deps build vz-assets
+	@[ "$$(uname -s)" = Darwin ] || { echo "e2e-vz-container: macOS only"; exit 1; }
+	@[ -f "$(VZ_CTR_IMAGES)/images.json" ] || { echo "e2e-vz-container: no $(VZ_CTR_IMAGES)/images.json (guest/images/build-sandbox-images.sh; PLATFORM=linux/amd64 for Rosetta)"; exit 1; }
+	@[ -f "$(CTR_APPS)/unmodified.txt" ] || scripts/e2e-container-prep.sh $(CTR_APPS)
+	$(VZ_CTR_ENV) $(GO) test -count=1 -v -run 'TestContainerSmoke|TestVZContainer' ./hostd/vm
+	cd e2e/container && $(VZ_CTR_ENV) $(GO) test -tags e2econtainer -count=1 -v -timeout 20m .
+
 ## e2e-linux-vm: L3 E2E from the installed release on a FRESH nested-virt Lima VM
 ## (twdl-kvm-u24; created if missing, stopped at the end): the linux-arm64 release with the
 ## microVM assets is built in Lima twd-dev, copied in with limactl copy, then install.sh ->
@@ -329,6 +345,7 @@ lint: api-check
 	GOOS=linux $(GO) vet -tags e2econtainer ./e2e/container/...
 	$(GO) vet -tags e2eimages ./e2e/container/...
 	GOOS=darwin $(GO) vet -tags e2evm ./e2e/vm/...
+	GOOS=darwin $(GO) vet -tags e2econtainer ./e2e/container/...
 	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -190,18 +191,75 @@ type Machine struct {
 	exitErr error
 	disks   []string
 	cleanup sync.Once
+
+	ctr *ctrState // container guests only
 }
 
 // Boot implements sandbox.Backend.
-func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err error) {
+func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (sandbox.VM, error) {
+	m, err := b.launch(ctx, vzLaunch{name: s.ID, log: s.Log, cpus: b.cfg.VCPUs, memMiB: b.cfg.MemMiB, handlers: s.Handlers,
+		prepare: func(m *Machine, drive string) ([]vzapi.Disk, error) {
+			// The DO volume: attached (decrypted) on the host first, so the
+			// guest is told whether to format it.
+			if v := s.Volume; v != nil {
+				var err error
+				m.vol, err = attachVolume(v)
+				if err != nil {
+					return nil, fmt.Errorf("volume %s: %w", v.Name, err)
+				}
+				m.info.Volume = v.Name
+				m.info.VolumeNew = m.vol.format
+				m.info.VolumeAttachMS = m.vol.attachMS
+			}
+			// Config drive: the instance dir + guest.json, as a raw tar.
+			if err := writeConfigDrive(drive, s, b.cfg.MTU, func(gc *proto.GuestConfig) {
+				gc.VolumeFormat = m.vol != nil && m.vol.format
+				if b.cfg.Rosetta {
+					gc.Rosetta = vzapi.RosettaTag
+				}
+			}); err != nil {
+				return nil, fmt.Errorf("config drive: %w", err)
+			}
+			return nil, nil
+		}})
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// vzLaunch is what differs between a DO guest (Boot) and a container
+// guest (BootContainer).
+type vzLaunch struct {
+	name         string
+	log          *slog.Logger
+	cpus, memMiB int
+	handlers     map[uint16]http.Handler // the guest's host-side services (nil: every flow refused)
+	gnet         sandbox.ContainerNet    // a container guest's sandbox egress proxy (nil: no egress)
+	ctr          *ctrState               // container guests only
+	// prepare runs in the VM's fresh dir: it writes the config drive at
+	// drive (attached read-only as /dev/vdb, after the rootfs) and returns
+	// the disks that follow it (/dev/vdc, ...). A DO volume (m.vol) comes
+	// last, as fd 6.
+	prepare func(m *Machine, drive string) ([]vzapi.Disk, error)
+}
+
+// launch boots one VM: run dir, config drive and disks, the VMM's
+// descriptors (NIC, control, vsock), the VMM, then the wait for the guest
+// to report ready (workerd healthy, or a container's entrypoint running).
+func (b *Backend) launch(ctx context.Context, l vzLaunch) (_ *Machine, err error) {
 	t0 := time.Now()
 	n := b.seq.Add(1)
-	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), s.ID, n)
+	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), l.name, n)
 	m := &Machine{agent: newAgent(), b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id),
-		ctlPending: map[int64]chan vzapi.Ctl{}, started: make(chan vzapi.Ctl, 1)}
+		ctlPending: map[int64]chan vzapi.Ctl{}, started: make(chan vzapi.Ctl, 1), ctr: l.ctr}
 	m.log = b.cfg.Log.With("vm", id)
-	if s.Log != nil {
-		m.log = s.Log.With("vm", id)
+	if l.log != nil {
+		m.log = l.log.With("vm", id)
+	}
+	if l.ctr != nil {
+		l.ctr.m = m
+		m.onEvent, m.onStream = l.ctr.event, m.attachStream
 	}
 	m.onBoot = func(n int) {
 		if n > 1 { // the guest rebooted (panic, or guestd gave up): a crash
@@ -217,6 +275,9 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 				<-m.done
 			}
 			m.teardown()
+			if l.ctr != nil && os.Getenv("TWD_KEEP_INSTANCES") == "" {
+				os.RemoveAll(m.dir) // a container's scratch disk goes with it
+			}
 		}
 	}()
 	os.RemoveAll(m.dir)
@@ -224,34 +285,23 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		return nil, err
 	}
 
-	// 1. The DO volume: attached (decrypted) on the host first, so the
-	// guest is told whether to format it.
-	if v := s.Volume; v != nil {
-		m.vol, err = attachVolume(v)
-		if err != nil {
-			return nil, fmt.Errorf("volume %s: %w", v.Name, err)
-		}
-		m.info.Volume = v.Name
-		m.info.VolumeNew = m.vol.format
-		m.info.VolumeAttachMS = m.vol.attachMS
-	}
-	// 2. Config drive: the instance dir + guest.json, as a raw tar.
+	// 1. Disks: the read-only rootfs, the config drive, then the launch's
+	// own (a container's image and scratch); a DO volume last.
 	drive := filepath.Join(m.dir, "config.tar")
-	if err := writeConfigDrive(drive, s, b.cfg.MTU, func(gc *proto.GuestConfig) {
-		gc.VolumeFormat = m.vol != nil && m.vol.format
-		if b.cfg.Rosetta {
-			gc.Rosetta = vzapi.RosettaTag
-		}
-	}); err != nil {
-		return nil, fmt.Errorf("config drive: %w", err)
+	extra, err := l.prepare(m, drive)
+	if err != nil {
+		return nil, err
 	}
-	m.disks = []string{b.cfg.Rootfs, drive}
+	disks := append([]vzapi.Disk{{Path: b.cfg.Rootfs, ReadOnly: true}, {Path: drive, ReadOnly: true}}, extra...)
+	for _, d := range disks {
+		m.disks = append(m.disks, d.Path)
+	}
 	if m.vol != nil {
 		m.disks = append(m.disks, m.vol.img)
 	}
 	m.info.Console = filepath.Join(m.dir, "console.log")
 
-	// 3. The VMM's descriptors: NIC (datagram frames), control, vsock.
+	// 2. The VMM's descriptors: NIC (datagram frames), control, vsock.
 	nicHost, nicVMM, err := dgramPair()
 	if err != nil {
 		return nil, err
@@ -285,16 +335,15 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		return nil, err
 	}
 	m.vsln = &fdListener{c: vc.(*net.UnixConn)}
-	m.vn, err = newDgramVnet(nicHost, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, s.Handlers)
+	m.vn, err = newDgramVnet(nicHost, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, l.handlers, l.gnet)
 	if err != nil {
 		return nil, err
 	}
 	m.ingress = m.ingressProxy()
 
-	// 4. The VMM.
-	vc2 := vzapi.Config{Kernel: b.cfg.Kernel, Cmdline: b.cfg.BootArgs, CPUs: b.cfg.VCPUs, MemMiB: b.cfg.MemMiB,
-		Disks:   []vzapi.Disk{{Path: b.cfg.Rootfs, ReadOnly: true}, {Path: drive, ReadOnly: true}},
-		Volume:  m.vol != nil,
+	// 3. The VMM.
+	vc2 := vzapi.Config{Kernel: b.cfg.Kernel, Cmdline: b.cfg.BootArgs, CPUs: l.cpus, MemMiB: l.memMiB,
+		Disks: disks, Volume: m.vol != nil,
 		Console: m.info.Console, MAC: guestMAC, MTU: b.cfg.MTU, VsockPort: proto.VsockPort, Rosetta: b.cfg.Rosetta}
 	cb, _ := json.Marshal(vc2)
 	logf, err := os.OpenFile(filepath.Join(m.dir, "vmm.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
@@ -324,7 +373,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	go m.acceptCtl(m.vsln)
 	go m.watch()
 
-	// 5. Wait for the VM to run, then for guestd to report workerd healthy.
+	// 4. Wait for the VM to run, then for guestd to report ready.
 	rctx, cancel := context.WithTimeout(ctx, b.cfg.ReadyTimeout)
 	defer cancel()
 	select {
@@ -341,13 +390,17 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	select {
 	case <-m.ready:
 	case <-m.done:
+		if m.ctr != nil && m.lastError() != "" {
+			return nil, fmt.Errorf("container guest: %s", m.lastError())
+		}
 		return nil, fmt.Errorf("microVM exited during boot: %v", m.exitErr)
 	case <-rctx.Done():
 		return nil, fmt.Errorf("microVM not ready after %v; events %v; last %s; console: %s", b.cfg.ReadyTimeout, m.eventTypes(), m.lastError(), m.logTail("console.log", 3000))
 	}
 	m.info.Total = time.Since(t0)
 	m.log.Info("microVM ready", "backend", "vz", "boot_ms", m.info.Boot.Milliseconds(), "ready_ms", m.info.Ready.Milliseconds(),
-		"total_ms", m.info.Total.Milliseconds(), "volume", m.info.Volume, "volume_ms", m.info.VolumeAttachMS, "volume_new", m.info.VolumeNew)
+		"total_ms", m.info.Total.Milliseconds(), "volume", m.info.Volume, "volume_ms", m.info.VolumeAttachMS, "volume_new", m.info.VolumeNew,
+		"container", l.ctr != nil)
 	return m, nil
 }
 
