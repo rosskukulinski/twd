@@ -4,7 +4,7 @@
 # config + virtiofs/erofs), rootfs.ext4 + manifest.json (guest/build-image.sh,
 # the same image the linux-arm64 release ships) and kernel-manifest.json.
 # Both builds need Linux, so on macOS a copy of this tree goes to Lima
-# $TWD_DEV_VM (default twd-dev, running, with ~/fc/rootfs for glibc), they run
+# $TWD_DEV_VM (default twd-dev, running; glibc comes from the pinned ubuntu-base, guest/inputs.sh), they run
 # there in /tmp/twd-vz-assets, and the files come back with `limactl copy`.
 # Cached: <outdir>/inputs.sha256 hashes every input (guest/, go.mod, go.sum,
 # the workerd version, the in-repo packages twd-guestd depends on), so an
@@ -30,8 +30,8 @@ else
 	say "no Linux builder: run on Linux or start Lima $DEV (limactl start $DEV)"
 	exit 3
 fi
-remote '[ "$(uname -m)" = aarch64 ] && test -d ~/fc/rootfs/usr/lib/aarch64-linux-gnu' ||
-	{ say "the builder must be arm64 Linux with ~/fc/rootfs (the glibc source for the guest image)"; exit 3; }
+remote '[ "$(uname -m)" = aarch64 ]' ||
+	{ say "the builder must be arm64 Linux"; exit 3; }
 
 deps=$(go list -deps -f '{{if not .Standard}}{{.Dir}}{{end}}' ./guest/twd-guestd 2>/dev/null | grep "^$ROOT/" | sed "s|^$ROOT/||")
 inputs=$( (git ls-files -co --exclude-standard guest go.mod go.sum; for d in $deps; do git ls-files -co --exclude-standard "$d"; done) | sort -u |

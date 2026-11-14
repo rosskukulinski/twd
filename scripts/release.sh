@@ -13,8 +13,8 @@
 # linux tarballs also hold bin/twd-vmhelper (the microVM tier's privileged
 # helper; `sudo twd host setup --microvm` installs a root-owned copy) and,
 # if TWD_VM_ASSETS_<arch> names a directory (make vm-assets, in Lima), the
-# microVM guest in share/twd/vm: vmlinux, rootfs.ext4 + manifest.json, and
-# Firecracker + jailer.
+# microVM guest in share/twd/vm: vmlinux (+ kernel.json), rootfs.ext4 +
+# manifest.json, and Firecracker + jailer, all for that arch.
 # darwin tarballs also hold bin/twd-vz (cgo: the microVM VMM on Virtualization.framework,
 # signed with the virtualization entitlement) and, if TWD_VZ_ASSETS names a
 # directory (make vz-assets), its guest in share/twd/vm.
@@ -113,7 +113,13 @@ for t in $TARGETS; do
 		done
 		mkdir -p "$st/share/twd/vm"
 		cp "$va/vmlinux" "$va/rootfs.ext4" "$va/manifest.json" "$va/firecracker" "$va/jailer" "$st/share/twd/vm/"
-		chmod 644 "$st/share/twd/vm/vmlinux" "$st/share/twd/vm/rootfs.ext4" "$st/share/twd/vm/manifest.json"
+		[ ! -f "$va/kernel.json" ] || cp "$va/kernel.json" "$st/share/twd/vm/"
+		chmod 644 "$st/share/twd/vm/vmlinux" "$st/share/twd/vm/rootfs.ext4" "$st/share/twd/vm/"*.json
+		# The guest must be this tarball's arch (KVM boots native guests only);
+		# manifests from before the "arch" field are arm64.
+		node scripts/check-arch.mjs linux "$arch" "$st/share/twd/vm/firecracker" "$st/share/twd/vm/jailer"
+		ga=$(node -p "require('$va/manifest.json').arch || 'arm64'")
+		[ "$ga" = "$arch" ] || { echo "release: $va/manifest.json is a $ga guest image, not $arch"; exit 1; }
 		chmod 755 "$st/share/twd/vm/firecracker" "$st/share/twd/vm/jailer"
 		microvm=true
 	fi

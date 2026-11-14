@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image guest-kernel release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container
 
 all: build
 
@@ -60,19 +60,36 @@ e2e-real: deps
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
 		$(GO) test -tags e2ereal -count=1 -v -timeout 15m ./e2e/real/...
 
-## guest-image: the microVM guest rootfs (Linux only; reproducible): workerd + twd-guestd.
-GUEST_OUT ?= guest/out
+## guest-image / guest-kernel / vm-assets: the microVM guest (Linux only; reproducible; inputs
+## pinned in guest/inputs.sh) for GUEST_ARCH (Go's name, amd64 or arm64; default: this machine).
+## Either arch builds on either (cross: the amd64 kernel needs gcc-x86-64-linux-gnu on arm64,
+## the arm64 one gcc-aarch64-linux-gnu on amd64).
+## guest-image: the rootfs: workerd + twd-guestd + glibc (ubuntu-base 24.04) + a CA bundle.
+GUEST_ARCH ?= $(shell $(GO) env GOARCH)
+GUEST_OUT  ?= guest/out/$(GUEST_ARCH)
+KERNEL_OUT ?= guest/out/kernel-$(GUEST_ARCH)
 guest-image: $(WORKERD)
-	guest/build-image.sh $(GUEST_OUT)
+	TARGETARCH=$(GUEST_ARCH) guest/build-image.sh $(GUEST_OUT)
+## guest-kernel: linux 6.1 LTS with Firecracker's CI guest config + guest/kernel/twd.config
+## (erofs, overlayfs). Reused when its inputs are unchanged (KERNEL_OUT/kernel.json).
+guest-kernel:
+	TARGETARCH=$(GUEST_ARCH) guest/build-kernel.sh $(KERNEL_OUT)
 
-## e2e-vm: the microVM tier in Firecracker (Linux + KVM; run inside Lima twd-dev, needs sudo).
-TWD_VM_KERNEL ?= $(HOME)/fc/vmlinux
+## e2e-vm: the microVM tier in Firecracker (Linux + KVM, native GUEST_ARCH; run inside Lima
+## twd-dev or on an amd64 KVM host; needs sudo). TWD_VM_KERNEL defaults to the guest-kernel
+## build (set it to use another kernel, e.g. ~/fc/vmlinux, without building one).
+DEFAULT_VM_KERNEL := $(abspath $(KERNEL_OUT))/vmlinux
+TWD_VM_KERNEL ?= $(DEFAULT_VM_KERNEL)
+VM_KERNEL_DEP = $(if $(filter $(DEFAULT_VM_KERNEL),$(TWD_VM_KERNEL)),guest-kernel)
 # 2 MiB pages for guest RAM (runtime sysctl inside the Lima VM, not persisted):
 # without them, workerd start-up under nested virt is ~8x slower.
 VM_HUGEPAGES ?= 2048
-VM_ENV = PATH="$$PATH" TWD_VM_KERNEL="$(TWD_VM_KERNEL)" TWD_VM_ROOTFS="$(CURDIR)/$(GUEST_OUT)/rootfs.ext4"
-e2e-vm: deps guest-image
+# TWD_VM_VCPUS / TWD_VM_BOOTARGS (optional) pass through to the tests (sudo drops the env).
+VM_ENV = PATH="$$PATH" TWD_VM_KERNEL="$(TWD_VM_KERNEL)" TWD_VM_ROOTFS="$(CURDIR)/$(GUEST_OUT)/rootfs.ext4" \
+	$(if $(TWD_VM_VCPUS),TWD_VM_VCPUS="$(TWD_VM_VCPUS)") $(if $(TWD_VM_BOOTARGS),TWD_VM_BOOTARGS="$(TWD_VM_BOOTARGS)")
+e2e-vm: deps guest-image $(VM_KERNEL_DEP)
 	@[ "$$(uname -s)" = Linux ] || { echo "e2e-vm: Linux only; run it inside Lima twd-dev"; exit 1; }
+	@[ "$(GUEST_ARCH)" = "$$($(GO) env GOARCH)" ] || { echo "e2e-vm: a $(GUEST_ARCH) guest can't boot on this $$($(GO) env GOARCH) host"; exit 1; }
 	@[ "$$(cat /proc/sys/vm/nr_hugepages)" -ge $(VM_HUGEPAGES) ] || sudo sysctl -qw vm.nr_hugepages=$(VM_HUGEPAGES)
 	$(GO) test -c -tags e2evm -o bin/e2evm.test ./e2e/vm
 	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
@@ -82,15 +99,14 @@ e2e-vm: deps guest-image
 ## the Sandbox SDK 0.x examples/minimal and the 1.0 flow run unmodified through hostd + workerd
 ## + one jailed VM per container, plus lifecycle/isolation checks and measurements.
 ## CTR_IMAGES is the dir guest/images/build-sandbox-images.sh wrote (run that on the Mac first);
-## the erofs guest kernel is built by guest/build-kernel.sh if missing.
+## The guest kernel (TWD_VM_KERNEL, the guest-kernel build) has erofs, so containers boot it too.
 CTR_IMAGES ?= $(CURDIR)/guest/out/images
-CTR_KERNEL ?= $(CURDIR)/$(GUEST_OUT)/kernel/vmlinux
+CTR_KERNEL ?= $(TWD_VM_KERNEL)
 CTR_APPS   ?= /tmp/twd-e2e-container-apps
 CTR_ENV = $(VM_ENV) TWD_VM_CONTAINER_KERNEL="$(CTR_KERNEL)" TWD_CTR_IMAGES="$(CTR_IMAGES)" TWD_CTR_APPS="$(CTR_APPS)"
-e2e-container: deps guest-image
+e2e-container: deps guest-image $(VM_KERNEL_DEP)
 	@[ "$$(uname -s)" = Linux ] || { echo "e2e-container: Linux only; run it inside Lima twd-dev"; exit 1; }
 	@[ -f "$(CTR_IMAGES)/images.json" ] || { echo "e2e-container: no $(CTR_IMAGES)/images.json (run guest/images/build-sandbox-images.sh on the Mac)"; exit 1; }
-	@[ -f "$(CTR_KERNEL)" ] || guest/build-kernel.sh $(dir $(CTR_KERNEL))
 	@[ "$$(cat /proc/sys/vm/nr_hugepages)" -ge $(VM_HUGEPAGES) ] || sudo sysctl -qw vm.nr_hugepages=$(VM_HUGEPAGES)
 	@[ -f "$(CTR_APPS)/unmodified.txt" ] || scripts/e2e-container-prep.sh $(CTR_APPS)
 	$(GO) test -c -o bin/vmsmoke.test ./hostd/vm
@@ -98,17 +114,22 @@ e2e-container: deps guest-image
 	sudo env $(CTR_ENV) bin/vmsmoke.test -test.v -test.count=1 -test.run TestContainerSmoke
 	cd e2e/container && sudo env $(CTR_ENV) ../../bin/e2econtainer.test -test.v -test.count=1 -test.timeout 20m
 
-## vm-assets: the microVM guest for the linux release (Linux only, in Lima twd-dev): the guest
-## image, the kernel (TWD_VM_KERNEL) and Firecracker + jailer (FC_BIN_DIR) in VM_ASSETS.
-FC_BIN_DIR ?= /usr/local/bin
-VM_ASSETS  ?= dist/vm-assets-$(shell go env GOARCH)
-vm-assets: guest-image
+## vm-assets: the microVM guest for the linux-$(GUEST_ARCH) release (Linux only; Lima twd-dev
+## builds both arches): the guest image, the kernel (TWD_VM_KERNEL, + its kernel.json) and
+## Firecracker + jailer (the pinned release, checksum-verified; FC_BIN_DIR=<dir> copies local
+## binaries instead) in VM_ASSETS.
+FC_BIN_DIR ?=
+VM_ASSETS  ?= dist/vm-assets-$(GUEST_ARCH)
+vm-assets: guest-image $(VM_KERNEL_DEP)
 	@[ "$$(uname -s)" = Linux ] || { echo "vm-assets: Linux only; run it inside Lima twd-dev"; exit 1; }
 	mkdir -p $(VM_ASSETS)
 	cp -f $(GUEST_OUT)/rootfs.ext4 $(GUEST_OUT)/manifest.json $(VM_ASSETS)/
 	cp -f $(TWD_VM_KERNEL) $(VM_ASSETS)/vmlinux
-	cp -f $(FC_BIN_DIR)/firecracker $(FC_BIN_DIR)/jailer $(VM_ASSETS)/
-	$(VM_ASSETS)/firecracker --version | head -1
+	@k="$$(dirname "$(TWD_VM_KERNEL)")/kernel.json"; if [ -f "$$k" ]; then cp -f "$$k" $(VM_ASSETS)/kernel.json; else rm -f $(VM_ASSETS)/kernel.json; fi
+	@if [ -n "$(FC_BIN_DIR)" ]; then cp -f $(FC_BIN_DIR)/firecracker $(FC_BIN_DIR)/jailer $(VM_ASSETS)/; \
+	else TARGETARCH=$(GUEST_ARCH) guest/fetch-firecracker.sh $(VM_ASSETS); fi
+	node scripts/check-arch.mjs linux $(GUEST_ARCH) $(VM_ASSETS)/firecracker $(VM_ASSETS)/jailer
+	@if [ "$(GUEST_ARCH)" = "$$($(GO) env GOARCH)" ]; then $(VM_ASSETS)/firecracker --version | head -1; fi
 
 ## vz-assets: the macOS microVM guest (vz backend): the arm64 guest kernel with virtiofs
 ## (guest/build-kernel-vz.sh) as vmlinux + the guest image, built in Lima twd-dev (or on arm64
@@ -197,29 +218,34 @@ ifndef RELEASE_VERSION
 RELEASE_VERSION := $(shell cat VERSION)-$(shell git rev-parse --short=8 HEAD)$(shell git diff --quiet HEAD -- . ':!STATUS.md' || echo -dirty)
 endif
 RELEASE_TARGETS ?= darwin-arm64 linux-arm64 linux-amd64
-## The linux-arm64 microVM guest (share/twd/vm: kernel, rootfs, firecracker, jailer) is
-## built by scripts/vm-assets-lima.sh: on Linux directly, on macOS inside Lima twd-dev
-## (cached in dist/vm-assets-arm64 by input hash). RELEASE_VM_ASSETS=auto (default): include
-## it when a builder is available, else warn and ship without the microVM tier
-## (release.json "microvm": false); 1: required; 0: never. TWD_VM_ASSETS_arm64 overrides.
+## The linux-arm64 and linux-amd64 microVM guests (share/twd/vm: kernel, rootfs, firecracker,
+## jailer) are built by scripts/vm-assets-lima.sh: on Linux directly, on macOS inside Lima
+## twd-dev (both arches there; cached in dist/vm-assets-<arch> by input hash).
+## RELEASE_VM_ASSETS=auto (default): include them when a builder is available, else warn and
+## ship without the microVM tier (release.json "microvm": false); 1: required; 0: never.
+## TWD_VM_ASSETS_arm64 / TWD_VM_ASSETS_amd64 override.
 ## The darwin-arm64 microVM guest (share/twd/vm: the vz kernel, the same rootfs) comes from
 ## scripts/vz-assets-lima.sh the same way (TWD_VZ_ASSETS overrides); its bin/twd-vz is
 ## signed with the virtualization entitlement.
 RELEASE_VM_ASSETS ?= auto
 release: deps
 	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS
-	@va="$${TWD_VM_ASSETS_arm64:-}"; vz="$${TWD_VZ_ASSETS:-}"; \
-	if [ -z "$$va" ] && [ "$(RELEASE_VM_ASSETS)" != 0 ] && echo "$(RELEASE_TARGETS)" | grep -q linux-arm64; then \
-		if sh scripts/vm-assets-lima.sh dist/vm-assets-arm64; then va="$(CURDIR)/dist/vm-assets-arm64"; \
-		elif [ "$(RELEASE_VM_ASSETS)" = 1 ]; then echo "release: microVM assets required (RELEASE_VM_ASSETS=1)"; exit 1; \
-		else echo "release: WARNING: the linux-arm64 tarball will have NO microVM guest (see scripts/vm-assets-lima.sh)"; fi; \
-	fi; \
+	@for a in arm64 amd64; do \
+		eval "va=\$${TWD_VM_ASSETS_$$a:-}"; \
+		if [ -z "$$va" ] && [ "$(RELEASE_VM_ASSETS)" != 0 ] && echo "$(RELEASE_TARGETS)" | grep -q "linux-$$a"; then \
+			if sh scripts/vm-assets-lima.sh dist/vm-assets-$$a $$a; then va="$(CURDIR)/dist/vm-assets-$$a"; \
+			elif [ "$(RELEASE_VM_ASSETS)" = 1 ]; then echo "release: linux-$$a microVM assets required (RELEASE_VM_ASSETS=1)"; exit 1; \
+			else echo "release: WARNING: the linux-$$a tarball will have NO microVM guest (see scripts/vm-assets-lima.sh)"; fi; \
+		fi; \
+		eval "TWD_VM_ASSETS_$$a=\$$va"; export TWD_VM_ASSETS_$$a; \
+	done; \
+	vz="$${TWD_VZ_ASSETS:-}"; \
 	if [ -z "$$vz" ] && [ "$(RELEASE_VM_ASSETS)" != 0 ] && echo "$(RELEASE_TARGETS)" | grep -q darwin-arm64; then \
 		if sh scripts/vz-assets-lima.sh $(VZ_ASSETS); then vz="$(CURDIR)/$(VZ_ASSETS)"; \
 		elif [ "$(RELEASE_VM_ASSETS)" = 1 ]; then echo "release: microVM assets required (RELEASE_VM_ASSETS=1)"; exit 1; \
 		else echo "release: WARNING: the darwin-arm64 tarball will have NO microVM guest (see scripts/vz-assets-lima.sh)"; fi; \
 	fi; \
-	TWD_VM_ASSETS_arm64="$$va" TWD_VZ_ASSETS="$$vz" sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
+	TWD_VZ_ASSETS="$$vz" sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
 
 ## e2e-mbp: E2E-MAC on the clean MacBook `mbp` from the release tarball (skips without
 ## the tailnet-1 key file or `ssh mbp`). twd runs on mbp; the test client + echo run here.

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,11 +53,11 @@ type Config struct {
 	Log          *slog.Logger
 }
 
-// DefaultBootArgs: the virtio console, panic → reboot, twd-guestd as init,
+// VZBootArgs: the vz guest's kernel cmdline: the virtio console, panic → reboot, twd-guestd as init,
 // read-only root on the first disk. vz restarts a rebooting guest (unlike
 // Firecracker, which exits): a guest that boots a second time is treated
 // as crashed (agent.onBoot), so a panic still ends the VM.
-const DefaultBootArgs = "console=hvc0 root=/dev/vda reboot=k panic=1 quiet ro rootfstype=ext4 init=/sbin/twd-guestd"
+const VZBootArgs = "console=hvc0 root=/dev/vda reboot=k panic=1 quiet ro rootfstype=ext4 init=/sbin/twd-guestd"
 
 // Backend is the vz microVM backend.
 type Backend struct {
@@ -92,6 +93,9 @@ func check(cfg Config) (rosetta string, err error) {
 			return "", err
 		}
 	}
+	if err := CheckArch(cfg.Kernel, cfg.Rootfs, runtime.GOARCH); err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, cfg.VMM, "-check", cfg.Kernel).CombinedOutput()
@@ -118,7 +122,7 @@ func New(cfg Config) (*Backend, error) {
 		cfg.MTU = 1500
 	}
 	if cfg.BootArgs == "" {
-		cfg.BootArgs = DefaultBootArgs
+		cfg.BootArgs = VZBootArgs
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 30 * time.Second
