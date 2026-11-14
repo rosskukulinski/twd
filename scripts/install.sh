@@ -120,7 +120,7 @@ mv "$STAGE/VERSION" "$PREFIX/VERSION"
 
 say "✓ installed twd $VERSION into $PREFIX ($(($(date +%s) - t0)) s)"
 say "  $("$PREFIX/bin/twd" version)"
-say "  $("$PREFIX/bin/workerd" --version) · process tier ($( [ "$os" = darwin ] && echo "dev-grade isolation on macOS; microVMs need Linux/KVM" || echo "see twd doctor for the sandbox and the microVM tier"))"
+say "  $("$PREFIX/bin/workerd" --version) · process tier ($( [ "$os" = darwin ] && echo "dev-grade isolation on macOS; microVM tier on Virtualization.framework when the release has share/twd/vm" || echo "see twd doctor for the sandbox and the microVM tier"))"
 case ":$PATH:" in
 *":$PREFIX/bin:"*) ;;
 *)
