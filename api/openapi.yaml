@@ -362,6 +362,71 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         default: { $ref: "#/components/responses/Error" }
 
+  /v1/tenants/{id}/workloads/{workload}/public:
+    parameters:
+      - $ref: "#/components/parameters/tenantID"
+      - $ref: "#/components/parameters/workloadName"
+    get:
+      tags: [tenants, deployments]
+      operationId: GetWorkloadPublic
+      summary: Read a workload's public-ingress exposure (`twd expose`)
+      description: |
+        ADR-029. A workload whose `twd.jsonc` declares `public` routes is
+        served over Funnel from its public node
+        (`https://<workload>.<tailnet>.ts.net/`) while `exposed` is true and
+        the tenant's `publicIngress` is `allow`. A workload that was never
+        toggled is exposed.
+      x-twd-role: admin
+      responses:
+        "200":
+          description: The workload's exposure.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkloadPublic" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+    patch:
+      tags: [tenants, deployments]
+      operationId: UpdateWorkloadPublic
+      summary: Expose or unexpose a workload's public routes (JSON Merge Patch)
+      description: |
+        `twd expose on|off` (ADR-029 D1): an operator override that survives
+        redeploys. `exposed: false` makes the host close the public node's
+        Funnel listener and reset its flows (the node and its certificate
+        stay); `true` reopens it. The lease holder is pushed at once.
+        `404 unknown_workload` when the tenant has no deployment of the
+        workload. Audited (`kind: expose_on` / `expose_off`).
+      x-twd-role: admin
+      x-twd-audit: true
+      parameters:
+        - $ref: "#/components/parameters/ifMatch"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: "#/components/schemas/WorkloadPublicPatch" }
+            examples:
+              off:
+                value: { exposed: false }
+          application/json:
+            schema: { $ref: "#/components/schemas/WorkloadPublicPatch" }
+      responses:
+        "200":
+          description: The updated exposure.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WorkloadPublic" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        default: { $ref: "#/components/responses/Error" }
+
   # ------------------------------------------------------------------ hosts
   /v1/hosts:
     post:
@@ -1572,6 +1637,12 @@ components:
       required: true
       description: The namespace lease epoch the caller believes it holds. Fenced in the store (`409 lease_lost`).
       schema: { type: integer, format: int64, minimum: 1 }
+    workloadName:
+      name: workload
+      in: path
+      required: true
+      description: Workload name (a DNS label).
+      schema: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$" }
     tenantID:
       name: id
       in: path
@@ -1899,6 +1970,8 @@ components:
         - identity_pending
         - no_host
         - policy_unavailable
+        - public_ingress_not_allowed
+        - unknown_workload
         - internal
     TombstoneError:
       description: "`410 Gone`: the error plus the kill record. `tombstone` is absent only when the 410 is `delegation_invalid` for a spawn whose parent is dead (the parent's record is then at `GET /v1/objects/{parent}`)."
@@ -2015,6 +2088,7 @@ components:
           type: string
           description: Host pool the tenant's deployments are placed on (hosts with a matching `pool`; empty = any host).
         tier: { $ref: "#/components/schemas/Tier" }
+        publicIngress: { $ref: "#/components/schemas/PublicIngress" }
         oboPublicKey: { type: string, description: base64 Ed25519 key that verifies this tenant's node certificates; hostd pins it. }
         createdAt: { type: integer, format: int64 }
         updatedAt: { type: integer, format: int64 }
@@ -2043,6 +2117,7 @@ components:
         maxObjects: { type: integer, minimum: 1 }
         pool: { type: string }
         tier: { $ref: "#/components/schemas/Tier" }
+        publicIngress: { $ref: "#/components/schemas/PublicIngress" }
       additionalProperties: false
     TenantPatch:
       type: object
@@ -2058,7 +2133,69 @@ components:
         maxObjects: { type: integer, minimum: 1 }
         pool: { type: [string, "null"] }
         tier: { $ref: "#/components/schemas/Tier" }
+        publicIngress:
+          description: "The ADR-029 gate: `allow` or `deny` (anything else is `400 bad_request`); `null` clears it (= `deny`)."
+          type: [string, "null"]
       additionalProperties: false
+    PublicIngress:
+      type: string
+      description: |
+        Operator gate for public (Funnel) ingress (ADR-029 D1). `allow`: the
+        tenant's `twd.jsonc` `public` routes take effect. `deny` (or absent):
+        a deploy that declares them is refused `403 public_ingress_not_allowed`,
+        and setting `deny` later makes hosts close every public listener.
+        `twd up` (single-tenant) creates its tenant with `allow`.
+      enum: [allow, deny]
+    WorkloadPublic:
+      type: object
+      required: [tenantID, workload, exposed]
+      properties:
+        tenantID: { type: string }
+        workload: { type: string }
+        exposed: { type: boolean, description: "`twd expose on` (true, the default) or `off`." }
+        updatedAt: { type: integer, format: int64 }
+        updatedBy: { type: string, description: The actor who last toggled it (see Conventions). }
+    WorkloadPublicPatch:
+      type: object
+      required: [exposed]
+      properties:
+        exposed: { type: boolean }
+      additionalProperties: false
+    PublicLimits:
+      type: object
+      description: netd's limits on a public listener (ADR-029 D5); defaults filled in.
+      properties:
+        rps: { type: number, description: "Requests per second, per workload." }
+        burst: { type: integer }
+        ipRps: { type: number, description: "Requests per second, per client IP." }
+        ipBurst: { type: integer }
+        maxBodyBytes: { type: integer, format: int64 }
+        maxHeaderBytes: { type: integer }
+        timeoutSeconds: { type: integer }
+        maxConns: { type: integer }
+    PublicAssignment:
+      type: object
+      description: |
+        A workload's public ingress (ADR-029). The host runs one extra node
+        for it (namespace `_public`, object name = the workload, hostname =
+        the workload name, `tags`) whose Funnel listener serves `routes`
+        while `exposed`.
+      required: [routes, limits, tags, exposed]
+      properties:
+        routes: { type: array, items: { type: string }, examples: [["/webhooks/*", "/oauth/callback"]] }
+        upgrade: { type: array, items: { type: string }, description: Routes on which WebSocket/SSE upgrades are allowed. }
+        limits: { $ref: "#/components/schemas/PublicLimits" }
+        tags: { type: array, items: { type: string }, examples: [["tag:twd-public"]] }
+        exposed: { type: boolean }
+    DeploymentPublic:
+      type: object
+      description: The deployment's public routes (ADR-029); absent when tailnet-only.
+      required: [url, routes, exposed, allowed]
+      properties:
+        url: { type: string, format: uri, examples: ["https://support.tail7906d5.ts.net/"] }
+        routes: { type: array, items: { type: string } }
+        exposed: { type: boolean, description: "`twd expose` setting." }
+        allowed: { type: boolean, description: "The tenant's `publicIngress` is `allow`; false: declared but not served." }
     TenantDeleteResult:
       type: object
       required: [tenantID, killed]
@@ -2234,6 +2371,7 @@ components:
         maxLive: { type: integer }
         maxDepth: { type: integer }
         endpoint: { $ref: "#/components/schemas/Endpoint" }
+        public: { $ref: "#/components/schemas/DeploymentPublic" }
         deployedBy: { type: string, description: The actor who deployed (see Conventions). }
         createdAt: { type: integer, format: int64 }
         updatedAt: { type: integer, format: int64 }
@@ -2280,6 +2418,7 @@ components:
         tier: { $ref: "#/components/schemas/Tier" }
         maxLive: { type: integer }
         maxDepth: { type: integer }
+        public: { $ref: "#/components/schemas/PublicAssignment" }
         createdAt: { type: integer, format: int64 }
     PreflightMissing:
       type: object
@@ -2298,6 +2437,12 @@ components:
         missingTagOwners: { type: array, items: { type: string } }
         tagOwnersSnippet: { type: string }
         unchecked: { type: array, items: { type: string }, description: "`tailnet.connects` entries that are names, not tags." }
+        missingNodeAttrs:
+          type: array
+          items: { type: string }
+          description: Missing policy `nodeAttrs` (ADR-029 D6), e.g. `funnel on tag:twd-public` for a workload with public routes.
+        nodeAttrsSnippet: { type: string, description: The `tagOwners` + `nodeAttrs` policy to add (HuJSON). }
+        publicURL: { type: string, format: uri, description: Where the workload's public routes will be served. }
 
     # ------------------------------------------------------------- objects
     ObjectStatus:

@@ -28,7 +28,9 @@ type TenantPatch struct {
 	MaxObjects             *int
 	Pool                   *string
 	Tier                   *string
-	By                     string
+	// PublicIngress is the ADR-029 gate ("allow" | "deny"; null clears = deny).
+	PublicIngress *string
+	By            string
 }
 
 // UpdateTenant applies a merge patch. Switching to wif (or changing a WIF
@@ -94,6 +96,15 @@ func (m *Mgmt) UpdateTenant(ctx context.Context, id string, p TenantPatch) (Tena
 		t.Tier = *p.Tier
 		changed["tier"] = t.Tier
 	}
+	gateChanged := false
+	if p.PublicIngress != nil {
+		if err := validPublicIngress(*p.PublicIngress); err != nil {
+			return Tenant{}, err
+		}
+		gateChanged = t.PublicAllowed() != (*p.PublicIngress == PublicAllow)
+		t.PublicIngress = *p.PublicIngress
+		changed["publicIngress"] = t.PublicIngress
+	}
 	switch t.MintMode {
 	case MintAPIKey:
 		if t.APIKeyFile == "" {
@@ -123,6 +134,10 @@ func (m *Mgmt) UpdateTenant(ctx context.Context, id string, p TenantPatch) (Tena
 	m.mu.Unlock()
 	changed["by"] = p.By
 	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "tenant_update", ActingFor: p.By}, changed)
+	if gateChanged {
+		// Hosts open or close public listeners at their next sync: push now.
+		m.pushTenantHosts(ctx, t.ID)
+	}
 	return t, nil
 }
 
@@ -477,7 +492,8 @@ func (m *Mgmt) Undeploy(ctx context.Context, id, reason, by string) (KillResult,
 // checked against the policy, nothing written.
 func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightResult, error) {
 	var res PreflightResult
-	if _, err := m.store.GetTenant(ctx, r.TenantID); err != nil {
+	t, err := m.store.GetTenant(ctx, r.TenantID)
+	if err != nil {
 		return res, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID)
 	}
 	if !validName(r.Workload) {
@@ -485,12 +501,20 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 	}
 	classes := r.Namespaces
 	var connects []string
+	var pub *DeploymentPublic
 	if len(r.Bundle) > 0 {
 		cfg, err := BundleConfig(r.Bundle)
 		if err != nil && len(classes) == 0 {
 			return res, errf(400, "bad_bundle", "%v", err)
 		}
 		if err == nil {
+			// Public routes: the tenant gate is checked first (ADR-029 D6).
+			if pub, err = bundlePublic(cfg); err != nil {
+				return res, err
+			}
+			if err := checkPublicDeploy(t, r.Workload, pub); err != nil {
+				return res, err
+			}
 			if len(classes) == 0 {
 				classes = cfg.Classes()
 			}
@@ -500,6 +524,7 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 	if len(classes) == 0 {
 		return res, errf(400, "bad_bundle", "no namespaces: the bundle's twd.jsonc declares neither tailnet.tags (the workload node) nor tailnet.objects")
 	}
+	classes = withPublicNamespace(classes, pub)
 	var src []string
 	for _, c := range classes {
 		for _, t := range c.Tags {
@@ -508,11 +533,14 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 			}
 		}
 	}
-	res, err := m.Preflight(ctx, r.TenantID, PreflightRequest{SrcTags: src, Connects: connects})
+	res, err = m.Preflight(ctx, r.TenantID, PreflightRequest{SrcTags: src, Connects: connects, Public: pub != nil})
 	if err != nil {
 		return res, err
 	}
 	res.SrcTags = src
+	if pub != nil {
+		res.PublicURL = "https://" + r.Workload + "." + t.Tailnet + "/"
+	}
 	m.audit(ctx, AuditRecord{TenantID: r.TenantID, Kind: "preflight", ActingFor: r.By}, map[string]any{"workload": r.Workload,
 		"ok": res.OK, "missing": len(res.Missing), "missingTagOwners": res.MissingTagOwners, "by": r.By})
 	return res, nil

@@ -496,21 +496,35 @@ func cmdUp(args []string) error {
 			APIKeyFile      string `json:"apiKeyFile"`
 			OAuthClientID   string `json:"oauthClientID"`
 			OAuthClientFile string `json:"oauthClientFile"`
+			PublicIngress   string `json:"publicIngress"`
 		}
 		if err := s.mgmt().Do(ctx, "GET", "/v1/tenants/"+tid, nil, &cur); err != nil {
 			var tr struct {
 				TenantID string `json:"tenantID"`
 			}
-			body := map[string]any{"tenantID": tid, "tailnet": *tailnet, "controlURL": *control}
+			// Single-tenant twd up: the operator is the tenant, so public
+			// ingress is allowed (ADR-029 D1); twd.jsonc "public" opts in.
+			body := map[string]any{"tenantID": tid, "tailnet": *tailnet, "controlURL": *control, "publicIngress": mgmt.PublicAllow}
 			maps.Copy(body, want)
 			if err := s.mgmt().Do(ctx, "POST", "/v1/tenants", body, &tr); err != nil {
 				return err
 			}
 			tid = tr.TenantID
-		} else if oauthMode && (cur.MintMode != "oauth" || cur.OAuthClientID != oauthCreds.ClientID || cur.OAuthClientFile != absOAuth) {
-			// A regenerated client (e.g. one with devices:core added).
-			if err := s.mgmt().Do(ctx, "PATCH", "/v1/tenants/"+tid, want, nil); err != nil {
-				return err
+		} else {
+			patch := map[string]any{}
+			if oauthMode && (cur.MintMode != "oauth" || cur.OAuthClientID != oauthCreds.ClientID || cur.OAuthClientFile != absOAuth) {
+				// A regenerated client (e.g. one with devices:core added).
+				maps.Copy(patch, want)
+			}
+			if cur.PublicIngress == "" {
+				// A tenant from before ADR-029: allow public ingress like a
+				// fresh twd up (an explicit "deny" is kept).
+				patch["publicIngress"] = mgmt.PublicAllow
+			}
+			if len(patch) > 0 {
+				if err := s.mgmt().Do(ctx, "PATCH", "/v1/tenants/"+tid, patch, nil); err != nil {
+					return err
+				}
 			}
 		}
 	default:
