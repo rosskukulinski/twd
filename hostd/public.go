@@ -209,6 +209,15 @@ func (h *Host) applyPublic(w *workload, spec *mgmtapi.PublicAssignment) {
 		return
 	}
 	if live && have != nil && sameRouting(have, want) {
+		// netd reports a listener that failed to open (no HTTPS certs or no
+		// funnel attribute yet): retry it on every sync while exposed.
+		if want.Enabled && have.Enabled {
+			if no := t.reg.Get(po.NetdID); no != nil && no.State() == netd.StateReady && !no.PublicListening() {
+				if err := t.reg.SetPublicEnabled(po.NetdID, true); err != nil {
+					h.log.Warn("public listener still not open", "workload", w.name, "err", netd.RedactError(err))
+				}
+			}
+		}
 		if have.Enabled != want.Enabled {
 			st := time.Now()
 			if err := t.reg.SetPublicEnabled(po.NetdID, want.Enabled); err != nil {
