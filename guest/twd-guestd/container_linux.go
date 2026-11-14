@@ -84,6 +84,15 @@ func (g *guest) runContainer() {
 		logf("container cgroup: %v (continuing without pids.max)", err)
 	}
 	c.cgroupFD = fd
+	if q := c.cfg.CPUQuotaUS; q > 0 {
+		// The host asked for a fractional-vCPU cap it can't apply itself:
+		// no cap, no container (it must not run uncapped).
+		if err := capCPU(fd, q); err != nil {
+			logf("container cpu.max: %v", err)
+			g.send(proto.Msg{Type: "ctr-exit", ExitCode: -1, Error: "container cpu.max: " + err.Error()})
+			select {}
+		}
+	}
 
 	// The entrypoint's output: kept in a ring (the host asks for it on
 	// failures) and forwarded as log events, never to the serial console
@@ -167,6 +176,11 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 		if err := waitDev(cc.Scratch); err != nil {
 			return fmt.Errorf("scratch device: %w", err)
 		}
+		if cc.ScratchFormat {
+			if err := formatScratch(cc.Scratch); err != nil {
+				return err
+			}
+		}
 		if err := unix.Mount(cc.Scratch, scratch, "ext4", unix.MS_NOATIME, "errors=remount-ro"); err != nil {
 			return fmt.Errorf("mount scratch %s: %w", cc.Scratch, err)
 		}
@@ -237,6 +251,32 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 	return nil
 }
 
+// formatScratch makes the overlay upper's ext4 on a blank scratch device
+// (no journal: the disk dies with the VM). Like formatVolume, it refuses a
+// device that isn't blank.
+func formatScratch(dev string) error {
+	f, err := os.Open(dev)
+	if err != nil {
+		return err
+	}
+	head := make([]byte, 64<<10)
+	n, _ := io.ReadFull(f, head)
+	f.Close()
+	for _, b := range head[:n] {
+		if b != 0 {
+			return fmt.Errorf("refusing to format scratch %s: not blank", dev)
+		}
+	}
+	st := time.Now()
+	out, err := exec.Command("/usr/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-O", "^has_journal", "-L", "twd-scratch", "-m", "0",
+		"-E", "lazy_itable_init=1,nodiscard", dev).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mke2fs scratch: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	logf("formatted scratch %s in %v", dev, time.Since(st).Round(time.Millisecond))
+	return nil
+}
+
 func writeIfAbsent(p, s string) {
 	if fi, err := os.Lstat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
 		return
@@ -264,6 +304,21 @@ func setupCgroup(pids int) (int, error) {
 		return -1, fmt.Errorf("pids.max: %w", err)
 	}
 	return unix.Open(ctrCgroup, unix.O_DIRECTORY|unix.O_RDONLY|unix.O_CLOEXEC, 0)
+}
+
+// capCPU sets cpu.max of the container cgroup (fd from setupCgroup) to
+// quota µs per 100 ms.
+func capCPU(fd, quota int) error {
+	if fd < 0 {
+		return errors.New("no container cgroup")
+	}
+	if quota < 1000 {
+		quota = 1000 // the kernel's floor is 1 ms
+	}
+	if err := os.WriteFile("/sys/fs/cgroup/cgroup.subtree_control", []byte("+cpu"), 0o644); err != nil {
+		return fmt.Errorf("enable cpu controller: %w", err)
+	}
+	return os.WriteFile(ctrCgroup+"/cpu.max", []byte(strconv.Itoa(quota)+" 100000"), 0o644)
 }
 
 // ctrExecSpec is what "twd-guestd ctr-exec" gets on fd 3.

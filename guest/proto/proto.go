@@ -97,6 +97,13 @@ type ContainerConfig struct {
 	// Pids is pids.max of the container's cgroup in the guest (0 = 4096).
 	Pids     int    `json:"pids,omitempty"`
 	Hostname string `json:"hostname,omitempty"`
+	// ScratchFormat: Scratch is a blank device the guest formats itself
+	// (vz: macOS has no mkfs.ext4; Firecracker's helper makes it instead).
+	ScratchFormat bool `json:"scratchFormat,omitempty"`
+	// CPUQuotaUS, if > 0, is cpu.max (µs per 100 ms) of the guest's
+	// container cgroup: the fractional-vCPU cap where the host can't cap
+	// the VMM itself (vz). Firecracker caps the VMM's cgroup instead.
+	CPUQuotaUS int `json:"cpuQuotaUs,omitempty"`
 }
 
 // Container-mode stream framing.
