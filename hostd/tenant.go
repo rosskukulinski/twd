@@ -108,6 +108,10 @@ func (h *Host) ensureTenant(ctx context.Context, id string) (*tenant, error) {
 		JoinParallel:  h.cfg.JoinParallel,
 		Logger:        h.log.With("tenant", id),
 		TSNetLogs:     h.cfg.TSNetLogs,
+		// Public ingress (ADR-029).
+		PublicListen:     h.cfg.PublicListen,
+		OnPublicRequest:  h.onPublicRequest,
+		OnPublicRejected: h.onPublicRejected,
 	})
 	if err != nil {
 		return nil, err

@@ -276,7 +276,17 @@ func (h *Host) startNodeLocked(o *object) {
 		o.readyCh = make(chan struct{})
 	}
 	eph := h.cfg.Ephemeral
-	no, err := t.reg.Create(o.NetdID, netd.ObjectOptions{Hostname: o.Hostname, Tags: o.Tags, Ephemeral: &eph})
+	opts := netd.ObjectOptions{Hostname: o.Hostname, Tags: o.Tags, Ephemeral: &eph}
+	if o.isPublicNode() {
+		// A public node never starts without its public options (it would
+		// otherwise come up as a tailnet listener): wait for applyPublic.
+		if opts.Public = h.publicOptionsLocked(o.TenantID, o.Workload); opts.Public == nil {
+			return
+		}
+		f := false
+		opts.Ephemeral = &f // its name is the public URL: never an ephemeral node
+	}
+	no, err := t.reg.Create(o.NetdID, opts)
 	if err != nil {
 		o.Status, o.Err = statusFailed, err.Error()
 		closeOnce(o.readyCh)
@@ -449,7 +459,10 @@ func (h *Host) killLocal(objectID, reason string) {
 			h.log.Info("object killed (tier 1)", "object", o.ID, "flows", rep.FlowsAborted, "abort_ms", rep.AbortMS)
 		}
 	}
-	if w != nil && o.Class != "" {
+	if o.ActingFor == OriginPublic && o.Class != "" {
+		h.pubCreates.forget(o.TenantID, o.Workload, o.Class, o.Name)
+	}
+	if w != nil && o.Class != "" && !o.isPublicNode() {
 		if inst := w.current(); inst != nil {
 			inst.admin(map[string]any{"kind": "admin", "op": "kill", "class": o.Class, "name": o.Name, "reason": reason})
 		}

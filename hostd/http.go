@@ -24,6 +24,7 @@ var errStatus = map[string]int{
 	"lease_lost": 409, "namespace_conflict": 409, "spawn_budget_exceeded": 429, "bootstrap_failed": 502,
 	"cap_missing": 403, "delegation_exceeds_parent": 403, "delegation_invalid": 403,
 	"forbidden_destination": 403, "peer_not_visible": 403, "acl_denied": 403,
+	"public_create_denied": 403, "public_request": 403, "not_public": 404,
 }
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {
@@ -211,6 +212,10 @@ type apiReq struct {
 	Records   []map[string]any              `json:"records"`
 	ActingFor string                        `json:"actingFor"`
 	Principal string                        `json:"principal"`
+	// Public: the request being served came from the public internet
+	// (ADR-029); ensure then refuses objects that neither exist nor were
+	// admitted.
+	Public bool `json:"public"`
 }
 
 func objView(o *object) map[string]any {
@@ -246,6 +251,11 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 			if !c.Node {
 				return nil, &apiError{Code: "bad_request", Detail: "class " + req.As.Class + " has no tailnet identity (\"node\": false)"}
 			}
+			if req.Public {
+				if e := h.ensureAllowedPublic(wl, req.As.Class, req.As.Name); e != nil {
+					return nil, e
+				}
+			}
 			return h.ensure(ctx, wl, req.As.Class, req.As.Name, nil, nil, "", req.ActingFor)
 		}
 		fail := func(err error) { writeAPIError(w, asAPIError(err)) }
@@ -260,7 +270,7 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 			if req.Wake {
 				o.Wakes++
 			}
-			late := req.ActingFor != "" && o.ActingFor == "" && o.Class != ""
+			late := req.ActingFor != "" && req.ActingFor != OriginPublic && o.ActingFor == "" && o.Class != ""
 			if late {
 				o.ActingFor = req.ActingFor
 			}
@@ -270,6 +280,14 @@ func (h *Host) hostAPI(inst *instance) http.Handler {
 				h.saveObjects()
 			}
 			writeJSON(w, 200, objView(o))
+		case "admit":
+			// ADR-029 D5: may a public request reach (class, name)?
+			existing, e := h.admitPublic(wl, inst.app, req.Class, req.Name)
+			if e != nil {
+				fail(e)
+				return
+			}
+			writeJSON(w, 200, map[string]any{"ok": true, "existing": existing})
 		case "self":
 			o, err := self()
 			if err != nil {
@@ -464,6 +482,15 @@ type WorkloadStatus struct {
 	Egress string `json:",omitempty"`
 	// LogFile is the app's log (workerd.log, or app.log for runtime node).
 	LogFile string `json:",omitempty"`
+	// Public is the workload's public ingress (ADR-029), if any.
+	Public *PublicStatus `json:",omitempty"`
+}
+
+// PublicStatus is a workload's public node as this host runs it.
+type PublicStatus struct {
+	ObjectID, Hostname, MagicDNS, Status string
+	Exposed                              bool
+	Routes                               []string
 }
 
 // Egress enforcement states (WorkloadStatus.Egress).
@@ -517,13 +544,22 @@ func (h *Host) Status() StatusView {
 		v.Objects = append(v.Objects, ObjectStatus{o.ID, o.NetdID, o.TenantID, o.Workload, o.Class, o.Name, o.Hostname, o.Status, o.NodeID, o.MagicDNS, o.IP, o.Err, o.Parent, o.Wakes})
 	}
 	wls := make([]*workload, 0, len(h.workloads))
-	for _, w := range h.workloads {
+	pubs := map[string]*PublicStatus{}
+	for k, w := range h.workloads {
 		wls = append(wls, w)
+		if ps := h.public[k]; ps != nil && ps.spec != nil {
+			st := &PublicStatus{Exposed: ps.spec.Exposed, Routes: ps.spec.Routes, Status: "pending"}
+			if o := h.byKey[objKey(w.tenantID, w.name, mgmtapi.PublicNamespace, w.name)]; o != nil {
+				st.ObjectID, st.Hostname, st.MagicDNS, st.Status = o.ID, o.Hostname, o.MagicDNS, o.Status
+			}
+			pubs[k] = st
+		}
 	}
 	h.mu.Unlock()
 	for _, w := range wls {
 		w.mu.Lock()
-		ws := WorkloadStatus{TenantID: w.tenantID, Workload: w.name, DeploymentID: w.activeDep, Status: w.status, Error: w.err, Epoch: w.epoch}
+		ws := WorkloadStatus{TenantID: w.tenantID, Workload: w.name, DeploymentID: w.activeDep, Status: w.status, Error: w.err, Epoch: w.epoch,
+			Public: pubs[w.tenantID+"/"+w.name]}
 		if w.active != nil {
 			ws.Requests = w.active.reqs.Load()
 			ws.InstanceDir = w.active.dir

@@ -34,6 +34,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/bundle"
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/internal/nodecert"
+	"github.com/rosskukulinski/twd/internal/publicspec"
 	"github.com/rosskukulinski/twd/internal/tsapi"
 	"github.com/rosskukulinski/twd/netd"
 )
@@ -74,6 +75,7 @@ type Server struct {
 	objects     map[string]*object
 	byName      map[string]string // tenant|workload|ns|name -> objectID
 	audit       map[string][]mgmtapi.AuditRecord
+	exposed     map[string]bool   // tenantID/workload -> `twd expose` (default on)
 	nodeIDs     map[string]string // stable node ID -> objectID (every node that reported ready)
 	remints     int               // POST /remint calls (rejoins rejected by control)
 	pushes      []string
@@ -128,6 +130,7 @@ type deployment struct {
 	epoch      int64
 	superseded bool
 	created    time.Time
+	public     *publicspec.Spec // twd.jsonc "public" (ADR-029)
 }
 
 type lease struct {
@@ -158,7 +161,7 @@ func New(cfg Config) *Server {
 	s := &Server{cfg: cfg, log: cfg.Logger, mux: http.NewServeMux(),
 		tenants: map[string]*tenant{}, hosts: map[string]*host{}, deployments: map[string]*deployment{},
 		leases: map[string]*lease{}, objects: map[string]*object{}, byName: map[string]string{},
-		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}, oboKey: priv, certDenied: map[string]bool{}}
+		audit: map[string][]mgmtapi.AuditRecord{}, nodeIDs: map[string]string{}, volKeys: map[string][]byte{}, oboKey: priv, certDenied: map[string]bool{}, exposed: map[string]bool{}}
 	m := s.mux
 	m.HandleFunc("GET /v1/healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]bool{"ok": true}) })
 	m.HandleFunc("GET /v1/certificates/{nodeID}", s.nodeCert)
@@ -394,13 +397,38 @@ func (s *Server) assignments(w http.ResponseWriter, r *http.Request) {
 		if d.Host != id || d.superseded {
 			continue
 		}
-		out = append(out, mgmtapi.Assignment{DeploymentID: d.DeploymentID, TenantID: d.tenantID, Workload: d.workload,
+		a := mgmtapi.Assignment{DeploymentID: d.DeploymentID, TenantID: d.tenantID, Workload: d.workload,
 			BundleURL: "/v1/deployments/" + d.DeploymentID + "/bundle", Namespaces: d.namespaces, Epoch: d.epoch,
 			WorkloadTags: d.wlTags, Lease: mgmtapi.LeaseName(d.tenantID, d.workload),
-			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created)})
+			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created)}
+		if d.public != nil {
+			exposed, set := s.exposed[d.tenantID+"/"+d.workload]
+			a.Public = &mgmtapi.PublicAssignment{Routes: d.public.Routes, Upgrade: d.public.Upgrade, Limits: d.public.Limits.Effective(),
+				Tags: []string{publicspec.Tag}, Exposed: exposed || !set}
+		}
+		out = append(out, a)
 	}
 	s.mu.Unlock()
 	writeJSON(w, 200, page(out))
+}
+
+// SetExposed is `twd expose on|off` (ADR-029): it changes the workload's
+// Assignment.Public.Exposed and pushes the assignments to its host.
+func (s *Server) SetExposed(tenantID, workload string, on bool) {
+	s.mu.Lock()
+	s.exposed[tenantID+"/"+workload] = on
+	var push string
+	for _, d := range s.deployments {
+		if d.tenantID == tenantID && d.workload == workload && !d.superseded {
+			if h := s.hosts[d.Host]; h != nil {
+				push = h.PushURL
+			}
+		}
+	}
+	s.mu.Unlock()
+	if push != "" {
+		s.push(push, "/v1/push/assignments", map[string]any{})
+	}
 }
 
 func (s *Server) sortedDeployments() []*deployment {
@@ -481,13 +509,16 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 		}
 		nss = append(nss, mgmtapi.NamespaceSpec{Class: c, Tags: tags, Agent: cl.Agent})
 	}
+	if app.Public != nil {
+		nss = append(nss, mgmtapi.NamespaceSpec{Class: publicspec.Namespace, Tags: []string{publicspec.Tag}})
+	}
 	for _, d := range s.deployments {
 		if d.tenantID == req.TenantID && d.workload == req.Workload {
 			d.superseded = true
 		}
 	}
 	d := &deployment{tenantID: req.TenantID, workload: req.Workload, bundle: req.Bundle, namespaces: nss,
-		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now()}
+		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now(), public: app.Public}
 	d.DeploymentID, d.Host, d.Status = newID("dp"), hostID, "assigned"
 	s.deployments[d.DeploymentID] = d
 	push := s.hosts[hostID].PushURL
@@ -630,6 +661,9 @@ func (s *Server) createObject(w http.ResponseWriter, r *http.Request) {
 	hn := req.Hostname
 	if hn == "" {
 		hn = newID("o")
+	}
+	if req.Namespace == publicspec.Namespace {
+		hn = workload // ADR-029: the public node is named after the workload (stable public URL)
 	}
 	o := &object{Object: mgmtapi.Object{ObjectID: newID("o"), TenantID: req.TenantID, Workload: workload, Namespace: req.Namespace,
 		ObjectName: req.ObjectName, Hostname: hn, Lease: mgmtapi.LeaseName(req.TenantID, workload), Status: "pending", Tags: tags, Host: l.host,

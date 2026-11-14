@@ -270,6 +270,7 @@ func (h *Host) deploy(w *workload, a mgmtapi.Assignment) {
 	}
 	w.mu.Unlock()
 	h.rejoinObjects(w, app)
+	go h.applyPublic(w, a.Public)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"tier", tier, "blue_green", old != nil, "ms", time.Since(st).Milliseconds())
 }
@@ -336,6 +337,7 @@ func (h *Host) deploySerial(w *workload, a mgmtapi.Assignment, app *bundle.App, 
 	w.mu.Unlock()
 	open()
 	h.rejoinObjects(w, app)
+	go h.applyPublic(w, a.Public)
 	h.log.Info("deployment active", "workload", w.name, "deployment", a.DeploymentID, "epoch", a.Epoch,
 		"runtime", app.Runtime, "tier", tier, "restart", old != nil, "ms", time.Since(st).Milliseconds())
 }
