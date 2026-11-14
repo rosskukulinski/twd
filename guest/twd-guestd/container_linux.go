@@ -362,7 +362,12 @@ func (g *guest) startExec(id string, es *proto.ExecSpec) (int, error) {
 		stream.Close()
 		return 0, err
 	}
-	env := mergeEnv(c.cfg.Env, es.Env)
+	// Cloudflare's exec inherits only PATH from the container's env.
+	var base []string
+	if p := envGet(c.cfg.Env, "PATH"); p != "" {
+		base = []string{"PATH=" + p}
+	}
+	env := mergeEnv(base, es.Env)
 	cwd := es.Cwd
 	if cwd == "" {
 		cwd = c.cfg.Cwd

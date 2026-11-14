@@ -115,9 +115,9 @@ func TestContainerSmoke(t *testing.T) {
 	if r.out != big || r.code != 0 {
 		t.Fatalf("stdin round trip: %d bytes back, code %d", len(r.out), r.code)
 	}
-	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "echo hello > /workspace/hello.txt && cat /workspace/hello.txt && pwd && id -u && echo $TWD_TEST $X"},
+	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "echo hello > /workspace/hello.txt && cat /workspace/hello.txt && pwd && id -u && echo x${TWD_TEST}x $X"},
 		Cwd: "/workspace", Env: []string{"X=y"}}, "")
-	if r.out != "hello\n/workspace\n0\n1 y\n" {
+	if r.out != "hello\n/workspace\n0\nxx y\n" {
 		t.Fatalf("file/cwd/env: %q", r.out)
 	}
 	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"id", "-u"}, User: "65534:65534"}, "")
