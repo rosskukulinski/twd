@@ -256,6 +256,34 @@ func TestVZRosetta(t *testing.T) {
 	}
 }
 
+// TestVZDiesWithHostd: when hostd goes away (its end of the VMM's control
+// socket closes, as on a hostd crash), the VMM stops the VM and exits: no
+// guest outlives its host.
+func TestVZDiesWithHostd(t *testing.T) {
+	b := vzBackend(t, false)
+	vmi, err := b.Boot(context.Background(), sandbox.Spec{ID: "orphan", AppDir: vzApp(t), WorkerdArgs: []string{"serve", "config.capnp", "--experimental"}, HealthCF: `{}`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := vmi.(*Machine)
+	defer m.Stop()
+	svc := m.Info().ServicePID
+	st := time.Now()
+	m.ctlConn.Close()
+	select {
+	case <-m.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the VMM outlived its control connection")
+	}
+	for i := 0; pidAlive(svc); i++ {
+		if i > 100 {
+			t.Fatalf("VM service %d survived", svc)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Logf("control socket closed → VMM and VM service gone in %v", time.Since(st))
+}
+
 func pidAlive(pid int) bool {
 	out, _ := exec.Command("/bin/ps", "-o", "pid=", "-p", fmt.Sprint(pid)).Output()
 	return strings.TrimSpace(string(out)) != ""
