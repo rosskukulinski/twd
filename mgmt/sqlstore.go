@@ -535,7 +535,7 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// mm-loop F3 (H02): one replica mints each object.
 		{"objects", "mint_claim", "ALTER TABLE objects ADD COLUMN mint_claim TEXT NOT NULL DEFAULT ''"},
 		{"objects", "mint_claimed_at", "ALTER TABLE objects ADD COLUMN mint_claimed_at BIGINT NOT NULL DEFAULT 0"},
-		// smart placement (ADR-029): why the deployment is on its host (JSON).
+		// smart placement (ADR-030): why the deployment is on its host (JSON).
 		{"deployments", "placement", "ALTER TABLE deployments ADD COLUMN placement TEXT NOT NULL DEFAULT ''"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")

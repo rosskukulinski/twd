@@ -178,7 +178,7 @@ type Assignment struct {
 	// Fence (F9, ADR-028 §3): stop serving this workload when mgmt is
 	// unreachable for FenceAfter. nil (an older mgmt) means true.
 	Fence *bool `json:"fence,omitempty"`
-	// PlacementTargets (smart placement, ADR-029) are what this host should
+	// PlacementTargets (smart placement, ADR-030) are what this host should
 	// measure tailnet paths to, from this tenant's nodes.
 	PlacementTargets []string `json:"placementTargets,omitempty"`
 }

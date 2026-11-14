@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// TestMM_S12_SmartPlacement (ADR-029): three replicas on Postgres place
+// TestMM_S12_SmartPlacement (ADR-030): three replicas on Postgres place
 // from the same stored path measurements. Fake hosts report through
 // different replicas; concurrent deploys through every replica must agree
 // on the host and the explanation (scoreHosts is deterministic and the

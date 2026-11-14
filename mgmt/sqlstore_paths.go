@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ---- smart placement: measured paths (ADR-029) ----
+// ---- smart placement: measured paths (ADR-030) ----
 
 // PutHostPaths replaces what host reported for tenant (one transaction:
 // the (host, tenant) rows are deleted and the new ones inserted, so a

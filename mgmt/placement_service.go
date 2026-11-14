@@ -18,7 +18,7 @@ import (
 	"github.com/tailscale/hujson"
 )
 
-// ---- smart placement: the mgmt side (ADR-029) ----
+// ---- smart placement: the mgmt side (ADR-030) ----
 
 // PathReport is what a host measured for one tenant (PUT
 // /v1/hosts/{id}/paths, and the reply to a probe push).

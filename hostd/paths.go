@@ -18,7 +18,7 @@ import (
 	"tailscale.com/tailcfg"
 )
 
-// Smart placement measurements (ADR-029, Proposed).
+// Smart placement measurements (ADR-030 draft, Proposed).
 //
 // The targets a workload connects to live on its tenant's tailnet; this
 // host's own node is on the operator tailnet. So hostd measures from a node
@@ -99,8 +99,13 @@ func (h *Host) pathLoop() {
 			last, lastAt = string(sig), time.Now()
 			continue
 		}
+		last = string(sig)
 		if h.reportPaths(ts) {
-			last, lastAt = string(sig), time.Now()
+			lastAt = time.Now()
+		} else {
+			// Retry in ~15 s (nodes still joining, or mgmt refused it), not
+			// at every poll.
+			lastAt = time.Now().Add(min(15*time.Second, every) - every)
 		}
 	}
 }

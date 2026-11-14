@@ -336,6 +336,57 @@ start `twd-hostd -host-id <id> -mgmt http://twd-mgmt.<tailnet> -tsnet-control-ur
 `twd host ls` / `twd host rm <id> [--drain]` manage hosts; `twd tenant set`
 (PATCH) and `twd tenant rm`, `twd undeploy <workload>` round out the CRUD.
 
+#### Where a workload runs (placement, multi-host)
+
+With more than one host, mgmt picks the host at deploy (ADR-030 draft, Proposed):
+
+1. **Eligible hosts** are live (a heartbeat in the last 10 s), in the tenant's
+   pool (`twd tenant set --pool`), offer the workload's tier (`"tier":
+   "microvm"` in `twd.jsonc`, or the tenant's: only hosts with KVM and the
+   helper, `twd host ls` TIERS) and have free capacity.
+2. `twd deploy --host <id>` pins one (it must still be eligible).
+3. Otherwise a workload that is **already running stays where it is**. A
+   better host appearing never moves it.
+4. Otherwise (first deploy, or its host died) **smart placement**: if the
+   app declares `tailnet.connects` (or `placement.targets`), the host with
+   the best measured path to those peers wins: direct WireGuard, then a peer
+   relay, then DERP, then unmeasured; then the lowest RTT. Ties go to the
+   host with more free capacity. Without targets it's the most free capacity.
+
+```jsonc
+// twd.jsonc
+{
+  "tailnet": { "tags": ["tag:api"], "connects": ["tag:db"] },
+  "placement": { "mode": "smart" }   // the default when connects is set; "off" to disable
+  // "placement": { "targets": ["pg-primary"], "aggregate": "worst" }  // or "sum" over several targets
+}
+```
+
+```
+$ twd deploy
+✓ placed     placed on h2: tag:db direct 1.8 ms (h1: relayed via DERP nyc 24 ms, h3: unmeasured)
+✓ deployed   api@h2 · …
+```
+
+**Where the measurements come from:** each host measures, every 60 s
+(`twd-hostd -path-every`), the targets of the workloads it runs, from that
+tenant's own nodes on the host. It resolves the tag or name in the node's
+netmap and sends WireGuard disco pings; no keys are minted to measure. At
+deploy, mgmt asks hosts without a fresh measurement to probe (≤ 2 s). A
+host that runs nothing of the tenant has no vantage point and stays
+"unmeasured", so in a new tenant the first workload goes by capacity. Pin
+it (`--host`) next to the database once, and later deploys can measure.
+Measurements expire after 5 min and live in mgmt's store, so every replica
+places alike.
+
+**Moving a running workload:** `twd deploy --replace` re-places it. It moves
+only if another eligible host is clearly better: a better path class, or
+≥ 2 ms and ≥ 20 % lower RTT. The lease moves at the next epoch in one
+conditional write, the new host starts it, and the old host stops at its
+next heartbeat. A stateful workload (Durable Objects without `"fence":
+"never"`) also needs `--force-takeover`: its DO storage stays on the old
+host's disk. `twd ls` shows each workload's placement reason.
+
 `twd up --local-dev` keeps the old unix socket + per-host token for
 `twd dev` and hermetic tests only; `twd doctor` flags it.
 

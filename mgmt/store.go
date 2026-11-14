@@ -103,10 +103,10 @@ type Store interface {
 	GetLease(ctx context.Context, name string) (Lease, error)
 	// MoveLease hands a held lease from (from, epoch) to to at epoch+1 in
 	// one conditional write (ErrLeaseLost if from no longer holds it at
-	// epoch): an explicit re-place of a running workload (ADR-029).
+	// epoch): an explicit re-place of a running workload (ADR-030).
 	MoveLease(ctx context.Context, name, from string, epoch int64, to string, ttl time.Duration, now time.Time) (Lease, error)
 
-	// Smart placement (ADR-029): PutHostPaths replaces a host's measured
+	// Smart placement (ADR-030): PutHostPaths replaces a host's measured
 	// paths for one tenant; HostPaths reads every host's paths to the
 	// given targets of a tenant.
 	PutHostPaths(ctx context.Context, hostID, tenantID string, ms []PathMeasurement, now time.Time) error

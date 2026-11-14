@@ -39,7 +39,7 @@ test-js:
 test-sdk: deps
 	$(GO) test -tags sdk -count=1 -v -timeout 10m ./e2e/sdk/...
 
-## e2e-placement: smart placement (ADR-029), hermetic: real twd-mgmt + two twd-hostd processes on
+## e2e-placement: smart placement (ADR-030), hermetic: real twd-mgmt + two twd-hostd processes on
 ## testcontrol + local DERP, a tag:db peer, one host forced onto DERP; placement, stickiness, --replace.
 e2e-placement: deps
 	$(GO) test -tags e2eplacement -count=1 -v -timeout 10m ./e2e/placement/...

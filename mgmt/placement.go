@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Smart placement (ADR-029, Proposed): when a workload declares what it
+// Smart placement (ADR-030 draft, Proposed): when a workload declares what it
 // connects to (twd.jsonc tailnet.connects, or placement.targets), mgmt
 // prefers the eligible host with the best measured tailnet path to those
 // targets: direct WireGuard over a peer relay over DERP, then lower RTT.

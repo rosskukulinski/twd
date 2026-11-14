@@ -124,7 +124,7 @@ type Config struct {
 	PushListener net.Listener
 	PushPort     int
 	// PathEvery is how often hostd measures and reports the tailnet paths
-	// to its assignments' placement targets (smart placement, ADR-029).
+	// to its assignments' placement targets (smart placement, ADR-030).
 	// 0 = DefaultPathEvery (60 s); negative disables measuring.
 	PathEvery time.Duration
 }

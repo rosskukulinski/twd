@@ -601,7 +601,7 @@ paths:
       operationId: ReportHostPaths
       summary: Report measured tailnet paths (smart placement)
       description: |
-        Smart placement (ADR-029). The host reports, per tenant, the path
+        Smart placement (ADR-030). The host reports, per tenant, the path
         from that tenant's nodes on this host to each target its workloads
         declare (`placementTargets` in its assignments): `direct` WireGuard,
         `peer-relay`, `derp`, or `unresolved` / `unreachable`, with the RTT.
@@ -681,7 +681,7 @@ paths:
         `Location: /v1/deployments/{id}`. Poll it until `status` is `active`
         or `failed`.
 
-        **Placement** (ADR-029; the answer's `placement` says why):
+        **Placement** (ADR-030; the answer's `placement` says why):
         1. Eligible hosts are live, in the tenant's pool, offer the
            workload's tier (`microvm` needs a host with KVM; `503 no_host`
            otherwise), and have free capacity.
@@ -2278,7 +2278,7 @@ components:
         measurement; placement only).
     PlacementDecision:
       type: object
-      description: Why a deployment is on its host (smart placement, ADR-029).
+      description: Why a deployment is on its host (smart placement, ADR-030).
       required: [host, reason, mode, summary]
       properties:
         host: { type: string }
@@ -2412,7 +2412,7 @@ components:
         replace:
           type: boolean
           description: >-
-            Re-place a running workload (smart placement, ADR-029): move it to a clearly better eligible
+            Re-place a running workload (smart placement, ADR-030): move it to a clearly better eligible
             host, or to `host` when pinned. Audited (`movedFrom`, `replace`).
         namespaces:
           type: array

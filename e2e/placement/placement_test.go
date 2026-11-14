@@ -1,6 +1,6 @@
 //go:build e2eplacement
 
-// Package placement is the hermetic smart-placement e2e (ADR-029): real
+// Package placement is the hermetic smart-placement e2e (ADR-030): real
 // twd-mgmt and two real twd-hostd processes on testcontrol + a local DERP,
 // a "database" peer tagged tag:db, and one host forced onto DERP
 // (TS_DEBUG_ALWAYS_USE_DERP=1 in that hostd's environment, so its nodes

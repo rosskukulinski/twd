@@ -562,7 +562,7 @@ type DeployRequest struct {
 	// stopped heartbeating, is really gone, so a stateful workload may move
 	// off it (ADR-028 §3). Audited.
 	ForceTakeover bool `json:"forceTakeover,omitempty"`
-	// Replace re-places the workload (`twd deploy --replace`, ADR-029):
+	// Replace re-places the workload (`twd deploy --replace`, ADR-030):
 	// the current live holder is not kept just because it holds the lease;
 	// the workload moves if another eligible host is clearly better (or to
 	// Host, when pinned). The lease moves at epoch+1 in one conditional
@@ -764,7 +764,7 @@ type DeploymentView struct {
 	Namespaces   []ClassConfig `json:"namespaces"`
 	DeployedBy   string        `json:"deployedBy,omitempty"`
 	CreatedAt    int64         `json:"createdAt"`
-	// Placement is why the deployment is on its host (ADR-029).
+	// Placement is why the deployment is on its host (ADR-030).
 	Placement *PlacementDecision `json:"placement,omitempty"`
 	Endpoint  struct {
 		ObjectID string `json:"objectID,omitempty"`
@@ -911,7 +911,7 @@ type Assignment struct {
 	// FenceAfter (stateful). Hosts treat a missing field as true.
 	Fence bool `json:"fence"`
 	// PlacementTargets are what the host should measure paths to for this
-	// workload (smart placement, ADR-029; empty = nothing).
+	// workload (smart placement, ADR-030; empty = nothing).
 	PlacementTargets []string `json:"placementTargets,omitempty"`
 }
 
