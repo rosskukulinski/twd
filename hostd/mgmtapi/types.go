@@ -4,7 +4,11 @@
 // types here are the subset hostd works with, converted at the edge.
 package mgmtapi
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"github.com/rosskukulinski/twd/internal/container"
+)
 
 // Error is every non-2xx body (DX.md catalog shape).
 type Error struct {
@@ -86,6 +90,67 @@ type RegisterRequest struct {
 	// AuditPubKey: base64 ed25519 key for hostSig.
 	AuditPubKey string `json:"auditPubKey,omitempty"`
 	Pool        string `json:"pool,omitempty"`
+	// Arch is GOARCH; Capacity the capacity vector (ADR-032 D9).
+	Arch     string        `json:"arch,omitempty"`
+	Capacity *HostCapacity `json:"capacity,omitempty"`
+}
+
+// HostCapacity is the spec's HostCapacity: what a host can run.
+type HostCapacity struct {
+	Nodes          int     `json:"nodes"`
+	VMs            int     `json:"vms"`
+	VMMemMiB       int     `json:"vmMemMiB"`
+	HugeMemMiB     int     `json:"hugeMemMiB"`
+	VCPUs          int     `json:"vcpus"`
+	VCPUOvercommit float64 `json:"vcpuOvercommit"`
+	ScratchMiB     int     `json:"scratchMiB"`
+}
+
+// HostUsage is the spec's HostUsage: live usage against HostCapacity.
+type HostUsage struct {
+	Nodes      int     `json:"nodes"`
+	VMs        int     `json:"vms"`
+	VMMemMiB   int     `json:"vmMemMiB"`
+	HugeMemMiB int     `json:"hugeMemMiB"`
+	VCPUs      float64 `json:"vcpus"`
+	ScratchMiB int     `json:"scratchMiB"`
+	Containers int     `json:"containers"`
+}
+
+// ContainerResources is the spec's ContainerResources (= container.Resources).
+type ContainerResources = container.Resources
+
+// RunningContainer is one container in a heartbeat (spec RunningContainer).
+type RunningContainer struct {
+	ReservationID string             `json:"reservationID,omitempty"`
+	TenantID      string             `json:"tenantID"`
+	Workload      string             `json:"workload"`
+	Class         string             `json:"class"`
+	Object        string             `json:"object"`
+	Resources     ContainerResources `json:"resources"`
+}
+
+// ContainerReservationRequest is POST /v1/container-reservations.
+type ContainerReservationRequest struct {
+	TenantID  string             `json:"tenantID"`
+	Workload  string             `json:"workload"`
+	Class     string             `json:"class"`
+	Object    string             `json:"object"`
+	Epoch     int64              `json:"epoch"`
+	Resources ContainerResources `json:"resources"`
+}
+
+// ContainerReservation is the spec's ContainerReservation.
+type ContainerReservation struct {
+	ReservationID string             `json:"reservationID"`
+	TenantID      string             `json:"tenantID"`
+	Workload      string             `json:"workload"`
+	Class         string             `json:"class"`
+	Object        string             `json:"object"`
+	Host          string             `json:"host"`
+	Resources     ContainerResources `json:"resources"`
+	CreatedAt     int64              `json:"createdAt"`
+	RenewedAt     int64              `json:"renewedAt"`
 }
 
 type OK struct {
@@ -108,6 +173,12 @@ type HeartbeatRequest struct {
 	Leases    []Lease `json:"leases"`
 	// Deployments (v0.1, optional) reports per-deployment status.
 	Deployments []DeploymentStatus `json:"deployments,omitempty"`
+	// Usage is live usage against the registered capacity.
+	Usage *HostUsage `json:"usage,omitempty"`
+	// Containers are the running containers (reservation reconciliation:
+	// an empty list means none run, so mgmt releases this host's
+	// reservations). Always set it (null is not in the spec).
+	Containers []RunningContainer `json:"containers"`
 }
 
 type KillOrder struct {

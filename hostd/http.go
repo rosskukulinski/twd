@@ -24,6 +24,10 @@ var errStatus = map[string]int{
 	"lease_lost": 409, "namespace_conflict": 409, "spawn_budget_exceeded": 429, "bootstrap_failed": 502,
 	"cap_missing": 403, "delegation_exceeds_parent": 403, "delegation_invalid": 403,
 	"forbidden_destination": 403, "peer_not_visible": 403, "acl_denied": 403,
+	// Containers (ADR-032): local capacity, the tenant quota (mgmt), mgmt
+	// unreachable (fail closed), a second start of a running container.
+	"capacity_exhausted": 503, "container_quota_exceeded": 429, "quota_unavailable": 503, "container_running": 409,
+	"tier_unavailable": 409,
 }
 
 func writeAPIError(w http.ResponseWriter, e *apiError) {

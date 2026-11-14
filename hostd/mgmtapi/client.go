@@ -224,6 +224,12 @@ func (c *Client) Register(ctx context.Context, r RegisterRequest) error {
 	if r.Pool != "" {
 		reg["pool"] = r.Pool
 	}
+	if r.Arch != "" {
+		reg["arch"] = r.Arch
+	}
+	if r.Capacity != nil {
+		reg["capacity"] = r.Capacity
+	}
 	switch {
 	case r.PushPort > 0:
 		reg["push"] = map[string]any{"port": r.PushPort}
@@ -401,6 +407,43 @@ func (c *Client) VolumeKey(ctx context.Context, tenantID, workload string, epoch
 		return nil, err
 	}
 	return out.Key, nil
+}
+
+// ReserveContainer is POST /v1/container-reservations: quota for one
+// container, granted only to the workload's lease holder at r.Epoch (201
+// new; 200 the reservation the key already holds). A refusal is a typed
+// *Error (429 container_quota_exceeded, 409 lease_lost); anything else
+// (transport, 5xx) means mgmt is unreachable.
+func (c *Client) ReserveContainer(ctx context.Context, r ContainerReservationRequest) (*ContainerReservation, error) {
+	body, err := jsonBody(r)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.V1().CreateContainerReservationWithBodyWithResponse(ctx, "application/json", body)
+	if err != nil {
+		return nil, err
+	}
+	var out ContainerReservation
+	if err := result(resp.HTTPResponse, resp.Body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ReleaseContainer is DELETE /v1/container-reservations/{id}; a reservation
+// that is already gone (404) counts as released.
+func (c *Client) ReleaseContainer(ctx context.Context, id string) error {
+	resp, err := c.V1().DeleteContainerReservationWithResponse(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := result(resp.HTTPResponse, resp.Body, nil); err != nil {
+		if e, ok := AsError(err); ok && e.Status == 404 {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 // Ready is PATCH /v1/objects/{id} {"status":"ready", …} (merge patch).

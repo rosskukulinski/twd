@@ -77,13 +77,13 @@ func TestDefaultMicroVMNeedsBackend(t *testing.T) {
 	}
 }
 
-// The registered and reported tiers follow the backend; ForceProcessTier
-// never advertises microvm.
+// The registered and reported tiers follow the backend (containers run in
+// microVMs); ForceProcessTier advertises neither.
 func TestHostTiers(t *testing.T) {
 	for _, c := range []struct {
 		vm, force bool
 		want      string
-	}{{false, false, "process"}, {true, false, "process,microvm"}, {true, true, "process"}} {
+	}{{false, false, "process"}, {true, false, "process,microvm,containers"}, {true, true, "process"}} {
 		h := &Host{cfg: Config{ForceProcessTier: c.force}}
 		if c.vm {
 			h.cfg.VM = fakeBackend{}
