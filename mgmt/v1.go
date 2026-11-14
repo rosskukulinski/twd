@@ -414,7 +414,19 @@ func (a *v1api) UpdateTenant(w http.ResponseWriter, r *http.Request, id v1.Tenan
 				}
 			}
 			sp = &s
-		case "registrationsPerMinute", "maxObjects":
+		case "maxContainerVCPU":
+			var f float64
+			if null {
+				writeErr(w, r, errf(400, "bad_request", "%s cannot be null", k))
+				return
+			}
+			if err := json.Unmarshal(raw, &f); err != nil {
+				writeErr(w, r, errf(400, "bad_request", "%s must be a number", k))
+				return
+			}
+			p.MaxContainerVCPU = &f
+			continue
+		case "registrationsPerMinute", "maxObjects", "maxContainers", "maxContainerMemMiB":
 			var n int
 			if null {
 				writeErr(w, r, errf(400, "bad_request", "%s cannot be null", k))
@@ -459,6 +471,10 @@ func (a *v1api) UpdateTenant(w http.ResponseWriter, r *http.Request, id v1.Tenan
 			p.RegistrationsPerMinute = ip
 		case "maxObjects":
 			p.MaxObjects = ip
+		case "maxContainers":
+			p.MaxContainers = ip
+		case "maxContainerMemMiB":
+			p.MaxContainerMemMiB = ip
 		}
 	}
 	t, err := a.s.M.UpdateTenant(r.Context(), id, p)
@@ -658,16 +674,12 @@ func (a *v1api) DeleteHost(w http.ResponseWriter, r *http.Request, id v1.HostID,
 }
 
 func (a *v1api) ReportHostStatus(w http.ResponseWriter, r *http.Request, id v1.HostID) {
-	var req struct {
-		LiveNodes   int                `json:"liveNodes"`
-		Leases      []HeartbeatLease   `json:"leases"`
-		Deployments []DeploymentStatus `json:"deployments"`
-	}
+	var req HostReport
 	if err := readJSON(r, &req); err != nil {
 		writeErr(w, r, err)
 		return
 	}
-	resp, err := a.s.M.Heartbeat(r.Context(), id, req.LiveNodes, req.Leases, req.Deployments...)
+	resp, err := a.s.M.ReportHostStatus(r.Context(), id, req)
 	if err != nil {
 		writeErr(w, r, err)
 		return
@@ -1247,6 +1259,58 @@ func (a *v1api) CreateVolumeKeyGrant(w http.ResponseWriter, r *http.Request, id 
 		Key       []byte `json:"key"`
 		GrantedAt int64  `json:"grantedAt"`
 	}{id, tenantID, workload, params.Epoch, key, a.s.M.now().UnixMilli()})
+}
+
+// ---- container reservations (ADR-032 D9) ----
+
+func (a *v1api) CreateContainerReservation(w http.ResponseWriter, r *http.Request) {
+	var req ReserveRequest
+	if err := readJSON(r, &req); err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	res, created, err := a.s.M.ReserveContainer(r.Context(), hostOf(r), req)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	if created {
+		location(w, "/v1/container-reservations/"+res.ID)
+		writeJSON(w, 201, res)
+		return
+	}
+	writeJSON(w, 200, res)
+}
+
+func (a *v1api) ListContainerReservations(w http.ResponseWriter, r *http.Request, params v1.ListContainerReservationsParams) {
+	pg, n, err := pageParams(params.Limit, params.Cursor)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	f := ContainerFilter{TenantID: str(params.Tenant), HostID: str(params.Host)}
+	if p := principalOf(r.Context()); p.Kind == "host" || r.Header.Get("Twd-Host-ID") != "" {
+		f.HostID = hostOf(r) // a host sees its own reservations only
+	}
+	rs, err := a.s.M.store.ListContainerReservations(r.Context(), f, pg)
+	if err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	writeJSON(w, 200, mkPage(rs, n, func(c ContainerReservation) PageKey { return PageKey{Created: c.CreatedAt, ID: c.ID} }))
+}
+
+func (a *v1api) DeleteContainerReservation(w http.ResponseWriter, r *http.Request, id v1.ReservationID) {
+	p := principalOf(r.Context())
+	host := ""
+	if p.Kind == "host" || p.Kind == "local" {
+		host = hostOf(r) // "" for a local admin (twd CLI): any host's
+	}
+	if err := a.s.M.ReleaseContainer(r.Context(), id, host, p.Actor(r)); err != nil {
+		writeErr(w, r, err)
+		return
+	}
+	w.WriteHeader(204)
 }
 
 // ---- role middleware ----

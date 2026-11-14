@@ -703,7 +703,7 @@ twd doctor                                     # "microvm_tier: ok"
 After that **twd runs as you**: `twd up …` as usual. `twd up` prints
 `tiers: process [Landlock+seccomp, landlock (ABI 4)], microvm [Firecracker,
 jailed, via twd-vmhelper; "tier": "microvm" in twd.jsonc]`. Without the
-setup, `"tier": "microvm"` falls back to the process tier with a warning,
+setup the host offers the process tier only: mgmt places `"tier": "microvm"` on a host that offers it (`503 no_host` if none), and a host that cannot run it refuses it (`tier_unavailable`), never running it in the process tier;
 and `twd doctor` says why (`microvm_tier: warn … fix: sudo
 ~/.twd/bin/twd host setup --microvm`).
 

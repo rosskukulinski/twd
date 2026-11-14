@@ -24,8 +24,28 @@ type Store interface {
 	UpsertHost(ctx context.Context, h Host) error
 	GetHost(ctx context.Context, id string) (Host, error)
 	ListHosts(ctx context.Context, pg Page) ([]Host, error)
-	TouchHost(ctx context.Context, id string, liveNodes int, now time.Time) error
+	// TouchHost records a heartbeat (usage nil: keep the stored usage).
+	TouchHost(ctx context.Context, id string, liveNodes int, usage *HostUsage, now time.Time) error
+	// DeleteHost removes the host and its container reservations.
 	DeleteHost(ctx context.Context, id string) error
+
+	// Container reservations (ADR-032 D9), keyed (tenant, workload, class,
+	// object). ReserveContainer inserts r, or renews the reservation already
+	// held for r's key, moving it to r.HostID (created false). A new key, or
+	// one that grows, must fit q (else *ContainerQuotaError) and fence must
+	// hold (ErrLeaseLost), both in the transaction that writes it.
+	ReserveContainer(ctx context.Context, r ContainerReservation, q ContainerQuota, fence *Fence) (ContainerReservation, bool, error)
+	GetContainerReservation(ctx context.Context, id string) (ContainerReservation, error)
+	// ReleaseContainer deletes reservation id if hostID holds it (else ErrNotFound).
+	ReleaseContainer(ctx context.Context, id, hostID string) error
+	ListContainerReservations(ctx context.Context, f ContainerFilter, pg Page) ([]ContainerReservation, error)
+	// ReconcileContainers applies hostID's heartbeat: its reservations for
+	// the running keys are renewed at now; a running key with no reservation
+	// is inserted when adopt allows it (a key held by another host is left
+	// alone); then hostID's reservations renewed before releaseBefore are
+	// deleted. It returns the inserted and the deleted ones.
+	ReconcileContainers(ctx context.Context, hostID string, running []ContainerReservation, now, releaseBefore int64,
+		adopt func(ContainerReservation) bool) (adopted, released []ContainerReservation, err error)
 
 	CreateDeployment(ctx context.Context, d Deployment) error
 	GetDeployment(ctx context.Context, id string) (Deployment, error)

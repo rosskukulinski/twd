@@ -132,6 +132,8 @@ tags:
     description: Hash-chained, append-only audit log.
   - name: volumes
     description: dm-crypt data keys for DO volumes (microVM tier).
+  - name: containers
+    description: Container and code-sandbox reservations against tenant quotas (microVM tier, ADR-032).
   - name: operational
     description: Health, status, identity, maintenance.
   - name: oidc
@@ -1387,6 +1389,130 @@ paths:
         "409": { $ref: "#/components/responses/LeaseLost" }
         default: { $ref: "#/components/responses/Error" }
 
+  # ------------------------------------------------------------- containers
+  /v1/container-reservations:
+    post:
+      tags: [containers]
+      operationId: CreateContainerReservation
+      summary: Reserve quota for a container before it starts
+      description: |
+        hostd calls this synchronously at `ctx.container.start()`, after its
+        own capacity check (`503 capacity_exhausted` is hostd's, never
+        mgmt's) and before it boots the container's VM. Only the host holding
+        the workload's lease at `epoch` may reserve (`409 lease_lost`).
+
+        The key is `(tenantID, workload, class, object)`: one container per
+        DO instance (ADR-032 D2). Reserving a key that already holds a
+        reservation is **idempotent** (`200`, the same `reservationID`; a
+        larger container re-checks the quota for the difference), so a
+        restart never needs new headroom, and a host that took the workload
+        over adopts the key. A new key is checked atomically, in the store,
+        against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+        and `maxContainerVCPU`, and the class's `max_instances` from the
+        deployment: over any of them is `429 container_quota_exceeded`
+        (`missing: {quota, limit, used, requested}`). Containers are not
+        objects: they count against neither `maxObjects` nor a host's
+        `capacityNodes`.
+
+        hostd **fails closed** when mgmt is unreachable: no reservation, no
+        start, except a restart of a container whose reservation it already
+        holds. Released by `DELETE` on stop; a reservation that no heartbeat
+        reports (`HostStatus.containers`) for 30 s after its creation is
+        released by mgmt, and one whose host stopped reporting it for 2 min no
+        longer counts, both on the store clock. Audited
+        (`kind: container_reserve`).
+      x-twd-role: host
+      x-twd-audit: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ContainerReservationCreate" }
+            example:
+              tenantID: tn_tail7906d5
+              workload: agent
+              class: Sandbox
+              object: my-sandbox
+              epoch: 3
+              resources: { vcpu: 0.0625, memMiB: 256, diskMiB: 2000 }
+      responses:
+        "201":
+          description: Reserved.
+          headers:
+            Location: { $ref: "#/components/headers/Location" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContainerReservation" }
+        "200":
+          description: The key already held a reservation (restart, or a takeover by the lease holder); it is returned, renewed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContainerReservation" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: Unknown tenant (`unknown_tenant`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "409": { $ref: "#/components/responses/LeaseLost" }
+        "429":
+          description: Over a container quota (`container_quota_exceeded`).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+              example:
+                code: container_quota_exceeded
+                message: "tenant tn_tail7906d5 runs 10 containers (maxContainers 10)"
+                missing: { quota: maxContainers, limit: 10, used: 10, requested: 1 }
+                doc_url: https://twd.dev/errors/container_quota_exceeded
+                trace_id: 7f3a…
+        default: { $ref: "#/components/responses/Error" }
+    get:
+      tags: [containers]
+      operationId: ListContainerReservations
+      summary: List container reservations
+      description: Hosts see their own reservations only.
+      x-twd-role: admin|host
+      parameters:
+        - $ref: "#/components/parameters/limit"
+        - $ref: "#/components/parameters/cursor"
+        - name: tenant
+          in: query
+          schema: { type: string }
+        - name: host
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: One page of reservations, ordered by `(createdAt, reservationID)`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ContainerReservationPage" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/container-reservations/{id}:
+    parameters:
+      - $ref: "#/components/parameters/reservationID"
+    delete:
+      tags: [containers]
+      operationId: DeleteContainerReservation
+      summary: Release a container reservation (the container stopped)
+      description: |
+        Only the holding host (or an admin) may release it (`403 forbidden`).
+        Idempotent from the host's side: `404` means it is already gone.
+        Audited (`kind: container_release`).
+      x-twd-role: host|admin
+      x-twd-audit: true
+      responses:
+        "204":
+          description: Released.
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        default: { $ref: "#/components/responses/Error" }
+
   # ------------------------------------------------------------ operational
   /v1/healthz:
     get:
@@ -1608,6 +1734,12 @@ components:
       description: "Volume ID `<tenantID>:<workload>` (one volume per workload; `:` is a legal path character)."
       schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}:[a-z0-9][a-z0-9-]{0,62}$" }
       example: "tn_tail7906d5:agent"
+    reservationID:
+      name: id
+      in: path
+      required: true
+      description: Container reservation ID (`cr_…`).
+      schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }
 
   headers:
     ETag:
@@ -1842,7 +1974,7 @@ components:
         | `lease_lost` | 409 | epoch/holder fence failed |
         | `lease_held` | 409 | another host holds the lease |
         | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
-        | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+        | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers |
         | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
         | `already_joined` | 409 | credential for an object that has a node |
         | `identity_conflict` | 409 | object ID collision across identities |
@@ -1855,10 +1987,11 @@ components:
         | `precondition_failed` | 412 | `If-Match` mismatch |
         | `object_quota_exceeded` | 429 | tenant `maxObjects` |
         | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+        | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
         | `bootstrap_failed` | 502 | control plane refused the mint |
         | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
         | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
-        | `no_host` | 503 | no live host for the deployment |
+        | `no_host` | 503 | no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) |
         | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
         | `internal` | 500 | — |
       enum:
@@ -1896,6 +2029,7 @@ components:
         - precondition_failed
         - object_quota_exceeded
         - spawn_budget_exceeded
+        - container_quota_exceeded
         - bootstrap_failed
         - host_token_unconfigured
         - identity_pending
@@ -1964,6 +2098,12 @@ components:
         - type: object
           properties:
             items: { type: array, items: { $ref: "#/components/schemas/Deployment" } }
+    ContainerReservationPage:
+      allOf:
+        - $ref: "#/components/schemas/Page"
+        - type: object
+          properties:
+            items: { type: array, items: { $ref: "#/components/schemas/ContainerReservation" } }
     ObjectPage:
       allOf:
         - $ref: "#/components/schemas/Page"
@@ -2013,6 +2153,9 @@ components:
         wif: { $ref: "#/components/schemas/WIFInfo" }
         registrationsPerMinute: { type: integer, minimum: 1, default: 200 }
         maxObjects: { type: integer, minimum: 1, default: 1000 }
+        maxContainers: { type: integer, minimum: 1, default: 10, description: "Running containers (ADR-032), across the tenant's workloads. Not objects: they don't count against `maxObjects`." }
+        maxContainerMemMiB: { type: integer, minimum: 1, default: 16384, description: Total guest memory of the tenant's running containers. }
+        maxContainerVCPU: { type: number, exclusiveMinimum: 0, default: 8, description: "Total vCPUs of the tenant's running containers (fractional: `lite` is 1/16)." }
         pool:
           type: string
           description: Host pool the tenant's deployments are placed on (hosts with a matching `pool`; empty = any host).
@@ -2043,6 +2186,9 @@ components:
         oauthClientFile: { type: string }
         registrationsPerMinute: { type: integer, minimum: 1 }
         maxObjects: { type: integer, minimum: 1 }
+        maxContainers: { type: integer, minimum: 1 }
+        maxContainerMemMiB: { type: integer, minimum: 1 }
+        maxContainerVCPU: { type: number, exclusiveMinimum: 0 }
         pool: { type: string }
         tier: { $ref: "#/components/schemas/Tier" }
       additionalProperties: false
@@ -2058,6 +2204,9 @@ components:
         oauthClientFile: { type: [string, "null"] }
         registrationsPerMinute: { type: integer, minimum: 1 }
         maxObjects: { type: integer, minimum: 1 }
+        maxContainers: { type: integer, minimum: 1 }
+        maxContainerMemMiB: { type: integer, minimum: 1 }
+        maxContainerVCPU: { type: number, exclusiveMinimum: 0 }
         pool: { type: [string, "null"] }
         tier: { $ref: "#/components/schemas/Tier" }
       additionalProperties: false
@@ -2106,6 +2255,46 @@ components:
       properties:
         port: { type: integer, minimum: 1, maximum: 65535 }
         url: { type: string, description: "`unix:///path/hostd.sock`; local-dev only." }
+    HostTier:
+      type: string
+      description: "What a host offers: the isolation tiers (`process`, `microvm`) and `containers` (ADR-032: it can run containers and code sandboxes, one microVM each, for images of its `arch`)."
+      enum: [process, microvm, containers]
+    Arch:
+      type: string
+      description: A Go GOARCH. Container images must match their host's.
+      enum: [amd64, arm64]
+    HostCapacity:
+      type: object
+      description: |
+        The capacity vector a host registers (ADR-032 D9). `nodes` is
+        tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO
+        instances and containers alike): their count, guest memory (all, and
+        the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit`
+        for scheduling) and scratch disk. A host without a microVM backend
+        reports 0 for every VM dimension.
+      required: [nodes, vms, vmMemMiB, hugeMemMiB, vcpus, vcpuOvercommit, scratchMiB]
+      properties:
+        nodes: { type: integer, minimum: 0 }
+        vms: { type: integer, minimum: 0 }
+        vmMemMiB: { type: integer, minimum: 0 }
+        hugeMemMiB: { type: integer, minimum: 0 }
+        vcpus: { type: integer, minimum: 0 }
+        vcpuOvercommit: { type: number, minimum: 0 }
+        scratchMiB: { type: integer, minimum: 0 }
+      additionalProperties: false
+    HostUsage:
+      type: object
+      description: Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`).
+      required: [nodes, vms, vmMemMiB, hugeMemMiB, vcpus, scratchMiB, containers]
+      properties:
+        nodes: { type: integer, minimum: 0 }
+        vms: { type: integer, minimum: 0 }
+        vmMemMiB: { type: integer, minimum: 0 }
+        hugeMemMiB: { type: integer, minimum: 0 }
+        vcpus: { type: number, minimum: 0 }
+        scratchMiB: { type: integer, minimum: 0 }
+        containers: { type: integer, minimum: 0 }
+      additionalProperties: false
     Host:
       type: object
       required: [hostID, status, capacityNodes, tiers, liveNodes, lastSeen, createdAt, updatedAt]
@@ -2113,7 +2302,10 @@ components:
         hostID: { type: string }
         status: { $ref: "#/components/schemas/HostStatusEnum" }
         capacityNodes: { type: integer }
-        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+        tiers: { type: array, items: { $ref: "#/components/schemas/HostTier" } }
+        arch: { $ref: "#/components/schemas/Arch" }
+        capacity: { $ref: "#/components/schemas/HostCapacity" }
+        usage: { $ref: "#/components/schemas/HostUsage" }
         pool: { type: string }
         nodeID: { type: string, description: "Stable node ID of the host's `tag:twd-host` tsnet node (bound at registration)." }
         dnsName: { type: string, description: "`twd-host-<hostID>.<tailnet>`." }
@@ -2133,7 +2325,7 @@ components:
           type: string
           description: "The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own)."
         pool: { type: string }
-        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" } }
+        tiers: { type: array, items: { $ref: "#/components/schemas/HostTier" } }
       additionalProperties: false
     HostJoin:
       type: object
@@ -2153,7 +2345,9 @@ components:
       required: [capacityNodes, tiers]
       properties:
         capacityNodes: { type: integer, minimum: 0 }
-        tiers: { type: array, items: { $ref: "#/components/schemas/Tier" }, minItems: 1 }
+        tiers: { type: array, items: { $ref: "#/components/schemas/HostTier" }, minItems: 1 }
+        arch: { $ref: "#/components/schemas/Arch" }
+        capacity: { $ref: "#/components/schemas/HostCapacity" }
         pool: { type: string }
         auditPubKey: { type: string }
         push: { $ref: "#/components/schemas/HostPush" }
@@ -2180,6 +2374,17 @@ components:
         liveNodes: { type: integer, minimum: 0 }
         leases: { type: array, items: { $ref: "#/components/schemas/Lease" } }
         deployments: { type: array, items: { $ref: "#/components/schemas/DeploymentReport" } }
+        usage: { $ref: "#/components/schemas/HostUsage" }
+        containers:
+          type: array
+          description: |
+            Every container running on this host (reservation reconciliation,
+            ADR-032 D9): a reported reservation is renewed; a host's
+            reservation left out for 30 s after its creation is released; a
+            reported container with no reservation is adopted if this host
+            holds the workload's lease (it runs; mgmt records it, over quota
+            or not, audited `container_reserve` with `adopted`), else ignored.
+          items: { $ref: "#/components/schemas/RunningContainer" }
       additionalProperties: false
     HostStatusResponse:
       type: object
@@ -2457,7 +2662,8 @@ components:
         `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
         `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
         `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-        `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+        `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`,
+        `container_reserve`, `container_release`.
       enum:
         - allow
         - deny
@@ -2486,6 +2692,8 @@ components:
         - credential
         - obo_root
         - object_update
+        - container_reserve
+        - container_release
     AuditSource:
       type: string
       description: "`mgmt` for the mgmt chain; `host` for netd/hostd security records; `tenant` for a `tenant_note` written by tenant code (unverified content)."
@@ -2559,6 +2767,53 @@ components:
         key: { type: string, contentEncoding: base64, format: password, description: 32 bytes. }
         grantedAt: { type: integer, format: int64 }
       x-twd-secret: true
+
+    # ---------------------------------------------------------- containers
+    ContainerResources:
+      type: object
+      description: "What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`)."
+      required: [vcpu, memMiB, diskMiB]
+      properties:
+        vcpu: { type: number, exclusiveMinimum: 0, maximum: 64 }
+        memMiB: { type: integer, minimum: 1 }
+        diskMiB: { type: integer, minimum: 0 }
+      additionalProperties: false
+    ContainerReservationCreate:
+      type: object
+      required: [tenantID, workload, class, object, epoch, resources]
+      properties:
+        tenantID: { type: string }
+        workload: { type: string }
+        class: { type: string, description: "The DO class (a wrangler `containers[].class_name`)." }
+        object: { type: string, minLength: 1, maxLength: 256, description: "The DO instance (its name or hex ID): one container per instance." }
+        epoch: { type: integer, format: int64, minimum: 1, description: The workload's lease epoch the host holds. }
+        resources: { $ref: "#/components/schemas/ContainerResources" }
+      additionalProperties: false
+    ContainerReservation:
+      type: object
+      required: [reservationID, tenantID, workload, class, object, host, resources, createdAt, renewedAt]
+      properties:
+        reservationID: { type: string, examples: [cr_5k2m9q] }
+        tenantID: { type: string }
+        workload: { type: string }
+        class: { type: string }
+        object: { type: string }
+        host: { type: string }
+        resources: { $ref: "#/components/schemas/ContainerResources" }
+        createdAt: { type: integer, format: int64, description: unix ms (store clock) }
+        renewedAt: { type: integer, format: int64, description: unix ms of the last reserve or heartbeat that reported it (store clock) }
+    RunningContainer:
+      type: object
+      description: One running container in a heartbeat.
+      required: [tenantID, workload, class, object, resources]
+      properties:
+        reservationID: { type: string, description: "The reservation it runs under (absent: started without one, e.g. a restart while mgmt was unreachable)." }
+        tenantID: { type: string }
+        workload: { type: string }
+        class: { type: string }
+        object: { type: string, minLength: 1, maxLength: 256 }
+        resources: { $ref: "#/components/schemas/ContainerResources" }
+      additionalProperties: false
 
     # --------------------------------------------------------- operational
     Health:

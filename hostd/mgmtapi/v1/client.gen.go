@@ -18,41 +18,65 @@ import (
 	"github.com/oapi-codegen/runtime"
 )
 
+// Defines values for Arch.
+const (
+	Amd64 Arch = "amd64"
+	Arm64 Arch = "arm64"
+)
+
+// Valid indicates whether the value is a known member of the Arch enum.
+func (e Arch) Valid() bool {
+	switch e {
+	case Amd64:
+		return true
+	case Arm64:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for AuditKind.
 const (
-	AuditKindAllow        AuditKind = "allow"
-	AuditKindCreate       AuditKind = "create"
-	AuditKindCredential   AuditKind = "credential"
-	AuditKindDeny         AuditKind = "deny"
-	AuditKindDeploy       AuditKind = "deploy"
-	AuditKindDeviceDelete AuditKind = "device_delete"
-	AuditKindEgress       AuditKind = "egress"
-	AuditKindHostAdd      AuditKind = "host_add"
-	AuditKindHostDelete   AuditKind = "host_delete"
-	AuditKindHostRegister AuditKind = "host_register"
-	AuditKindKill         AuditKind = "kill"
-	AuditKindMint         AuditKind = "mint"
-	AuditKindObjectUpdate AuditKind = "object_update"
-	AuditKindOboRoot      AuditKind = "obo_root"
-	AuditKindPreflight    AuditKind = "preflight"
-	AuditKindPrincipal    AuditKind = "principal"
-	AuditKindPurge        AuditKind = "purge"
-	AuditKindReady        AuditKind = "ready"
-	AuditKindReap         AuditKind = "reap"
-	AuditKindRemint       AuditKind = "remint"
-	AuditKindSpawn        AuditKind = "spawn"
-	AuditKindTenantCreate AuditKind = "tenant_create"
-	AuditKindTenantDelete AuditKind = "tenant_delete"
-	AuditKindTenantNote   AuditKind = "tenant_note"
-	AuditKindTenantUpdate AuditKind = "tenant_update"
-	AuditKindUndeploy     AuditKind = "undeploy"
-	AuditKindVolumeKey    AuditKind = "volume_key"
+	AuditKindAllow            AuditKind = "allow"
+	AuditKindContainerRelease AuditKind = "container_release"
+	AuditKindContainerReserve AuditKind = "container_reserve"
+	AuditKindCreate           AuditKind = "create"
+	AuditKindCredential       AuditKind = "credential"
+	AuditKindDeny             AuditKind = "deny"
+	AuditKindDeploy           AuditKind = "deploy"
+	AuditKindDeviceDelete     AuditKind = "device_delete"
+	AuditKindEgress           AuditKind = "egress"
+	AuditKindHostAdd          AuditKind = "host_add"
+	AuditKindHostDelete       AuditKind = "host_delete"
+	AuditKindHostRegister     AuditKind = "host_register"
+	AuditKindKill             AuditKind = "kill"
+	AuditKindMint             AuditKind = "mint"
+	AuditKindObjectUpdate     AuditKind = "object_update"
+	AuditKindOboRoot          AuditKind = "obo_root"
+	AuditKindPreflight        AuditKind = "preflight"
+	AuditKindPrincipal        AuditKind = "principal"
+	AuditKindPurge            AuditKind = "purge"
+	AuditKindReady            AuditKind = "ready"
+	AuditKindReap             AuditKind = "reap"
+	AuditKindRemint           AuditKind = "remint"
+	AuditKindSpawn            AuditKind = "spawn"
+	AuditKindTenantCreate     AuditKind = "tenant_create"
+	AuditKindTenantDelete     AuditKind = "tenant_delete"
+	AuditKindTenantNote       AuditKind = "tenant_note"
+	AuditKindTenantUpdate     AuditKind = "tenant_update"
+	AuditKindUndeploy         AuditKind = "undeploy"
+	AuditKindVolumeKey        AuditKind = "volume_key"
 )
 
 // Valid indicates whether the value is a known member of the AuditKind enum.
 func (e AuditKind) Valid() bool {
 	switch e {
 	case AuditKindAllow:
+		return true
+	case AuditKindContainerRelease:
+		return true
+	case AuditKindContainerReserve:
 		return true
 	case AuditKindCreate:
 		return true
@@ -172,6 +196,7 @@ const (
 	ErrorCodeBadCursor               ErrorCode = "bad_cursor"
 	ErrorCodeBadRequest              ErrorCode = "bad_request"
 	ErrorCodeBootstrapFailed         ErrorCode = "bootstrap_failed"
+	ErrorCodeContainerQuotaExceeded  ErrorCode = "container_quota_exceeded"
 	ErrorCodeDelegationExceedsParent ErrorCode = "delegation_exceeds_parent"
 	ErrorCodeDelegationInvalid       ErrorCode = "delegation_invalid"
 	ErrorCodeExists                  ErrorCode = "exists"
@@ -221,6 +246,8 @@ func (e ErrorCode) Valid() bool {
 	case ErrorCodeBadRequest:
 		return true
 	case ErrorCodeBootstrapFailed:
+		return true
+	case ErrorCodeContainerQuotaExceeded:
 		return true
 	case ErrorCodeDelegationExceedsParent:
 		return true
@@ -330,6 +357,27 @@ func (e HostStatusEnum) Valid() bool {
 	case HostStatusEnumPending:
 		return true
 	case HostStatusEnumStale:
+		return true
+	default:
+		return false
+	}
+}
+
+// Defines values for HostTier.
+const (
+	HostTierContainers HostTier = "containers"
+	HostTierMicrovm    HostTier = "microvm"
+	HostTierProcess    HostTier = "process"
+)
+
+// Valid indicates whether the value is a known member of the HostTier enum.
+func (e HostTier) Valid() bool {
+	switch e {
+	case HostTierContainers:
+		return true
+	case HostTierMicrovm:
+		return true
+	case HostTierProcess:
 		return true
 	default:
 		return false
@@ -452,16 +500,16 @@ func (e StatusClockSource) Valid() bool {
 
 // Defines values for Tier.
 const (
-	Microvm Tier = "microvm"
-	Process Tier = "process"
+	TierMicrovm Tier = "microvm"
+	TierProcess Tier = "process"
 )
 
 // Valid indicates whether the value is a known member of the Tier enum.
 func (e Tier) Valid() bool {
 	switch e {
-	case Microvm:
+	case TierMicrovm:
 		return true
-	case Process:
+	case TierProcess:
 		return true
 	default:
 		return false
@@ -564,6 +612,9 @@ func (e PurgeTenantObjectsParamsState) Valid() bool {
 	}
 }
 
+// Arch A Go GOARCH. Container images must match their host's.
+type Arch string
+
 // Assignment What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
 type Assignment struct {
 	BundleURL    string  `json:"bundleURL"`
@@ -609,7 +660,8 @@ type AuditBatch struct {
 // `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`,
+// `container_reserve`, `container_release`.
 type AuditKind string
 
 // AuditPage defines model for AuditPage.
@@ -649,7 +701,8 @@ type AuditRecord struct {
 	// `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
-	// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
+	// `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`,
+	// `container_reserve`, `container_release`.
 	Kind     AuditKind `json:"kind"`
 	ObjectID *string   `json:"objectID,omitempty"`
 
@@ -706,6 +759,59 @@ type ClassConfig struct {
 
 	// TTL `10m`-style duration or seconds.
 	TTL *string `json:"ttl,omitempty"`
+}
+
+// ContainerReservation defines model for ContainerReservation.
+type ContainerReservation struct {
+	Class string `json:"class"`
+
+	// CreatedAt unix ms (store clock)
+	CreatedAt int64  `json:"createdAt"`
+	Host      string `json:"host"`
+	Object    string `json:"object"`
+
+	// RenewedAt unix ms of the last reserve or heartbeat that reported it (store clock)
+	RenewedAt int64 `json:"renewedAt"`
+
+	// ReservationID Examples: cr_5k2m9q
+	ReservationID string `json:"reservationID"`
+
+	// Resources What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`).
+	Resources ContainerResources `json:"resources"`
+	TenantID  string             `json:"tenantID"`
+	Workload  string             `json:"workload"`
+}
+
+// ContainerReservationCreate defines model for ContainerReservationCreate.
+type ContainerReservationCreate struct {
+	// Class The DO class (a wrangler `containers[].class_name`).
+	Class string `json:"class"`
+
+	// Epoch The workload's lease epoch the host holds.
+	Epoch int64 `json:"epoch"`
+
+	// Object The DO instance (its name or hex ID): one container per instance.
+	Object string `json:"object"`
+
+	// Resources What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`).
+	Resources ContainerResources `json:"resources"`
+	TenantID  string             `json:"tenantID"`
+	Workload  string             `json:"workload"`
+}
+
+// ContainerReservationPage defines model for ContainerReservationPage.
+type ContainerReservationPage struct {
+	Items []ContainerReservation `json:"items"`
+
+	// NextCursor Pass as `?cursor=` for the next page; `null` when there is none.
+	NextCursor nullable.Nullable[string] `json:"nextCursor"`
+}
+
+// ContainerResources What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`).
+type ContainerResources struct {
+	DiskMiB int     `json:"diskMiB"`
+	MemMiB  int     `json:"memMiB"`
+	Vcpu    float32 `json:"vcpu"`
 }
 
 // Credential A single-use auth key. Never logged; `String()` redacts it in Go.
@@ -834,7 +940,7 @@ type Error struct {
 	// | `lease_lost` | 409 | epoch/holder fence failed |
 	// | `lease_held` | 409 | another host holds the lease |
 	// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
-	// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+	// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers |
 	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
@@ -847,10 +953,11 @@ type Error struct {
 	// | `precondition_failed` | 412 | `If-Match` mismatch |
 	// | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 	// | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+	// | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
 	// | `bootstrap_failed` | 502 | control plane refused the mint |
 	// | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 	// | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
-	// | `no_host` | 503 | no live host for the deployment |
+	// | `no_host` | 503 | no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) |
 	// | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
 	// | `internal` | 500 | — |
 	Code    ErrorCode `json:"code"`
@@ -890,7 +997,7 @@ type Error struct {
 // | `lease_lost` | 409 | epoch/holder fence failed |
 // | `lease_held` | 409 | another host holds the lease |
 // | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
-// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers |
 // | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 // | `already_joined` | 409 | credential for an object that has a node |
 // | `identity_conflict` | 409 | object ID collision across identities |
@@ -903,10 +1010,11 @@ type Error struct {
 // | `precondition_failed` | 412 | `If-Match` mismatch |
 // | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 // | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+// | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
 // | `bootstrap_failed` | 502 | control plane refused the mint |
 // | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 // | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
-// | `no_host` | 503 | no live host for the deployment |
+// | `no_host` | 503 | no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) |
 // | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
 // | `internal` | 500 | — |
 type ErrorCode string
@@ -921,10 +1029,21 @@ type HealthOk bool
 
 // Host defines model for Host.
 type Host struct {
+	// Arch A Go GOARCH. Container images must match their host's.
+	Arch *Arch `json:"arch,omitempty"`
+
 	// AuditPubKey base64 ed25519; verifies `hostSig`.
-	AuditPubKey   *string `json:"auditPubKey,omitempty"`
-	CapacityNodes int     `json:"capacityNodes"`
-	CreatedAt     int64   `json:"createdAt"`
+	AuditPubKey *string `json:"auditPubKey,omitempty"`
+
+	// Capacity The capacity vector a host registers (ADR-032 D9). `nodes` is
+	// tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO
+	// instances and containers alike): their count, guest memory (all, and
+	// the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit`
+	// for scheduling) and scratch disk. A host without a microVM backend
+	// reports 0 for every VM dimension.
+	Capacity      *HostCapacity `json:"capacity,omitempty"`
+	CapacityNodes int           `json:"capacityNodes"`
+	CreatedAt     int64         `json:"createdAt"`
 
 	// DNSName `twd-host-<hostID>.<tailnet>`.
 	DNSName *string `json:"dnsName,omitempty"`
@@ -949,8 +1068,27 @@ type Host struct {
 
 	// Status `pending`: created by `twd host add`, never registered. `live`: heartbeated within 10 s. `stale`: registered, no recent heartbeat. `draining`: being deleted.
 	Status    HostStatusEnum `json:"status"`
-	Tiers     []Tier         `json:"tiers"`
+	Tiers     []HostTier     `json:"tiers"`
 	UpdatedAt int64          `json:"updatedAt"`
+
+	// Usage Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`).
+	Usage *HostUsage `json:"usage,omitempty"`
+}
+
+// HostCapacity The capacity vector a host registers (ADR-032 D9). `nodes` is
+// tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO
+// instances and containers alike): their count, guest memory (all, and
+// the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit`
+// for scheduling) and scratch disk. A host without a microVM backend
+// reports 0 for every VM dimension.
+type HostCapacity struct {
+	HugeMemMiB     int     `json:"hugeMemMiB"`
+	Nodes          int     `json:"nodes"`
+	ScratchMiB     int     `json:"scratchMiB"`
+	VcpuOvercommit float32 `json:"vcpuOvercommit"`
+	Vcpus          int     `json:"vcpus"`
+	VMMemMiB       int     `json:"vmMemMiB"`
+	Vms            int     `json:"vms"`
 }
 
 // HostCreate defines model for HostCreate.
@@ -959,8 +1097,8 @@ type HostCreate struct {
 	Pool   *string `json:"pool,omitempty"`
 
 	// TenantID The operator tenant whose credential mints the key (default: the tenant whose tailnet is mgmt's own).
-	TenantID *string `json:"tenantID,omitempty"`
-	Tiers    *[]Tier `json:"tiers,omitempty"`
+	TenantID *string     `json:"tenantID,omitempty"`
+	Tiers    *[]HostTier `json:"tiers,omitempty"`
 }
 
 // HostDeleteResult defines model for HostDeleteResult.
@@ -1008,23 +1146,43 @@ type HostPush struct {
 
 // HostRegistration defines model for HostRegistration.
 type HostRegistration struct {
-	AuditPubKey   *string `json:"auditPubKey,omitempty"`
-	CapacityNodes int     `json:"capacityNodes"`
-	Pool          *string `json:"pool,omitempty"`
+	// Arch A Go GOARCH. Container images must match their host's.
+	Arch        *Arch   `json:"arch,omitempty"`
+	AuditPubKey *string `json:"auditPubKey,omitempty"`
+
+	// Capacity The capacity vector a host registers (ADR-032 D9). `nodes` is
+	// tailnet nodes (= `capacityNodes`); the rest bound microVMs (DO
+	// instances and containers alike): their count, guest memory (all, and
+	// the part backed by 2 MiB huge pages), vCPUs (times `vcpuOvercommit`
+	// for scheduling) and scratch disk. A host without a microVM backend
+	// reports 0 for every VM dimension.
+	Capacity      *HostCapacity `json:"capacity,omitempty"`
+	CapacityNodes int           `json:"capacityNodes"`
+	Pool          *string       `json:"pool,omitempty"`
 
 	// Push Where mgmt pushes kills and assignment changes. Over the tailnet,
 	// `port` names hostd's push listener on **its own tsnet node** (the
 	// WhoIs node; mgmt never pushes anywhere else). `url` is accepted only
 	// on the local-dev socket and only as `unix:///…`.
-	Push  *HostPush `json:"push,omitempty"`
-	Tiers []Tier    `json:"tiers"`
+	Push  *HostPush  `json:"push,omitempty"`
+	Tiers []HostTier `json:"tiers"`
 }
 
 // HostStatus The heartbeat body.
 type HostStatus struct {
+	// Containers Every container running on this host (reservation reconciliation,
+	// ADR-032 D9): a reported reservation is renewed; a host's
+	// reservation left out for 30 s after its creation is released; a
+	// reported container with no reservation is adopted if this host
+	// holds the workload's lease (it runs; mgmt records it, over quota
+	// or not, audited `container_reserve` with `adopted`), else ignored.
+	Containers  *[]RunningContainer `json:"containers,omitempty"`
 	Deployments *[]DeploymentReport `json:"deployments,omitempty"`
 	Leases      []Lease             `json:"leases"`
 	LiveNodes   int                 `json:"liveNodes"`
+
+	// Usage Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`).
+	Usage *HostUsage `json:"usage,omitempty"`
 }
 
 // HostStatusEnum `pending`: created by `twd host add`, never registered. `live`: heartbeated within 10 s. `stale`: registered, no recent heartbeat. `draining`: being deleted.
@@ -1040,6 +1198,20 @@ type HostStatusResponse struct {
 
 	// RevokeObjects Object IDs killed in the last 10 min in namespaces this host holds; kill idempotently.
 	RevokeObjects []string `json:"revokeObjects"`
+}
+
+// HostTier What a host offers: the isolation tiers (`process`, `microvm`) and `containers` (ADR-032: it can run containers and code sandboxes, one microVM each, for images of its `arch`).
+type HostTier string
+
+// HostUsage Live usage against `HostCapacity`, reported with every heartbeat. `containers` is the running containers (a subset of `vms`).
+type HostUsage struct {
+	Containers int     `json:"containers"`
+	HugeMemMiB int     `json:"hugeMemMiB"`
+	Nodes      int     `json:"nodes"`
+	ScratchMiB int     `json:"scratchMiB"`
+	Vcpus      float32 `json:"vcpus"`
+	VMMemMiB   int     `json:"vmMemMiB"`
+	Vms        int     `json:"vms"`
 }
 
 // JWKS defines model for JWKS.
@@ -1305,6 +1477,20 @@ type PurgeResult struct {
 	Purged []string `json:"purged"`
 }
 
+// RunningContainer One running container in a heartbeat.
+type RunningContainer struct {
+	Class  string `json:"class"`
+	Object string `json:"object"`
+
+	// ReservationID The reservation it runs under (absent: started without one, e.g. a restart while mgmt was unreachable).
+	ReservationID *string `json:"reservationID,omitempty"`
+
+	// Resources What one container reserves: vCPUs (fractional; Cloudflare's `lite` is 0.0625), guest memory and scratch disk (from its class's `instance_type`).
+	Resources ContainerResources `json:"resources"`
+	TenantID  string             `json:"tenantID"`
+	Workload  string             `json:"workload"`
+}
+
 // SelfInfo defines model for SelfInfo.
 type SelfInfo struct {
 	// DNSName `twd-mgmt.<tailnet>`
@@ -1380,7 +1566,16 @@ type Tenant struct {
 	// ControlURL Non-default control plane (testcontrol, headscale).
 	ControlURL *string `json:"controlURL,omitempty"`
 	CreatedAt  int64   `json:"createdAt"`
-	MaxObjects int     `json:"maxObjects"`
+
+	// MaxContainerMemMiB Total guest memory of the tenant's running containers.
+	MaxContainerMemMiB *int `json:"maxContainerMemMiB,omitempty"`
+
+	// MaxContainerVCPU Total vCPUs of the tenant's running containers (fractional: `lite` is 1/16).
+	MaxContainerVCPU *float32 `json:"maxContainerVCPU,omitempty"`
+
+	// MaxContainers Running containers (ADR-032), across the tenant's workloads. Not objects: they don't count against `maxObjects`.
+	MaxContainers *int `json:"maxContainers,omitempty"`
+	MaxObjects    int  `json:"maxObjects"`
 
 	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode MintMode `json:"mintMode"`
@@ -1420,9 +1615,12 @@ type Tenant struct {
 
 // TenantCreate defines model for TenantCreate.
 type TenantCreate struct {
-	APIKeyFile *string `json:"apiKeyFile,omitempty"`
-	ControlURL *string `json:"controlURL,omitempty"`
-	MaxObjects *int    `json:"maxObjects,omitempty"`
+	APIKeyFile         *string  `json:"apiKeyFile,omitempty"`
+	ControlURL         *string  `json:"controlURL,omitempty"`
+	MaxContainerMemMiB *int     `json:"maxContainerMemMiB,omitempty"`
+	MaxContainerVCPU   *float32 `json:"maxContainerVCPU,omitempty"`
+	MaxContainers      *int     `json:"maxContainers,omitempty"`
+	MaxObjects         *int     `json:"maxObjects,omitempty"`
 
 	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode               MintMode `json:"mintMode"`
@@ -1458,8 +1656,11 @@ type TenantPage struct {
 
 // TenantPatch JSON Merge Patch over the updatable fields. `null` clears an optional field.
 type TenantPatch struct {
-	APIKeyFile nullable.Nullable[string] `json:"apiKeyFile,omitempty"`
-	MaxObjects *int                      `json:"maxObjects,omitempty"`
+	APIKeyFile         nullable.Nullable[string] `json:"apiKeyFile,omitempty"`
+	MaxContainerMemMiB *int                      `json:"maxContainerMemMiB,omitempty"`
+	MaxContainerVCPU   *float32                  `json:"maxContainerVCPU,omitempty"`
+	MaxContainers      *int                      `json:"maxContainers,omitempty"`
+	MaxObjects         *int                      `json:"maxObjects,omitempty"`
 
 	// MintMode `oauth`: a Tailscale OAuth client (scope `auth_keys`, tag `tag:twd`; optionally `devices:core` and `policy_file:read`) whose secret stays in a 0600 file on the mgmt host (the default for self-hosted installs). `wif`: keyless, mints through a WIF trust credential (mgmt's OIDC issuer over Funnel; hosted / multi-tenant). `apikey`: a Tailscale API key file (explicit fallback, tests). `static`: fakemgmt only (testcontrol accepts any key).
 	MintMode               *MintMode                 `json:"mintMode,omitempty"`
@@ -1529,7 +1730,7 @@ type TombstoneError struct {
 	// | `lease_lost` | 409 | epoch/holder fence failed |
 	// | `lease_held` | 409 | another host holds the lease |
 	// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
-	// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+	// | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier, or `containers` (for the image's `arch`) when the bundle declares containers |
 	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
@@ -1542,10 +1743,11 @@ type TombstoneError struct {
 	// | `precondition_failed` | 412 | `If-Match` mismatch |
 	// | `object_quota_exceeded` | 429 | tenant `maxObjects` |
 	// | `spawn_budget_exceeded` | 429 | `maxLive` / `maxDepth` |
+	// | `container_quota_exceeded` | 429 | tenant `maxContainers` / `maxContainerMemMiB` / `maxContainerVCPU`, or the class's `max_instances` (`missing: {quota, limit, used, requested}`) |
 	// | `bootstrap_failed` | 502 | control plane refused the mint |
 	// | `host_token_unconfigured` | 503 | local-dev mgmt without a token (fail closed) |
 	// | `identity_pending` | 503 | mint still queued (`Retry-After: 1`) |
-	// | `no_host` | 503 | no live host for the deployment |
+	// | `no_host` | 503 | no live host for the deployment (in the tenant's pool, offering its tier, and `containers` for the image's `arch` when it declares containers) |
 	// | `policy_unavailable` | 503 | mgmt cannot read the tenant policy |
 	// | `internal` | 500 | — |
 	Code    ErrorCode `json:"code"`
@@ -1652,6 +1854,9 @@ type Limit = int
 // ObjectID defines model for objectID.
 type ObjectID = string
 
+// ReservationID defines model for reservationID.
+type ReservationID = string
+
 // TenantID defines model for tenantID.
 type TenantID = string
 
@@ -1735,6 +1940,17 @@ type ListAuditParams struct {
 type GetCertificateParams struct {
 	// Tenant The receiving object's tenant (certificates are per tenant).
 	Tenant string `form:"tenant" json:"tenant"`
+}
+
+// ListContainerReservationsParams defines parameters for ListContainerReservations.
+type ListContainerReservationsParams struct {
+	// Limit Page size, 1–500 (default 50). Out-of-range values are `400 bad_request`.
+	Limit *Limit `form:"limit,omitempty" json:"limit,omitempty"`
+
+	// Cursor Opaque page cursor from the previous page's `nextCursor`. Filters must be repeated unchanged.
+	Cursor *Cursor `form:"cursor,omitempty" json:"cursor,omitempty"`
+	Tenant *string `form:"tenant,omitempty" json:"tenant,omitempty"`
+	Host   *string `form:"host,omitempty" json:"host,omitempty"`
 }
 
 // ListDeploymentsParams defines parameters for ListDeployments.
@@ -1915,6 +2131,9 @@ type CreateVolumeKeyGrantParams struct {
 
 // AppendAuditJSONRequestBody defines body for AppendAudit for application/json ContentType.
 type AppendAuditJSONRequestBody = AuditBatch
+
+// CreateContainerReservationJSONRequestBody defines body for CreateContainerReservation for application/json ContentType.
+type CreateContainerReservationJSONRequestBody = ContainerReservationCreate
 
 // CreateDeploymentJSONRequestBody defines body for CreateDeployment for application/json ContentType.
 type CreateDeploymentJSONRequestBody = DeploymentCreate
@@ -2358,6 +2577,88 @@ type ClientInterface interface {
 	//
 	// Corresponds with GET /v1/certificates/{stableNodeID} (the `GetCertificate` operationId).
 	GetCertificate(ctx context.Context, stableNodeID string, params *GetCertificateParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// ListContainerReservations List container reservations
+	//
+	// Hosts see their own reservations only.
+	//
+	// Corresponds with GET /v1/container-reservations (the `ListContainerReservations` operationId).
+	ListContainerReservations(ctx context.Context, params *ListContainerReservationsParams, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CreateContainerReservationWithBody Reserve quota for a container before it starts
+	//
+	// hostd calls this synchronously at `ctx.container.start()`, after its
+	// own capacity check (`503 capacity_exhausted` is hostd's, never
+	// mgmt's) and before it boots the container's VM. Only the host holding
+	// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+	//
+	// The key is `(tenantID, workload, class, object)`: one container per
+	// DO instance (ADR-032 D2). Reserving a key that already holds a
+	// reservation is **idempotent** (`200`, the same `reservationID`; a
+	// larger container re-checks the quota for the difference), so a
+	// restart never needs new headroom, and a host that took the workload
+	// over adopts the key. A new key is checked atomically, in the store,
+	// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+	// and `maxContainerVCPU`, and the class's `max_instances` from the
+	// deployment: over any of them is `429 container_quota_exceeded`
+	// (`missing: {quota, limit, used, requested}`). Containers are not
+	// objects: they count against neither `maxObjects` nor a host's
+	// `capacityNodes`.
+	//
+	// hostd **fails closed** when mgmt is unreachable: no reservation, no
+	// start, except a restart of a container whose reservation it already
+	// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+	// reports (`HostStatus.containers`) for 30 s after its creation is
+	// released by mgmt, and one whose host stopped reporting it for 2 min no
+	// longer counts, both on the store clock. Audited
+	// (`kind: container_reserve`).
+	//
+	// Takes any type of body and a specified content type.
+	//
+	// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+	CreateContainerReservationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// CreateContainerReservation Reserve quota for a container before it starts
+	//
+	// hostd calls this synchronously at `ctx.container.start()`, after its
+	// own capacity check (`503 capacity_exhausted` is hostd's, never
+	// mgmt's) and before it boots the container's VM. Only the host holding
+	// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+	//
+	// The key is `(tenantID, workload, class, object)`: one container per
+	// DO instance (ADR-032 D2). Reserving a key that already holds a
+	// reservation is **idempotent** (`200`, the same `reservationID`; a
+	// larger container re-checks the quota for the difference), so a
+	// restart never needs new headroom, and a host that took the workload
+	// over adopts the key. A new key is checked atomically, in the store,
+	// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+	// and `maxContainerVCPU`, and the class's `max_instances` from the
+	// deployment: over any of them is `429 container_quota_exceeded`
+	// (`missing: {quota, limit, used, requested}`). Containers are not
+	// objects: they count against neither `maxObjects` nor a host's
+	// `capacityNodes`.
+	//
+	// hostd **fails closed** when mgmt is unreachable: no reservation, no
+	// start, except a restart of a container whose reservation it already
+	// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+	// reports (`HostStatus.containers`) for 30 s after its creation is
+	// released by mgmt, and one whose host stopped reporting it for 2 min no
+	// longer counts, both on the store clock. Audited
+	// (`kind: container_reserve`).
+	//
+	// Takes a body of the `application/json` content type.
+	//
+	// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+	CreateContainerReservation(ctx context.Context, body CreateContainerReservationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error)
+
+	// DeleteContainerReservation Release a container reservation (the container stopped)
+	//
+	// Only the holding host (or an admin) may release it (`403 forbidden`).
+	// Idempotent from the host's side: `404` means it is already gone.
+	// Audited (`kind: container_release`).
+	//
+	// Corresponds with DELETE /v1/container-reservations/{id} (the `DeleteContainerReservation` operationId).
+	DeleteContainerReservation(ctx context.Context, id ReservationID, reqEditors ...RequestEditorFn) (*http.Response, error)
 
 	// ListDeployments List deployments
 	//
@@ -3057,6 +3358,128 @@ func (c *Client) GetAuditVerification(ctx context.Context, reqEditors ...Request
 // Corresponds with GET /v1/certificates/{stableNodeID} (the `GetCertificate` operationId).
 func (c *Client) GetCertificate(ctx context.Context, stableNodeID string, params *GetCertificateParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
 	req, err := NewGetCertificateRequest(c.Server, stableNodeID, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// ListContainerReservations List container reservations
+//
+// Hosts see their own reservations only.
+//
+// Corresponds with GET /v1/container-reservations (the `ListContainerReservations` operationId).
+func (c *Client) ListContainerReservations(ctx context.Context, params *ListContainerReservationsParams, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewListContainerReservationsRequest(c.Server, params)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CreateContainerReservationWithBody Reserve quota for a container before it starts
+//
+// hostd calls this synchronously at `ctx.container.start()`, after its
+// own capacity check (`503 capacity_exhausted` is hostd's, never
+// mgmt's) and before it boots the container's VM. Only the host holding
+// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+//
+// The key is `(tenantID, workload, class, object)`: one container per
+// DO instance (ADR-032 D2). Reserving a key that already holds a
+// reservation is **idempotent** (`200`, the same `reservationID`; a
+// larger container re-checks the quota for the difference), so a
+// restart never needs new headroom, and a host that took the workload
+// over adopts the key. A new key is checked atomically, in the store,
+// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+// and `maxContainerVCPU`, and the class's `max_instances` from the
+// deployment: over any of them is `429 container_quota_exceeded`
+// (`missing: {quota, limit, used, requested}`). Containers are not
+// objects: they count against neither `maxObjects` nor a host's
+// `capacityNodes`.
+//
+// hostd **fails closed** when mgmt is unreachable: no reservation, no
+// start, except a restart of a container whose reservation it already
+// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+// reports (`HostStatus.containers`) for 30 s after its creation is
+// released by mgmt, and one whose host stopped reporting it for 2 min no
+// longer counts, both on the store clock. Audited
+// (`kind: container_reserve`).
+//
+// Takes any type of body and a specified content type.
+//
+// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+func (c *Client) CreateContainerReservationWithBody(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateContainerReservationRequestWithBody(c.Server, contentType, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// CreateContainerReservation Reserve quota for a container before it starts
+//
+// hostd calls this synchronously at `ctx.container.start()`, after its
+// own capacity check (`503 capacity_exhausted` is hostd's, never
+// mgmt's) and before it boots the container's VM. Only the host holding
+// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+//
+// The key is `(tenantID, workload, class, object)`: one container per
+// DO instance (ADR-032 D2). Reserving a key that already holds a
+// reservation is **idempotent** (`200`, the same `reservationID`; a
+// larger container re-checks the quota for the difference), so a
+// restart never needs new headroom, and a host that took the workload
+// over adopts the key. A new key is checked atomically, in the store,
+// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+// and `maxContainerVCPU`, and the class's `max_instances` from the
+// deployment: over any of them is `429 container_quota_exceeded`
+// (`missing: {quota, limit, used, requested}`). Containers are not
+// objects: they count against neither `maxObjects` nor a host's
+// `capacityNodes`.
+//
+// hostd **fails closed** when mgmt is unreachable: no reservation, no
+// start, except a restart of a container whose reservation it already
+// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+// reports (`HostStatus.containers`) for 30 s after its creation is
+// released by mgmt, and one whose host stopped reporting it for 2 min no
+// longer counts, both on the store clock. Audited
+// (`kind: container_reserve`).
+//
+// Takes a body of the `application/json` content type.
+//
+// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+func (c *Client) CreateContainerReservation(ctx context.Context, body CreateContainerReservationJSONRequestBody, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewCreateContainerReservationRequest(c.Server, body)
+	if err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
+	if err := c.applyEditors(ctx, req, reqEditors); err != nil {
+		return nil, err
+	}
+	return c.Client.Do(req)
+}
+
+// DeleteContainerReservation Release a container reservation (the container stopped)
+//
+// Only the holding host (or an admin) may release it (`403 forbidden`).
+// Idempotent from the host's side: `404` means it is already gone.
+// Audited (`kind: container_release`).
+//
+// Corresponds with DELETE /v1/container-reservations/{id} (the `DeleteContainerReservation` operationId).
+func (c *Client) DeleteContainerReservation(ctx context.Context, id ReservationID, reqEditors ...RequestEditorFn) (*http.Response, error) {
+	req, err := NewDeleteContainerReservationRequest(c.Server, id)
 	if err != nil {
 		return nil, err
 	}
@@ -4421,6 +4844,170 @@ func NewGetCertificateRequest(server string, stableNodeID string, params *GetCer
 	}
 
 	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewListContainerReservationsRequest constructs an http.Request for the ListContainerReservations method
+func NewListContainerReservationsRequest(server string, params *ListContainerReservationsParams) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/container-reservations")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	if params != nil {
+		// queryValues collects non-styled parameters (passthrough, JSON)
+		// that are safe to round-trip through url.Values.Encode().
+		queryValues := queryURL.Query()
+		// rawQueryFragments collects pre-encoded query fragments from
+		// styled parameters, preserving literal commas as delimiters
+		// per the OpenAPI spec (e.g. "color=blue,black,brown").
+		var rawQueryFragments []string
+
+		if params.Limit != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "limit", *params.Limit, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "integer", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Cursor != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "cursor", *params.Cursor, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Tenant != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "tenant", *params.Tenant, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if params.Host != nil {
+
+			if queryFrag, err := runtime.StyleParamWithOptions("form", true, "host", *params.Host, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationQuery, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			} else {
+				for _, qp := range strings.Split(queryFrag, "&") {
+					rawQueryFragments = append(rawQueryFragments, qp)
+				}
+			}
+
+		}
+
+		if encoded := queryValues.Encode(); encoded != "" {
+			rawQueryFragments = append(rawQueryFragments, encoded)
+		}
+		queryURL.RawQuery = strings.Join(rawQueryFragments, "&")
+	}
+
+	req, err := http.NewRequest(http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// NewCreateContainerReservationRequest calls the generic CreateContainerReservation builder with application/json body
+func NewCreateContainerReservationRequest(server string, body CreateContainerReservationJSONRequestBody) (*http.Request, error) {
+	var bodyReader io.Reader
+	buf, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	bodyReader = bytes.NewReader(buf)
+	return NewCreateContainerReservationRequestWithBody(server, "application/json", bodyReader)
+}
+
+// NewCreateContainerReservationRequestWithBody constructs an http.Request for the CreateContainerReservation method, with any body, and a specified content type
+func NewCreateContainerReservationRequestWithBody(server string, contentType string, body io.Reader) (*http.Request, error) {
+	var err error
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/container-reservations")
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, queryURL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Add("Content-Type", contentType)
+
+	return req, nil
+}
+
+// NewDeleteContainerReservationRequest constructs an http.Request for the DeleteContainerReservation method
+func NewDeleteContainerReservationRequest(server string, id ReservationID) (*http.Request, error) {
+	var err error
+
+	var pathParam0 string
+
+	pathParam0, err = runtime.StyleParamWithOptions("simple", false, "id", id, runtime.StyleParamOptions{ParamLocation: runtime.ParamLocationPath, Type: "string", Format: ""})
+	if err != nil {
+		return nil, err
+	}
+
+	serverURL, err := url.Parse(server)
+	if err != nil {
+		return nil, err
+	}
+
+	operationPath := fmt.Sprintf("/v1/container-reservations/%s", pathParam0)
+	if operationPath[0] == '/' {
+		operationPath = "." + operationPath
+	}
+
+	queryURL, err := serverURL.Parse(operationPath)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodDelete, queryURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -6379,6 +6966,92 @@ type ClientWithResponsesInterface interface {
 	// Corresponds with GET /v1/certificates/{stableNodeID} (the `GetCertificate` operationId).
 	GetCertificateWithResponse(ctx context.Context, stableNodeID string, params *GetCertificateParams, reqEditors ...RequestEditorFn) (*GetCertificateResponse, error)
 
+	// ListContainerReservationsWithResponse List container reservations
+	//
+	// Hosts see their own reservations only.
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with GET /v1/container-reservations (the `ListContainerReservations` operationId).
+	ListContainerReservationsWithResponse(ctx context.Context, params *ListContainerReservationsParams, reqEditors ...RequestEditorFn) (*ListContainerReservationsResponse, error)
+
+	// CreateContainerReservationWithBodyWithResponse Reserve quota for a container before it starts
+	//
+	// hostd calls this synchronously at `ctx.container.start()`, after its
+	// own capacity check (`503 capacity_exhausted` is hostd's, never
+	// mgmt's) and before it boots the container's VM. Only the host holding
+	// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+	//
+	// The key is `(tenantID, workload, class, object)`: one container per
+	// DO instance (ADR-032 D2). Reserving a key that already holds a
+	// reservation is **idempotent** (`200`, the same `reservationID`; a
+	// larger container re-checks the quota for the difference), so a
+	// restart never needs new headroom, and a host that took the workload
+	// over adopts the key. A new key is checked atomically, in the store,
+	// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+	// and `maxContainerVCPU`, and the class's `max_instances` from the
+	// deployment: over any of them is `429 container_quota_exceeded`
+	// (`missing: {quota, limit, used, requested}`). Containers are not
+	// objects: they count against neither `maxObjects` nor a host's
+	// `capacityNodes`.
+	//
+	// hostd **fails closed** when mgmt is unreachable: no reservation, no
+	// start, except a restart of a container whose reservation it already
+	// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+	// reports (`HostStatus.containers`) for 30 s after its creation is
+	// released by mgmt, and one whose host stopped reporting it for 2 min no
+	// longer counts, both on the store clock. Audited
+	// (`kind: container_reserve`).
+	//
+	// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+	CreateContainerReservationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateContainerReservationResponse, error)
+
+	// CreateContainerReservationWithResponse Reserve quota for a container before it starts
+	//
+	// hostd calls this synchronously at `ctx.container.start()`, after its
+	// own capacity check (`503 capacity_exhausted` is hostd's, never
+	// mgmt's) and before it boots the container's VM. Only the host holding
+	// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+	//
+	// The key is `(tenantID, workload, class, object)`: one container per
+	// DO instance (ADR-032 D2). Reserving a key that already holds a
+	// reservation is **idempotent** (`200`, the same `reservationID`; a
+	// larger container re-checks the quota for the difference), so a
+	// restart never needs new headroom, and a host that took the workload
+	// over adopts the key. A new key is checked atomically, in the store,
+	// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+	// and `maxContainerVCPU`, and the class's `max_instances` from the
+	// deployment: over any of them is `429 container_quota_exceeded`
+	// (`missing: {quota, limit, used, requested}`). Containers are not
+	// objects: they count against neither `maxObjects` nor a host's
+	// `capacityNodes`.
+	//
+	// hostd **fails closed** when mgmt is unreachable: no reservation, no
+	// start, except a restart of a container whose reservation it already
+	// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+	// reports (`HostStatus.containers`) for 30 s after its creation is
+	// released by mgmt, and one whose host stopped reporting it for 2 min no
+	// longer counts, both on the store clock. Audited
+	// (`kind: container_reserve`).
+	//
+	// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+	CreateContainerReservationWithResponse(ctx context.Context, body CreateContainerReservationJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateContainerReservationResponse, error)
+
+	// DeleteContainerReservationWithResponse Release a container reservation (the container stopped)
+	//
+	// Only the holding host (or an admin) may release it (`403 forbidden`).
+	// Idempotent from the host's side: `404` means it is already gone.
+	// Audited (`kind: container_release`).
+	//
+	// Returns a wrapper object for the known response body format(s).
+	//
+	// Corresponds with DELETE /v1/container-reservations/{id} (the `DeleteContainerReservation` operationId).
+	DeleteContainerReservationWithResponse(ctx context.Context, id ReservationID, reqEditors ...RequestEditorFn) (*DeleteContainerReservationResponse, error)
+
 	// ListDeploymentsWithResponse List deployments
 	//
 	// Returns a wrapper object for the known response body format(s).
@@ -7527,6 +8200,290 @@ func (r GetCertificateResponse) StatusCode() int {
 
 // ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
 func (r GetCertificateResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// ListContainerReservationsResponse400Headers the declared response headers of an HTTP 400 response for ListContainerReservations
+type ListContainerReservationsResponse400Headers struct {
+	TwdError *string
+}
+
+// ListContainerReservationsResponse403Headers the declared response headers of an HTTP 403 response for ListContainerReservations
+type ListContainerReservationsResponse403Headers struct {
+	TwdError *string
+}
+
+// ListContainerReservationsResponseDefaultHeaders the declared response headers of an HTTP default response for ListContainerReservations
+type ListContainerReservationsResponseDefaultHeaders struct {
+	TwdError *string
+}
+
+type ListContainerReservationsResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *ContainerReservationPage
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *Forbidden
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *ListContainerReservationsResponse400Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *ListContainerReservationsResponse403Headers
+	// HeadersDefault the parsed response headers for an HTTP default response
+	HeadersDefault *ListContainerReservationsResponseDefaultHeaders
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r ListContainerReservationsResponse) GetJSON200() *ContainerReservationPage {
+	return r.JSON200
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r ListContainerReservationsResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r ListContainerReservationsResponse) GetJSON403() *Forbidden {
+	return r.JSON403
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r ListContainerReservationsResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r ListContainerReservationsResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r ListContainerReservationsResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r ListContainerReservationsResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r ListContainerReservationsResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// CreateContainerReservationResponse201Headers the declared response headers of an HTTP 201 response for CreateContainerReservation
+type CreateContainerReservationResponse201Headers struct {
+	Location *string
+}
+
+// CreateContainerReservationResponse400Headers the declared response headers of an HTTP 400 response for CreateContainerReservation
+type CreateContainerReservationResponse400Headers struct {
+	TwdError *string
+}
+
+// CreateContainerReservationResponse403Headers the declared response headers of an HTTP 403 response for CreateContainerReservation
+type CreateContainerReservationResponse403Headers struct {
+	TwdError *string
+}
+
+// CreateContainerReservationResponse409Headers the declared response headers of an HTTP 409 response for CreateContainerReservation
+type CreateContainerReservationResponse409Headers struct {
+	TwdError *string
+}
+
+// CreateContainerReservationResponseDefaultHeaders the declared response headers of an HTTP default response for CreateContainerReservation
+type CreateContainerReservationResponseDefaultHeaders struct {
+	TwdError *string
+}
+
+type CreateContainerReservationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON200 the response for an HTTP 200 `application/json` response
+	JSON200 *ContainerReservation
+	// JSON201 the response for an HTTP 201 `application/json` response
+	JSON201 *ContainerReservation
+	// JSON400 the response for an HTTP 400 `application/json` response
+	JSON400 *BadRequest
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *Forbidden
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *Error
+	// JSON409 the response for an HTTP 409 `application/json` response
+	JSON409 *LeaseLost
+	// JSON429 the response for an HTTP 429 `application/json` response
+	JSON429 *Error
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+	// Headers201 the parsed response headers for an HTTP 201 response
+	Headers201 *CreateContainerReservationResponse201Headers
+	// Headers400 the parsed response headers for an HTTP 400 response
+	Headers400 *CreateContainerReservationResponse400Headers
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *CreateContainerReservationResponse403Headers
+	// Headers409 the parsed response headers for an HTTP 409 response
+	Headers409 *CreateContainerReservationResponse409Headers
+	// HeadersDefault the parsed response headers for an HTTP default response
+	HeadersDefault *CreateContainerReservationResponseDefaultHeaders
+}
+
+// GetJSON200 returns the response for an HTTP 200 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON200() *ContainerReservation {
+	return r.JSON200
+}
+
+// GetJSON201 returns the response for an HTTP 201 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON201() *ContainerReservation {
+	return r.JSON201
+}
+
+// GetJSON400 returns the response for an HTTP 400 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON400() *BadRequest {
+	return r.JSON400
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON403() *Forbidden {
+	return r.JSON403
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON404() *Error {
+	return r.JSON404
+}
+
+// GetJSON409 returns the response for an HTTP 409 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON409() *LeaseLost {
+	return r.JSON409
+}
+
+// GetJSON429 returns the response for an HTTP 429 `application/json` response
+func (r CreateContainerReservationResponse) GetJSON429() *Error {
+	return r.JSON429
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r CreateContainerReservationResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r CreateContainerReservationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r CreateContainerReservationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r CreateContainerReservationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r CreateContainerReservationResponse) ContentType() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Header.Get("Content-Type")
+	}
+	return ""
+}
+
+// DeleteContainerReservationResponse403Headers the declared response headers of an HTTP 403 response for DeleteContainerReservation
+type DeleteContainerReservationResponse403Headers struct {
+	TwdError *string
+}
+
+// DeleteContainerReservationResponse404Headers the declared response headers of an HTTP 404 response for DeleteContainerReservation
+type DeleteContainerReservationResponse404Headers struct {
+	TwdError *string
+}
+
+// DeleteContainerReservationResponseDefaultHeaders the declared response headers of an HTTP default response for DeleteContainerReservation
+type DeleteContainerReservationResponseDefaultHeaders struct {
+	TwdError *string
+}
+
+type DeleteContainerReservationResponse struct {
+	Body         []byte
+	HTTPResponse *http.Response
+	// JSON403 the response for an HTTP 403 `application/json` response
+	JSON403 *Forbidden
+	// JSON404 the response for an HTTP 404 `application/json` response
+	JSON404 *NotFound
+	// JSONDefault the response for an HTTP default `application/json` response
+	JSONDefault *Error
+	// Headers403 the parsed response headers for an HTTP 403 response
+	Headers403 *DeleteContainerReservationResponse403Headers
+	// Headers404 the parsed response headers for an HTTP 404 response
+	Headers404 *DeleteContainerReservationResponse404Headers
+	// HeadersDefault the parsed response headers for an HTTP default response
+	HeadersDefault *DeleteContainerReservationResponseDefaultHeaders
+}
+
+// GetJSON403 returns the response for an HTTP 403 `application/json` response
+func (r DeleteContainerReservationResponse) GetJSON403() *Forbidden {
+	return r.JSON403
+}
+
+// GetJSON404 returns the response for an HTTP 404 `application/json` response
+func (r DeleteContainerReservationResponse) GetJSON404() *NotFound {
+	return r.JSON404
+}
+
+// GetJSONDefault returns the response for an HTTP default `application/json` response
+func (r DeleteContainerReservationResponse) GetJSONDefault() *Error {
+	return r.JSONDefault
+}
+
+// GetBody returns the raw response body bytes
+func (r DeleteContainerReservationResponse) GetBody() []byte {
+	return r.Body
+}
+
+// Status returns HTTPResponse.Status
+func (r DeleteContainerReservationResponse) Status() string {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.Status
+	}
+	return http.StatusText(0)
+}
+
+// StatusCode returns HTTPResponse.StatusCode
+func (r DeleteContainerReservationResponse) StatusCode() int {
+	if r.HTTPResponse != nil {
+		return r.HTTPResponse.StatusCode
+	}
+	return 0
+}
+
+// ContentType is a convenience method to retrieve the Content-Type value from the HTTP response headers
+func (r DeleteContainerReservationResponse) ContentType() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Header.Get("Content-Type")
 	}
@@ -10797,6 +11754,116 @@ func (c *ClientWithResponses) GetCertificateWithResponse(ctx context.Context, st
 	return ParseGetCertificateResponse(rsp)
 }
 
+// ListContainerReservationsWithResponse List container reservations
+//
+// Hosts see their own reservations only.
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with GET /v1/container-reservations (the `ListContainerReservations` operationId).
+func (c *ClientWithResponses) ListContainerReservationsWithResponse(ctx context.Context, params *ListContainerReservationsParams, reqEditors ...RequestEditorFn) (*ListContainerReservationsResponse, error) {
+	rsp, err := c.ListContainerReservations(ctx, params, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseListContainerReservationsResponse(rsp)
+}
+
+// CreateContainerReservationWithBodyWithResponse Reserve quota for a container before it starts
+//
+// hostd calls this synchronously at `ctx.container.start()`, after its
+// own capacity check (`503 capacity_exhausted` is hostd's, never
+// mgmt's) and before it boots the container's VM. Only the host holding
+// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+//
+// The key is `(tenantID, workload, class, object)`: one container per
+// DO instance (ADR-032 D2). Reserving a key that already holds a
+// reservation is **idempotent** (`200`, the same `reservationID`; a
+// larger container re-checks the quota for the difference), so a
+// restart never needs new headroom, and a host that took the workload
+// over adopts the key. A new key is checked atomically, in the store,
+// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+// and `maxContainerVCPU`, and the class's `max_instances` from the
+// deployment: over any of them is `429 container_quota_exceeded`
+// (`missing: {quota, limit, used, requested}`). Containers are not
+// objects: they count against neither `maxObjects` nor a host's
+// `capacityNodes`.
+//
+// hostd **fails closed** when mgmt is unreachable: no reservation, no
+// start, except a restart of a container whose reservation it already
+// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+// reports (`HostStatus.containers`) for 30 s after its creation is
+// released by mgmt, and one whose host stopped reporting it for 2 min no
+// longer counts, both on the store clock. Audited
+// (`kind: container_reserve`).
+//
+// Takes any type of body and a specified content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+func (c *ClientWithResponses) CreateContainerReservationWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader, reqEditors ...RequestEditorFn) (*CreateContainerReservationResponse, error) {
+	rsp, err := c.CreateContainerReservationWithBody(ctx, contentType, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateContainerReservationResponse(rsp)
+}
+
+// CreateContainerReservationWithResponse Reserve quota for a container before it starts
+//
+// hostd calls this synchronously at `ctx.container.start()`, after its
+// own capacity check (`503 capacity_exhausted` is hostd's, never
+// mgmt's) and before it boots the container's VM. Only the host holding
+// the workload's lease at `epoch` may reserve (`409 lease_lost`).
+//
+// The key is `(tenantID, workload, class, object)`: one container per
+// DO instance (ADR-032 D2). Reserving a key that already holds a
+// reservation is **idempotent** (`200`, the same `reservationID`; a
+// larger container re-checks the quota for the difference), so a
+// restart never needs new headroom, and a host that took the workload
+// over adopts the key. A new key is checked atomically, in the store,
+// against the tenant's `maxContainers` (running), `maxContainerMemMiB`
+// and `maxContainerVCPU`, and the class's `max_instances` from the
+// deployment: over any of them is `429 container_quota_exceeded`
+// (`missing: {quota, limit, used, requested}`). Containers are not
+// objects: they count against neither `maxObjects` nor a host's
+// `capacityNodes`.
+//
+// hostd **fails closed** when mgmt is unreachable: no reservation, no
+// start, except a restart of a container whose reservation it already
+// holds. Released by `DELETE` on stop; a reservation that no heartbeat
+// reports (`HostStatus.containers`) for 30 s after its creation is
+// released by mgmt, and one whose host stopped reporting it for 2 min no
+// longer counts, both on the store clock. Audited
+// (`kind: container_reserve`).
+//
+// Takes a body of the `application/json` content type, and returns a wrapper object for the known response body format(s).
+//
+// Corresponds with POST /v1/container-reservations (the `CreateContainerReservation` operationId).
+func (c *ClientWithResponses) CreateContainerReservationWithResponse(ctx context.Context, body CreateContainerReservationJSONRequestBody, reqEditors ...RequestEditorFn) (*CreateContainerReservationResponse, error) {
+	rsp, err := c.CreateContainerReservation(ctx, body, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseCreateContainerReservationResponse(rsp)
+}
+
+// DeleteContainerReservationWithResponse Release a container reservation (the container stopped)
+//
+// Only the holding host (or an admin) may release it (`403 forbidden`).
+// Idempotent from the host's side: `404` means it is already gone.
+// Audited (`kind: container_release`).
+//
+// Returns a wrapper object for the known response body format(s).
+//
+// Corresponds with DELETE /v1/container-reservations/{id} (the `DeleteContainerReservation` operationId).
+func (c *ClientWithResponses) DeleteContainerReservationWithResponse(ctx context.Context, id ReservationID, reqEditors ...RequestEditorFn) (*DeleteContainerReservationResponse, error) {
+	rsp, err := c.DeleteContainerReservation(ctx, id, reqEditors...)
+	if err != nil {
+		return nil, err
+	}
+	return ParseDeleteContainerReservationResponse(rsp)
+}
+
 // ListDeploymentsWithResponse List deployments
 //
 // Returns a wrapper object for the known response body format(s).
@@ -12140,6 +13207,290 @@ func ParseGetCertificateResponse(rsp *http.Response) (*GetCertificateResponse, e
 		response.Headers410 = &headers
 	case true:
 		var headers GetCertificateResponseDefaultHeaders
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.HeadersDefault = &headers
+	}
+
+	return response, nil
+}
+
+// ParseListContainerReservationsResponse parses an HTTP response from a ListContainerReservationsWithResponse call
+func ParseListContainerReservationsResponse(rsp *http.Response) (*ListContainerReservationsResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &ListContainerReservationsResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ContainerReservationPage
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 400:
+		var headers ListContainerReservationsResponse400Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 403:
+		var headers ListContainerReservationsResponse403Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers403 = &headers
+	case true:
+		var headers ListContainerReservationsResponseDefaultHeaders
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.HeadersDefault = &headers
+	}
+
+	return response, nil
+}
+
+// ParseCreateContainerReservationResponse parses an HTTP response from a CreateContainerReservationWithResponse call
+func ParseCreateContainerReservationResponse(rsp *http.Response) (*CreateContainerReservationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &CreateContainerReservationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 200:
+		var dest ContainerReservation
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON200 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 201:
+		var dest ContainerReservation
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON201 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 400:
+		var dest BadRequest
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON400 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 409:
+		var dest LeaseLost
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON409 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 429:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON429 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 201:
+		var headers CreateContainerReservationResponse201Headers
+		if values := rsp.Header.Values("Location"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Location", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: "uri-reference"}); err != nil {
+				return nil, err
+			}
+			headers.Location = &value
+		}
+		response.Headers201 = &headers
+	case rsp.StatusCode == 400:
+		var headers CreateContainerReservationResponse400Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers400 = &headers
+	case rsp.StatusCode == 403:
+		var headers CreateContainerReservationResponse403Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 409:
+		var headers CreateContainerReservationResponse409Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers409 = &headers
+	case true:
+		var headers CreateContainerReservationResponseDefaultHeaders
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.HeadersDefault = &headers
+	}
+
+	return response, nil
+}
+
+// ParseDeleteContainerReservationResponse parses an HTTP response from a DeleteContainerReservationWithResponse call
+func ParseDeleteContainerReservationResponse(rsp *http.Response) (*DeleteContainerReservationResponse, error) {
+	bodyBytes, err := io.ReadAll(rsp.Body)
+	defer func() { _ = rsp.Body.Close() }()
+	if err != nil {
+		return nil, err
+	}
+
+	response := &DeleteContainerReservationResponse{
+		Body:         bodyBytes,
+		HTTPResponse: rsp,
+	}
+
+	switch {
+	case rsp.StatusCode == 204:
+		break // No content-type
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 403:
+		var dest Forbidden
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON403 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && rsp.StatusCode == 404:
+		var dest NotFound
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSON404 = &dest
+
+	case strings.Contains(rsp.Header.Get("Content-Type"), "json") && true:
+		var dest Error
+		if err := json.Unmarshal(bodyBytes, &dest); err != nil {
+			return nil, err
+		}
+		response.JSONDefault = &dest
+
+	}
+
+	switch {
+	case rsp.StatusCode == 403:
+		var headers DeleteContainerReservationResponse403Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers403 = &headers
+	case rsp.StatusCode == 404:
+		var headers DeleteContainerReservationResponse404Headers
+		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
+			var value string
+			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {
+				return nil, err
+			}
+			headers.TwdError = &value
+		}
+		response.Headers404 = &headers
+	case true:
+		var headers DeleteContainerReservationResponseDefaultHeaders
 		if values := rsp.Header.Values("Twd-Error"); len(values) > 0 {
 			var value string
 			if err := runtime.BindStyledParameterWithOptions("simple", "Twd-Error", values[0], &value, runtime.BindStyledParameterOptions{ParamLocation: runtime.ParamLocationHeader, Explode: false, Required: false, Type: "string", Format: ""}); err != nil {

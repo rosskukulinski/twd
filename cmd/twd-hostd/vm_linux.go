@@ -18,7 +18,7 @@ type vmOptions struct {
 // vmBackend enables the microVM tier when this host can run it: KVM, the
 // guest kernel and image, and the twd-vmhelper service (`sudo twd host
 // setup --microvm`; as root without it, an in-process helper). Otherwise
-// microvm deployments fall back to the process tier.
+// microvm deployments are refused (tier_unavailable), never downgraded.
 func vmBackend(o vmOptions, log *slog.Logger) sandbox.Backend {
 	if os.Geteuid() == 0 {
 		if _, err := os.Stat(o.helper); err != nil {
