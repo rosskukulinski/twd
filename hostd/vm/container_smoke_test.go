@@ -148,11 +148,12 @@ for a in [("192.168.72.1",3128),("192.168.72.1",3130),("192.168.72.1",22),("10.0
 	}
 	t.Logf("egress probes:\n%s", r.out)
 	// pids.max: a process storm stops at the cgroup limit.
-	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "n=0; for i in $(seq 1 200); do sleep 30 & n=$((n+1)); done 2>/dev/null; echo started; cat /sys/fs/cgroup/pids.max 2>/dev/null; true"}}, "")
-	t.Logf("pids storm: %q code %d", r.out, r.code)
-	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "ps -e 2>/dev/null | wc -l || ls /proc | grep -c '^[0-9]'"}}, "")
-	t.Logf("processes after storm: %s", strings.TrimSpace(r.out))
-	runExec(t, c, sandbox.ExecSpec{Argv: []string{"pkill", "sleep"}}, "")
+	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"sh", "-c", "for i in $(seq 1 200); do sleep 3 & done; echo all-200-started"}}, "")
+	t.Logf("pids storm (pids.max 64): %q %q code %d", r.out, r.err, r.code)
+	if strings.Contains(r.out, "all-200-started") || r.code == 0 {
+		t.Fatalf("pids.max did not stop the storm: %+v", r)
+	}
+	time.Sleep(4 * time.Second) // the storm's sleeps end
 
 	// A long-running exec, killed by signal; and a server reached via DialPort.
 	e, err := c.Exec(ctx, sandbox.ExecSpec{Argv: []string{"python3", "-m", "http.server", "8000", "--bind", "0.0.0.0"}, Cwd: "/workspace"})
