@@ -58,8 +58,7 @@ type agent struct {
 	// events or receive the host's ops.
 	ctlToken string
 	// ctlConns counts the control connections accepted this boot (> 1:
-	// guestd reconnected, e.g. after a Firecracker snapshot reset the
-	// guest's vsock connections).
+	// guestd reconnected after its connection died).
 	ctlConns int
 
 	mu      sync.Mutex
@@ -106,8 +105,8 @@ func (m *agent) acceptCtl(ln net.Listener) {
 // (container guests) says so and carries its stream token (onStream checks
 // it); a control connection is guestd's "hello" with this boot's ctlToken.
 // Anything else is closed. guestd reconnects whenever its connection dies
-// (Firecracker resets the guest's vsock connections when it takes a
-// snapshot, e.g. the keyscan's memory dump), so an authenticated hello
+// (a vsock transport reset, e.g. around a VMM snapshot such as the
+// keyscan's memory dump, would do that), so an authenticated hello
 // replaces the current control channel; an unauthenticated one never
 // touches it.
 func (m *agent) route(c net.Conn) {

@@ -118,8 +118,8 @@ func TestAgentControlChannelNotHijackable(t *testing.T) {
 		t.Fatal("a forged ready was accepted")
 	}
 
-	// guestd reconnects (its connection died: a Firecracker snapshot resets
-	// vsock): the authenticated connection becomes the control channel.
+	// guestd reconnects (its connection died, e.g. a vsock transport
+	// reset): the authenticated connection becomes the control channel.
 	again := dialAgent(t, a, proto.Msg{Type: "hello", Token: a.ctlToken})
 	again.serve("guestd-2")
 	if !guestd.closedByHost(t) {

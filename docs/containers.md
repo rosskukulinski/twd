@@ -87,7 +87,7 @@ the VMM's cgroup on Firecracker, `cpu.max` on the guest's container cgroup on
 vz. The disk is a fresh sparse scratch disk (the overlay's writable layer),
 gone when the VM stops. `pids.max` applies in the guest (and to the VMM on
 Firecracker). Container processes hold at most Docker's default capability
-set, so root in an image can't lift these limits.
+set minus `CAP_MKNOD`, so root in an image can't lift these limits.
 
 Admission at `start()`, in order: the host's capacity vector (VMs, memory,
 vCPU with overcommit, scratch disk; shared with microVM DOs), else
@@ -190,10 +190,20 @@ DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
   (erofs) on Linux and `guest/build-kernel-vz.sh`'s on macOS. Every
   container process starts through `twd-guestd ctr-exec`: a re-exec in a new
   mount namespace that `pivot_root`s into the overlay and detaches the old
-  root, so no container process sees guestd or its config. It drops every
-  capability outside Docker's default set (no `CAP_SYS_ADMIN`, so no cgroup2
-  mount; no `CAP_SYS_PTRACE`, so no `/proc/1/root`), then sets the image's
-  user.
+  root, so no container process sees guestd or its config. It installs a
+  seccomp filter (`socket`/`socketpair(AF_VSOCK)` and `io_uring_setup` fail
+  with `EPERM`; vsock is guestd's channel to the host, and io_uring could
+  make sockets out of seccomp's sight; nothing else is filtered), drops
+  every capability outside Docker's default set minus `CAP_MKNOD` (no
+  `CAP_SYS_ADMIN`, so no cgroup2 mount; no `CAP_SYS_PTRACE`, so no
+  `/proc/1/root`), then sets the image's user.
+- **No device nodes.** A guest has no device cgroup (Docker's reason for
+  keeping `CAP_MKNOD`), so container root can't make nodes at all, and every
+  container mount is `nodev`: the overlay root, its lower and upper, and
+  `/dev`, a tmpfs whose `null`, `zero`, `full`, `random`, `urandom` and
+  `tty` are bind mounts of the guest's own. Nothing in the container opens
+  the VM's disks (config drive, rootfs, image, scratch), including a node an
+  image ships. `mknod` of a FIFO still works; `mknod` of a device is `EPERM`.
 - **Both backends share the host side** (`hostd/vm/container.go`: exec
   streams, events, ports) and the same NIC: a userspace stack with no gateway
   services whose only DNS server and TCP destinations are the run's sandbox
@@ -215,9 +225,17 @@ DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
 
 - Control: the existing vsock NDJSON channel (guest → host port 1024). New
   ops `exec`, `signal`, `resize`, `status`; events `ctr-ready`, `ctr-exit`,
-  `exec-exit`, `log`. A connection now opens with a `hello` line.
+  `exec-exit`, `log`. A connection opens with a `hello` line carrying the
+  boot's control token (`GuestConfig.CtlToken`, 256 random bits, on the
+  config drive only); the host closes any connection without it, so nothing
+  but guestd can open, replace or forge the channel. guestd reconnects
+  whenever its connection dies (it always has; a vsock transport reset
+  around a VMM snapshot would cause one), and an authenticated reconnect
+  replaces the channel (DO guests too).
 - Exec stdio: one more guest-initiated vsock connection per exec, whose first
-  line is `{"type":"stream","exec":<id>}`; then frames (1 byte kind, u32 BE
+  line is `{"type":"stream","exec":<id>,"token":<t>}`, `t` being the random
+  per-exec token the host sent in the `exec` op; the host attaches it to the
+  exec only with that token (constant-time compare, once); then frames (1 byte kind, u32 BE
   length, payload): stdin / stdin-EOF (half-close) host → guest, stdout,
   stderr, exit (int32) guest → host. No helper change was needed: the
   helper's single vsock listener carries both kinds.
@@ -379,7 +397,12 @@ twd deploy                    /v2/  OCI registry                            no c
   refused before anything is fetched; so a cache hit never tells one tenant
   which images another runs. Pinned entries are keyed by manifest digest.
   `-container-image-cache-max-mib` caps the converted cache (least recently
-  used first; images of running containers are held). `-container-image-dir`
+  used first; images of running containers are held). Converting one image
+  is capped too (`image.Limits`): `-container-image-max-mib` uncompressed
+  layer bytes (default 40960, twice Cloudflare's 20 GB disk; counted while
+  decompressing and from the entries' sizes, so a decompression bomb stops
+  at the cap), 128 layers, 1 Mi entries, path depth 256 and length 4096; an
+  image over one fails with `image.ErrLimit` and leaves nothing behind. `-container-image-dir`
   (a directory of tarballs) remains for tests and hosts without a registry.
 - **Signing** (cosign) is deferred (ADR-032).
 
