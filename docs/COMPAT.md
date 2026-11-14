@@ -49,7 +49,7 @@ check below runs in both.
 | Email (`cloudflare:email`, `routeAgentEmail`) | ❌ | ❌ | `UnsupportedBindings` | the bundler stubs `cloudflare:email`; constructing `EmailMessage` throws "not supported on twd" |
 | Browser Rendering (`env.BROWSER`, `agents/browser`) | ❌ | ❌ | `UnsupportedBindings` | |
 | Codemode / dynamic agents (`env.LOADER` for tenants) | ❌ | ❌ | `UnsupportedBindings` | Worker Loader is platform-only |
-| `harness/container/*` | ❌ | ❌ | — | needs a container/process (`node:child_process`, `fs`, `net`); ADR-022 Node process tier |
+| `harness/container/*` | not tested | not tested | — | was ❌ (needed a container). twd now implements `ctx.container` (ADR-032, below), the primitive it builds on, but no `harness/container` code has been run on twd |
 | `McpAgent` | not tested | | — | deprecated upstream; use `createMcpHandler` (ADR-022) |
 | `@callable` RPC, `useAgent`, `AIChatAgent` | not tested | | — | same DO/WebSocket primitives as above (assumption) |
 
@@ -68,7 +68,35 @@ check below runs in both.
 | `traceparent` propagation | ✅ | `TraceparentPropagated` | `mcpFetch` sends `00-<caller traceId>-<span>-01`; hostd assigns each hop its own trace ID (the header is not trusted) |
 | On-behalf-of (`actingFor`) assertions on MCP calls | ❌ | — | RFC §4.6 not implemented: the server sees the agent's node, not the human it acts for |
 | `WorkflowAgent` / Workflow SDK | ❌ | — | `node:vm` (ADR-022: Node process tier, branch m9) |
-| `HarnessAgent`, Sandbox, hosted Vercel services | ❌ | — | client-only or process tier |
+| `HarnessAgent`, Vercel Sandbox, hosted Vercel services | ❌ | — | client-only or process tier (Cloudflare's Sandbox SDK: see below) |
+
+## Containers: `ctx.container` and the Cloudflare Sandbox SDK (ADR-032)
+
+Measured by `make e2e-container` (Firecracker, Lima `twd-dev`, arm64),
+`make e2e-vz-container` (vz, this Mac) and `make e2e-container-registry`
+(the examples built from their own Dockerfiles through twd's registry), on
+branch `design/containers-sandboxes-microvm-tier` (2026-11-14). Each
+container is its own microVM attached to one Durable Object; see
+[containers.md](containers.md).
+
+| Thing | Linux arm64 (Firecracker) | Linux amd64 (Firecracker) | macOS (vz) | Process-only / no-KVM hosts | Test |
+|---|---|---|---|---|---|
+| `ctx.container` in a DO (`start`, `running`, `inspect`, `exec`, `getTcpPort().fetch`, `monitor`, `signal`, `destroy`, `setInactivityTimeout`) | ✅ | ⚠ not verified | ✅ | ❌ `tier_unavailable` | `TestE2EContainer` `B_raw_ctx_container_python_Files`, `Lifecycle`, `PortsAndAttribution`, `InactivityTimeout`, `KillCascades` |
+| `interceptOutboundHttp` / `interceptAllOutboundHttp` / `interceptOutboundHttps` | ✅ enforced | ⚠ | ✅ | ❌ | `Egress/InterceptToParentIdentity`, `Egress/InterceptHTTPS` (e2e), `TestContainerEgress` (hostd) |
+| `enableInternet` | ✅ allowlist only (`tailnet.egress.internet`), host's own network | ⚠ | ✅ | ❌ | `Egress/AllowlistedInternet` |
+| `getTcpPort().connect()`, WebSocket to a container port | ❌ deferred | ❌ | ❌ | ❌ | |
+| `snapshotContainer`, `containerSnapshot`, directory snapshots | ❌ v1.1 / deferred | ❌ | ❌ | ❌ | |
+| `@cloudflare/containers` `Container` class (0.3.x) | ✅ (what Sandbox 0.x runs on) | ⚠ | ✅ | ❌ | `A_SandboxSDK0x_minimal` |
+| Sandbox SDK 0.x (`@cloudflare/sandbox` 0.12.14) `examples/minimal`: `getSandbox`, `exec`, `writeFile`/`readFile` | ✅ unmodified, arm64 rebuild of `cloudflare/sandbox:0.12.14` via the alias map | ⚠ stock image, not verified | ✅ stock amd64 image under Rosetta (`-vm-rosetta`), or the arm64 rebuild | ❌ | `A_SandboxSDK0x_minimal` |
+| Sandbox SDK 1.0 (`@cloudflare/sandbox` 1.0.x): raw `ctx.container.start` + `exec().output()` + `Files` via `sandbox-shim` | ✅ unmodified | ⚠ | ✅ | ❌ | `B_SandboxSDK10_minimal`, `B_raw_ctx_container_python_Files` |
+| Sandbox SDK processes, sessions, code interpreter, streaming | not tested | not tested | not tested | ❌ | they use the same `exec` / port paths (assumption) |
+| Sandbox SDK `exposePort` / preview URLs (`proxyToSandbox`) | ❌ `not_supported` / `501` (ADR-029) | ❌ | ❌ | ❌ | `TestContainerEgress` (hostd: facet and plain-DO) |
+| Sandbox SDK backups, bucket mounts (R2) | ❌ | ❌ | ❌ | ❌ | |
+| Images from the app's own Dockerfile via `twd deploy` (built on the developer machine, pinned by digest, pulled by the host) | ✅ | ⚠ (pinning by arch is unit-tested) | not run end to end (host pull uses the same code) | ❌ | `TestE2EContainerRegistry` |
+
+amd64 is "⚠ not verified": the code and the amd64 guest assets exist, but
+the only x86 test host (a nested KVM guest) loses interrupts in its L2 VMs, so
+no amd64 microVM has booted to ready there (STATUS.md, ADR-032 section).
 
 ## twd behaviour found by this suite
 

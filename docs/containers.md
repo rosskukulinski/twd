@@ -1,67 +1,215 @@
-# Containers and sandboxes: `ctx.container` on the microVM tier
+# Containers and code sandboxes: `ctx.container` on the microVM tier
 
-ADR-032 (design repo) is the decision; this is how the core runtime works.
+twd runs Cloudflare's container surface: `ctx.container` in a Durable
+Object, the `Container` class from `@cloudflare/containers`, and the Sandbox
+SDK (0.x and 1.0) on top of it. Each container is its own microVM attached to
+one object. ADR-032 (design repo) is the decision. This page explains how to
+use it first, then how it works.
 
-## Shape
+## Using containers
+
+### Declare the class
+
+Declare containers the way wrangler does: a `containers` entry per DO class,
+and the class bound as a Durable Object.
+
+```jsonc
+// wrangler.jsonc
+{
+  "containers": [
+    { "class_name": "Sandbox", "image": "./Dockerfile", "instance_type": "lite", "max_instances": 4 }
+  ],
+  "durable_objects": { "bindings": [{ "name": "Sandbox", "class_name": "Sandbox" }] }
+}
+```
+
+- `image` is a Dockerfile (or build directory), or a registry ref
+  (`docker.io/...`). `twd deploy` builds Dockerfiles on your machine with
+  `docker buildx`, pushes them to twd's registry, and pins every image by
+  digest (see [Images](#images-build-registry-pinning-host-pull-adr-032-d3)).
+  The host never builds and never runs a container engine.
+- `instance_type` is one of Cloudflare's types or custom resources (below).
+  `max_instances` caps the running containers of that class for the tenant.
+- twd.jsonc can add `"containers"` too: the same array form, or
+  `{"<Class>": {"image": ref, "images": {name: ref}}}` to pin refs (Sandbox SDK
+  1.0 named images). A pin may only name that class's wrangler images.
+- A bundle with containers is placed only on a host that offers the
+  `containers` tier, for the image's arch (`503 no_host`; with `--host` or a
+  sticky lease holder that lacks it, `409 tier_unavailable`). This applies even
+  when the parent object itself is process-tier.
+
+### Use it
+
+The app code is Cloudflare's, unchanged. These run unmodified on twd (the v1
+acceptance tests):
+
+- **Sandbox SDK 0.x** (`@cloudflare/sandbox` 0.12.x, `examples/minimal`):
+  `getSandbox(env.Sandbox, id)`, `sandbox.exec('python3 -c "print(2 + 2)"')`,
+  `writeFile` / `readFile`. Its Bun server runs in the image
+  (`docker.io/cloudflare/sandbox:0.12.14`) and is reached via `getTcpPort`.
+- **Sandbox SDK 1.0** and raw `ctx.container`:
+  `ctx.container.start({image, entrypoint: ["sleep", "infinity"], enableInternet: false})`,
+  `ctx.container.exec(argv).output()`, and 1.0's `Files` helper, which runs the
+  image's `sandbox-shim` through `exec`.
+
+The `ctx.container` methods twd implements:
+
+| Method | On twd |
+|---|---|
+| `start({env, entrypoint, enableInternet, image, instance, labels})` | ✅ returns at once (no readiness wait); throws if already running. `image` must be one of the class's pinned images |
+| `running`, `inspect()` | ✅ |
+| `exec(argv, {stdin, stdout, stderr, cwd, env, user, signal, pty})` | ✅ streamed stdio, `kill()`, `exitCode`, `output()`; `pty` + `resize()`. No shell, no timeout, env not inherited except `PATH` (Cloudflare semantics) |
+| `getTcpPort(p).fetch()` | ✅ HTTP to a port the container listens on (on `0.0.0.0`) |
+| `getTcpPort(p).connect()`, WebSocket upgrades to a container port | ❌ `not_supported` (deferred) |
+| `monitor()`, `signal(n)`, `destroy(reason?)` | ✅ |
+| `setInactivityTimeout(ms)` | ✅ ≤ 6 h; default 10 min |
+| `interceptOutboundHttp(addr, fetcher)`, `interceptAllOutboundHttp(fetcher)`, `interceptOutboundHttps(addr, fetcher)` | ✅ enforced (see [Egress](#egress-what-a-container-can-reach)) |
+| `start({containerSnapshot})`, `snapshotContainer()`, `directorySnapshots` | ❌ `not_supported` (v1.1) |
+| Sandbox SDK `exposePort()` / preview URLs (`proxyToSandbox`) | ❌ `exposePort()` throws `not_supported`; a preview-proxy request gets `501 not_supported` (needs public ingress, ADR-029) |
+
+### Instance types
+
+Cloudflare's types (checked 2026-11-13), or custom
+`{vcpu, memoryMib, diskMb}` up to 4 vCPU, 12 GiB and 20 GB:
+
+| Type | vCPU | Memory | Disk |
+|---|---|---|---|
+| `lite` | 1/16 | 256 MiB | 2 GB |
+| `basic` | 1/4 | 1 GiB | 4 GB |
+| `standard-1` | 1/2 | 4 GiB | 8 GB |
+| `standard-2` | 1 | 6 GiB | 12 GB |
+| `standard-3` | 2 | 8 GiB | 16 GB |
+| `standard-4` | 4 | 12 GiB | 20 GB |
+
+Each container is a VM with the type's whole vCPUs rounded up (at least 1)
+and its memory as guest RAM. A fractional vCPU is a CPU quota: `cpu.max` on
+the VMM's cgroup on Firecracker, `cpu.max` on the guest's container cgroup on
+vz. The disk is a fresh sparse scratch disk (the overlay's writable layer),
+gone when the VM stops. `pids.max` applies in the guest (and to the VMM on
+Firecracker). Container processes hold at most Docker's default capability
+set, so root in an image can't lift these limits.
+
+Admission at `start()`, in order: the host's capacity vector (VMs, memory,
+vCPU with overcommit, scratch disk; shared with microVM DOs), else
+`503 capacity_exhausted`; then a synchronous reservation in mgmt against the
+tenant's quotas (`maxContainers` 10, `maxContainerMemMiB` 16384,
+`maxContainerVCPU` 8 by default; `twd tenant set --max-containers ...`) and
+the class's `max_instances`, else `429 container_quota_exceeded`. If mgmt is
+unreachable the start fails closed (`503 quota_unavailable`), except a
+restart of a container this host already holds a reservation for. Containers
+are not nodes: they don't count against `maxObjects`.
+
+### Egress: what a container can reach
+
+A container has **no tailnet node and no tailnet reach**. Its network ends at
+a per-container proxy on the host:
+
+- **By default, nothing.** DNS answers only names the container may reach;
+  every other name is NXDOMAIN, every other TCP connection is reset, other
+  UDP is dropped. That includes the tailnet, the parent's node, the host,
+  link-local/metadata addresses and private ranges.
+- **Interceptors are the way to the tailnet.** `interceptOutboundHttp("api.internal", handler)`
+  delivers the container's matching requests to the **parent object's**
+  handler. The parent decides what to relay, and its own `fetch()` leaves
+  with the parent's identity, egress policy and caps. Treat the request as
+  untrusted input. `interceptOutboundHttps` works the same over TLS: each
+  container gets its own ephemeral CA, installed in the image at
+  `/etc/cloudflare/certs/cloudflare-containers-ca.crt` and in its trust
+  bundles. Up to 128 interceptors per container.
+- **`enableInternet: true`** reaches only the hosts on the workload's
+  `tailnet.egress.internet` allowlist in twd.jsonc, never a private, tailnet,
+  metadata or host address (even through a DNS name that resolves to one).
+  Each new destination is audited as `egress` with `actingFor: "sandbox-of
+  <object>"`, and refusals as `deny`. There is no tenant exit node yet, so
+  the traffic leaves from the host's own network
+  (`twd-hostd -container-internet=direct`, the default; `off` refuses it).
+- **Inbound** is only the parent's `getTcpPort(p).fetch()`.
+
+### Lifetime
+
+- `start()` boots the VM; the container runs until its entrypoint exits,
+  `destroy()` (SIGTERM, then SIGKILL after at most 10 s), its inactivity
+  timeout, or the host's hard max lifetime (24 h by default).
+- It belongs to the object, not to the isolate: it survives the object's
+  eviction and a blue/green redeploy of the parent (the new code sees
+  `running`). It dies with its host; nothing migrates.
+- `twd kill <object>`, stopping the workload, and fencing (ADR-028; a
+  container inherits its parent class's fence) all SIGKILL the VM at once.
+- Disks are ephemeral. There are no snapshots yet.
+
+### Platforms
+
+| Host | Containers | Notes |
+|---|---|---|
+| Linux arm64, KVM (Firecracker) | ✅ verified (Lima, nested KVM) | the stock `cloudflare/sandbox` images are amd64 only, so twd swaps in its arm64 rebuilds through the alias map; app code is unchanged |
+| Linux amd64, KVM (Firecracker) | ⚠ built, not verified | stock images run as published (no alias). The only x86 test host so far is a nested guest whose L2 VMs lose interrupts, so no amd64 VM has booted to ready there |
+| macOS, Apple silicon (vz) | ✅ verified | needs `mkfs.erofs` (`brew install erofs-utils`). With `twd-hostd -vm-rosetta` the stock amd64 images run under Rosetta; without it, the arm64 rebuilds |
+| no KVM / NAS / process-only hosts | ❌ | they don't offer `containers`; a container bundle is not placed there and `start()` throws `tier_unavailable` (no fallback) |
+
+`twd dev` uses the process tier, so `ctx.container.start()` throws
+`tier_unavailable` there.
+
+### Not supported (v1)
+
+- Preview URLs (`exposePort`, `proxyToSandbox`): need public ingress (ADR-029).
+- `getTcpPort().connect()`, raw TCP and WebSocket upgrades to container ports.
+- `snapshotContainer`, `containerSnapshot`, directory snapshots, backups,
+  bucket mounts, persistent sandbox volumes.
+- Memory snapshots and fork.
+- HTTP/2 and WebSocket upgrades through interceptors (HTTP/1.1 only).
+- A container with its own tailnet node (`sandbox.tailnet.tags`), and
+  standalone containers not attached to an object.
+- Image signing (cosign) and registry garbage collection.
+- A tenant exit node or gateway for `enableInternet` (the host's network is
+  used).
+- Nested virtualization and GPUs (non-goals).
+- Workers bindings the Sandbox SDK templates may also use (KV, R2, Workers AI)
+  remain unsupported on twd as before (docs/COMPAT.md).
+
+## How it works
 
 ```
 DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
    └─ platform TailnetApi (attests the object) ── HOSTD binding ── hostd /v1/container…
         └─ container manager, keyed (tenant, workload, class, object)
-             └─ hostd/vm BootContainer ── twd-vmhelper ── jailer ── Firecracker
+             └─ hostd/vm BootContainer ── twd-vmhelper ── jailer ── Firecracker   (Linux)
+                                       └─ twd-vz (Virtualization.framework)       (macOS)
                   guest: twd-guestd (PID 1) ── overlay(erofs image + scratch) ── ENTRYPOINT/CMD, execs
 ```
 
-- **One VM per container, one container per object.** Its own jail uid,
-  network namespace and cgroup (`cpu.max` carries fractional vCPUs,
-  `memory.max`, `pids.max`); the parent's DO volume, volume key, egress MAC
-  key and tailnet identity are never part of it.
+- **One VM per container, one container per object.** On Firecracker its own
+  jail uid, network namespace and cgroup (`cpu.max` carries fractional
+  vCPUs, `memory.max`, `pids.max`); the parent's DO volume, volume key,
+  egress MAC key and tailnet identity are never part of it.
 - **Image:** an OCI image becomes a read-only erofs (`hostd/image`; per-tenant
   content-addressed cache, `public` scope for operator-marked bases). Each run
-  gets a fresh sparse ext4 scratch made by the helper inside the jail: the
-  overlay's upper layer, gone with the VM (disks are ephemeral).
+  gets a fresh sparse ext4 scratch: the overlay's upper layer, gone with the
+  VM.
 - **Guest:** the same guest rootfs and twd-guestd as DO VMs, in container
   mode (`guest.json` "container"); the kernel is `guest/build-kernel.sh`'s
-  (erofs). Every container process starts through `twd-guestd ctr-exec`: a
-  re-exec in a new mount namespace that `pivot_root`s into the overlay and
-  detaches the old root, so no container process sees guestd or its config.
-
-## Platforms
-
-- **Linux/KVM (Firecracker):** as above, on arm64 and amd64. On amd64 the
-  stock `docker.io/cloudflare/sandbox` images run as published (the alias
-  map only applies on arm64). amd64 has not been verified end to end. The
-  only x86 test host so far is a nested guest on an AMD NAS, and there
-  Firecracker guests randomly lose interrupts (timer and virtio). The stock
-  image set converts there, and the container guest boots as far as mounting
-  the erofs image and scratch. To build the image set on a developer
-  machine: `PLATFORM=linux/amd64 guest/images/build-sandbox-images.sh DIR`.
-- **macOS (Virtualization.framework, `hostd/vm/container_darwin.go`):** the
-  same guest rootfs, guestd container mode and protocol, one `twd-vz` VMM
-  per container. A Mac host advertises `containers` when the vz kernel has
-  erofs and `mkfs.erofs` is installed (`brew install erofs-utils`).
-  macOS has no jailer, cgroups or `mkfs.ext4`, so:
-  - the scratch disk is a sparse file the guest formats
-    (`ContainerConfig.ScratchFormat`);
-  - fractional vCPUs are `cpu.max` on the guest's container cgroup
-    (`ContainerConfig.CPUQuotaUS`). Only the VM's whole vCPU count is a
-    hard cap. Container processes keep guest root's capabilities, so root in
-    a container can mount cgroup2 and lift its own `cpu.max`. That was
-    verified on vz; the fix is to drop capabilities in `ctr-exec`. On vz a
-    fractional instance type is therefore a scheduling share, not a limit;
-  - `pids.max` is enforced in the guest only, with the same caveat. There is
-    one VMM process and no host cgroup.
-- **Rosetta for Linux (Apple silicon, `twd-hostd -vm-rosetta`, opt-in):**
-  guestd registers Rosetta with binfmt_misc using the `F` flag, so it works
-  in every container mount namespace. The backend reports `amd64` as an
-  emulated arch, and hostd then accepts linux/amd64 images and drops the
-  arm64 alias map, so the stock images run unchanged. Without
-  `-vm-rosetta`, a Mac uses the arm64 rebuilds through the alias map, as
-  Linux arm64 does.
-- **Egress is the same on both backends:** each takes the container NIC's
-  host services from `containerHandlers` (`hostd/vm/container.go`). In v1
-  that function returns nothing, so every flow is refused. It is the one
-  hook for the sandbox egress proxy.
+  (erofs) on Linux and `guest/build-kernel-vz.sh`'s on macOS. Every
+  container process starts through `twd-guestd ctr-exec`: a re-exec in a new
+  mount namespace that `pivot_root`s into the overlay and detaches the old
+  root, so no container process sees guestd or its config. It drops every
+  capability outside Docker's default set (no `CAP_SYS_ADMIN`, so no cgroup2
+  mount; no `CAP_SYS_PTRACE`, so no `/proc/1/root`), then sets the image's
+  user.
+- **Both backends share the host side** (`hostd/vm/container.go`: exec
+  streams, events, ports) and the same NIC: a userspace stack with no gateway
+  services whose only DNS server and TCP destinations are the run's sandbox
+  egress proxy (`ContainerSpec.Net`).
+- **vz differences** (macOS has no jailer, cgroups or `mkfs.ext4`): the
+  scratch disk is a sparse file the guest formats
+  (`ContainerConfig.ScratchFormat`); fractional vCPUs are `cpu.max` on the
+  guest's container cgroup (`ContainerConfig.CPUQuotaUS`); `pids.max` is the
+  guest's only. Isolation is the hypervisor plus one VMM process per
+  container.
+- **Rosetta** (`-vm-rosetta`): guestd registers Rosetta with binfmt_misc
+  using the `F` flag, so it works in every container mount namespace. The
+  backend reports `amd64` as an emulated arch; hostd then accepts
+  linux/amd64 images from `-container-image-dir` and drops its local alias
+  map. Images pinned by mgmt follow the host's registered arch (arm64), so
+  through the registry a Rosetta Mac still runs the arm64 rebuilds.
 
 ## Host ⇄ guest protocol (guest/proto)
 
@@ -86,7 +234,7 @@ server must listen on `0.0.0.0` (as on Cloudflare). Not listening →
 Cloudflare's error string `the container is not listening`, which
 `@cloudflare/containers` relies on.
 
-## Egress: the sandbox egress proxy (ADR-032 D4)
+## The sandbox egress proxy (ADR-032 D4)
 
 A container guest's NIC ends at a per-run proxy in hostd's process
 (`netd/sbxnet`), not at any tsnet server: it has no tailnet identity, no
@@ -153,6 +301,10 @@ derived key), every volume key (DEK) of the tenant's workloads on the host,
 the host's own key/token/credential files, and the run's HTTPS-intercept CA
 private key. Each needle kind must exist on the host (positive control),
 and a per-run canary held in guestd's memory must be found in the dump.
+On vz, Virtualization.framework refuses to save the VM's state (as for DO
+guests), so the disks and guest files are scanned but RAM is not; the
+report's control then reads `FAILED: guest RAM not scanned` and the command
+exits `keys_in_guest`.
 
 ## Images: build, registry, pinning, host pull (ADR-032 D3)
 
@@ -259,14 +411,9 @@ object (as for `ctx.tailnet`, docs/egress-modes.md): code in the workload
 could drive another plain object's container of the same workload (same
 trust domain), never a facet object's and never another workload's.
 
-## Not in v1 (ADR-032 deferred)
-
-`getTcpPort().connect()`, WebSocket upgrades to container ports,
-`snapshotContainer`, directory snapshots, preview URLs (`exposePort`,
-`not_supported`), image signing (cosign), registry garbage collection, a
-tenant exit-node or gateway path for `enableInternet`.
+## Host tiers
 
 A host advertises the `containers` tier (and mgmt places container bundles
 on it) only when containers can actually run there: a microVM backend whose
-helper supports container guests, a guest kernel with erofs, and
-`mkfs.erofs`.
+helper (Firecracker) or kernel (vz) supports container guests, a guest
+kernel with erofs, and `mkfs.erofs`.
