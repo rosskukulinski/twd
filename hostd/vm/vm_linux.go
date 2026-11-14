@@ -3,21 +3,13 @@
 package vm
 
 import (
-	"archive/tar"
-	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"log/slog"
 	"net"
-	"net/http"
-	"net/http/httputil"
-	"net/netip"
-	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -195,44 +187,21 @@ func (b *Backend) Name() string { return "firecracker" }
 // Via says how VMs are launched (helper service or in-process).
 func (b *Backend) Via() string { return b.via }
 
-var (
-	gatewayIP = netip.MustParseAddr(proto.GatewayIP)
-	guestIP   = netip.MustParseAddr(proto.GuestIP)
-	gwMAC     = net.HardwareAddr{0x06, 0x00, 0xc0, 0xa8, 0x48, 0x01}
-)
-
-const guestMAC = "06:00:c0:a8:48:02"
-
 // Machine is one running Firecracker microVM.
 type Machine struct {
-	b       *Backend
-	id      string
-	dir     string
-	log     *slog.Logger
-	conn    *helperapi.Conn
-	pid     int
-	vn      *vnet
-	tapFD   int
-	vsock   net.Listener
-	ingress http.Handler
-	volume  bool
+	agent
+	b      *Backend
+	id     string
+	dir    string
+	conn   *helperapi.Conn
+	pid    int
+	tapFD  int
+	vsock  net.Listener
+	volume bool
 
-	info    sandbox.Info
-	start   time.Time
-	done    chan struct{}
-	ready   chan struct{}
-	readyOK atomic.Bool
 	stopped atomic.Bool
 	exitErr error
 	disks   []string
-
-	mu      sync.Mutex
-	ctl     net.Conn
-	enc     *json.Encoder
-	pending map[int64]chan proto.Msg
-	nextID  int64
-	events  []proto.Msg
-	lastErr string
 	cleanup sync.Once
 }
 
@@ -241,8 +210,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	t0 := time.Now()
 	n := b.seq.Add(1)
 	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), s.ID, n)
-	m := &Machine{b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id), tapFD: -1,
-		done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}}
+	m := &Machine{agent: newAgent(), b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id), tapFD: -1}
 	m.log = b.cfg.Log.With("vm", id)
 	if s.Log != nil {
 		m.log = s.Log.With("vm", id)
@@ -258,7 +226,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	}
 	// 1. Config drive: the instance dir + guest.json, as a raw tar.
 	drive := filepath.Join(m.dir, "config.tar")
-	if err := writeConfigDrive(drive, s, b.cfg.MTU); err != nil {
+	if err := writeConfigDrive(drive, s, b.cfg.MTU, nil); err != nil {
 		return nil, fmt.Errorf("config drive: %w", err)
 	}
 	m.disks = []string{b.cfg.Rootfs, drive}
@@ -336,7 +304,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		return nil, err
 	}
 	m.ingress = m.ingressProxy()
-	go m.acceptCtl()
+	go m.acceptCtl(m.vsock)
 	go m.watch()
 
 	// 4. Wait for guestd to report workerd healthy.
@@ -427,151 +395,10 @@ func (m *Machine) consoleTail(n int) string {
 	return netd.Redact(string(bytes.TrimSpace(b)))
 }
 
-// ---- control channel ----
-
-func (m *Machine) acceptCtl() {
-	for {
-		c, err := m.vsock.Accept()
-		if err != nil {
-			return
-		}
-		m.mu.Lock()
-		if m.ctl != nil {
-			m.ctl.Close()
-		}
-		m.ctl, m.enc = c, json.NewEncoder(c)
-		m.mu.Unlock()
-		go m.readCtl(c)
-	}
-}
-
-func (m *Machine) readCtl(c net.Conn) {
-	sc := bufio.NewScanner(c)
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
-	for sc.Scan() {
-		var msg proto.Msg
-		if json.Unmarshal(sc.Bytes(), &msg) != nil {
-			continue
-		}
-		m.mu.Lock()
-		if msg.Type == "resp" {
-			if ch := m.pending[msg.ID]; ch != nil {
-				delete(m.pending, msg.ID)
-				ch <- msg
-			}
-			m.mu.Unlock()
-			continue
-		}
-		if len(m.events) < 256 {
-			m.events = append(m.events, msg)
-		}
-		m.mu.Unlock()
-		switch msg.Type {
-		case "boot":
-			m.info.Boot = time.Since(m.start)
-		case "ready":
-			m.info.Ready = time.Since(m.start)
-			m.info.GuestUptimeAtReady = time.Duration(msg.UptimeMS) * time.Millisecond
-			if m.readyOK.CompareAndSwap(false, true) {
-				close(m.ready)
-			}
-		case "workerd-exit":
-			m.log.Warn("guest workerd exited", "code", msg.ExitCode, "restarts", msg.Restarts, "err", msg.Error)
-			m.mu.Lock()
-			m.lastErr = fmt.Sprintf("workerd exit %d %s", msg.ExitCode, msg.Error)
-			m.mu.Unlock()
-		}
-	}
-}
-
-func (m *Machine) eventTypes() []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var s []string
-	for _, e := range m.events {
-		s = append(s, e.Type)
-	}
-	return s
-}
-
-// Op implements sandbox.VM.
-func (m *Machine) Op(ctx context.Context, msg proto.Msg) (proto.Msg, error) {
-	ch := make(chan proto.Msg, 1)
-	m.mu.Lock()
-	if m.enc == nil {
-		m.mu.Unlock()
-		return proto.Msg{}, errors.New("guest agent not connected")
-	}
-	m.nextID++
-	msg.ID = m.nextID
-	m.pending[msg.ID] = ch
-	err := m.enc.Encode(msg)
-	m.mu.Unlock()
-	if err != nil {
-		return proto.Msg{}, err
-	}
-	select {
-	case r := <-ch:
-		if r.Error != "" {
-			return r, errors.New(r.Error)
-		}
-		return r, nil
-	case <-ctx.Done():
-		return proto.Msg{}, ctx.Err()
-	case <-m.done:
-		return proto.Msg{}, errors.New("microVM exited")
-	}
-}
-
-// ---- ingress ----
-
-func (m *Machine) ingressProxy() http.Handler {
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return m.vn.dialGuest(ctx, proto.IngressPort)
-		},
-		MaxIdleConnsPerHost: 64,
-		IdleConnTimeout:     30 * time.Second,
-	}
-	target := &url.URL{Scheme: "http", Host: "guest"}
-	return &httputil.ReverseProxy{
-		Transport:     tr,
-		FlushInterval: -1,
-		ErrorLog:      nil,
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
-			pr.Out.Host = pr.In.Host
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if r.Context().Err() != nil {
-				return
-			}
-			netd.WriteError(w, &netd.Error{Code: netd.CodeUpstreamUnavailable, Detail: "microVM: " + err.Error()})
-		},
-	}
-}
-
-// Ingress implements sandbox.VM.
-func (m *Machine) Ingress() http.Handler { return m.ingress }
-
-// DialGuest implements sandbox.VM.
-func (m *Machine) DialGuest(ctx context.Context) (net.Conn, error) {
-	return m.vn.dialGuest(ctx, proto.IngressPort)
-}
-
 // ---- lifecycle ----
-
-// Done implements sandbox.VM.
-func (m *Machine) Done() <-chan struct{} { return m.done }
 
 // Err implements sandbox.VM.
 func (m *Machine) Err() error { return m.exitErr }
-
-// Info implements sandbox.VM.
-func (m *Machine) Info() sandbox.Info { return m.info }
-
-// Refused implements sandbox.VM.
-func (m *Machine) Refused() []string { return m.vn.refusedFlows() }
 
 // Disks implements sandbox.VM.
 func (m *Machine) Disks() []string { return m.disks }
@@ -666,55 +493,4 @@ func (m *Machine) MemoryDump(ctx context.Context, dir string) (string, error) {
 		err = cerr
 	}
 	return mem, err
-}
-
-// ---- config drive ----
-
-func writeConfigDrive(path string, s sandbox.Spec, mtu int) error {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	gc := proto.GuestConfig{UnixNano: time.Now().UnixNano(), IP: proto.GuestIP, Gateway: proto.GatewayIP, Prefix: proto.PrefixLen,
-		MTU: mtu, WorkerdArgs: s.WorkerdArgs, HealthCF: s.HealthCF, Debug: s.Debug}
-	if s.Volume != nil {
-		gc.Volume = proto.VolumeDev
-	}
-	gb, _ := json.Marshal(gc)
-	if err := tw.WriteHeader(&tar.Header{Name: proto.GuestConfigFile, Mode: 0o600, Size: int64(len(gb)), Typeflag: tar.TypeReg}); err != nil {
-		return err
-	}
-	tw.Write(gb)
-	err := filepath.WalkDir(s.AppDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(s.AppDir, p)
-		if rel == "." {
-			return nil
-		}
-		if d.IsDir() {
-			return tw.WriteHeader(&tar.Header{Name: filepath.ToSlash(rel) + "/", Mode: 0o700, Typeflag: tar.TypeDir})
-		}
-		if !d.Type().IsRegular() {
-			return nil // sockets etc.
-		}
-		b, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		if err := tw.WriteHeader(&tar.Header{Name: filepath.ToSlash(rel), Mode: 0o600, Size: int64(len(b)), Typeflag: tar.TypeReg}); err != nil {
-			return err
-		}
-		_, err = tw.Write(b)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	if err := tw.Close(); err != nil {
-		return err
-	}
-	if pad := buf.Len() % 4096; pad != 0 {
-		buf.Write(make([]byte, 4096-pad))
-	}
-	return os.WriteFile(path, buf.Bytes(), 0o600)
 }
