@@ -40,7 +40,20 @@ func under(p, dir string) bool { return dir == "" || strings.HasPrefix(p, dir+"/
 // Hard links whose target the upper layers removed or replaced become
 // regular files with the content the target had when the link was made.
 // Entry order is layer order, so every kept hard link follows its target.
-func Flatten(layers []Layer, w io.Writer) error {
+// It applies the default Limits (FlattenLimited).
+func Flatten(layers []Layer, w io.Writer) error { return FlattenLimited(layers, w, Limits{}) }
+
+// FlattenLimited is Flatten under lim (zero fields: defaults): the first
+// pass checks the layer count, every entry (count, name, size) and the
+// decompressed bytes as it reads, so nothing is written for an image over
+// a limit; the second pass counts the bytes again as it writes. A limit
+// error is a *LimitError (errors.Is ErrLimit).
+func FlattenLimited(layers []Layer, w io.Writer, lim Limits) error {
+	lim = lim.withDefaults()
+	if len(layers) > lim.MaxLayers {
+		return &LimitError{"layers", int64(lim.MaxLayers)}
+	}
+	b1 := &budget{lim: lim}
 	cur := map[string]ref{}    // path -> the entry that currently provides it
 	isDir := map[string]bool{} // path -> current entry is a directory
 	linkSrc := map[ref]ref{}   // hard link entry -> the target entry at link time
@@ -49,7 +62,7 @@ func Flatten(layers []Layer, w io.Writer) error {
 		if err != nil {
 			return err
 		}
-		tr := tar.NewReader(rc)
+		tr := tar.NewReader(b1.reader(rc))
 		for k := 0; ; k++ {
 			h, err := tr.Next()
 			if err == io.EOF {
@@ -61,6 +74,10 @@ func Flatten(layers []Layer, w io.Writer) error {
 			}
 			name, err := cleanName(h.Name)
 			if err != nil {
+				rc.Close()
+				return fmt.Errorf("layer %d: %w", li, err)
+			}
+			if err := b1.entry(name, h.Size); err != nil {
 				rc.Close()
 				return fmt.Errorf("layer %d: %w", li, err)
 			}
@@ -146,13 +163,14 @@ func Flatten(layers []Layer, w io.Writer) error {
 	}()
 	stashHdr := map[ref]*tar.Header{}
 
+	b2 := &budget{lim: lim}
 	tw := tar.NewWriter(w)
 	for li, open := range layers {
 		rc, err := open()
 		if err != nil {
 			return err
 		}
-		tr := tar.NewReader(rc)
+		tr := tar.NewReader(b2.reader(rc))
 		for k := 0; ; k++ {
 			h, err := tr.Next()
 			if err == io.EOF {

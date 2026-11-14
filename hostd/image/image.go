@@ -73,6 +73,9 @@ type Store struct {
 	// MaxBytes caps the converted images on disk (0 = no cap): past it the
 	// least recently used ones not in use (Hold) are removed.
 	MaxBytes int64
+	// Limits caps one conversion's layers, entries and uncompressed bytes
+	// (zero fields: the defaults; see Limits).
+	Limits Limits
 	// Evicted counts images GC removed.
 	Evicted int
 
@@ -257,7 +260,7 @@ func (s *Store) Get(ctx context.Context, tenant, ref string) (*Image, error) {
 // manifest digest, which also covers the layers).
 func (s *Store) convert(ref, scope, src, key string) (*Image, error) {
 	st := time.Now()
-	a, err := openArchive(src, append([]string{s.arch()}, s.Emulated...)...)
+	a, err := openArchive(src, s.Limits, append([]string{s.arch()}, s.Emulated...)...)
 	if err != nil {
 		return nil, fmt.Errorf("image %s: %w", ref, err)
 	}
@@ -340,7 +343,7 @@ func (s *Store) mkfs(a *archive, out, hx string) error {
 		return err
 	}
 	defer os.Remove(merged.Name())
-	if err := Flatten(layers, merged); err != nil {
+	if err := FlattenLimited(layers, merged, s.Limits); err != nil {
 		merged.Close()
 		return err
 	}

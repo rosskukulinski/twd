@@ -298,7 +298,7 @@ func TestOpenArchiveOCIIndex(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "img.tar")
 	os.WriteFile(p, tarFiles(t, files), 0o600)
 	for _, arch := range []string{"amd64", "arm64"} {
-		a, err := openArchive(p, arch)
+		a, err := openArchive(p, Limits{}, arch)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +313,7 @@ func TestOpenArchiveOCIIndex(t *testing.T) {
 		}
 		a.close()
 	}
-	if _, err := openArchive(p, "riscv64"); err == nil {
+	if _, err := openArchive(p, Limits{}, "riscv64"); err == nil {
 		t.Fatal("riscv64 should be refused")
 	}
 }
@@ -344,7 +344,7 @@ func TestOpenArchiveDockerSave(t *testing.T) {
 	files["manifest.json"] = m
 	p := filepath.Join(t.TempDir(), "img.tar")
 	os.WriteFile(p, tarFiles(t, files), 0o600)
-	a, err := openArchive(p, "arm64")
+	a, err := openArchive(p, Limits{}, "arm64")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,7 +357,7 @@ func TestOpenArchiveDockerSave(t *testing.T) {
 	m, _ = json.Marshal([]any{map[string]any{"Config": "../../etc/passwd", "Layers": []string{}}})
 	files["manifest.json"] = m
 	os.WriteFile(p, tarFiles(t, files), 0o600)
-	if _, err := openArchive(p, "arm64"); err == nil {
+	if _, err := openArchive(p, Limits{}, "arm64"); err == nil {
 		t.Fatal("blob outside the archive accepted")
 	}
 }

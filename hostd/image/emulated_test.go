@@ -56,7 +56,7 @@ func TestStoreEmulatedArch(t *testing.T) {
 	files["index.json"] = idx
 	p := filepath.Join(t.TempDir(), "both.tar")
 	os.WriteFile(p, tarFiles(t, files), 0o600)
-	a, err := openArchive(p, "arm64", "amd64")
+	a, err := openArchive(p, Limits{}, "arm64", "amd64")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestStoreEmulatedArch(t *testing.T) {
 	if a.digest != "sha256:"+sha(cfgJSON("arm64")) {
 		t.Fatal("index resolved to the emulated variant though the native one exists")
 	}
-	if _, err := openArchive(p, "riscv64"); err == nil {
+	if _, err := openArchive(p, Limits{}, "riscv64"); err == nil {
 		t.Fatal("riscv64 accepted")
 	}
 }

@@ -59,7 +59,7 @@ type descriptor struct {
 
 // openArchive reads a `docker save` tarball or an OCI image layout (as a
 // tar, or a directory) holding one image for the first of arches it has.
-func openArchive(src string, arches ...string) (*archive, error) {
+func openArchive(src string, lim Limits, arches ...string) (*archive, error) {
 	st, err := os.Stat(src)
 	if err != nil {
 		return nil, err
@@ -73,7 +73,7 @@ func openArchive(src string, arches ...string) (*archive, error) {
 			return nil, err
 		}
 		a.dir = d
-		if err := untar(src, d); err != nil {
+		if err := untar(src, d, lim); err != nil {
 			a.close()
 			return nil, err
 		}
@@ -108,6 +108,9 @@ func openArchive(src string, arches ...string) (*archive, error) {
 		}
 	} else {
 		return fail(errors.New("not a docker-save tarball or OCI image layout (no index.json or manifest.json)"))
+	}
+	if l := lim.withDefaults().MaxLayers; len(a.layers) > l {
+		return fail(&LimitError{"layers", int64(l)})
 	}
 	for _, p := range append([]string{cfgPath}, a.layers...) {
 		if !strings.HasPrefix(filepath.Clean(p), filepath.Clean(a.dir)+string(filepath.Separator)) {
@@ -214,8 +217,10 @@ type readCloser struct {
 func (r readCloser) Close() error { return r.close() }
 
 // untar extracts the outer image tarball (regular files and dirs only;
-// names are confined to dst).
-func untar(src, dst string) error {
+// names are confined to dst) within lim's bytes, entries and names.
+func untar(src, dst string, lim Limits) error {
+	lim = lim.withDefaults()
+	b := &budget{lim: lim}
 	f, err := os.Open(src)
 	if err != nil {
 		return err
@@ -232,6 +237,9 @@ func untar(src, dst string) error {
 		}
 		name, err := cleanName(h.Name)
 		if err != nil {
+			return err
+		}
+		if err := b.entry(name, h.Size); err != nil {
 			return err
 		}
 		if name == "" {
@@ -251,7 +259,7 @@ func untar(src, dst string) error {
 			if err != nil {
 				return err
 			}
-			_, err = io.Copy(out, tr)
+			_, err = io.Copy(out, b.reader(tr))
 			if cerr := out.Close(); err == nil {
 				err = cerr
 			}
