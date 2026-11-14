@@ -188,6 +188,13 @@ func run() error {
 		for _, r := range splitList(*ctrPublic) {
 			st.Public[image.NormalizeRef(r)] = true
 		}
+		// vz with Rosetta for Linux runs linux/amd64 images as they are
+		// (ADR-032 D7): the stock cloudflare/sandbox images, so no arm64
+		// alias substitution.
+		if em, ok := cb.(interface{ EmulatedArches() []string }); ok && len(em.EmulatedArches()) > 0 {
+			st.Emulated, st.Aliases = em.EmulatedArches(), nil
+			log.Info("containers: emulated image arches (no alias map)", "arches", st.Emulated)
+		}
 		// Offer containers only when they can actually run here (the host
 		// advertises the "containers" tier from this; ADR-032 D5).
 		if err := containersUsable(cb, st); err != nil {

@@ -58,8 +58,8 @@ type descriptor struct {
 }
 
 // openArchive reads a `docker save` tarball or an OCI image layout (as a
-// tar, or a directory) holding one image for arch.
-func openArchive(src, arch string) (*archive, error) {
+// tar, or a directory) holding one image for the first of arches it has.
+func openArchive(src string, arches ...string) (*archive, error) {
 	st, err := os.Stat(src)
 	if err != nil {
 		return nil, err
@@ -86,7 +86,7 @@ func openArchive(src, arch string) (*archive, error) {
 	}
 	var cfgPath string
 	if b, err := os.ReadFile(filepath.Join(a.dir, "index.json")); err == nil {
-		m, err := a.ociManifest(b, arch, 0)
+		m, err := a.ociManifest(b, arches, 0)
 		if err != nil {
 			return fail(err)
 		}
@@ -136,8 +136,8 @@ type ociManifestDoc struct {
 }
 
 // ociManifest resolves an index (or nested index) to the image manifest
-// for linux/arch.
-func (a *archive) ociManifest(b []byte, arch string, depth int) (*ociManifestDoc, error) {
+// for linux/<the first of arches the index has>.
+func (a *archive) ociManifest(b []byte, arches []string, depth int) (*ociManifestDoc, error) {
 	if depth > 4 {
 		return nil, errors.New("OCI index nesting too deep")
 	}
@@ -152,12 +152,16 @@ func (a *archive) ociManifest(b []byte, arch string, depth int) (*ociManifestDoc
 		return &doc, nil
 	}
 	var pick *descriptor
+	rank := len(arches) // of pick, in arches (len: a platform-less manifest)
 	for i := range doc.Manifests {
 		d := &doc.Manifests[i]
 		if d.Platform != nil {
-			if d.Platform.OS == "linux" && d.Platform.Architecture == arch {
-				pick = d
-				break
+			if d.Platform.OS == "linux" {
+				for r, arch := range arches {
+					if d.Platform.Architecture == arch && (pick == nil || r < rank) {
+						pick, rank = d, r
+					}
+				}
 			}
 			continue // e.g. attestation manifests (platform unknown/unknown)
 		}
@@ -166,13 +170,13 @@ func (a *archive) ociManifest(b []byte, arch string, depth int) (*ociManifestDoc
 		}
 	}
 	if pick == nil {
-		return nil, fmt.Errorf("the image has no linux/%s variant", arch)
+		return nil, fmt.Errorf("the image has no linux/%s variant", strings.Join(arches, " or linux/"))
 	}
 	mb, err := os.ReadFile(a.blob(pick.Digest))
 	if err != nil {
 		return nil, err
 	}
-	return a.ociManifest(mb, arch, depth+1)
+	return a.ociManifest(mb, arches, depth+1)
 }
 
 // openLayer opens a layer blob uncompressed (tar, gzip or zstd).

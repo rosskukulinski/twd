@@ -54,6 +54,10 @@ type Store struct {
 	Mkfs string
 	// Arch is the host's GOARCH-style architecture (default runtime.GOARCH).
 	Arch string
+	// Emulated are further image architectures the container backend runs
+	// (amd64 under Rosetta for Linux on a Mac, ADR-032 D7). An image index
+	// still resolves to the native variant first.
+	Emulated []string
 	// Sources resolve refs to image files.
 	Sources []Source
 	// Aliases rewrite refs before resolution (arm64 rebuilds of amd64-only
@@ -169,6 +173,19 @@ func (s *Store) arch() string {
 	return runtime.GOARCH
 }
 
+// Runs reports whether images of arch run here (natively or emulated).
+func (s *Store) Runs(arch string) bool {
+	if arch == s.arch() {
+		return true
+	}
+	for _, e := range s.Emulated {
+		if arch == e {
+			return true
+		}
+	}
+	return false
+}
+
 var scopeRE = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
 // Get returns ref converted for tenant (from the cache, or converted now).
@@ -223,7 +240,7 @@ func (s *Store) Get(ctx context.Context, tenant, ref string) (*Image, error) {
 // convert converts src into the scope's cache (a no-op on a hit).
 func (s *Store) convert(ref, scope, src string) (*Image, error) {
 	st := time.Now()
-	a, err := openArchive(src, s.arch())
+	a, err := openArchive(src, append([]string{s.arch()}, s.Emulated...)...)
 	if err != nil {
 		return nil, fmt.Errorf("image %s: %w", ref, err)
 	}
@@ -236,8 +253,9 @@ func (s *Store) convert(ref, scope, src string) (*Image, error) {
 	if err := json.Unmarshal(a.config, &cfg); err != nil {
 		return nil, fmt.Errorf("image %s: config: %w", ref, err)
 	}
-	if cfg.OS != "" && cfg.OS != "linux" || cfg.Architecture != "" && cfg.Architecture != s.arch() {
-		return nil, fmt.Errorf("image %s is %s/%s; this host runs linux/%s (ADR-032 D3: the image must match the host's arch)", ref, cfg.OS, cfg.Architecture, s.arch())
+	if cfg.OS != "" && cfg.OS != "linux" || cfg.Architecture != "" && !s.Runs(cfg.Architecture) {
+		return nil, fmt.Errorf("image %s is %s/%s; this host runs linux/%s (ADR-032 D3: the image must match the host's arch)", ref, cfg.OS, cfg.Architecture,
+			strings.Join(append([]string{s.arch()}, s.Emulated...), ", linux/"))
 	}
 	dir := filepath.Join(s.Dir, scope)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
