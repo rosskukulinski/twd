@@ -51,7 +51,8 @@ var allowedTailnets = map[string]bool{"tail7906d5.ts.net": true}
 const NoAdminTag = "tag:ttest-noadmin"
 
 // Policy is what this scenario adds to tailnet 1 (on top of cliflow.Policy):
-// the keyless base (mgmt/host tags, Funnel, autogroup:admin's admin cap),
+// the keyless base (mgmt/host/issuer tags, Funnel on the issuer's own node
+// only, autogroup:admin's admin cap),
 // the admin cap for tag:ttest (the linked CLI) and a non-admin tag.
 func Policy() policy.Snippet {
 	s := cliflow.Policy() // includes policy.InfraSnippet: twd/mgmt/host tagOwners + host ⇄ mgmt grants
@@ -62,7 +63,8 @@ func Policy() policy.Snippet {
 		map[string]any{"src": []string{cliflow.TestTag}, "dst": []string{mgmt.MgmtTag}, "ip": []string{"tcp:443", "tcp:80"}, "app": adminApp},
 		map[string]any{"src": []string{NoAdminTag}, "dst": []string{mgmt.MgmtTag}, "ip": []string{"tcp:443", "tcp:80"}},
 	)
-	s.NodeAttrs = []map[string]any{{"target": []string{mgmt.MgmtTag}, "attr": []string{"funnel"}}}
+	s.TagOwners[mgmt.IssuerTag] = []string{"autogroup:admin", "tag:twd"}
+	s.NodeAttrs = []map[string]any{{"target": []string{mgmt.IssuerTag}, "attr": []string{"funnel"}}}
 	return s
 }
 
@@ -214,8 +216,9 @@ func TestE2EKeyless(t *testing.T) {
 	// minted by the test, standing in for the browser login) → the console
 	// steps are printed and the stack keeps running, waiting for the IDs.
 	mgmtKey := keyTo("mgmt", []string{mgmt.MgmtTag}, true)
+	issuerKey := keyTo("issuer", []string{mgmt.IssuerTag}, true)
 	upArgs := []string{"up", "--wif", "--yes", "--control-url", prodControl, "--hostname-prefix", twdPrefix, "--mgmt-hostname", testPrefix + "mgmt",
-		"--mgmt-authkey-file", mgmtKey, "--ephemeral", "--allow-sibling-egress"}
+		"--mgmt-authkey-file", mgmtKey, "--issuer-authkey-file", issuerKey, "--ephemeral", "--allow-sibling-egress"}
 	t1 := time.Now()
 	so, se, d, err := host.Twd(append(upArgs, "--json")...)
 	res.Numbers["up_step1_ms"] = float64(d.Milliseconds())
@@ -224,13 +227,18 @@ func TestE2EKeyless(t *testing.T) {
 		fmt.Sprintf("err=%v stderr=%s stdout=%s", err, netd.Redact(se), netd.Redact(so)))
 	var cfg struct {
 		MintMode, APIKeyFile, MgmtDNSName, MgmtNodeID, IssuerURL, Tailnet string
+		IssuerDNSName, IssuerNodeID                                       string
 		HTTPS                                                             bool
 	}
 	cb, _ := os.ReadFile(filepath.Join(state, "twd.json"))
 	json.Unmarshal(cb, &cfg)
-	check("no_api_key_in_twd_state", cfg.MintMode == "wif" && cfg.APIKeyFile == "" && cfg.Tailnet == tailnet && cfg.HTTPS && cfg.MgmtDNSName != "" && cfg.IssuerURL == "https://"+cfg.MgmtDNSName,
+	check("no_api_key_in_twd_state", cfg.MintMode == "wif" && cfg.APIKeyFile == "" && cfg.Tailnet == tailnet && cfg.HTTPS && cfg.MgmtDNSName != "",
 		fmt.Sprintf("twd.json: %+v", cfg))
+	// The issuer runs on its OWN node, never on mgmt's.
+	check("issuer_on_own_node", cfg.IssuerDNSName != "" && cfg.IssuerDNSName != cfg.MgmtDNSName && cfg.IssuerURL == "https://"+cfg.IssuerDNSName &&
+		cfg.IssuerNodeID != "" && cfg.IssuerNodeID != cfg.MgmtNodeID, fmt.Sprintf("issuer %s (%s), mgmt %s", cfg.IssuerDNSName, cfg.IssuerNodeID, cfg.MgmtDNSName))
 	tracker.Track(cfg.MgmtNodeID, "mgmt-node")
+	tracker.Track(cfg.IssuerNodeID, "issuer-node")
 	tenantID := "tn_" + strings.Split(tailnet, ".")[0]
 	issuer := cfg.IssuerURL + "/t/" + tenantID
 	// mgmt is up; the host's own node waits for a join key that only the
@@ -262,6 +270,14 @@ func TestE2EKeyless(t *testing.T) {
 	}
 	res.Numbers["funnel_first_fetch_ms"] = float64(time.Since(t0).Milliseconds())
 	check("issuer_public_via_funnel", disc.Issuer == issuer, fmt.Sprintf("%s in %v", issuer, time.Since(t0).Round(time.Millisecond)))
+	// mgmt's node answers nothing from the public internet (it never
+	// listens on Funnel), while the issuer, on its own node, does.
+	if r, err := pub.Get("https://" + cfg.MgmtDNSName + "/.well-known/openid-configuration"); err == nil {
+		r.Body.Close()
+		check("mgmt_not_public", false, fmt.Sprintf("https://%s answered %d from the public internet", cfg.MgmtDNSName, r.StatusCode))
+	} else {
+		check("mgmt_not_public", true, "https://"+cfg.MgmtDNSName+" unreachable from the public internet: "+netd.Redact(err.Error()))
+	}
 
 	// 4. The trust credentials (API key use (a)): what the admin creates in the console.
 	mint, err := api.CreateFederated(ctx, tsapi.FederatedOptions{Scopes: []string{"auth_keys"}, Tags: []string{"tag:twd"},

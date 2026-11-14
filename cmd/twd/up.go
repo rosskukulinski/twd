@@ -52,13 +52,25 @@ func operatorSnippet() policy.Snippet {
 }
 
 // keylessSnippet is the policy WIF mode needs (ADR-026): operatorSnippet
-// plus the funnel attribute on tag:twd-mgmt (the WIF issuer is served over
-// Funnel). Applying it needs an API key (--policy-apply in apikey mode); in
-// the browser flow it is printed for the admin console.
+// plus the WIF issuer's own node (tag:twd-issuer, owned like tag:twd-mgmt)
+// and the funnel attribute on it, and only on it: mgmt's node, which
+// serves the API, is never Funnel-capable. Applying it needs an API key
+// (--policy-apply in apikey mode); in the browser flow it is printed for
+// the admin console.
 func keylessSnippet() policy.Snippet {
 	s := operatorSnippet()
-	s.NodeAttrs = []map[string]any{{"target": []string{mgmt.MgmtTag}, "attr": []string{"funnel"}}}
+	s.TagOwners[mgmt.IssuerTag] = []string{"autogroup:admin", "tag:twd"}
+	s.NodeAttrs = []map[string]any{{"target": []string{mgmt.IssuerTag}, "attr": []string{"funnel"}}}
 	return s
+}
+
+// issuerHostnameFor names the WIF issuer's node after mgmt's: twd-mgmt →
+// twd-issuer, <prefix>mgmt → <prefix>issuer, anything else → <name>-issuer.
+func issuerHostnameFor(mgmtHostname string) string {
+	if b, ok := strings.CutSuffix(mgmtHostname, "mgmt"); ok {
+		return b + "issuer"
+	}
+	return mgmtHostname + "-issuer"
 }
 
 // keylessPolicyOptions lets the keyless snippet through Check (RT-06):
@@ -84,27 +96,28 @@ func defaultHostID() string {
 }
 
 type upResult struct {
-	StateDir   string             `json:"stateDir"`
-	Tailnet    string             `json:"tailnet"`
-	MintMode   string             `json:"mintMode"`
-	TenantID   string             `json:"tenantID"`
-	HostID     string             `json:"hostID"`
-	Started    bool               `json:"started"`
-	LoggedIn   bool               `json:"loggedIn,omitempty"` // an interactive login happened
-	MgmtNode   string             `json:"mgmtNode,omitempty"` // twd-mgmt.<tailnet>.ts.net
-	MgmtNodeID string             `json:"mgmtNodeID,omitempty"`
-	MgmtIP     string             `json:"mgmtIP,omitempty"`
-	HTTPS      bool               `json:"https,omitempty"`
-	Funnel     bool               `json:"funnel,omitempty"`
-	Issuer     string             `json:"issuer,omitempty"`
-	WIF        *wifResult         `json:"wif,omitempty"`
-	PolicyOK   bool               `json:"policyOK"`
-	PolicyDiff string             `json:"policySnippet,omitempty"`
-	Applied    bool               `json:"policyApplied"`
-	Service    string             `json:"service,omitempty"`
-	LingerHint string             `json:"lingerHint,omitempty"`
-	SleepHint  string             `json:"sleepHint,omitempty"`
-	Timings    map[string]float64 `json:"timingsMs"`
+	StateDir     string             `json:"stateDir"`
+	Tailnet      string             `json:"tailnet"`
+	MintMode     string             `json:"mintMode"`
+	TenantID     string             `json:"tenantID"`
+	HostID       string             `json:"hostID"`
+	Started      bool               `json:"started"`
+	LoggedIn     bool               `json:"loggedIn,omitempty"` // an interactive login happened
+	MgmtNode     string             `json:"mgmtNode,omitempty"` // twd-mgmt.<tailnet>.ts.net
+	MgmtNodeID   string             `json:"mgmtNodeID,omitempty"`
+	IssuerNodeID string             `json:"issuerNodeID,omitempty"` // wif: the issuer's own node (tag:twd-issuer)
+	MgmtIP       string             `json:"mgmtIP,omitempty"`
+	HTTPS        bool               `json:"https,omitempty"`
+	Funnel       bool               `json:"funnel,omitempty"`
+	Issuer       string             `json:"issuer,omitempty"`
+	WIF          *wifResult         `json:"wif,omitempty"`
+	PolicyOK     bool               `json:"policyOK"`
+	PolicyDiff   string             `json:"policySnippet,omitempty"`
+	Applied      bool               `json:"policyApplied"`
+	Service      string             `json:"service,omitempty"`
+	LingerHint   string             `json:"lingerHint,omitempty"`
+	SleepHint    string             `json:"sleepHint,omitempty"`
+	Timings      map[string]float64 `json:"timingsMs"`
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -116,7 +129,7 @@ func cmdUp(args []string) error {
 	tailnet := f.String("tailnet", "", "the tailnet to serve (apikey mode: required; oauth: read from the client's devices or mgmt's node; wif: read from the login). Overrides discovery")
 	oauthFile := f.String("oauth-client-file", "", "RECOMMENDED mint mode \"oauth\": 0600 file with TS_OAUTH_CLIENT_ID=… and TS_OAUTH_CLIENT_SECRET=tskey-client-… (an OAuth client with Auth Keys write, tag tag:twd). No browser, no Funnel")
 	keyFile := f.String("api-key-file", "", "FALLBACK mint mode \"apikey\": file with TS_API_KEY=… (read at use, never copied); needs --tailnet")
-	wifF := f.Bool("wif", false, "mint mode \"wif\": keyless browser flow (tailnet login, mgmt's OIDC issuer over Funnel + HTTPS, a WIF trust credential); for hosted / multi-tenant mgmt")
+	wifF := f.Bool("wif", false, "mint mode \"wif\": keyless browser flow (tailnet login, an OIDC issuer on its own tag:twd-issuer node over Funnel + HTTPS, a WIF trust credential); for hosted / multi-tenant mgmt")
 	yes := f.Bool("yes", false, "non-interactive: don't ask for confirmation")
 	apply := f.Bool("policy-apply", false, "apikey mode: apply the policy snippet (validated first, written with If-Match); default: print it")
 	control := f.String("control-url", prodControl, "coordination server for the tailnet's nodes")
@@ -132,6 +145,7 @@ func cmdUp(args []string) error {
 	siblings := f.Bool("allow-sibling-egress", false, "let objects reach other objects on this host over the tailnet (hairpin; single-host tests and demos)")
 	service := f.Bool("service", false, "run the supervisor as a service that starts at login: Linux systemd user unit (~/.config/systemd/user/twd.service), macOS LaunchAgent (~/Library/LaunchAgents/dev.twd.up.plist)")
 	mgmtHost := f.String("mgmt-hostname", "", "mgmt's own tailnet node name (default "+defaultMgmtHostname+")")
+	issuerKey := f.String("issuer-authkey-file", "", "wif: TS_AUTHKEY=… file for the WIF issuer's own node (tag "+mgmt.IssuerTag+"; unattended join: tests, automation); default: interactive login")
 	mgmtKey := f.String("mgmt-authkey-file", "", "TS_AUTHKEY=… file for mgmt's node (unattended join: tests, automation); default: oauth/apikey mint it, wif logs in interactively")
 	wifID := f.String("wif-client-id", "", "wif: the mint trust credential's client ID (default: prompt after printing the console steps)")
 	wifLife := f.String("wif-lifecycle-client-id", "", "wif: the lifecycle trust credential's client ID (optional)")
@@ -365,7 +379,7 @@ func cmdUp(args []string) error {
 			for _, l := range snippetLines(keylessSnippet()) {
 				fmt.Fprintln(out, l)
 			}
-			fmt.Fprintf(out, "  (tagOwners: the account you log in with must be allowed to own %s · nodeAttrs: Funnel serves the WIF issuer · grants: admins may use twd over the tailnet)\n", mgmt.MgmtTag)
+			fmt.Fprintf(out, "  (tagOwners: the account you log in with must be allowed to own %s and %s · nodeAttrs: Funnel serves the WIF issuer from its own node, never mgmt's · grants: admins may use twd over the tailnet)\n", mgmt.MgmtTag, mgmt.IssuerTag)
 			if !*yes && isTerminal() {
 				fmt.Fprintf(out, "Is this in your policy now? The login fails with \"requested tags [%s] are invalid or not permitted\" otherwise. [y/N] ", mgmt.MgmtTag)
 				ln, _ := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -396,21 +410,64 @@ func cmdUp(args []string) error {
 			return fail("state_conflict", "mgmt's node joined tailnet "+node.Tailnet+", not --tailnet "+*tailnet).
 				withFix("drop --tailnet (it is discovered), or use the right credential")
 		}
-		if wifMode {
-			if !node.HTTPS {
-				return fail("https_required", "this tailnet has no HTTPS certificates, so mgmt's WIF issuer can't be served over Funnel",
-					"node "+node.DNSName+" joined fine (tags "+strings.Join(node.Tags, ",")+"); its state is kept, so the next twd up needs no login").
-					withFix("admin console › DNS › HTTPS Certificates › Enable HTTPS, then run twd up again", "or use an OAuth client (no HTTPS or Funnel needed): twd up --oauth-client-file <file>")
-			}
-			if !node.Funnel {
-				return fail("funnel_required", "mgmt's node has no Funnel permission, so the WIF issuer can't be published for Tailscale to verify tokens",
-					"node "+node.DNSName+" joined (tags "+strings.Join(node.Tags, ",")+"); state kept, the next twd up needs no login").
-					withFix(`add to your tailnet policy: "nodeAttrs": [{"target": ["`+mgmt.MgmtTag+`"], "attr": ["funnel"]}]`, "then run twd up again (it re-reads the policy on join)")
-			}
+		if node.Funnel {
+			// mgmt never serves Funnel; a funnel attribute on its tag (from
+			// an older twd's keyless snippet) is only exposure to remove.
+			fmt.Fprintf(os.Stderr, "! policy   %s has the funnel attribute; twd no longer uses it (the WIF issuer runs on its own %s node): remove {\"target\": [\"%s\"], \"attr\": [\"funnel\"]} from nodeAttrs\n",
+				mgmt.MgmtTag, mgmt.IssuerTag, mgmt.MgmtTag)
+		}
+		if wifMode && !node.HTTPS {
+			return fail("https_required", "this tailnet has no HTTPS certificates, so the WIF issuer can't be served over Funnel",
+				"node "+node.DNSName+" joined fine (tags "+strings.Join(node.Tags, ",")+"); its state is kept, so the next twd up needs no login").
+				withFix("admin console › DNS › HTTPS Certificates › Enable HTTPS, then run twd up again", "or use an OAuth client (no HTTPS or Funnel needed): twd up --oauth-client-file <file>")
 		}
 		s.Cfg.MgmtHostname, s.Cfg.MgmtDNSName, s.Cfg.MgmtNodeID, s.Cfg.MgmtIP, s.Cfg.HTTPS = mgmtHostname, node.DNSName, node.NodeID, node.IP, node.HTTPS
 		if wifMode {
-			s.Cfg.IssuerURL = "https://" + node.DNSName
+			// The WIF issuer is public, so it gets its OWN node (tag
+			// twd-issuer, no grants, Funnel-only, discovery + JWKS): mgmt's
+			// node is never reachable over Funnel.
+			ihn := s.Cfg.IssuerHostname
+			if ihn == "" {
+				ihn = issuerHostnameFor(mgmtHostname)
+			}
+			ikey := ""
+			if *issuerKey != "" {
+				if ikey, err = tsapi.LoadEnvFile(*issuerKey, "TS_AUTHKEY"); err != nil {
+					return fail("bad_request", "can't read TS_AUTHKEY from "+*issuerKey, err.Error())
+				}
+			}
+			if !isFile(filepath.Join(s.issuerTsnetDir(), "tailscaled.state")) && ikey == "" {
+				fmt.Fprintf(out, "twd up · wif · the WIF issuer joins as its own node %q (tag %s): it serves only the public OIDC discovery + JWKS over Funnel\n", ihn, mgmt.IssuerTag)
+			}
+			if err := os.MkdirAll(s.issuerTsnetDir(), 0o700); err != nil {
+				return err
+			}
+			is := time.Now()
+			inode, err := joinMgmtNode(ctx, joinOpts{Dir: s.issuerTsnetDir(), Hostname: ihn, ControlURL: *control, Tags: []string{mgmt.IssuerTag},
+				AuthKey: ikey, Timeout: *loginTO, Out: out})
+			if err != nil {
+				return err
+			}
+			timings["issuer_join"] = ms(time.Since(is))
+			if !slices.Contains(inode.Tags, mgmt.IssuerTag) && *control == prodControl {
+				return fail("bootstrap_failed", "the issuer's node joined without the "+mgmt.IssuerTag+" tag (tags: "+strings.Join(inode.Tags, ",")+")",
+					"the account that logged in is not a tagOwner of "+mgmt.IssuerTag+", so control dropped the tag").
+					withFix("add to tagOwners: \"" + mgmt.IssuerTag + "\": [\"autogroup:admin\", \"tag:twd\"], then remove the node " + inode.DNSName + " in the admin console and run twd up again")
+			}
+			if !inode.Funnel {
+				return fail("funnel_required", "the issuer's node has no Funnel permission, so the WIF issuer can't be published for Tailscale to verify tokens",
+					"node "+inode.DNSName+" joined (tags "+strings.Join(inode.Tags, ",")+"); state kept, the next twd up needs no login").
+					withFix(`add to your tailnet policy: "nodeAttrs": [{"target": ["`+mgmt.IssuerTag+`"], "attr": ["funnel"]}]`, "then run twd up again (it re-reads the policy on join)")
+			}
+			newIssuer := "https://" + inode.DNSName
+			if old := s.Cfg.IssuerURL; old != "" && old != newIssuer && s.Cfg.WIFClientID != "" {
+				// An older twd served the issuer from mgmt's node: trust
+				// credentials name that issuer, so they must be re-created.
+				fmt.Fprintf(os.Stderr, "! wif      the issuer moved from %s to %s (its own node): create a new trust credential for it (the old one no longer verifies) and run twd up --wif-client-id <id>\n", old, newIssuer)
+				s.Cfg.WIFClientID, s.Cfg.WIFLifecycleClientID = "", ""
+			}
+			s.Cfg.IssuerHostname, s.Cfg.IssuerDNSName, s.Cfg.IssuerNodeID, s.Cfg.IssuerURL = ihn, inode.DNSName, inode.NodeID, newIssuer
+			res.IssuerNodeID = inode.NodeID
 		}
 	} else if mgmtHostname != "" {
 		res.MgmtNode, res.MgmtNodeID, res.MgmtIP, res.HTTPS, res.Funnel = s.Cfg.MgmtDNSName, s.Cfg.MgmtNodeID, s.Cfg.MgmtIP, s.Cfg.HTTPS, s.Cfg.IssuerURL != ""
@@ -424,7 +481,8 @@ func cmdUp(args []string) error {
 	res.Tailnet = *tailnet
 	if !s.configured() {
 		s.Cfg = Config{Tailnet: *tailnet, CreatedAt: time.Now().UTC().Format(time.RFC3339), MgmtHostname: s.Cfg.MgmtHostname, MgmtDNSName: s.Cfg.MgmtDNSName,
-			MgmtNodeID: s.Cfg.MgmtNodeID, MgmtIP: s.Cfg.MgmtIP, HTTPS: s.Cfg.HTTPS, IssuerURL: s.Cfg.IssuerURL}
+			MgmtNodeID: s.Cfg.MgmtNodeID, MgmtIP: s.Cfg.MgmtIP, HTTPS: s.Cfg.HTTPS, IssuerURL: s.Cfg.IssuerURL,
+			IssuerHostname: s.Cfg.IssuerHostname, IssuerDNSName: s.Cfg.IssuerDNSName, IssuerNodeID: s.Cfg.IssuerNodeID}
 	}
 	switch {
 	case apikeyMode:
@@ -820,10 +878,12 @@ func cmdSupervise(args []string) error {
 	}
 	if s.Cfg.MgmtHostname != "" {
 		// mgmt's own tailnet node (joined by twd up): the API over WhoIs
-		// and, in keyless mode, the WIF issuer over Funnel.
+		// (never Funnel). In keyless mode the WIF issuer runs on its own node.
 		margs = append(margs, "-tsnet-hostname", s.Cfg.MgmtHostname, "-tsnet-control-url", s.Cfg.ControlURL, "-tsnet-tags", mgmt.MgmtTag)
-		if s.Cfg.keyless() && s.Cfg.IssuerURL != "" {
-			margs = append(margs, "-funnel", "-issuer-url", s.Cfg.IssuerURL)
+		if s.Cfg.keyless() && s.Cfg.IssuerURL != "" && s.Cfg.IssuerHostname != "" {
+			// The issuer on its own node; mgmt's node never serves Funnel.
+			margs = append(margs, "-funnel", "-issuer-url", s.Cfg.IssuerURL,
+				"-issuer-tsnet-hostname", s.Cfg.IssuerHostname, "-issuer-tsnet-dir", s.issuerTsnetDir())
 		}
 	}
 	hargs := []string{hostdBin, "-host-id", s.Cfg.HostID,

@@ -71,6 +71,12 @@ const HostTag = "tag:twd-host"
 // MgmtTag is mgmt's own tag; the admin grant targets it.
 const MgmtTag = "tag:twd-mgmt"
 
+// IssuerTag is the WIF issuer's own node (wif mode only). It is the only
+// node twd-mgmt runs that may use Funnel: mgmt's node (MgmtTag), which
+// serves the API, is never Funnel-capable. The issuer node has no grants
+// and serves only OIDC discovery and the JWKS (public keys).
+const IssuerTag = "tag:twd-issuer"
+
 // AdminCap is the app capability that makes a tailnet caller a twd admin.
 // It is granted to tag:twd-mgmt; autogroup:admin members get it from the
 // base snippet, and any group, user or tag may be granted it too.

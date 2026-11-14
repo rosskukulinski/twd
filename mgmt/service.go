@@ -2338,7 +2338,9 @@ const (
 // PrivilegedKinds are the kinds a tenant may never submit (RT-02).
 var PrivilegedKinds = map[string]bool{"allow": true, "deny": true, "egress": true, "spawn": true, "kill": true,
 	"create": true, "mint": true, "ready": true, "credential": true, "principal": true, "device_delete": true,
-	"tenant": true, "deploy": true, "obo_root": true}
+	"tenant": true, "deploy": true, "obo_root": true,
+	// ADR-029: public ingress records come from netd/hostd only.
+	"public_request": true, "public_rejected": true, "public_object_created": true, "expose_on": true, "expose_off": true}
 
 // checkAuditSource enforces the provenance contract on a host-submitted
 // record: a "tenant" source may only carry a tenant_note, and a tenant_note

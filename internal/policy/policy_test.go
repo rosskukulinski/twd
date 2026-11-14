@@ -110,10 +110,10 @@ func TestApply(t *testing.T) {
 // refused (RT-06), and nodeAttrs may only set funnel on twd tags.
 func keylessSnip() Snippet {
 	return Snippet{
-		TagOwners: map[string][]string{"tag:twd-mgmt": {"autogroup:admin"}},
+		TagOwners: map[string][]string{"tag:twd-mgmt": {"autogroup:admin"}, "tag:twd-issuer": {"autogroup:admin"}},
 		Grants: []map[string]any{{"src": []string{"autogroup:admin"}, "dst": []string{"tag:twd-mgmt"}, "ip": []string{"tcp:443", "tcp:80"},
 			"app": map[string]any{"twd.dev/cap/admin": []any{map[string]any{}}}}},
-		NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"funnel"}}},
+		NodeAttrs: []map[string]any{{"target": []string{"tag:twd-issuer"}, "attr": []string{"funnel"}}},
 	}
 }
 
@@ -133,7 +133,7 @@ func TestMergeNodeAttrsAndAdminGrant(t *testing.T) {
 			t.Fatalf("merge into %q: %v", in[:min(len(in), 20)], err)
 		}
 		s := string(out)
-		for _, want := range []string{`"attr": ["funnel"]`, `"twd.dev/cap/admin"`, `"tag:twd-mgmt"`} {
+		for _, want := range []string{`"attr": ["funnel"]`, `"twd.dev/cap/admin"`, `"tag:twd-mgmt"`, `"tag:twd-issuer"`} {
 			if !strings.Contains(s, want) && !strings.Contains(s, strings.ReplaceAll(want, " ", "")) {
 				t.Fatalf("merged policy lacks %q:\n%s", want, s)
 			}
@@ -156,7 +156,7 @@ func TestMergeNodeAttrsAndAdminGrant(t *testing.T) {
 	for _, bad := range []Snippet{
 		{NodeAttrs: []map[string]any{{"target": []string{"tag:other"}, "attr": []string{"funnel"}}}},
 		{NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"mullvad"}}}},
-		{NodeAttrs: []map[string]any{{"target": []string{"tag:twd-mgmt"}, "attr": []string{"funnel"}, "app": 1}}},
+		{NodeAttrs: []map[string]any{{"target": []string{"tag:twd-issuer"}, "attr": []string{"funnel"}, "app": 1}}},
 		{NodeAttrs: []map[string]any{{"target": []string{"*"}, "attr": []string{"funnel"}}}},
 	} {
 		if err := Check(bad, opts); err == nil {

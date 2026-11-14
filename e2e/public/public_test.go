@@ -482,7 +482,7 @@ func TestE2EPublic(t *testing.T) {
 			Kind      string          `json:"kind"`
 			ActingFor string          `json:"actingFor"`
 			Detail    json.RawMessage `json:"detail"`
-		} `json:"items"`
+		} `json:"records"`
 	}
 	var n int
 	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(time.Second) {

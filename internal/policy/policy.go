@@ -23,7 +23,7 @@ type Snippet struct {
 	TagOwners map[string][]string `json:"tagOwners,omitempty"`
 	Grants    []map[string]any    `json:"grants,omitempty"`
 	// NodeAttrs are nodeAttrs entries ({"target": [...], "attr": [...]}),
-	// e.g. the funnel attribute for tag:twd-mgmt (M10).
+	// e.g. the funnel attribute for tag:twd-issuer (WIF) or tag:twd-public.
 	NodeAttrs []map[string]any `json:"nodeAttrs,omitempty"`
 }
 
@@ -244,8 +244,12 @@ func Check(s Snippet, o Options) error {
 }
 
 // FunnelTargets are the only tags twd gives the funnel nodeAttr (ADR-029
-// D6): mgmt's node (the WIF issuer) and public nodes.
-var FunnelTargets = []string{"tag:twd-mgmt", PublicTag}
+// D6): public nodes and the WIF issuer's own node. Never tag:twd-mgmt:
+// mgmt's node serves the API and must not be reachable from the internet.
+var FunnelTargets = []string{PublicTag, IssuerTag}
+
+// IssuerTag is the WIF issuer's own node (mgmt.IssuerTag).
+const IssuerTag = "tag:twd-issuer"
 
 // PublicTag is the tag of a workload's public node (ADR-029).
 const PublicTag = "tag:twd-public"

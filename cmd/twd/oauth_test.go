@@ -38,8 +38,27 @@ func TestOperatorSnippet(t *testing.T) {
 	if len(s.Grants) != 3 || len(s.NodeAttrs) != 0 {
 		t.Fatalf("oauth snippet: %d grants, nodeAttrs %v (no Funnel in oauth mode)", len(s.Grants), s.NodeAttrs)
 	}
-	if k := keylessSnippet(); len(k.NodeAttrs) != 1 || !reflect.DeepEqual(k.TagOwners, s.TagOwners) {
-		t.Fatalf("wif snippet keeps funnel: %+v", k.NodeAttrs)
+	// wif: the operator snippet plus the issuer's own node, and Funnel on
+	// that node only; mgmt's node is never Funnel-capable.
+	k := keylessSnippet()
+	wantK := map[string][]string{mgmt.IssuerTag: {"autogroup:admin", "tag:twd"}}
+	for t, o := range s.TagOwners {
+		wantK[t] = o
+	}
+	if !reflect.DeepEqual(k.TagOwners, wantK) {
+		t.Fatalf("wif tagOwners %v, want %v", k.TagOwners, wantK)
+	}
+	if kj, _ := json.Marshal(k.NodeAttrs); len(k.NodeAttrs) != 1 || string(kj) != `[{"attr":["funnel"],"target":["`+mgmt.IssuerTag+`"]}]` || strings.Contains(string(kj), mgmt.MgmtTag) {
+		t.Fatalf("wif snippet must put funnel on %s only: %s", mgmt.IssuerTag, kj)
+	}
+	if _, ok := s.TagOwners[mgmt.IssuerTag]; ok {
+		t.Fatal("operatorSnippet must not be mutated by keylessSnippet")
+	}
+	if mgmt.IssuerTag != policy.IssuerTag {
+		t.Fatalf("mgmt.IssuerTag %q != policy.IssuerTag %q", mgmt.IssuerTag, policy.IssuerTag)
+	}
+	if err := policy.Check(policy.Snippet{NodeAttrs: []map[string]any{{"target": []string{mgmt.MgmtTag}, "attr": []string{"funnel"}}}}, keylessPolicyOptions()); err == nil {
+		t.Fatal("policy.Check must refuse funnel on " + mgmt.MgmtTag)
 	}
 	for _, sn := range []policy.Snippet{s, keylessSnippet()} {
 		if err := policy.Check(sn, keylessPolicyOptions()); err != nil {

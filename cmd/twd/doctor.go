@@ -197,7 +197,7 @@ func cmdDoctor(args []string) error {
 			}
 			return "ok", d, ""
 		case s.Cfg.keyless():
-			d := "wif (keyless): mgmt node " + s.Cfg.MgmtDNSName + " serves the OIDC issuer " + s.Cfg.IssuerURL + " over Funnel; trust credential client ID " + s.Cfg.WIFClientID + " (public)"
+			d := "wif (keyless): the issuer's own node " + s.Cfg.IssuerDNSName + " (" + mgmt.IssuerTag + ") serves the OIDC issuer " + s.Cfg.IssuerURL + " over Funnel; mgmt's node " + s.Cfg.MgmtDNSName + " is never Funnel-capable; trust credential client ID " + s.Cfg.WIFClientID + " (public)"
 			if s.Cfg.WIFLifecycleClientID == "" {
 				return "warn", d + "; no lifecycle credential (kill deletes no devices; no preflight or spawn checks)", "twd up --wif-lifecycle-client-id <id> (scopes devices:core, policy_file:read)"
 			}
