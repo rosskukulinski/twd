@@ -20,39 +20,45 @@ import (
 
 // Defines values for AuditKind.
 const (
-	AuditKindAllow        AuditKind = "allow"
-	AuditKindCreate       AuditKind = "create"
-	AuditKindCredential   AuditKind = "credential"
-	AuditKindDeny         AuditKind = "deny"
-	AuditKindDeploy       AuditKind = "deploy"
-	AuditKindDeviceDelete AuditKind = "device_delete"
-	AuditKindEgress       AuditKind = "egress"
-	AuditKindHostAdd      AuditKind = "host_add"
-	AuditKindHostDelete   AuditKind = "host_delete"
-	AuditKindHostRegister AuditKind = "host_register"
-	AuditKindKill         AuditKind = "kill"
-	AuditKindMint         AuditKind = "mint"
-	AuditKindObjectUpdate AuditKind = "object_update"
-	AuditKindOboRoot      AuditKind = "obo_root"
-	AuditKindPreflight    AuditKind = "preflight"
-	AuditKindPrincipal    AuditKind = "principal"
-	AuditKindPurge        AuditKind = "purge"
-	AuditKindReady        AuditKind = "ready"
-	AuditKindReap         AuditKind = "reap"
-	AuditKindRemint       AuditKind = "remint"
-	AuditKindSpawn        AuditKind = "spawn"
-	AuditKindTenantCreate AuditKind = "tenant_create"
-	AuditKindTenantDelete AuditKind = "tenant_delete"
-	AuditKindTenantNote   AuditKind = "tenant_note"
-	AuditKindTenantUpdate AuditKind = "tenant_update"
-	AuditKindUndeploy     AuditKind = "undeploy"
-	AuditKindVolumeKey    AuditKind = "volume_key"
+	AuditKindAllow          AuditKind = "allow"
+	AuditKindContainerStart AuditKind = "container_start"
+	AuditKindContainerStop  AuditKind = "container_stop"
+	AuditKindCreate         AuditKind = "create"
+	AuditKindCredential     AuditKind = "credential"
+	AuditKindDeny           AuditKind = "deny"
+	AuditKindDeploy         AuditKind = "deploy"
+	AuditKindDeviceDelete   AuditKind = "device_delete"
+	AuditKindEgress         AuditKind = "egress"
+	AuditKindHostAdd        AuditKind = "host_add"
+	AuditKindHostDelete     AuditKind = "host_delete"
+	AuditKindHostRegister   AuditKind = "host_register"
+	AuditKindKill           AuditKind = "kill"
+	AuditKindMint           AuditKind = "mint"
+	AuditKindObjectUpdate   AuditKind = "object_update"
+	AuditKindOboRoot        AuditKind = "obo_root"
+	AuditKindPreflight      AuditKind = "preflight"
+	AuditKindPrincipal      AuditKind = "principal"
+	AuditKindPurge          AuditKind = "purge"
+	AuditKindReady          AuditKind = "ready"
+	AuditKindReap           AuditKind = "reap"
+	AuditKindRemint         AuditKind = "remint"
+	AuditKindSpawn          AuditKind = "spawn"
+	AuditKindTenantCreate   AuditKind = "tenant_create"
+	AuditKindTenantDelete   AuditKind = "tenant_delete"
+	AuditKindTenantNote     AuditKind = "tenant_note"
+	AuditKindTenantUpdate   AuditKind = "tenant_update"
+	AuditKindUndeploy       AuditKind = "undeploy"
+	AuditKindVolumeKey      AuditKind = "volume_key"
 )
 
 // Valid indicates whether the value is a known member of the AuditKind enum.
 func (e AuditKind) Valid() bool {
 	switch e {
 	case AuditKindAllow:
+		return true
+	case AuditKindContainerStart:
+		return true
+	case AuditKindContainerStop:
 		return true
 	case AuditKindCreate:
 		return true
@@ -605,7 +611,8 @@ type AuditBatch struct {
 }
 
 // AuditKind Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-// `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+// `principal`, `tenant_note` (source `tenant`, unverified),
+// `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
 // `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 // `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 // `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
@@ -645,7 +652,8 @@ type AuditRecord struct {
 	HostSig *string `json:"hostSig,omitempty"`
 
 	// Kind Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-	// `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+	// `principal`, `tenant_note` (source `tenant`, unverified),
+	// `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
 	// `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 	// `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 	// `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,

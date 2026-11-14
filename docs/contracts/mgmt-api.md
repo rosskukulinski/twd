@@ -1090,13 +1090,14 @@ Extends `Page`.
 #### `AuditKind`
 
 Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`,
-`principal`, `tenant_note` (source `tenant`, unverified). mgmt chain:
+`principal`, `tenant_note` (source `tenant`, unverified),
+`container_start`, `container_stop` (an object's container, ADR-032). mgmt chain:
 `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`,
 `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`,
 `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`,
 `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`.
 
-Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`, `credential`, `obo_root`, `object_update`
+Enum: `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note`, `container_start`, `container_stop`, `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight`, `host_add`, `credential`, `obo_root`, `object_update`
 
 #### `AuditPage`
 
@@ -1124,7 +1125,7 @@ written, no HTML escaping. `seq` and `chain` are assigned by mgmt.
 | `grant` | string | no |  |
 | `hash` | string | yes |  |
 | `hostSig` | string | no | base64 ed25519 over utf8(hash); host chains only. |
-| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`. |
+| `kind` | `AuditKind` | yes | Host chain (netd/hostd): `allow`, `deny`, `egress`, `spawn`, `kill`, `principal`, `tenant_note` (source `tenant`, unverified), `container_start`, `container_stop` (an object's container, ADR-032). mgmt chain: `tenant_create`, `tenant_update`, `tenant_delete`, `host_register`, `host_delete`, `deploy`, `undeploy`, `create`, `mint`, `remint`, `ready`, `kill`, `device_delete`, `purge`, `volume_key`, `reap`, `preflight` (optional; dryRun deploys), `host_add`, `credential`, `obo_root`, `object_update`. |
 | `objectID` | string | no |  |
 | `prevHash` | string | yes | `""` for the first record of a chain. |
 | `seq` | integer (int64) | no | (read-only) |
