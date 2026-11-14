@@ -75,6 +75,51 @@ for t in json.loads(sys.argv[1]):
 print(json.dumps(out))
 `
 
+// plumbingScript, as container root, tries the guest's plumbing: a vsock
+// connection to the host (CID 2, guestd's port 1024) and device nodes for
+// every virtio disk (in /tmp on the overlay and in /dev), reading the
+// first 512 bytes if a node could be made.
+const plumbingScript = `
+import errno, json, os, socket, stat
+def en(e): return errno.errorcode.get(e.errno, str(e.errno))
+out = {"uid": os.getuid()}
+for k, typ in (("vsock_connect_2_1024", socket.SOCK_STREAM), ("vsock_dgram", socket.SOCK_DGRAM)):
+    try:
+        s = socket.socket(socket.AF_VSOCK, typ)
+        try:
+            s.settimeout(3); s.connect((2, 1024)); out[k] = "CONNECTED"
+        except OSError as e: out[k] = "socket ok, connect " + en(e)
+    except OSError as e: out[k] = en(e)
+disks = {}
+for d in sorted(os.listdir("/sys/block")):
+    if not d.startswith("vd"): continue
+    major, minor = map(int, open("/sys/block/%s/dev" % d).read().split(":"))
+    m = {"dev": "%d:%d" % (major, minor)}
+    for where in ("tmp", "dev"):
+        p = "/%s/twd-probe-%s" % (where, d)
+        try:
+            os.mknod(p, 0o600 | stat.S_IFBLK, os.makedev(major, minor)); m["mknod_" + where] = "ok"
+        except OSError as e: m["mknod_" + where] = en(e)
+        if os.path.exists(p):
+            try:
+                with open(p, "rb") as f: m["read_" + where] = "READ %d bytes" % len(f.read(512))
+            except OSError as e: m["read_" + where] = en(e)
+            os.unlink(p)
+        else: m["read_" + where] = "no node"
+    disks[d] = m
+out["disks"] = disks
+for l in open("/proc/self/mountinfo"):
+    f = l.split()
+    if f[4] in ("/", "/dev"): out[("root" if f[4] == "/" else "dev") + "_nodev"] = "nodev" in f[5].split(",")
+try:
+    os.mkfifo("/tmp/twd-probe-fifo"); os.unlink("/tmp/twd-probe-fifo"); out["mkfifo"] = "ok"
+except OSError as e: out["mkfifo"] = en(e)
+try:
+    open("/dev/null", "w").write("x"); out["dev_null"] = "ok"
+except OSError as e: out["dev_null"] = en(e)
+print(json.dumps(out))
+`
+
 // fetchScript GETs argv[1] (cafile argv[2] if given) and prints status and body.
 const fetchScript = `
 import json, ssl, sys, urllib.request
@@ -204,6 +249,40 @@ func testEgress(t *testing.T, ev *egressEnv, set func(string, any)) {
 			}
 		}
 		ev.call("/f/egi/destroy")
+	})
+
+	t.Run("GuestPlumbingSealed", func(t *testing.T) {
+		r := ev.py(t, "eg", plumbingScript)
+		set("guest_plumbing_sealed", r)
+		if r["uid"] != float64(0) {
+			t.Fatalf("the probe must run as container root: %v", r)
+		}
+		// guestd's channel to the host: seccomp says EPERM (the host would
+		// refuse an unauthenticated connection anyway).
+		if r["vsock_connect_2_1024"] != "EPERM" || r["vsock_dgram"] != "EPERM" {
+			t.Fatalf("AF_VSOCK from the container: %v", r)
+		}
+		// The VM's disks (config drive, rootfs, image, scratch): no device
+		// node for them can be made (no CAP_MKNOD), and none would open
+		// (every container mount is nodev).
+		disks, _ := r["disks"].(map[string]any)
+		if len(disks) < 3 {
+			t.Fatalf("expected the guest's virtio disks in /sys/block: %v", r)
+		}
+		for d, v := range disks {
+			m, _ := v.(map[string]any)
+			for _, where := range []string{"tmp", "dev"} {
+				if m["mknod_"+where] != "EPERM" || m["read_"+where] != "no node" {
+					t.Errorf("%s in /%s: %v", d, where, m)
+				}
+			}
+		}
+		if r["root_nodev"] != true || r["dev_nodev"] != true {
+			t.Errorf("container / and /dev must be nodev: %v", r)
+		}
+		if r["mkfifo"] != "ok" || r["dev_null"] != "ok" {
+			t.Errorf("ordinary node use broke: %v", r)
+		}
 	})
 
 	t.Run("StrictKeyscan", func(t *testing.T) {

@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func colon(s string) [][]string {
@@ -101,5 +103,17 @@ func TestInstallCA(t *testing.T) {
 	}
 	if p, err := resolveIn(root, "/etc/ssl/certs/../../../../etc/ssl/certs/ca-certificates.crt"); err != nil || p != filepath.Join(root, "usr/share/bundle.crt") {
 		t.Fatalf("resolveIn: %q %v", p, err)
+	}
+}
+
+// TestCtrCapsNoMknod: container root can't make device nodes.
+func TestCtrCapsNoMknod(t *testing.T) {
+	if ctrCapMask()&(1<<unix.CAP_MKNOD) != 0 {
+		t.Fatal("CAP_MKNOD is in the container capability set")
+	}
+	for _, c := range []int{unix.CAP_SYS_ADMIN, unix.CAP_SYS_PTRACE, unix.CAP_SYS_RAWIO, unix.CAP_SYS_MODULE} {
+		if ctrCapMask()&(1<<uint(c)) != 0 {
+			t.Fatalf("capability %d in the container set", c)
+		}
 	}
 }

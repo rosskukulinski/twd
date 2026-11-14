@@ -175,7 +175,7 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 	if err := waitDev(cc.Image); err != nil {
 		return fmt.Errorf("image device: %w", err)
 	}
-	if err := unix.Mount(cc.Image, lower, "erofs", unix.MS_RDONLY, ""); err != nil {
+	if err := unix.Mount(cc.Image, lower, "erofs", unix.MS_RDONLY|unix.MS_NODEV, ""); err != nil {
 		return fmt.Errorf("mount image (erofs) %s: %w", cc.Image, err)
 	}
 	if cc.Scratch != "" {
@@ -187,10 +187,10 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 				return err
 			}
 		}
-		if err := unix.Mount(cc.Scratch, scratch, "ext4", unix.MS_NOATIME, "errors=remount-ro"); err != nil {
+		if err := unix.Mount(cc.Scratch, scratch, "ext4", unix.MS_NOATIME|unix.MS_NODEV, "errors=remount-ro"); err != nil {
 			return fmt.Errorf("mount scratch %s: %w", cc.Scratch, err)
 		}
-	} else if err := unix.Mount("tmpfs", scratch, "tmpfs", 0, "mode=0700,size=25%"); err != nil {
+	} else if err := unix.Mount("tmpfs", scratch, "tmpfs", unix.MS_NODEV, "mode=0700,size=25%"); err != nil {
 		return err
 	}
 	for _, d := range []string{scratch + "/upper", scratch + "/work"} {
@@ -199,7 +199,10 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 		}
 	}
 	opts := "lowerdir=" + lower + ",upperdir=" + scratch + "/upper,workdir=" + scratch + "/work"
-	if err := unix.Mount("overlay", ctrRoot, "overlay", 0, opts); err != nil {
+	// nodev: the container's root (and so /tmp, /workspace, …) never
+	// opens a device node, whether container root made it or the image
+	// shipped it.
+	if err := unix.Mount("overlay", ctrRoot, "overlay", unix.MS_NODEV, opts); err != nil {
 		return fmt.Errorf("mount overlay: %w", err)
 	}
 	r := func(p string) string { return filepath.Join(ctrRoot, p) }
@@ -216,20 +219,23 @@ func setupContainerRoot(cc *proto.ContainerConfig) error {
 	if err := unix.Mount("sysfs", r("sys"), "sysfs", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC|unix.MS_RDONLY, ""); err != nil {
 		return fmt.Errorf("container /sys: %w", err)
 	}
-	// /dev: a tmpfs with the usual nodes only (no block devices: the
-	// image, scratch and guest disks are not the container's business).
-	if err := unix.Mount("tmpfs", r("dev"), "tmpfs", unix.MS_NOSUID|unix.MS_NOEXEC, "mode=0755,size=64k"); err != nil {
+	// /dev: a nodev tmpfs with the usual nodes only, each bind-mounted
+	// from the guest's devtmpfs (a bind mount of its own, so it works
+	// while the rest of /dev can't hold a usable node). No block devices:
+	// the image, scratch and guest disks are not the container's business.
+	if err := unix.Mount("tmpfs", r("dev"), "tmpfs", unix.MS_NOSUID|unix.MS_NOEXEC|unix.MS_NODEV, "mode=0755,size=64k"); err != nil {
 		return fmt.Errorf("container /dev: %w", err)
 	}
-	for _, n := range []struct {
-		name         string
-		major, minor uint32
-	}{{"null", 1, 3}, {"zero", 1, 5}, {"full", 1, 7}, {"random", 1, 8}, {"urandom", 1, 9}, {"tty", 5, 0}} {
-		p := r("dev/" + n.name)
-		if err := unix.Mknod(p, unix.S_IFCHR|0o666, int(unix.Mkdev(n.major, n.minor))); err != nil {
-			return fmt.Errorf("mknod %s: %w", p, err)
+	for _, n := range []string{"null", "zero", "full", "random", "urandom", "tty"} {
+		p := r("dev/" + n)
+		if err := os.WriteFile(p, nil, 0o666); err != nil {
+			return err
 		}
-		os.Chmod(p, 0o666)
+		if err := unix.Mount("/dev/"+n, p, "", unix.MS_BIND, ""); err != nil {
+			return fmt.Errorf("bind /dev/%s: %w", n, err)
+		}
+		// MS_BIND ignores the other flags: nosuid/noexec take a remount.
+		unix.Mount("", p, "", unix.MS_REMOUNT|unix.MS_BIND|unix.MS_NOSUID|unix.MS_NOEXEC, "")
 	}
 	for l, t := range map[string]string{"fd": "/proc/self/fd", "stdin": "/proc/self/fd/0", "stdout": "/proc/self/fd/1", "stderr": "/proc/self/fd/2", "ptmx": "pts/ptmx"} {
 		os.Symlink(t, r("dev/"+l))
@@ -905,8 +911,13 @@ func ctrExec() {
 }
 
 // ctrCaps is the most a container process holds: Docker's default set
-// (what images and the Sandbox SDK's servers are written against).
-var ctrCaps = []int{unix.CAP_CHOWN, unix.CAP_DAC_OVERRIDE, unix.CAP_FSETID, unix.CAP_FOWNER, unix.CAP_MKNOD,
+// (what images and the Sandbox SDK's servers are written against) minus
+// CAP_MKNOD. Docker keeps MKNOD because its device cgroup stops a node
+// from being opened; a guest has no device cgroup, so container root could
+// make /dev/vd* nodes and read the raw disks (config drive, image,
+// scratch). Every container mount is nodev as well (setupContainerRoot),
+// which also disarms device nodes an image ships.
+var ctrCaps = []int{unix.CAP_CHOWN, unix.CAP_DAC_OVERRIDE, unix.CAP_FSETID, unix.CAP_FOWNER,
 	unix.CAP_NET_RAW, unix.CAP_SETGID, unix.CAP_SETUID, unix.CAP_SETFCAP, unix.CAP_SETPCAP,
 	unix.CAP_NET_BIND_SERVICE, unix.CAP_SYS_CHROOT, unix.CAP_KILL, unix.CAP_AUDIT_WRITE}
 
