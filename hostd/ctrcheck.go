@@ -157,8 +157,17 @@ func (h *Host) ContainerCheck(ctx context.Context, tenantID, wlName, class, obje
 			ks.Found = append(ks.Found, scanFile(p, needles)...)
 		}
 	}
+	// The guest's own files: no tailscale-looking state outside the
+	// container root. Inside it the names are the tenant image's (Debian
+	// ships /var/lib/shells.state); the image and scratch disks and RAM are
+	// content-scanned above and below instead.
 	if r, err := sc.Op(ctx, proto.Msg{Op: "fsscan"}); err == nil {
-		ks.GuestFiles, ks.GuestStateF = r.Scanned, r.Found
+		ks.GuestFiles = r.Scanned
+		for _, f := range r.Found {
+			if !strings.HasPrefix(f, "/run/twd/ctr/") {
+				ks.GuestStateF = append(ks.GuestStateF, f)
+			}
+		}
 	}
 	dir, err := os.MkdirTemp(h.cfg.DataDir, "memscan-")
 	if err != nil {
