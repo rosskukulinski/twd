@@ -52,6 +52,10 @@ func logf(format string, args ...any) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "ctr-exec" && os.Getpid() != 1 {
+		ctrExec() // a container process's setup stage (container_linux.go)
+		return
+	}
 	if os.Getpid() != 1 {
 		logf("not PID 1; refusing to run")
 		os.Exit(2)
@@ -90,10 +94,14 @@ func run() error {
 		}
 	}
 
-	g := &guest{cfg: cfg, out: make(chan proto.Msg, 64)}
+	g := &guest{cfg: cfg, out: make(chan proto.Msg, 256), waiters: map[int]chan int{}}
 	go g.vsockLoop()
 	go g.reap()
 	g.send(proto.Msg{Type: "boot", UptimeMS: time.Since(start).Milliseconds()})
+	if cfg.Container != nil {
+		g.runContainer()
+		return nil
+	}
 	g.superviseWorkerd()
 	return nil
 }
@@ -265,6 +273,8 @@ type guest struct {
 	restarts   int
 	stopping   bool     // shutdown: don't restart workerd
 	exits      chan int // workerd exit statuses, fed by reap()
+	ctr        *container
+	waiters    map[int]chan int // container processes: pid -> exit status (reap)
 }
 
 func (g *guest) send(m proto.Msg) {
@@ -301,6 +311,11 @@ func (g *guest) serveHost(f *os.File) {
 		wmu.Lock()
 		defer wmu.Unlock()
 		return enc.Encode(m)
+	}
+	// The first line names the connection: control (this) or an exec's
+	// stdio stream (proto.ExecStreamHello).
+	if write(proto.Msg{Type: "hello", UptimeMS: time.Since(start).Milliseconds()}) != nil {
+		return
 	}
 	go func() {
 		defer close(done)
@@ -352,6 +367,8 @@ func (g *guest) handle(m proto.Msg) proto.Msg {
 			break
 		}
 		r.Results = probe(m.Targets)
+	case "exec", "signal", "resize", "status":
+		g.handleContainer(m, &r)
 	default:
 		r.Error = "unknown op " + m.Op
 	}
@@ -549,6 +566,14 @@ func (g *guest) reap() {
 				break
 			}
 			g.mu.Lock()
+			if ch := g.waiters[pid]; ch != nil {
+				delete(g.waiters, pid)
+				code := ws.ExitStatus()
+				if ws.Signaled() {
+					code = 128 + int(ws.Signal())
+				}
+				ch <- code // buffered (1)
+			}
 			if pid == g.workerdPID && g.exits != nil {
 				g.workerdPID = 0
 				select {
