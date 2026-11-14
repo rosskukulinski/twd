@@ -101,7 +101,7 @@ func TestE2EKeyless(t *testing.T) {
 	root, _ := nettest.FindRepoRoot()
 	res := cliflow.NewResults("m10-"+run, tailnet)
 	resultsTo := filepath.Join(root, "e2e", "real", "results", "m10-"+time.Now().Format("20060102-150405")+"-"+run+".json")
-	ctx, cancel := context.WithTimeout(context.Background(), 22*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 32*time.Minute)
 	defer cancel()
 	check := func(name string, ok bool, detail string) {
 		t.Helper()
@@ -278,7 +278,8 @@ func TestE2EKeyless(t *testing.T) {
 	pub := publicHTTP()
 	t0 := time.Now()
 	var disc struct{ Issuer string }
-	for time.Since(t0) < 4*time.Minute {
+	// New public names take up to 10 min in public DNS (KB 1223), plus the first certificate.
+	for time.Since(t0) < 12*time.Minute {
 		resp, err := pub.Get(issuer + "/.well-known/openid-configuration")
 		if err == nil {
 			json.NewDecoder(resp.Body).Decode(&disc)

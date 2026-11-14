@@ -382,6 +382,15 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("funnel on the issuer node %s: %w", *issHostname, err)
 		}
+		if ilc, err := its.LocalClient(); err == nil {
+			if st, err := ilc.StatusWithoutPeers(ctx); err == nil && st.Self != nil {
+				// A new name's first certificate takes longer than a Funnel
+				// client's TLS handshake: warm it now, or every early
+				// handshake (Tailscale's token-exchange verifier fetching the
+				// JWKS) fails until issuance finishes.
+				netd.PrefetchCert(ilc, st.Self.DNSName, log.With("node", *issHostname))
+			}
+		}
 		api.Listeners = append(api.Listeners, "issuer-funnel:443")
 		log.Info("WIF issuer served over Funnel on its own node", "node", *issHostname, "tag", mgmt.IssuerTag)
 		servers = append(servers, serve("issuer-funnel", fl, issuer.Handler()))

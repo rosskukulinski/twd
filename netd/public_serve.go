@@ -39,6 +39,8 @@ type publicState struct {
 	ln    net.Listener // nil when closed
 	hs    *http.Server
 	conns int // open public connections (MaxConns)
+	// prefetched: the node's certificate was requested once (real Funnel).
+	prefetched bool
 
 	node *bucket
 	ips  map[netip.Addr]*bucket
@@ -314,6 +316,18 @@ func (o *Object) openPublic() error {
 		return nil
 	}
 	go hs.Serve(ln)
+	p.mu.Lock()
+	first := !p.prefetched
+	p.prefetched = true
+	p.mu.Unlock()
+	if o.reg.cfg.PublicListen == nil && first {
+		// Real Funnel: warm the node's certificate now (ADR-029), so the
+		// first public client doesn't time out waiting for issuance.
+		o.mu.Lock()
+		lc, name := o.lc, o.dnsName
+		o.mu.Unlock()
+		PrefetchCert(lc, name, o.reg.log.With("object", o.id))
+	}
 	o.reg.log.Info("public listener open", "object", o.id, "addr", raw.Addr().String(), "routes", strings.Join(p.opts.Routes, ","))
 	return nil
 }

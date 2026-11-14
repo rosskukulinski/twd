@@ -130,7 +130,7 @@ e2e-keyless: deps
 	@if [ ! -f "$(TS_CREDS)/tailnet1_api.env" ]; then \
 		echo "e2e-keyless: SKIPPED ($(TS_CREDS)/tailnet1_api.env not found)"; exit 0; fi; \
 	TWD_E2E_API_KEY_FILE="$(TS_CREDS)/tailnet1_api.env" TWD_E2E_TAILNET="$(TAILNET1)" \
-		$(GO) test -tags e2ekeyless -count=1 -v -timeout 25m ./e2e/keyless/...
+		$(GO) test -tags e2ekeyless -count=1 -v -timeout 35m ./e2e/keyless/...
 
 ## e2e-oauth: M12 on tailnet 1: `twd up --oauth-client-file` (mint mode oauth: an OAuth client with
 ## auth_keys + devices:core + policy_file:read, tag:twd; no browser, no Funnel, no API key given to twd)
