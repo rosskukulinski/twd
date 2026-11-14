@@ -1,6 +1,8 @@
 package sbxnet
 
 import (
+	"strings"
+
 	"golang.org/x/net/dns/dnsmessage"
 )
 
@@ -47,7 +49,7 @@ func (p *Proxy) DNS(query []byte) []byte {
 	}
 	addr, ok := p.Lookup(q.Name.String())
 	if !ok {
-		p.deny(q.Name.String(), "dns_refused", "")
+		p.deny(strings.TrimSuffix(q.Name.String(), "."), "dns_refused", "")
 		return reply(dnsmessage.RCodeNameError, false, [4]byte{})
 	}
 	if q.Type == dnsmessage.TypeA {

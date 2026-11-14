@@ -247,6 +247,7 @@ type launch struct {
 	req      *helperapi.StartRequest
 	extra    func(m *Machine) (*os.File, error) // the fifth drive (DO volume or container image)
 	handlers map[uint16]http.Handler
+	gnet     sandbox.ContainerNet // a container guest's egress proxy (nil: no egress)
 	ctr      *ctrState
 }
 
@@ -342,7 +343,7 @@ func (b *Backend) launch(ctx context.Context, l launch) (_ *Machine, err error) 
 		m.info.Jail = &sandbox.Jail{ID: j.ID, Chroot: j.Chroot, Cgroup: j.Cgroup, CPUMax: j.CPUMax, Seccomp: j.Seccomp,
 			Netns: j.Netns, UID: j.UID, GID: j.GID, MemMax: j.MemMax}
 	}
-	m.vn, err = newVnet(m.tapFD, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, l.handlers)
+	m.vn, err = newVnet(m.tapFD, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, l.handlers, l.gnet)
 	if err != nil {
 		return nil, err
 	}
