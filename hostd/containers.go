@@ -288,9 +288,15 @@ func (m *ctrManager) start(ctx context.Context, inst *instance, k ctrKey, cc *bu
 	// Local capacity, then the mgmt reservation (fails closed).
 	m.mu.Lock()
 	n, mem, vcpu := m.usageLocked()
+	same := m.classLiveLocked(k)
 	m.mu.Unlock()
 	if m.cap.Max > 0 && n > m.cap.Max || m.cap.MemMiB > 0 && mem > m.cap.MemMiB || m.cap.VCPU > 0 && vcpu > m.cap.VCPU+1e-9 {
 		return fail(ctrError("capacity_exhausted", "this host runs %d containers (%d MiB, %.3g vCPU), at its container capacity", n-1, mem-res.MemoryMiB, vcpu-res.VCPU))
+	}
+	// max_instances, as far as this host can see (its class's objects are
+	// co-located with their parents; mgmt's reservation counts all hosts).
+	if cc.MaxInstances > 0 && same > cc.MaxInstances {
+		return fail(ctrError("quota_exceeded", "class %s already runs its max_instances (%d) containers", k.class, cc.MaxInstances))
 	}
 	release, err := m.quota.Reserve(ctx, ContainerReservation{TenantID: k.tenant, Workload: k.workload, Class: k.class, Object: k.name,
 		VCPU: res.VCPU, MemMiB: res.MemoryMiB, DiskMB: res.DiskMB, MaxInstances: cc.MaxInstances})
@@ -1077,4 +1083,20 @@ func (m *ctrManager) objectID(k ctrKey) string {
 		}
 	}
 	return ""
+}
+
+// classLiveLocked counts the live containers of k's class (m.mu held).
+func (m *ctrManager) classLiveLocked(k ctrKey) int {
+	n := 0
+	for ck, c := range m.ctrs {
+		if ck.tenant != k.tenant || ck.workload != k.workload || ck.class != k.class {
+			continue
+		}
+		c.mu.Lock()
+		if c.state == "starting" || c.state == "running" {
+			n++
+		}
+		c.mu.Unlock()
+	}
+	return n
 }

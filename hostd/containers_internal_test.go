@@ -117,6 +117,17 @@ func TestContainerCapacityAndQuota(t *testing.T) {
 		t.Fatalf("live %d", procs.Live())
 	}
 
+	// The class's max_instances.
+	h3, _ := ctrHost(t, nil)
+	inst3 := ctrInst(h3, "t", "w")
+	inst3.app.Containers["Box"].MaxInstances = 1
+	if err := ctrStart(t, h3, inst3, "a", startReq{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctrStart(t, h3, inst3, "b", startReq{}); codeOf(err) != "quota_exceeded" {
+		t.Fatalf("over max_instances: %v", err)
+	}
+
 	var got []ContainerReservation
 	released := 0
 	h2, procs2 := ctrHost(t, func(c *Config) {
