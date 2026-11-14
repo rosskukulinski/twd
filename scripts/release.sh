@@ -15,6 +15,9 @@
 # if TWD_VM_ASSETS_<arch> names a directory (make vm-assets, in Lima), the
 # microVM guest in share/twd/vm: vmlinux, rootfs.ext4 + manifest.json, and
 # Firecracker + jailer.
+# darwin tarballs also hold bin/twd-vz (cgo: the microVM VMM on Virtualization.framework,
+# signed with the virtualization entitlement) and, if TWD_VZ_ASSETS names a
+# directory (make vz-assets), its guest in share/twd/vm.
 # darwin binaries are ad-hoc code-signed (codesign -s -; they are unsigned
 # otherwise and arm64 macOS refuses to run unsigned code).
 set -eu
@@ -65,6 +68,15 @@ for t in $TARGETS; do
 	[ "$os" = linux ] && cmds="$cmds ./cmd/twd-vmhelper"
 	CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
 		-o "$st/bin/" $cmds
+	# twd-vz (darwin): the microVM tier's per-VM VMM links Virtualization.framework,
+	# so it is the one cgo binary; built on (and for) this Mac's arch only.
+	if [ "$os" = darwin ]; then
+		if [ "$(uname -s)" = Darwin ] && [ "$(go env GOARCH)" = "$arch" ]; then
+			CGO_ENABLED=1 GOOS=darwin GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "$st/bin/twd-vz" ./cmd/twd-vz
+		else
+			echo "release: $os-$arch: NO twd-vz (needs cgo on a $arch Mac): no microVM tier"
+		fi
+	fi
 
 	# workerd from the npm platform package, checked against the lockfile.
 	# npm names amd64 "64" (@cloudflare/workerd-linux-64).
@@ -105,6 +117,21 @@ for t in $TARGETS; do
 		chmod 755 "$st/share/twd/vm/firecracker" "$st/share/twd/vm/jailer"
 		microvm=true
 	fi
+	# microVM guest for the vz backend (darwin, when built: make vz-assets): the
+	# virtiofs kernel as vmlinux + the same guest image; needs bin/twd-vz.
+	if [ "$os" = darwin ] && [ -n "${TWD_VZ_ASSETS:-}" ] && [ -f "$st/bin/twd-vz" ]; then
+		for f in vmlinux rootfs.ext4 manifest.json kernel-manifest.json; do
+			[ -f "$TWD_VZ_ASSETS/$f" ] || { echo "release: $TWD_VZ_ASSETS/$f missing (make vz-assets)"; exit 1; }
+		done
+		mkdir -p "$st/share/twd/vm"
+		cp "$TWD_VZ_ASSETS/vmlinux" "$TWD_VZ_ASSETS/rootfs.ext4" "$TWD_VZ_ASSETS/manifest.json" "$TWD_VZ_ASSETS/kernel-manifest.json" "$st/share/twd/vm/"
+		chmod 644 "$st/share/twd/vm/"*
+		microvm=true
+	fi
+	if [ "$os" = darwin ]; then
+		if [ $microvm = true ]; then echo "release: $os-$arch microVM guest (vz) in share/twd/vm: included"
+		else echo "release: $os-$arch microVM guest (vz): NOT included (make vz-assets needs Lima twd-dev)"; fi
+	fi
 	if [ "$os" = linux ]; then
 		if [ $microvm = true ]; then echo "release: $os-$arch microVM guest assets (share/twd/vm): included"
 		else echo "release: $os-$arch microVM guest assets (share/twd/vm): NOT included (the microVM tier needs a release built with them: make release with Lima twd-dev running, or on Linux)"; fi
@@ -126,6 +153,13 @@ EOF
 			codesign --force --sign - "$b"
 			codesign --verify "$b"
 		done
+		# twd-vz must carry the virtualization entitlement (ad hoc is enough).
+		if [ -f "$st/bin/twd-vz" ]; then
+			codesign --force --sign - --entitlements cmd/twd-vz/twd-vz.entitlements "$st/bin/twd-vz"
+			codesign -d --entitlements - "$st/bin/twd-vz" 2>/dev/null | grep -q com.apple.security.virtualization ||
+				{ echo "release: twd-vz lacks the virtualization entitlement"; exit 1; }
+			if [ -f "$st/share/twd/vm/vmlinux" ]; then "$st/bin/twd-vz" -check "$st/share/twd/vm/vmlinux"; fi
+		fi
 		# workerd must run here (the native target).
 		if [ "$(uname -m)" = "$arch" ]; then
 			"$st/bin/workerd" --version

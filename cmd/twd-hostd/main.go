@@ -71,7 +71,7 @@ func run() error {
 		logLevel   = flag.String("log-level", "info", "debug|info|warn|error")
 		tsnetLogs  = flag.Bool("tsnet-logs", false, "forward tsnet logs at debug level")
 		tier       = flag.String("default-tier", "process", "tier for deployments and tenants that name none: process | microvm")
-		vmKernel   = flag.String("vm-kernel", vmAsset(home, "vmlinux"), "microVM tier: guest kernel (Linux only)")
+		vmKernel   = flag.String("vm-kernel", vmAsset(home, "vmlinux"), "microVM tier: guest kernel (Firecracker on Linux, Virtualization.framework on macOS)")
 		vmRootfs   = flag.String("vm-rootfs", vmAsset(home, "rootfs.ext4"), "microVM tier: guest image from guest/build-image.sh")
 		vmHelper   = flag.String("vm-helper", helperapi.DefaultSocket, "microVM tier: twd-vmhelper socket (sudo twd host setup --microvm)")
 		vmFC       = flag.String("firecracker", "/usr/local/bin/firecracker", "microVM tier, as root without the helper service: firecracker binary")
@@ -80,6 +80,8 @@ func run() error {
 		vmMem      = flag.Int("vm-mem-mib", 512, "microVM tier: guest memory")
 		vmCPUs     = flag.Int("vm-vcpus", 2, "microVM tier: guest vCPUs")
 		vmHuge     = flag.String("vm-hugepages", "auto", "microVM tier: back guest RAM with 2 MiB pages: auto | on | off")
+		vzVMM      = flag.String("vz-vmm", "", "microVM tier on macOS: the twd-vz VMM, signed with the virtualization entitlement (default: next to twd-hostd)")
+		vmRosetta  = flag.Bool("vm-rosetta", false, "microVM tier on macOS (Apple silicon): share Rosetta for Linux into guests so x86_64 binaries run")
 		sandboxF   = flag.String("sandbox", "auto", "process-tier workerd/Node sandbox: auto (seatbelt on macOS, landlock on Linux) | seatbelt | landlock | none")
 		insecureSH = flag.Bool("insecure-shared-host", false, "without a process sandbox, still run process-tier workloads of more than one tenant (tenants are NOT isolated from each other)")
 		sbDeny     = flag.String("sandbox-deny", "", "comma-separated extra paths no workerd may read, write or connect to (twd up: its state and run dirs)")
@@ -170,7 +172,7 @@ func run() error {
 		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH, AllowSiblingEgress: *siblings,
 		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB, VMMemMiB: *vmMem, VMVCPUs: *vmCPUs,
 		VM: vmBackend(vmOptions{kernel: *vmKernel, rootfs: *vmRootfs, firecracker: *vmFC, jailer: *vmJailer, helper: *vmHelper,
-			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge, containerKernel: *ctrKernel}, log),
+			memMiB: *vmMem, vcpus: *vmCPUs, hugePages: *vmHuge, containerKernel: *ctrKernel, vzVMM: *vzVMM, rosetta: *vmRosetta}, log),
 		ContainerIdle: *ctrIdle, ContainerMaxLife: *ctrMaxLife, ContainerGrace: *ctrGrace,
 		ContainerCapacity: hostd.ContainerCapacity{Max: *ctrMax, MemMiB: *ctrMemMiB, VCPU: *ctrVCPU}}
 	// Containers (ADR-032) run on the microVM backend; without it this host

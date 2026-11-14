@@ -4,7 +4,6 @@ package vm
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -26,18 +25,6 @@ const smokeJS = `export default {
     return new Response("hello from the guest " + (req.cf ? JSON.stringify(req.cf) : "nocf"));
   }
 };
-`
-
-const smokeCapnp = `using Workerd = import "/workerd/workerd.capnp";
-const config :Workerd.Config = (
-  services = [ (name = "main", worker = .w), (name = "gw", external = (address = "192.168.72.1:3128", http = ())) ],
-  sockets = [ (name = "in", address = "*:8080", service = "main", http = (cfBlobHeader = "x-twd-cf")) ],
-);
-const w :Workerd.Worker = (
-  compatibilityDate = "2026-04-01",
-  modules = [ (name = "w.js", esModule = embed "w.js") ],
-  bindings = [ (name = "GW", service = "gw") ],
-);
 `
 
 // TestSmoke boots the guest image with a tiny workerd config (needs root,
@@ -94,10 +81,4 @@ func TestSmoke(t *testing.T) {
 	k := time.Now()
 	<-m.Done()
 	t.Logf("kill → done %v", time.Since(k))
-}
-
-func envInt(k string) int {
-	var n int
-	fmt.Sscan(os.Getenv(k), &n)
-	return n
 }

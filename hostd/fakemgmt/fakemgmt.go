@@ -1342,6 +1342,17 @@ func (s *Server) NodeIDs() map[string]string {
 	return out
 }
 
+// HostTiers returns the tiers each host registered with.
+func (s *Server) HostTiers() map[string][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string][]string{}
+	for id, h := range s.hosts {
+		out[id] = append([]string(nil), h.Tiers...)
+	}
+	return out
+}
+
 // Minters returns the apikey tenants' minters (for revoking keys at cleanup).
 func (s *Server) Minters() []*tsapi.Minter {
 	s.mu.Lock()

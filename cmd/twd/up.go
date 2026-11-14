@@ -1292,6 +1292,9 @@ func tierLine(s *state) string {
 		sb = "Seatbelt, dev-grade isolation"
 	}
 	if runtime.GOOS == "darwin" {
+		if slices.Contains(hv.Tiers, "microvm") {
+			return "tiers: process [" + sb + "], microvm [Virtualization.framework, one VMM + VM service per guest, via " + hv.VMVia + "; \"tier\": \"microvm\" in twd.jsonc]"
+		}
 		return "tier: process [" + sb + "]"
 	}
 	if slices.Contains(hv.Tiers, "microvm") {

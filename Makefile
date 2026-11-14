@@ -5,12 +5,16 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm e2e-container guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot vz-assets vz-kernel e2e-vz e2e-container
 
 all: build
 
+## build: every binary into bin/. On macOS, twd-vz (the microVM tier's per-VM VMM, cgo on
+## Virtualization.framework) is ad-hoc signed with the virtualization entitlement it needs.
+VZ_ENTITLEMENTS := cmd/twd-vz/twd-vz.entitlements
 build:
 	$(GO) build -o bin/ ./cmd/...
+	@if [ "$$(uname -s)" = Darwin ]; then codesign --force --sign - --entitlements $(VZ_ENTITLEMENTS) bin/twd-vz; fi
 
 $(WORKERD): package.json package-lock.json
 	npm ci --no-audit --no-fund
@@ -106,6 +110,28 @@ vm-assets: guest-image
 	cp -f $(FC_BIN_DIR)/firecracker $(FC_BIN_DIR)/jailer $(VM_ASSETS)/
 	$(VM_ASSETS)/firecracker --version | head -1
 
+## vz-assets: the macOS microVM guest (vz backend): the arm64 guest kernel with virtiofs
+## (guest/build-kernel-vz.sh) as vmlinux + the guest image, built in Lima twd-dev (or on arm64
+## Linux) and cached in VZ_ASSETS by input hash (scripts/vz-assets-lima.sh).
+VZ_ASSETS ?= dist/vz-assets-arm64
+vz-assets:
+	sh scripts/vz-assets-lima.sh $(VZ_ASSETS)
+
+## vz-kernel: just the vz guest kernel (arm64 Linux only, e.g. inside Lima twd-dev) into bin/vz.
+vz-kernel:
+	guest/build-kernel-vz.sh bin/vz
+
+## e2e-vz: the microVM tier on this Mac (Virtualization.framework; no sudo): the vz smoke,
+## volume and Rosetta tests (hostd/vm), then E2E-VM (e2e/vm) with the vz backend: tier
+## selection, attributed egress per object, DO storage on the encrypted volume, isolation,
+## no keys in the guest, no host network from the guest, kill → restart, redeploy.
+VZ_ENV = TWD_VZ_VMM="$(CURDIR)/bin/twd-vz" TWD_VM_KERNEL="$(CURDIR)/$(VZ_ASSETS)/vmlinux" TWD_VM_ROOTFS="$(CURDIR)/$(VZ_ASSETS)/rootfs.ext4"
+e2e-vz: deps build vz-assets
+	@[ "$$(uname -s)" = Darwin ] || { echo "e2e-vz: macOS only"; exit 1; }
+	$(VZ_ENV) TWD_VM_ROSETTA=$$(bin/twd-vz -check $(VZ_ASSETS)/vmlinux | grep -q rosetta=installed && echo 1) \
+		$(GO) test -count=1 -v -run 'TestVZ|TestDgram' ./hostd/vm
+	cd e2e/vm && $(VZ_ENV) $(GO) test -tags e2evm -count=1 -v -timeout 15m .
+
 ## e2e-linux-vm: L3 E2E from the installed release on a FRESH nested-virt Lima VM
 ## (twdl-kvm-u24; created if missing, stopped at the end): the linux-arm64 release with the
 ## microVM assets is built in Lima twd-dev, copied in with limactl copy, then install.sh ->
@@ -176,16 +202,24 @@ RELEASE_TARGETS ?= darwin-arm64 linux-arm64 linux-amd64
 ## (cached in dist/vm-assets-arm64 by input hash). RELEASE_VM_ASSETS=auto (default): include
 ## it when a builder is available, else warn and ship without the microVM tier
 ## (release.json "microvm": false); 1: required; 0: never. TWD_VM_ASSETS_arm64 overrides.
+## The darwin-arm64 microVM guest (share/twd/vm: the vz kernel, the same rootfs) comes from
+## scripts/vz-assets-lima.sh the same way (TWD_VZ_ASSETS overrides); its bin/twd-vz is
+## signed with the virtualization entitlement.
 RELEASE_VM_ASSETS ?= auto
 release: deps
 	rm -rf dist/stage dist/twd-*.tar.gz dist/SHA256SUMS
-	@va="$${TWD_VM_ASSETS_arm64:-}"; \
+	@va="$${TWD_VM_ASSETS_arm64:-}"; vz="$${TWD_VZ_ASSETS:-}"; \
 	if [ -z "$$va" ] && [ "$(RELEASE_VM_ASSETS)" != 0 ] && echo "$(RELEASE_TARGETS)" | grep -q linux-arm64; then \
 		if sh scripts/vm-assets-lima.sh dist/vm-assets-arm64; then va="$(CURDIR)/dist/vm-assets-arm64"; \
 		elif [ "$(RELEASE_VM_ASSETS)" = 1 ]; then echo "release: microVM assets required (RELEASE_VM_ASSETS=1)"; exit 1; \
 		else echo "release: WARNING: the linux-arm64 tarball will have NO microVM guest (see scripts/vm-assets-lima.sh)"; fi; \
 	fi; \
-	TWD_VM_ASSETS_arm64="$$va" sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
+	if [ -z "$$vz" ] && [ "$(RELEASE_VM_ASSETS)" != 0 ] && echo "$(RELEASE_TARGETS)" | grep -q darwin-arm64; then \
+		if sh scripts/vz-assets-lima.sh $(VZ_ASSETS); then vz="$(CURDIR)/$(VZ_ASSETS)"; \
+		elif [ "$(RELEASE_VM_ASSETS)" = 1 ]; then echo "release: microVM assets required (RELEASE_VM_ASSETS=1)"; exit 1; \
+		else echo "release: WARNING: the darwin-arm64 tarball will have NO microVM guest (see scripts/vz-assets-lima.sh)"; fi; \
+	fi; \
+	TWD_VM_ASSETS_arm64="$$va" TWD_VZ_ASSETS="$$vz" sh scripts/release.sh $(RELEASE_VERSION) $(RELEASE_TARGETS)
 
 ## e2e-mbp: E2E-MAC on the clean MacBook `mbp` from the release tarball (skips without
 ## the tailnet-1 key file or `ssh mbp`). twd runs on mbp; the test client + echo run here.
@@ -244,6 +278,7 @@ lint: api-check
 	GOOS=linux $(GO) vet ./hostd/vm/... ./guest/... ./cmd/twd-hostd/... ./cmd/twd-vmhelper/... ./cmd/twd/...
 	GOOS=linux $(GO) vet -tags e2evm ./e2e/vm/...
 	GOOS=linux $(GO) vet -tags e2econtainer ./e2e/container/...
+	GOOS=darwin $(GO) vet -tags e2evm ./e2e/vm/...
 	$(GO) vet -tags e2elinuxvm ./e2e/linuxvm/...
 	$(GO) vet -tags e2emac ./e2e/mac/...
 	$(GO) vet -tags e2emulti ./e2e/multi/...

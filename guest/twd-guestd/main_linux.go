@@ -89,8 +89,13 @@ func run() error {
 	}
 	os.MkdirAll(proto.DODir, 0o700)
 	if cfg.Volume != "" {
-		if err := mountVolume(cfg.Volume); err != nil {
+		if err := mountVolume(cfg.Volume, cfg.VolumeFormat); err != nil {
 			return fmt.Errorf("DO volume: %w", err)
+		}
+	}
+	if cfg.Rosetta != "" {
+		if err := rosetta(cfg.Rosetta); err != nil {
+			logf("rosetta: %v", err) // x86_64 binaries won't run; the guest still serves
 		}
 	}
 
@@ -106,11 +111,12 @@ func run() error {
 	return nil
 }
 
-// mountVolume mounts the persistent DO volume (ext4 made on the host) at
-// DODir. The host decrypts it (dm-crypt); there is no key in here. data=
-// ordered plus the host's Writeback cache mode make workerd's fsyncs reach
-// the host disk.
-func mountVolume(dev string) error {
+// mountVolume mounts the persistent DO volume (ext4 made on the host, or
+// here if format is set and the device is blank) at DODir. The host
+// decrypts it (dm-crypt, or an encrypted disk image on macOS); there is no
+// key in here. data=ordered plus the host's flush handling make workerd's
+// fsyncs reach the host disk.
+func mountVolume(dev string, format bool) error {
 	var err error
 	for i := 0; i < 100; i++ { // devtmpfs creates the node asynchronously
 		if _, err = os.Stat(dev); err == nil {
@@ -121,10 +127,69 @@ func mountVolume(dev string) error {
 	if err != nil {
 		return err
 	}
+	if format {
+		if err := formatVolume(dev); err != nil {
+			return err
+		}
+	}
 	if err := unix.Mount(dev, proto.DODir, "ext4", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC|unix.MS_NOATIME, "errors=remount-ro,data=ordered"); err != nil {
 		return fmt.Errorf("mount %s: %w", dev, err)
 	}
 	os.Chmod(proto.DODir, 0o700)
+	return nil
+}
+
+// formatVolume makes the DO filesystem on a new volume. It refuses a
+// device that is not blank: the host asks only for new volumes, and a
+// wrong answer must not destroy data.
+func formatVolume(dev string) error {
+	f, err := os.Open(dev)
+	if err != nil {
+		return err
+	}
+	head := make([]byte, 64<<10)
+	n, _ := io.ReadFull(f, head)
+	f.Close()
+	if !bytes.Equal(head[:n], make([]byte, n)) {
+		return fmt.Errorf("refusing to format %s: not blank", dev)
+	}
+	st := time.Now()
+	out, err := exec.Command("/usr/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-L", "twd-do", "-m", "0",
+		"-E", "lazy_itable_init=0,lazy_journal_init=0,nodiscard", dev).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("mke2fs: %v: %s", err, bytes.TrimSpace(out))
+	}
+	logf("formatted %s in %v", dev, time.Since(st).Round(time.Millisecond))
+	return nil
+}
+
+// rosettaBinfmt is Apple's documented binfmt_misc entry for Rosetta for
+// Linux (x86_64 ELF executables), with the interpreter path left out. The
+// escapes are parsed by the kernel, not by Go.
+const rosettaBinfmt = `:rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:` +
+	`\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:`
+
+// rosetta mounts the host's Rosetta for Linux share (virtiofs tag) and
+// registers it for x86_64 executables. Flags: F opens the interpreter now
+// (it keeps working whatever mount namespace a later process runs in), C
+// computes credentials from the binary, not the interpreter.
+func rosetta(tag string) error {
+	if err := os.MkdirAll(proto.RosettaDir, 0o755); err != nil {
+		return err
+	}
+	if err := unix.Mount(tag, proto.RosettaDir, "virtiofs", unix.MS_RDONLY|unix.MS_NOSUID|unix.MS_NODEV, ""); err != nil {
+		return fmt.Errorf("mount virtiofs %s: %w", tag, err)
+	}
+	const bf = "/proc/sys/fs/binfmt_misc"
+	if _, err := os.Stat(bf + "/register"); err != nil {
+		if err := unix.Mount("binfmt_misc", bf, "binfmt_misc", unix.MS_NOSUID|unix.MS_NODEV|unix.MS_NOEXEC, ""); err != nil {
+			return fmt.Errorf("mount binfmt_misc: %w", err)
+		}
+	}
+	if err := os.WriteFile(bf+"/register", []byte(rosettaBinfmt+proto.RosettaDir+"/rosetta:CF"), 0); err != nil && !errors.Is(err, unix.EEXIST) {
+		return fmt.Errorf("register binfmt: %w", err)
+	}
+	logf("rosetta registered for x86_64 binaries")
 	return nil
 }
 
@@ -189,7 +254,11 @@ func readConfigDrive(dev string) (*proto.GuestConfig, error) {
 				cfgb = b
 				continue
 			}
-			if err := os.WriteFile(p, b, 0o600); err != nil {
+			mode := os.FileMode(0o600)
+			if h.Mode&0o100 != 0 {
+				mode = 0o700
+			}
+			if err := os.WriteFile(p, b, mode); err != nil {
 				return nil, err
 			}
 		}
@@ -369,6 +438,12 @@ func (g *guest) handle(m proto.Msg) proto.Msg {
 		r.Results = probe(m.Targets)
 	case "exec", "signal", "resize", "status":
 		g.handleContainer(m, &r)
+	case "run":
+		if !g.cfg.Debug {
+			r.Error = "run needs debug mode"
+			break
+		}
+		r.Text, r.ExitCode, r.Error = runDebug(m.Argv)
 	default:
 		r.Error = "unknown op " + m.Op
 	}
@@ -505,6 +580,31 @@ func fsscan(root string) (found []string, n int) {
 		return nil
 	})
 	return found, n
+}
+
+// runDebug runs argv (relative to AppDir) for a platform test and returns its
+// combined output (≤ 64 KiB) and exit code.
+func runDebug(argv []string) (string, int, string) {
+	if len(argv) == 0 {
+		return "", -1, "no argv"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+	cmd.Dir = proto.AppDir
+	cmd.Env = []string{"HOME=/tmp", "PATH=/usr/bin:/bin", "TZ=UTC"}
+	out, err := cmd.CombinedOutput()
+	if len(out) > 64<<10 {
+		out = out[:64<<10]
+	}
+	var ee *exec.ExitError
+	switch {
+	case errors.As(err, &ee):
+		return string(out), ee.ExitCode(), ""
+	case err != nil:
+		return string(out), -1, err.Error()
+	}
+	return string(out), 0, ""
 }
 
 func probe(targets []string) []proto.ProbeResult {
