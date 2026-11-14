@@ -12,7 +12,12 @@
 //     binary in a new mount namespace that pivots into the overlay root,
 //     drops to the image's (or the exec's) user and execs the target. So
 //     no container process ever sees guestd, its config or /run/twd;
-//   - all of them live in the guest cgroup "ctr" (pids.max);
+//   - all of them live in the guest cgroup "ctr" (pids.max, and cpu.max
+//     where the host can't cap the VMM);
+//   - they run with Docker's default capability set at most (ctrCaps):
+//     no CAP_SYS_ADMIN, so container root can't mount cgroup2 and lift
+//     its own pids.max / cpu.max, and no CAP_SYS_PTRACE, so it can't
+//     reach guestd's namespace through /proc/1/root;
 //   - exec stdio travels on its own vsock connection (proto.ExecStreamHello)
 //     as frames; exit codes too.
 //
@@ -31,6 +36,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -809,6 +815,8 @@ func (g *guest) handleContainer(m proto.Msg, r *proto.Msg) {
 // namespace (from clone), pivot into the overlay root, credentials, cwd,
 // exec. Errors go to fd 4 (close-on-exec), then exit 127.
 func ctrExec() {
+	// Capabilities are per thread: drop and exec from this one.
+	runtime.LockOSThread()
 	errf := os.NewFile(4, "err")
 	fail := func(format string, a ...any) {
 		fmt.Fprintf(errf, format, a...)
@@ -865,6 +873,9 @@ func ctrExec() {
 	if err != nil {
 		fail("exec %s: %v", spec.Argv[0], err)
 	}
+	if err := dropBoundingCaps(); err != nil {
+		fail("capabilities: %v", err)
+	}
 	// syscall's (not x/sys's) set*id apply to every thread of the process.
 	if err := syscall.Setgroups(groups); err != nil {
 		fail("setgroups: %v", err)
@@ -875,11 +886,63 @@ func ctrExec() {
 	if err := syscall.Setuid(uid); err != nil {
 		fail("setuid: %v", err)
 	}
+	if err := setCaps(uid); err != nil {
+		fail("capabilities: %v", err)
+	}
 	if err := unix.Chdir(cwd); err != nil {
 		fail("chdir %s: %v", cwd, err)
 	}
 	err = unix.Exec(path, spec.Argv, env)
 	fail("exec %s: %v", path, err)
+}
+
+// ctrCaps is the most a container process holds: Docker's default set
+// (what images and the Sandbox SDK's servers are written against).
+var ctrCaps = []int{unix.CAP_CHOWN, unix.CAP_DAC_OVERRIDE, unix.CAP_FSETID, unix.CAP_FOWNER, unix.CAP_MKNOD,
+	unix.CAP_NET_RAW, unix.CAP_SETGID, unix.CAP_SETUID, unix.CAP_SETFCAP, unix.CAP_SETPCAP,
+	unix.CAP_NET_BIND_SERVICE, unix.CAP_SYS_CHROOT, unix.CAP_KILL, unix.CAP_AUDIT_WRITE}
+
+func ctrCapMask() (m uint64) {
+	for _, c := range ctrCaps {
+		m |= 1 << uint(c)
+	}
+	return m
+}
+
+// dropBoundingCaps removes every capability outside ctrCaps from this
+// thread's bounding set, so no exec (a setuid-root binary included) in
+// the container can regain it.
+func dropBoundingCaps() error {
+	keep := ctrCapMask()
+	for c := 0; c <= unix.CAP_LAST_CAP; c++ {
+		if keep&(1<<uint(c)) != 0 {
+			continue
+		}
+		if err := unix.Prctl(unix.PR_CAPBSET_DROP, uintptr(c), 0, 0, 0); err != nil && !errors.Is(err, unix.EINVAL) {
+			return fmt.Errorf("drop capability %d from the bounding set: %w", c, err)
+		}
+	}
+	return nil
+}
+
+// setCaps sets this thread's capabilities for the exec: ctrCaps for
+// root, none for any other user (set*id already cleared those).
+func setCaps(uid int) error {
+	var m uint64
+	if uid == 0 {
+		m = ctrCapMask()
+	}
+	hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var data [2]unix.CapUserData
+	for i := range data {
+		w := uint32(m >> (32 * uint(i)))
+		data[i] = unix.CapUserData{Effective: w, Permitted: w, Inheritable: w}
+	}
+	if err := unix.Capset(&hdr, &data[0]); err != nil {
+		return err
+	}
+	// No ambient capabilities survive into the target either.
+	return unix.Prctl(unix.PR_CAP_AMBIENT, unix.PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
 }
 
 func envGet(env []string, k string) string {

@@ -223,6 +223,33 @@ for a in [` + strings.Join(targets, ",") + `]:
 	}
 	time.Sleep(4 * time.Second) // the storm's sleeps end
 
+	// Container root can't lift its own limits: it can't mount cgroup2
+	// (no CAP_SYS_ADMIN) and can't reach guestd's cgroup through
+	// /proc/1/root (no CAP_SYS_PTRACE), so pids.max and a guest-side
+	// cpu.max hold against code running as root in the image.
+	r = runExec(t, c, sandbox.ExecSpec{Argv: []string{"python3", "-c", `
+import ctypes, errno, os
+libc = ctypes.CDLL(None, use_errno=True)
+out = {"uid": os.getuid()}
+for l in open("/proc/self/status"):
+    if l.startswith("CapEff") or l.startswith("CapBnd"): out[l.split(":")[0]] = l.split()[1]
+os.makedirs("/tmp/cg", exist_ok=True)
+rc = libc.mount(b"none", b"/tmp/cg", b"cgroup2", 0, None)
+out["mount"] = "MOUNTED" if rc == 0 else errno.errorcode[ctypes.get_errno()]
+paths = ["/proc/1/root/sys/fs/cgroup/ctr/pids.max", "/proc/1/root/sys/fs/cgroup/ctr/cpu.max"]
+if rc == 0: paths += ["/tmp/cg/ctr/pids.max", "/tmp/cg/ctr/cpu.max"]
+for p in paths:
+    try:
+        open(p, "w").write("max"); out[p] = "WROTE"
+    except Exception as e:
+        out[p] = type(e).__name__
+print(out)
+`}}, "")
+	t.Logf("container root vs its limits: %s", strings.TrimSpace(r.out))
+	if r.code != 0 || !strings.Contains(r.out, "'uid': 0") || strings.Contains(r.out, "MOUNTED") || strings.Contains(r.out, "WROTE") {
+		t.Fatalf("container root lifted (or could not be checked against) its cgroup limits: %+v", r)
+	}
+
 	// A long-running exec, killed by signal; and a server reached via DialPort.
 	e, err := c.Exec(ctx, sandbox.ExecSpec{Argv: []string{"python3", "-m", "http.server", "8000", "--bind", "0.0.0.0"}, Cwd: "/workspace"})
 	if err != nil {
