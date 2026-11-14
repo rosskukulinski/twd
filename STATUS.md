@@ -1441,3 +1441,85 @@ Run `e6d03b` (2026-11-08 23:56 PT) via `policy.ApplyWith` (additions only, valid
   - `--host` without the tier, or a live lease holder without the tier the workload now asks for → new `409 tier_unavailable` with the fix (`twd undeploy` then deploy, or pick another host). Stickiness never keeps a workload on the wrong tier.
 - **Tests:** `mgmt/tier_test.go` (`TestPlacementTier` 10 cases, `TestPlacementTierStickyHolder`). `make test`, `make lint`, `make test-pg`: PASS.
 - **Not changed:** hostd's fallback (`hostd/workload.go` `tierFor`) still downgrades with a warning when a microvm assignment reaches a host without a VM backend (e.g. the backend vanished after registration, or `twd dev`). Making it refuse is a follow-up.
+
+## Public ingress over Funnel (ADR-029) and a separate WIF issuer node (2026-11-13)
+
+Design: ADR-029 (design repo, Proposed, with implementation notes). User doc: [docs/public-ingress.md](docs/public-ingress.md).
+
+- **Opt-in:** twd.jsonc `public.routes` (path patterns, no `true` shorthand), `public.upgrade` and `public.limits`, plus per-class `public.create` + `maxObjects` (`internal/publicspec`, shared by the bundle parser, mgmt, netd and the CLI).
+  - **Tenant gate:** `publicIngress: allow|deny`. It is `allow` for single-tenant `twd up`, and deploying `public` against `deny` fails `public_ingress_not_allowed`.
+  - **Expose:** `twd expose off|on <workload>` survives redeploys and is audited on both chains.
+- **Public node:**
+  - **Identity:** one per public workload, namespace `_public`, tag `tag:twd-public`, hostname = the workload, so the URL is `https://<workload>.<tailnet>.ts.net/`.
+  - **Listener:** netd listens on `ListenFunnel :443` only. Connections that aren't Funnel are closed, and the node has no tailnet listener.
+  - **Delivery:** every request goes to the workload's Worker (`DeliverTo` = the entry node). Object nodes are never public.
+  - **Certificate:** it is prefetched.
+  - **Name clash:** a MagicDNS de-duplicated name is never served (`public_name_taken`).
+- **Requests:**
+  - **Order:** limits (per workload and per IP token buckets with `Retry-After`, body, headers, timeout, conns) → canonical path + route allowlist (`/_twd` never) → identity headers stripped → `CF-Connecting-IP` / `X-Forwarded-For` from `FunnelConn.Src` → cf blob with `requester:{kind:"public"}`, no caller.
+  - **netd's own headers:** `X-Forwarded-*` now survive the workerd reverse proxy (`netd.KeepForwarded`).
+- **JS:** `getRequester()` added. `getCaller()` throws `public_request`.
+- **Public requests can't mint nodes:** a public fetch gets a guarded `env`, and its `ctx.tailnet.spawn` / `kill` are refused.
+  - **Admission:** hostd `/v1/admit` allows existing objects, or opted-in classes up to `maxObjects` and 20/min per tenant (persisted in `public-creates.json`).
+  - **Second check:** the Host DO calls `ensure {public:true}` before a facet runs.
+- **Audit:** `public_request` per request, without the query string. Limit refusals are summarized per minute (`public_rejected`). Also `public_object_created`, `expose_on` / `expose_off`. All are new `AuditKind`s in the spec.
+- **Policy:**
+  - **Funnel targets:** `policy.FunnelTargets` = `tag:twd-public`, `tag:twd-issuer`. `Check` refuses `funnel` on `tag:twd-mgmt` (and on any other tag).
+  - **Snippet:** `PublicSnippet()`, printed by `twd deploy`.
+  - **Doctor rows:** `https_certs`, `public_ingress`, `funnel_attr:<wl>`, `public_probe:<wl>`.
+- **mgmt is never Funnel-capable (Ross).** The WIF issuer now runs on its own node, `tag:twd-issuer`: no grants, Funnel-only, discovery + JWKS only.
+  - **Joining it:** `twd up --wif` joins that node with a second login, or `--issuer-authkey-file`.
+  - **Leftover policy:** `twd up` warns when `tag:twd-mgmt` still has a `funnel` attribute.
+  - **Issuer URL changed:** stored WIF client IDs are cleared, so a new trust credential is required.
+
+### Test results
+- **Hermetic:**
+  - **Suites:** `make test-go` and `make test-js` PASS. New:
+    - `internal/publicspec` tests;
+    - `netd/public_test.go` (12 tests: headers and blob, routes, `/_twd` even with `/*`, upgrade, rate limits, body/header limits, timeout, non-Funnel conn closed, MaxConns, expose toggle < 1 s with RST, disabled at create, rejoin stays public);
+    - `hostd/gen` `TestGeneratedWrapperPublic` (real workerd);
+    - JS `public.test.js` (11 tests);
+    - mgmt `TestPublic*` on SQLite and Postgres;
+    - policy hostile cases;
+    - `cmd/twd` `public_test.go`.
+  - **`hostd TestPublicIngress`:** real hostd + workerd + testcontrol + fakemgmt, with Funnel injected as `*ipn.FunnelConn`, PASS under `-race`. Covered:
+    - spoofed identity headers and a forged cf blob never reach the app;
+    - existing object reachable, new one `public_create_denied` with no mgmt object created;
+    - opt-in class up to `maxObjects` 2;
+    - spawn refused, 413, 429 with `Retry-After`;
+    - audit with no query string;
+    - expose off cut an in-flight stream in **1.1–1.9 ms**.
+- **`make e2e-public` (tailnet 1, real Funnel, public DNS via 1.1.1.1): PASS**, run `1a66e8` (625 s, `e2e/real/results/m13-public-20261113-221221-1a66e8.json`).
+  - **Identity:** the requester was public with the client's real public IP, `getCaller` threw `public_request`, and spoofed headers were dropped.
+  - **Routes:** 404 `not_public`, 400 for `..`, `/_twd` refused.
+  - **Objects:** existing object reachable, new one `public_create_denied`, opt-in up to `maxObjects`, spawn denied, 413.
+  - **Expose:** **`twd expose off` cut a live public stream 137 ms after the CLI started** (CLI 46 ms), and the URL refused afterwards. `expose on` was back to 200 in 319 ms.
+  - **Audit and doctor:** 12+ `public_request` records with no query string; `twd doctor` `public_probe` ok.
+  - **Cleanup:** 0 devices left, OAuth client deleted.
+  - **First public fetch of a new name:** 7m57s and 9m26s (public DNS + first certificate).
+  - **Earlier runs:**
+    - `196882`: everything passed except the audit check, which was a harness bug (it read `items` instead of the CLI's `records`).
+    - `c1f781` (after the certificate-prefetch change): no certificate was issued for any new name in 10+ min, including mgmt's own tailnet name, which the change doesn't touch. Every prefetch attempt hit its 3-minute deadline.
+- **`make e2e-keyless` with the issuer node:**
+  - **Run `0582eb`:** found that the issuer's first certificate outlasted every Funnel handshake (fixed: prefetch).
+  - **Run `56c6a9`:** passed 12 checks:
+    - issuer on its own node (`twd-…-issuer`, not mgmt);
+    - issuer public via Funnel in 8m31s;
+    - **mgmt's node unreachable from the public internet**;
+    - both trust credentials' token exchanges + policy read;
+    - deploy with a WIF-minted object node;
+    - doctor labels.
+
+    It then failed at `twd link https://<mgmt>`, because mgmt's tailnet HTTPS certificate wasn't issued in the window (same certificate stall as `c1f781`). One test CLI node it never got to track was deleted by ID afterwards. Tailnet 1 now has 0 test devices.
+- **Policy writes on tailnet 1 (approved by Ross),** each validated and additions only, with If-Match and a backup:
+  - run `196882`: `tagOwners["tag:twd-public"]` + nodeAttr funnel on `tag:twd-public`;
+  - run `0582eb`: `tagOwners["tag:twd-issuer"]` + nodeAttr funnel on `tag:twd-issuer`.
+
+  The old `funnel` on `tag:twd-mgmt` is still in tailnet 1's policy; Ross chose not to remove it.
+
+### Gaps
+- **Certificate stall:** a clean real-tailnet rerun of `e2e-keyless` (from `twd link` on) and of `e2e-public` after the prefetch change waits on the certificate issuance stall clearing. Hypothesis, not verified: today's many new `*.tail7906d5.ts.net` names hit Let's Encrypt's per-domain weekly limit.
+- **Guard bypass:** the public-create guard guards the `env` a handler is given. `import { env } from "cloudflare:workers"` bypasses it. For facet classes the Host DO still refuses a `fetch`; plain-DO and `node:false` classes rely on the guard alone.
+- **Host moves:** the public node's state does not move through custody; a host move that clashes on the name is refused instead.
+- **Not supported yet:** `"runtime": "node"` + `public`; tsidp (ADR-029 D4); custom domains; GeoIP.
+- **Harness:** the e2e cliflow doesn't track a CLI tsnet node whose `twd link` fails before joining (cleaned up by hand this time).
