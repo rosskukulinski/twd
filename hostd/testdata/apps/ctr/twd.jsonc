@@ -7,6 +7,9 @@
   },
   "tailnet": {
     "tags": ["tag:ttest"],
+    // the only internet hosts a container started with enableInternet may reach
+    // (rebind.test resolves to a private address: refused anyway)
+    "egress": { "internet": ["allowed.test", "rebind.test"] },
     "objects": {
       "Box": { "tags": ["tag:ttest"] },
       // plain-DO mode

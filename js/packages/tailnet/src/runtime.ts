@@ -8,7 +8,7 @@
 // workload is calling, so tenant code cannot act as another object.
 
 import { TailnetError, fromResponse } from "./errors.js";
-import { createContainer, defineContainer, type ContainerSpec } from "./container.js";
+import { createContainer, defineContainer, dispatchIntercept, notSupportedPreview, type ContainerSpec } from "./container.js";
 
 /** The platform's TailnetApi stub (RPC). */
 export interface TailnetApiStub {
@@ -191,9 +191,41 @@ export function wrapFacetClass(C: any, name: string, bindings: BindingMap, opts:
         const self = this as any;
         if (typeof self.alarm === "function") return self.alarm(info);
       }
+      // Called by the Host DO with a request the container sent to an
+      // intercepted destination (hostd's sandbox egress proxy).
+      async __twd_intercept(key: string, req: Request) {
+        return dispatchIntercept((this as any).ctx, key, req);
+      }
     },
   }[name];
+  if (opts.container) noPreviewURLs(W);
   return W;
+}
+
+// Sandbox SDK preview URLs (exposePort, proxyToSandbox) need public
+// ingress (ADR-029): on twd they fail with a typed not_supported error
+// instead of minting URLs nothing can reach.
+const PREVIEW_HEADER = "x-sandbox-preview-proxy";
+function noPreviewURLs(W: any) {
+  const proto = Object.getPrototypeOf(W.prototype);
+  if (typeof proto?.exposePort === "function") {
+    W.prototype.exposePort = async function () {
+      throw notSupportedPreview();
+    };
+  }
+  const f = W.prototype.fetch;
+  if (typeof f === "function") {
+    W.prototype.fetch = async function (this: any, req: Request) {
+      if (req?.headers?.get?.(PREVIEW_HEADER)) {
+        const e = notSupportedPreview();
+        return new Response(JSON.stringify({ code: "not_supported", message: e.message }), {
+          status: 501,
+          headers: { "content-type": "application/json", "twd-error": "not_supported" },
+        });
+      }
+      return f.call(this, req);
+    };
+  }
 }
 
 /**
@@ -227,6 +259,12 @@ export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts:
         (this as any).ctx.storage.kv.put("__twd_killed", reason || "killed");
         return true;
       }
+      async __twd_intercept(key: string, req: Request) {
+        const self = this as any;
+        const k = self.ctx.storage.kv.get("__twd_killed");
+        if (k) return killedResponse(k);
+        return dispatchIntercept(self.ctx, key, req);
+      }
     },
   }[name];
   if (typeof proto.fetch === "function") {
@@ -236,6 +274,7 @@ export function wrapPlainClass(C: any, name: string, bindings: BindingMap, opts:
       return proto.fetch.call(this, req);
     };
   }
+  if (opts.container) noPreviewURLs(W);
   return W;
 }
 

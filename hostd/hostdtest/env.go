@@ -53,6 +53,10 @@ type Options struct {
 	ContainerGrace    time.Duration
 	ContainerCapacity hostd.ContainerCapacity
 	ContainerQuota    hostd.ContainerQuota
+	ContainerMaxLife  time.Duration
+	ContainerInternet *hostd.ContainerInternet
+	// FenceAfter is passed to hostd (0: its default).
+	FenceAfter time.Duration
 }
 
 // Env is fakemgmt (on a unix socket) plus one running twd-hostd.
@@ -122,7 +126,8 @@ func Start(t testing.TB, o Options) *Env {
 		KillTombstone: o.KillTombstone, HostnamePrefix: o.HostnamePrefix, Logger: log,
 		VM: o.VM, DefaultTier: o.DefaultTier, VMDebug: o.VMDebug, Sandbox: testSandbox(o.Sandbox), InsecureSharedHost: o.InsecureSharedHost, HostSockets: o.HostSockets, AllowSiblingEgress: o.AllowSiblingEgress,
 		Containers: o.Containers, Images: o.Images, ContainerIdle: o.ContainerIdle, ContainerGrace: o.ContainerGrace,
-		ContainerCapacity: o.ContainerCapacity, ContainerQuota: o.ContainerQuota,
+		ContainerCapacity: o.ContainerCapacity, ContainerQuota: o.ContainerQuota, ContainerMaxLife: o.ContainerMaxLife,
+		ContainerInternet: o.ContainerInternet, FenceAfter: o.FenceAfter,
 	})
 	if err != nil {
 		t.Fatal(err)
