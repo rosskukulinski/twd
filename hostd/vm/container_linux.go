@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"os"
 	"time"
 
@@ -81,7 +80,7 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 	if kernel == "" {
 		kernel = b.cfg.Kernel
 	}
-	cs := &ctrState{exited: make(chan struct{}), streams: map[string]chan net.Conn{}, log: &tailBuf{max: 64 << 10}}
+	cs := newCtrState()
 	gc := proto.GuestConfig{UnixNano: time.Now().UnixNano(), IP: proto.GuestIP, Gateway: proto.GatewayIP, Prefix: proto.PrefixLen,
 		MTU: b.cfg.MTU, Container: &proto.ContainerConfig{Image: proto.ImageDev, Argv: s.Argv, Env: s.Env, Cwd: s.Cwd, User: s.User,
 			Pids: pids, Hostname: s.Hostname, CACert: string(s.CACert), Canary: s.Canary}}
@@ -94,7 +93,10 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 	l := launch{name: s.ID, log: s.Log, kernel: kernel, req: req, ctr: cs,
 		handlers: nil,   // no gateway services (DO egress, host API) for a container
 		gnet:     s.Net, // its sandbox egress proxy (nil: no egress of any kind)
-		drive:    func(p string) error { return writeGuestJSON(p, gc) },
+		drive: func(p, token string) error {
+			gc.CtlToken = token
+			return writeGuestJSON(p, gc)
+		},
 		extra: func(m *Machine) (*os.File, error) {
 			f, err := os.Open(s.Image)
 			if err != nil {

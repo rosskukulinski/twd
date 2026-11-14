@@ -381,9 +381,9 @@ func (g *guest) serveHost(f *os.File) {
 		defer wmu.Unlock()
 		return enc.Encode(m)
 	}
-	// The first line names the connection: control (this) or an exec's
-	// stdio stream (proto.ExecStreamHello).
-	if write(proto.Msg{Type: "hello", UptimeMS: time.Since(start).Milliseconds()}) != nil {
+	// The first line names the connection: control (this, authenticated
+	// by the boot's token) or an exec's stdio stream (proto.ExecStreamHello).
+	if write(proto.Msg{Type: "hello", Token: g.cfg.CtlToken, UptimeMS: time.Since(start).Milliseconds()}) != nil {
 		return
 	}
 	go func() {

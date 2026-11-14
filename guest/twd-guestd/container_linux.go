@@ -480,7 +480,7 @@ func (g *guest) spawnCtr(spec ctrExecSpec, stdin, stdout, stderr *os.File, pty b
 
 // startExec runs one exec: it opens the stdio stream to the host, starts
 // the process and pumps frames until it exits.
-func (g *guest) startExec(id string, es *proto.ExecSpec) (int, error) {
+func (g *guest) startExec(id, token string, es *proto.ExecSpec) (int, error) {
 	g.mu.Lock()
 	c := g.ctr
 	g.mu.Unlock()
@@ -501,7 +501,7 @@ func (g *guest) startExec(id string, es *proto.ExecSpec) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("exec stream: %w", err)
 	}
-	hello, _ := json.Marshal(proto.Msg{Type: proto.ExecStreamHello, Exec: id})
+	hello, _ := json.Marshal(proto.Msg{Type: proto.ExecStreamHello, Exec: id, Token: token})
 	if _, err := stream.Write(append(hello, '\n')); err != nil {
 		stream.Close()
 		return 0, err
@@ -766,7 +766,7 @@ func (g *guest) handleContainer(m proto.Msg, r *proto.Msg) {
 			r.Error = "exec: no spec"
 			return
 		}
-		pid, err := g.startExec(m.Exec, m.ExecSpec)
+		pid, err := g.startExec(m.Exec, m.Token, m.ExecSpec)
 		if err != nil {
 			r.Error = err.Error()
 			return
@@ -874,6 +874,12 @@ func ctrExec() {
 	path, err := lookPath(spec.Argv[0], envGet(env, "PATH"))
 	if err != nil {
 		fail("exec %s: %v", spec.Argv[0], err)
+	}
+	// No vsock (guestd's channel to the host) and no io_uring for any
+	// container process: installed while this is still root with every
+	// capability (no no_new_privs needed), inherited across the exec.
+	if err := installCtrSeccomp(); err != nil {
+		fail("%v", err)
 	}
 	if err := dropBoundingCaps(); err != nil {
 		fail("capabilities: %v", err)

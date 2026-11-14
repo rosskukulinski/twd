@@ -56,8 +56,20 @@ type ctrState struct {
 	exited   chan struct{}
 	exitOnce sync.Once
 	exitCode int
-	streams  map[string]chan net.Conn
+	streams  map[string]*pendingStream // exec id -> the stream it waits for
 	log      *tailBuf
+}
+
+// pendingStream is an exec waiting for its stdio stream: only a connection
+// that names the exec and carries its token (issued in the exec op, random
+// per exec) is it.
+type pendingStream struct {
+	token string
+	ch    chan net.Conn
+}
+
+func newCtrState() *ctrState {
+	return &ctrState{exited: make(chan struct{}), streams: map[string]*pendingStream{}, log: &tailBuf{max: 64 << 10}}
 }
 
 // event consumes container messages from the control channel.
@@ -105,21 +117,33 @@ func (s *ctrState) event(msg proto.Msg) bool {
 	return false
 }
 
-func (m *Machine) attachStream(id string, c net.Conn) {
+func (m *Machine) attachStream(id, token string, c net.Conn) {
 	if m.ctr == nil {
 		c.Close()
 		return
 	}
-	s := m.ctr
+	m.ctr.attach(id, token, c)
+}
+
+// attach hands an exec stream connection to the exec waiting for it, if
+// its token is that exec's (constant-time compare). A connection with a
+// wrong token is closed and the exec keeps waiting for the real one.
+func (s *ctrState) attach(id, token string, c net.Conn) {
 	s.mu.Lock()
-	ch := s.streams[id]
-	delete(s.streams, id)
+	p := s.streams[id]
+	ok := p != nil && tokenEqual(token, p.token)
+	if ok {
+		delete(s.streams, id)
+	}
 	s.mu.Unlock()
-	if ch == nil {
-		c.Close() // nobody asked for this exec
+	if !ok {
+		if s.m != nil && p != nil {
+			s.m.log.Warn("refused an exec stream with a wrong token", "exec", id)
+		}
+		c.Close() // nobody asked for this exec, or not with this token
 		return
 	}
-	ch <- c
+	p.ch <- c
 }
 
 // ctrVM implements sandbox.Container.
@@ -140,10 +164,10 @@ func (c *ctrVM) Exec(ctx context.Context, es sandbox.ExecSpec) (sandbox.Exec, er
 		return nil, errors.New("the container is not running")
 	default:
 	}
-	id := newExecID()
+	id, token := newExecID(), newToken()
 	ch := make(chan net.Conn, 1)
 	c.s.mu.Lock()
-	c.s.streams[id] = ch
+	c.s.streams[id] = &pendingStream{token: token, ch: ch}
 	c.s.mu.Unlock()
 	drop := func() {
 		c.s.mu.Lock()
@@ -155,7 +179,7 @@ func (c *ctrVM) Exec(ctx context.Context, es sandbox.ExecSpec) (sandbox.Exec, er
 		default:
 		}
 	}
-	r, err := c.m.Op(ctx, proto.Msg{Op: "exec", Exec: id, ExecSpec: &proto.ExecSpec{Argv: es.Argv, Env: es.Env, Cwd: es.Cwd, User: es.User,
+	r, err := c.m.Op(ctx, proto.Msg{Op: "exec", Exec: id, Token: token, ExecSpec: &proto.ExecSpec{Argv: es.Argv, Env: es.Env, Cwd: es.Cwd, User: es.User,
 		Stdin: es.Stdin, Stdout: es.Stdout, Stderr: es.Stderr, PTY: es.PTY, Cols: es.Cols, Rows: es.Rows}})
 	if err != nil {
 		drop()

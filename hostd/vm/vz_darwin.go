@@ -212,7 +212,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (sandbox.VM, error) 
 				m.info.VolumeAttachMS = m.vol.attachMS
 			}
 			// Config drive: the instance dir + guest.json, as a raw tar.
-			if err := writeConfigDrive(drive, s, b.cfg.MTU, func(gc *proto.GuestConfig) {
+			if err := writeConfigDrive(drive, s, b.cfg.MTU, m.ctlToken, func(gc *proto.GuestConfig) {
 				gc.VolumeFormat = m.vol != nil && m.vol.format
 				if b.cfg.Rosetta {
 					gc.Rosetta = vzapi.RosettaTag

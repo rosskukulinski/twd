@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -68,7 +67,7 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 	if pids <= 0 {
 		pids = 4096
 	}
-	cs := &ctrState{exited: make(chan struct{}), streams: map[string]chan net.Conn{}, log: &tailBuf{max: 64 << 10}}
+	cs := newCtrState()
 	gc := proto.GuestConfig{UnixNano: time.Now().UnixNano(), IP: proto.GuestIP, Gateway: proto.GatewayIP, Prefix: proto.PrefixLen,
 		MTU: b.cfg.MTU, Container: &proto.ContainerConfig{Image: proto.ImageDev, Argv: s.Argv, Env: s.Env, Cwd: s.Cwd, User: s.User,
 			Pids: pids, Hostname: s.Hostname, CPUQuotaUS: quota, CACert: string(s.CACert), Canary: s.Canary}}
@@ -99,6 +98,7 @@ func (b *Backend) BootContainer(ctx context.Context, s sandbox.ContainerSpec) (s
 				disks = append(disks, vzapi.Disk{Path: p})
 				gc.Container.Scratch, gc.Container.ScratchFormat = proto.ScratchDev, true
 			}
+			gc.CtlToken = m.ctlToken
 			return disks, writeGuestJSON(drive, gc)
 		}})
 	if err != nil {

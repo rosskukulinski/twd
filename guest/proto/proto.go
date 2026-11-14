@@ -6,6 +6,13 @@
 // the guest gets workerd's config and bundle, a per-instance egress MAC key
 // (platform attribution, not a tailnet credential), and its network
 // addresses. Node keys and auth keys stay in host netd.
+//
+// The one credential is guest-internal: GuestConfig.CtlToken, a random
+// per-boot token that authenticates guestd's control connections to the
+// host (so a process in the guest other than guestd can't open, take over
+// or forge the control channel), and the per-exec Msg.Token that does the
+// same for an exec's stdio stream. Neither is worth anything outside that
+// one VM's boot.
 package proto
 
 import (
@@ -78,6 +85,11 @@ type GuestConfig struct {
 	// silicon): guestd mounts it read-only at RosettaDir and registers it
 	// with binfmt_misc, so x86_64 ELF binaries run in the arm64 guest.
 	Rosetta string `json:"rosetta,omitempty"`
+	// CtlToken authenticates guestd to the host: the first line of every
+	// control connection ("hello") carries it, and the host refuses a
+	// connection without it (random per boot; guestd keeps it in memory,
+	// and container processes can't read the config drive).
+	CtlToken string `json:"ctlToken,omitempty"`
 	// Container, if set, makes this a container guest: no workerd; guestd
 	// mounts the image + scratch as an overlay root and runs the image's
 	// entrypoint in it as a supervised child.
@@ -128,7 +140,8 @@ var CATrustBundles = []string{"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tl
 const (
 	// ExecStreamHello is the Type of the first line a guest sends on a new
 	// vsock connection that carries one exec's stdio (Msg.Exec names the
-	// exec) instead of the control channel.
+	// exec, Msg.Token is the stream token the host issued in the exec op)
+	// instead of the control channel.
 	ExecStreamHello = "stream"
 
 	// Exec stream frames: a 1-byte kind, a 4-byte big-endian length, then
@@ -168,7 +181,8 @@ const RosettaDir = "/run/rosetta"
 
 // Msg is one control-channel message (either direction).
 //
-// guest → host: Type "boot" (once, on connect), "ready" (workerd healthy),
+// guest → host: Type "hello" (the first line of a control connection;
+// Token = GuestConfig.CtlToken), "boot" (once), "ready" (workerd healthy),
 // "workerd-exit", "log", or "resp" (answer to an op, same ID).
 // host → guest: Op "probe", "stats", "fsscan", "ping", "shutdown" (stop
 // workerd, sync and unmount the volume: the host may then release it),
@@ -178,8 +192,9 @@ const RosettaDir = "/run/rosetta"
 //
 // Container guests: guest → host Type "ctr-ready" (the entrypoint runs:
 // PID), "ctr-exit" (it exited: ExitCode, 128+n for signal n), "exec-exit"
-// (Exec, ExitCode). host → guest Op "exec" (Exec id + ExecSpec: the guest
-// first opens the exec's stdio stream, then answers with the PID),
+// (Exec, ExitCode). host → guest Op "exec" (Exec id + ExecSpec + Token: the
+// guest first opens the exec's stdio stream, naming Exec and Token, then
+// answers with the PID),
 // "signal" (Signal to the entrypoint, or to Exec's process if set),
 // "resize" (Exec, Cols, Rows) and "status" (Running, PID, Exited, ExitCode).
 type Msg struct {
@@ -212,6 +227,10 @@ type Msg struct {
 	// fsscan: files whose name looks like tailscale state
 	Found   []string `json:"found,omitempty"`
 	Scanned int      `json:"scanned,omitempty"`
+
+	// hello: GuestConfig.CtlToken; exec / ExecStreamHello: the exec's
+	// stream token (random per exec, issued by the host)
+	Token string `json:"token,omitempty"`
 
 	// container guests
 	Exec     string    `json:"exec,omitempty"`

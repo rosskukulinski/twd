@@ -28,13 +28,14 @@ const guestMAC = "06:00:c0:a8:48:02"
 // ---- config drive ----
 
 // writeConfigDrive writes the config drive: guest.json + the instance dir,
-// as a raw tar padded to 4 KiB. extra adjusts guest.json (backend-specific
-// fields) before it is written.
-func writeConfigDrive(path string, s sandbox.Spec, mtu int, extra func(*proto.GuestConfig)) error {
+// as a raw tar padded to 4 KiB. token is the boot's control-channel token
+// (agent.ctlToken); extra adjusts guest.json (backend-specific fields)
+// before it is written.
+func writeConfigDrive(path string, s sandbox.Spec, mtu int, token string, extra func(*proto.GuestConfig)) error {
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	gc := proto.GuestConfig{UnixNano: time.Now().UnixNano(), IP: proto.GuestIP, Gateway: proto.GatewayIP, Prefix: proto.PrefixLen,
-		MTU: mtu, WorkerdArgs: s.WorkerdArgs, HealthCF: s.HealthCF, Debug: s.Debug}
+		MTU: mtu, WorkerdArgs: s.WorkerdArgs, HealthCF: s.HealthCF, Debug: s.Debug, CtlToken: token}
 	if s.Volume != nil {
 		gc.Volume = proto.VolumeDev
 	}

@@ -216,7 +216,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	req := &helperapi.StartRequest{Name: s.ID, MemMiB: b.cfg.MemMiB, VCPUs: b.cfg.VCPUs, HugePages: b.cfg.HugePages,
 		BootArgs: b.cfg.BootArgs, MTU: b.cfg.MTU, GuestMAC: guestMAC, GuestCID: 3, VsockPort: proto.VsockPort}
 	l := launch{name: s.ID, log: s.Log, kernel: b.cfg.Kernel, req: req, handlers: s.Handlers,
-		drive: func(p string) error { return writeConfigDrive(p, s, b.cfg.MTU, nil) }}
+		drive: func(p, token string) error { return writeConfigDrive(p, s, b.cfg.MTU, token, nil) }}
 	if v := s.Volume; v != nil {
 		l.extra = func(m *Machine) (*os.File, error) {
 			f, format, err := openVolume(v)
@@ -243,7 +243,7 @@ type launch struct {
 	name     string
 	log      *slog.Logger
 	kernel   string
-	drive    func(path string) error // writes the config drive
+	drive    func(path, token string) error // writes the config drive (token: GuestConfig.CtlToken)
 	req      *helperapi.StartRequest
 	extra    func(m *Machine) (*os.File, error) // the fifth drive (DO volume or container image)
 	handlers map[uint16]http.Handler
@@ -275,7 +275,7 @@ func (b *Backend) launch(ctx context.Context, l launch) (_ *Machine, err error) 
 	}
 	// 1. Config drive: the instance dir + guest.json, as a raw tar.
 	drive := filepath.Join(m.dir, "config.tar")
-	if err := l.drive(drive); err != nil {
+	if err := l.drive(drive, m.ctlToken); err != nil {
 		return nil, fmt.Errorf("config drive: %w", err)
 	}
 	m.disks = []string{b.cfg.Rootfs, drive}

@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -42,9 +45,22 @@ type agent struct {
 	boots  int
 	// Container guests: onEvent sees every guest event first (true =
 	// consumed), and onStream gets each exec stdio connection (the guest
-	// opens it with an ExecStreamHello line naming the exec).
+	// opens it with an ExecStreamHello line naming the exec and carrying
+	// its stream token; onStream checks the token).
 	onEvent  func(proto.Msg) bool
-	onStream func(exec string, c net.Conn)
+	onStream func(exec, token string, c net.Conn)
+
+	// ctlToken is this boot's control-channel token (GuestConfig.CtlToken,
+	// on the config drive): a guest connection is the control channel
+	// only if its "hello" carries it. Anything else in the guest that can
+	// open a vsock connection to the host (a container process that got
+	// past its seccomp filter) can't take the channel over, forge guest
+	// events or receive the host's ops.
+	ctlToken string
+	// ctlConns counts the control connections accepted this boot (> 1:
+	// guestd reconnected, e.g. after a Firecracker snapshot reset the
+	// guest's vsock connections).
+	ctlConns int
 
 	mu      sync.Mutex
 	ctl     net.Conn
@@ -56,7 +72,22 @@ type agent struct {
 }
 
 func newAgent() agent {
-	return agent{done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}}
+	return agent{done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}, ctlToken: newToken()}
+}
+
+// newToken is a random 256-bit token (hex).
+func newToken() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("crypto/rand: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// tokenEqual compares a token the guest sent with the expected one in
+// constant time ("" never matches).
+func tokenEqual(got, want string) bool {
+	return want != "" && subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
 }
 
 // ---- control channel ----
@@ -72,8 +103,13 @@ func (m *agent) acceptCtl(ln net.Listener) {
 }
 
 // route reads a guest connection's first line: an exec stdio stream
-// (container guests) says so; anything else is the control channel
-// (guestd opens it with "hello").
+// (container guests) says so and carries its stream token (onStream checks
+// it); a control connection is guestd's "hello" with this boot's ctlToken.
+// Anything else is closed. guestd reconnects whenever its connection dies
+// (Firecracker resets the guest's vsock connections when it takes a
+// snapshot, e.g. the keyscan's memory dump), so an authenticated hello
+// replaces the current control channel; an unauthenticated one never
+// touches it.
 func (m *agent) route(c net.Conn) {
 	br := bufio.NewReaderSize(c, 64<<10)
 	c.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -84,21 +120,42 @@ func (m *agent) route(c net.Conn) {
 		return
 	}
 	var first proto.Msg
-	json.Unmarshal(line, &first)
-	if first.Type == proto.ExecStreamHello {
+	if json.Unmarshal(line, &first) != nil {
+		c.Close()
+		return
+	}
+	switch first.Type {
+	case proto.ExecStreamHello:
 		if m.onStream == nil {
 			c.Close()
 			return
 		}
-		m.onStream(first.Exec, &bufConn{Conn: c, r: br})
+		m.onStream(first.Exec, first.Token, &bufConn{Conn: c, r: br})
+		return
+	case "hello":
+		if tokenEqual(first.Token, m.ctlToken) {
+			break
+		}
+		fallthrough
+	default:
+		if m.log != nil {
+			m.log.Warn("refused an unauthenticated guest vsock connection", "type", first.Type)
+		}
+		c.Close()
 		return
 	}
 	m.mu.Lock()
-	if m.ctl != nil {
-		m.ctl.Close()
-	}
+	old := m.ctl
 	m.ctl, m.enc = c, json.NewEncoder(c)
+	m.ctlConns++
+	n := m.ctlConns
 	m.mu.Unlock()
+	if old != nil {
+		old.Close()
+		if m.log != nil {
+			m.log.Info("guest control channel reconnected", "connections", n)
+		}
+	}
 	m.readCtl(io.MultiReader(bytes.NewReader(append([]byte(nil), line...)), br))
 }
 
