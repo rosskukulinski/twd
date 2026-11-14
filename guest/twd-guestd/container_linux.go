@@ -355,8 +355,10 @@ func formatScratch(dev string) error {
 		}
 	}
 	st := time.Now()
-	out, err := exec.Command("/usr/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-O", "^has_journal", "-L", "twd-scratch", "-m", "0",
-		"-E", "lazy_itable_init=1,nodiscard", dev).CombinedOutput()
+	// foreground: PID 1's reaper runs by now and would take mke2fs's exit
+	// status (cmd.Wait: "waitid: no child processes").
+	out, err := foreground(exec.Command("/usr/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-O", "^has_journal", "-L", "twd-scratch", "-m", "0",
+		"-E", "lazy_itable_init=1,nodiscard", dev))
 	if err != nil {
 		return fmt.Errorf("mke2fs scratch: %v: %s", err, strings.TrimSpace(string(out)))
 	}

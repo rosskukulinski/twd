@@ -154,8 +154,8 @@ func formatVolume(dev string) error {
 		return fmt.Errorf("refusing to format %s: not blank", dev)
 	}
 	st := time.Now()
-	out, err := exec.Command("/usr/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-L", "twd-do", "-m", "0",
-		"-E", "lazy_itable_init=0,lazy_journal_init=0,nodiscard", dev).CombinedOutput()
+	out, err := foreground(exec.Command("/usr/sbin/mke2fs", "-q", "-F", "-t", "ext4", "-L", "twd-do", "-m", "0",
+		"-E", "lazy_itable_init=0,lazy_journal_init=0,nodiscard", dev))
 	if err != nil {
 		return fmt.Errorf("mke2fs: %v: %s", err, bytes.TrimSpace(out))
 	}
@@ -593,7 +593,7 @@ func runDebug(argv []string) (string, int, string) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Dir = proto.AppDir
 	cmd.Env = []string{"HOME=/tmp", "PATH=/usr/bin:/bin", "TZ=UTC"}
-	out, err := cmd.CombinedOutput()
+	out, err := foreground(cmd)
 	if len(out) > 64<<10 {
 		out = out[:64<<10]
 	}
@@ -653,12 +653,26 @@ func probe(targets []string) []proto.ProbeResult {
 
 // ---- workerd supervision ----
 
+// fgMu keeps reap() from stealing the exit status of a command guestd
+// itself waits for (exec.Cmd.Wait): such commands run under its read lock
+// (foreground), reap's Wait4(-1) under its write lock.
+var fgMu sync.RWMutex
+
+// foreground runs cmd to completion and returns its combined output, with
+// reap() held off until it has been waited for.
+func foreground(cmd *exec.Cmd) ([]byte, error) {
+	fgMu.RLock()
+	defer fgMu.RUnlock()
+	return cmd.CombinedOutput()
+}
+
 // reap collects every child (PID 1 inherits orphans) and reports workerd's
 // exit status.
 func (g *guest) reap() {
 	sig := make(chan os.Signal, 8)
 	signal.Notify(sig, syscall.SIGCHLD)
 	for range sig {
+		fgMu.Lock()
 		for {
 			var ws unix.WaitStatus
 			pid, err := unix.Wait4(-1, &ws, unix.WNOHANG, nil)
@@ -683,6 +697,7 @@ func (g *guest) reap() {
 			}
 			g.mu.Unlock()
 		}
+		fgMu.Unlock()
 	}
 }
 
