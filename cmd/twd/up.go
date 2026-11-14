@@ -1257,6 +1257,9 @@ func remoteStatus(f *flags, s *state) error {
 				if d.DeployedBy != "" {
 					by = " · by " + d.DeployedBy
 				}
+				if d.Error != "" {
+					by += " · " + d.Error
+				}
 				fmt.Printf("  workload    %s %s · http://%s/%s\n", d.Workload, d.Status, d.Endpoint.MagicDNS, by)
 			}
 		}

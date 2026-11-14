@@ -506,9 +506,8 @@ type StatusView struct {
 // Status returns a snapshot.
 func (h *Host) Status() StatusView {
 	h.mu.Lock()
-	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo(), Tiers: []string{"process"}, InsecureSharedHost: h.cfg.InsecureSharedHost}
+	v := StatusView{HostID: h.cfg.HostID, Sandbox: h.SandboxInfo(), Tiers: h.tiers(), InsecureSharedHost: h.cfg.InsecureSharedHost}
 	if h.cfg.VM != nil {
-		v.Tiers = append(v.Tiers, "microvm")
 		if vv, ok := h.cfg.VM.(interface{ Via() string }); ok {
 			v.VMVia = vv.Via()
 		}

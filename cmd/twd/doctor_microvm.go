@@ -15,12 +15,12 @@ import (
 // doctorMicroVM (Linux): can this user run the microVM tier? KVM, the
 // guest kernel and image from the release, and the twd-vmhelper service
 // (installed by `sudo twd host setup --microvm`) answering this uid. If
-// not, it's a warning, not a failure: microvm deployments fall back to the
-// process tier.
+// not, it's a warning, not a failure: microvm deployments are refused (not
+// run in the process tier).
 func doctorMicroVM(s *state) (string, string, string) {
 	const setup = "sudo ~/.twd/bin/twd host setup --microvm   (one time; then twd runs as you)"
 	if _, err := os.Stat("/dev/kvm"); err != nil {
-		return "warn", "no /dev/kvm: microvm deployments fall back to the process tier", "run on a host with KVM (bare metal, or a VM with nested virtualization)"
+		return "warn", "no /dev/kvm: microvm deployments are refused here (tier_unavailable)", "run on a host with KVM (bare metal, or a VM with nested virtualization)"
 	}
 	share := filepath.Join(filepath.Dir(exeDir()), "share", "twd", "vm")
 	for _, a := range []string{"vmlinux", "rootfs.ext4"} {
@@ -36,7 +36,7 @@ func doctorMicroVM(s *state) (string, string, string) {
 		} else if helperapi.IsCode(err, helperapi.CodeUnauthorized) {
 			why = fmt.Sprintf("the twd-vmhelper service does not allow uid %d", os.Getuid())
 		}
-		return "warn", why + ": microvm deployments fall back to the process tier", setup
+		return "warn", why + ": microvm deployments are refused here (tier_unavailable)", setup
 	}
 	if r.Version != helperapi.Version {
 		return "warn", fmt.Sprintf("twd-vmhelper speaks protocol %d, this twd %d", r.Version, helperapi.Version), setup

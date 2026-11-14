@@ -80,8 +80,14 @@ type Config struct {
 	Logger       *slog.Logger
 	TSNetLogs    bool
 	// VM boots microVM sandboxes (hostd/vm: Firecracker on Linux + KVM).
-	// Nil means every workload runs in the process tier, whatever it asks for.
+	// Nil means this host offers the process tier only: a microvm
+	// deployment is refused (tier_unavailable), never downgraded.
 	VM sandbox.Backend
+	// ForceProcessTier is explicit local development (twd dev): every
+	// workload runs in the process tier whatever its twd.jsonc or tenant
+	// asks for, and the host registers the process tier only. Never set it
+	// on a host that serves real tenants (ADR-032 D5b).
+	ForceProcessTier bool
 	// DefaultTier applies when neither the deployment (twd.jsonc "tier")
 	// nor the tenant names one. Default "process".
 	DefaultTier string
@@ -195,6 +201,9 @@ func New(cfg Config) (*Host, error) {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
 	}
+	if cfg.DefaultTier == "microvm" && cfg.VM == nil && !cfg.ForceProcessTier {
+		return nil, errors.New("hostd: default tier microvm needs a microVM backend (Linux + KVM + twd-vmhelper: `sudo twd host setup --microvm`); without one, use -default-tier process")
+	}
 	sb, err := ResolveSandbox(cfg.Sandbox)
 	if err != nil {
 		return nil, err
@@ -265,11 +274,7 @@ func (h *Host) Start(ctx context.Context) error {
 }
 
 func (h *Host) register(ctx context.Context) error {
-	tiers := []string{"process"}
-	if h.cfg.VM != nil {
-		tiers = append(tiers, "microvm")
-	}
-	req := mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes, Tiers: tiers,
+	req := mgmtapi.RegisterRequest{HostID: h.cfg.HostID, CapacityNodes: h.cfg.CapacityNodes, Tiers: h.tiers(),
 		AuditPubKey: base64.StdEncoding.EncodeToString(h.audit.key.Public().(ed25519.PublicKey))}
 	if h.cfg.PushPort > 0 {
 		// tsnet transport: mgmt pushes to this host's node at PushPort.
@@ -279,6 +284,16 @@ func (h *Host) register(ctx context.Context) error {
 		req.PushURL = "unix://" + h.pushSock
 	}
 	return h.mgmt.Register(ctx, req)
+}
+
+// tiers lists what this host offers: the process tier always, the microVM
+// tier with a backend (not under ForceProcessTier).
+func (h *Host) tiers() []string {
+	tiers := []string{"process"}
+	if h.cfg.VM != nil && !h.cfg.ForceProcessTier {
+		tiers = append(tiers, "microvm")
+	}
+	return tiers
 }
 
 // Close stops every workload and node (node state is kept for rejoin).
