@@ -255,7 +255,7 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
 - In wif mode, policy reads use the lifecycle credential, which then needs `policy_file:read`; this hasn't been tested on a real tailnet.
 - No Lima/Linux test run yet; the linux/arm64 build was only cross-compiled.
 
-## Cron triggers (DONE, branch `short-hyena`)
+## Cron triggers (DONE, branch `build-cron-triggers`)
 `wrangler.jsonc` `triggers.crons` run the default export's `scheduled()`. User docs: `docs/cron-triggers.md`.
 
 **Parser** (`internal/cron`)
