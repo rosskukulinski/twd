@@ -11,8 +11,9 @@ import (
 )
 
 type vmOptions struct {
-	kernel, rootfs, firecracker, jailer, helper, hugePages string
-	memMiB, vcpus                                          int
+	kernel, rootfs, firecracker, jailer, helper, hugePages, vzVMM string
+	memMiB, vcpus                                                 int
+	rosetta                                                       bool
 }
 
 // vmBackend enables the microVM tier when this host can run it: KVM, the

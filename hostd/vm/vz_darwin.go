@@ -522,9 +522,11 @@ func (m *Machine) teardown() {
 }
 
 // MemoryDump implements sandbox.VM via Virtualization.framework's saved
-// machine state (pause, save, resume). The framework may refuse to save a
-// VM with a file-handle NIC, or write the state encrypted: callers must
-// check that the dump is usable (vmcheck's positive control does).
+// machine state (pause, save, resume). On macOS 27.2 the framework
+// validates this configuration for save but the VM service then fails it
+// ("permission denied"), so the no-keys memory scan is not available on
+// vz; callers get the error (and must in any case check that a dump is
+// usable: vmcheck's positive control does).
 func (m *Machine) MemoryDump(ctx context.Context, dir string) (string, error) {
 	p := filepath.Join(dir, m.id+".vzstate")
 	if err := m.vmmOp(ctx, vzapi.Ctl{Op: "save", Path: p}); err != nil {
