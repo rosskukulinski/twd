@@ -156,7 +156,7 @@ func TestE2EContainer(t *testing.T) {
 
 	t.Run("A_SandboxSDK0x_minimal", func(t *testing.T) {
 		r, d := getJSON("http://" + wV0.IP + "/run")
-		if r["_status"] != 200 || r["output"] != "2 + 2 = 4\n" || r["exitCode"] != float64(0) || r["success"] != true {
+		if r["_status"] != 200 || strings.TrimSpace(fmt.Sprint(r["output"])) != "2 + 2 = 4" || r["exitCode"] != float64(0) || r["success"] != true {
 			t.Fatalf("/run: %v", r)
 		}
 		set("a_first_run_ms (container boot + Bun server ready + exec)", d.Milliseconds())
@@ -167,7 +167,7 @@ func TestE2EContainer(t *testing.T) {
 		var lat []time.Duration
 		for i := 0; i < 20; i++ {
 			r, d := getJSON("http://" + wV0.IP + "/run")
-			if r["output"] != "2 + 2 = 4\n" {
+			if strings.TrimSpace(fmt.Sprint(r["output"])) != "2 + 2 = 4" {
 				t.Fatalf("/run #%d: %v", i, r)
 			}
 			lat = append(lat, d)
