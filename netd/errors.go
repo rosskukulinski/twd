@@ -19,6 +19,14 @@ const (
 	CodeBadRequest           = "bad_request"
 	CodeDialFailed           = "dial_failed"
 	CodeUpstreamUnavailable  = "upstream_unavailable"
+
+	// Public ingress (ADR-029).
+	CodeRateLimited       = "rate_limited"        // 429, with Retry-After
+	CodePayloadTooLarge   = "payload_too_large"   // 413
+	CodeHeaderTooLarge    = "header_too_large"    // 431
+	CodeNotPublic         = "not_public"          // 404: the path is not in public.routes
+	CodeUpgradeNotAllowed = "upgrade_not_allowed" // 403: the route is not in public.upgrade
+	CodeRequestTimeout    = "request_timeout"     // 504: public.limits.timeoutSeconds expired
 )
 
 // DocBase is the prefix for doc_url in error bodies.
@@ -57,6 +65,18 @@ func (e *Error) Status() int {
 		return http.StatusGone
 	case CodeIdentityPending, CodeUpstreamUnavailable:
 		return http.StatusServiceUnavailable
+	case CodeRateLimited:
+		return http.StatusTooManyRequests
+	case CodePayloadTooLarge:
+		return http.StatusRequestEntityTooLarge
+	case CodeHeaderTooLarge:
+		return http.StatusRequestHeaderFieldsTooLarge
+	case CodeNotPublic:
+		return http.StatusNotFound
+	case CodeUpgradeNotAllowed:
+		return http.StatusForbidden
+	case CodeRequestTimeout:
+		return http.StatusGatewayTimeout
 	default:
 		return http.StatusBadGateway
 	}
