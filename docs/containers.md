@@ -30,7 +30,11 @@ DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
 
 - **Linux/KVM (Firecracker):** as above, on arm64 and amd64. On amd64 the
   stock `docker.io/cloudflare/sandbox` images run as published (the alias
-  map only applies on arm64). To build the image set on a developer
+  map only applies on arm64). amd64 has not been verified end to end. The
+  only x86 test host so far is a nested guest on an AMD NAS, and there
+  Firecracker guests randomly lose interrupts (timer and virtio). The stock
+  image set converts there, and the container guest boots as far as mounting
+  the erofs image and scratch. To build the image set on a developer
   machine: `PLATFORM=linux/amd64 guest/images/build-sandbox-images.sh DIR`.
 - **macOS (Virtualization.framework, `hostd/vm/container_darwin.go`):** the
   same guest rootfs, guestd container mode and protocol, one `twd-vz` VMM
@@ -40,11 +44,13 @@ DO (workerd, any tier) ── ctx.container (polyfill in the generated wrapper)
   - the scratch disk is a sparse file the guest formats
     (`ContainerConfig.ScratchFormat`);
   - fractional vCPUs are `cpu.max` on the guest's container cgroup
-    (`ContainerConfig.CPUQuotaUS`). The VM's whole vCPU count is the hard
-    cap. A container can't escape the cap unless it can reach guest root's
-    cgroupfs;
-  - `pids.max` is enforced in the guest only. There is one VMM process and no
-    host cgroup.
+    (`ContainerConfig.CPUQuotaUS`). Only the VM's whole vCPU count is a
+    hard cap. Container processes keep guest root's capabilities, so root in
+    a container can mount cgroup2 and lift its own `cpu.max`. That was
+    verified on vz; the fix is to drop capabilities in `ctr-exec`. On vz a
+    fractional instance type is therefore a scheduling share, not a limit;
+  - `pids.max` is enforced in the guest only, with the same caveat. There is
+    one VMM process and no host cgroup.
 - **Rosetta for Linux (Apple silicon, `twd-hostd -vm-rosetta`, opt-in):**
   guestd registers Rosetta with binfmt_misc using the `F` flag, so it works
   in every container mount namespace. The backend reports `amd64` as an
