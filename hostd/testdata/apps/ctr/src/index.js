@@ -104,6 +104,16 @@ async function handle(self, req) {
         return J({ error: String(e.message) });
       }
     }
+    case "portsig": {
+      // @cloudflare/containers' health check: a fetch with an AbortSignal.
+      const t0 = Date.now();
+      try {
+        const r = await c.getTcpPort(Number(q.get("p"))).fetch("http://containerstarthealthcheck", { signal: AbortSignal.timeout(3000) });
+        return J({ status: r.status, ms: Date.now() - t0 });
+      } catch (e) {
+        return J({ error: String(e.message), ms: Date.now() - t0 });
+      }
+    }
     case "inspect":
       return J({ info: await c.inspect() });
     case "intercept":

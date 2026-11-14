@@ -985,7 +985,9 @@ func (m *ctrManager) servePort(w http.ResponseWriter, r *http.Request, k ctrKey,
 	end := c.begin()
 	defer end()
 	// Dial first, so that "not listening" is a typed error, not a 502 page.
-	conn, err := vm.DialPort(r.Context(), port)
+	dctx, dcancel := context.WithTimeout(r.Context(), 10*time.Second)
+	conn, err := vm.DialPort(dctx, port)
+	dcancel()
 	if err != nil {
 		writeAPIError(w, ctrError("not_listening", "the container is not listening on port %d: %v", port, err))
 		return

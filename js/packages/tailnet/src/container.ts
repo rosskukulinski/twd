@@ -326,8 +326,30 @@ export function createContainer(tw: Tw, ctx: any, cls: string, spec: ContainerSp
       return {
         async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
           await settle();
-          const req = new Request(input as any, init);
-          const r = await tw.ctrFetch({ ...as, port }, req);
+          const src = new Request(input as any, init);
+          // An AbortSignal can't cross the RPC to the platform: send the
+          // request without it and honour it here.
+          const sig: AbortSignal | undefined = (init as any)?.signal ?? (input instanceof Request ? input.signal : undefined);
+          if (sig?.aborted) throw sig.reason ?? new Error("aborted");
+          const hasBody = src.method !== "GET" && src.method !== "HEAD";
+          const req = new Request(src.url, { method: src.method, headers: src.headers, body: hasBody ? src.body : undefined, redirect: "manual" });
+          const pending = tw.ctrFetch({ ...as, port }, req);
+          const r: Response = sig
+            ? await new Promise<Response>((res, rej) => {
+                const onAbort = () => rej(sig.reason ?? new Error("aborted"));
+                sig.addEventListener("abort", onAbort, { once: true });
+                pending.then(
+                  (v) => {
+                    sig.removeEventListener("abort", onAbort);
+                    res(v);
+                  },
+                  (e) => {
+                    sig.removeEventListener("abort", onAbort);
+                    rej(e);
+                  },
+                );
+              })
+            : await pending;
           const code = r.headers.get("twd-error");
           if (code && (code === "not_listening" || code === "container_not_running" || code.startsWith("container_"))) {
             throw await errorOf(r);

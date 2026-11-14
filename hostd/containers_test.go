@@ -169,6 +169,12 @@ func TestContainerPolyfill(t *testing.T) {
 		if !strings.Contains(fmt.Sprint(r["error"]), "the container is not listening") {
 			t.Fatalf("closed port: %v", r)
 		}
+		for _, p := range []string{"8080", "8081"} {
+			r = call("/f/a/portsig", "p", p)
+			if p == "8080" && r["status"] != float64(200) || p == "8081" && !strings.Contains(fmt.Sprint(r["error"]), "the container is not listening") || r["ms"].(float64) > 2500 {
+				t.Fatalf("fetch with an AbortSignal, port %s: %v", p, r)
+			}
+		}
 		if r := call("/f/a/inspect"); fmt.Sprint(get(r, "info", "image")) != "twd.test/box:1" {
 			t.Fatalf("inspect: %v", r)
 		}

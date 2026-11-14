@@ -362,8 +362,26 @@ function createContainer(tw, ctx, cls, spec, self) {
       return {
         async fetch(input, init) {
           await settle();
-          const req = new Request(input, init);
-          const r = await tw.ctrFetch({ ...as, port }, req);
+          const src = new Request(input, init);
+          const sig = init?.signal ?? (input instanceof Request ? input.signal : void 0);
+          if (sig?.aborted) throw sig.reason ?? new Error("aborted");
+          const hasBody = src.method !== "GET" && src.method !== "HEAD";
+          const req = new Request(src.url, { method: src.method, headers: src.headers, body: hasBody ? src.body : void 0, redirect: "manual" });
+          const pending = tw.ctrFetch({ ...as, port }, req);
+          const r = sig ? await new Promise((res, rej) => {
+            const onAbort = () => rej(sig.reason ?? new Error("aborted"));
+            sig.addEventListener("abort", onAbort, { once: true });
+            pending.then(
+              (v) => {
+                sig.removeEventListener("abort", onAbort);
+                res(v);
+              },
+              (e) => {
+                sig.removeEventListener("abort", onAbort);
+                rej(e);
+              }
+            );
+          }) : await pending;
           const code = r.headers.get("twd-error");
           if (code && (code === "not_listening" || code === "container_not_running" || code.startsWith("container_"))) {
             throw await errorOf(r);
