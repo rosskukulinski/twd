@@ -18,6 +18,13 @@ import (
 
 // TwdConfig is the part of twd.jsonc mgmt reads.
 type TwdConfig struct {
+	// Tier is the requested isolation tier ("process", "microvm"; "" = the
+	// tenant's default). Placement only sends a workload to hosts that offer
+	// its tier.
+	Tier string `json:"tier"`
+	// Runtime is "" / "workerd" or "node" (Node apps always run in the
+	// process tier).
+	Runtime string `json:"runtime"`
 	Tailnet struct {
 		// Tags are the workload entry node's tags (the "_workload" namespace).
 		Tags []string `json:"tags"`
