@@ -175,6 +175,9 @@ type Assignment struct {
 	Tailnet      string   `json:"tailnet"`
 	ControlURL   string   `json:"controlURL,omitempty"`
 	CreatedAt    int64    `json:"createdAt"`
+	// Fence (F9, ADR-028 §3): stop serving this workload when mgmt is
+	// unreachable for FenceAfter. nil (an older mgmt) means true.
+	Fence *bool `json:"fence,omitempty"`
 }
 
 type ObjectRef struct {

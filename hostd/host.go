@@ -52,9 +52,12 @@ type Config struct {
 	WorkerdBin string
 	// HeartbeatEvery is the heartbeat (and assignment poll) period (3 s).
 	HeartbeatEvery time.Duration
-	// FenceAfter: with no successful heartbeat for this long, the host stops
-	// serving every namespace (self-fencing below the 10 s lease TTL). 0 = 9 s;
-	// negative disables.
+	// FenceAfter: with no successful heartbeat for this long (monotonic
+	// clock), the host stops serving its *stateful* workloads (assignment
+	// "fence"; ADR-028 §3); stateless Workers keep serving. It must stay
+	// below mgmt's NamespaceLeaseTTL (45 s) minus a margin, so a host has
+	// stopped serving before its lease can be taken over: at most
+	// MaxFenceAfter. 0 = DefaultFenceAfter (30 s); negative disables.
 	FenceAfter time.Duration
 	// HostnamePrefix is prepended to every node hostname (e2e runs use a
 	// unique per-run prefix).
@@ -151,6 +154,15 @@ type Host struct {
 	runDirOwned bool
 }
 
+// DefaultFenceAfter rides out typical mgmt restarts and database failovers;
+// MaxFenceAfter keeps it below mgmt's 45 s namespace lease with a 5 s margin
+// for heartbeat RTT and clock-rate drift (ADR-028 §3; checked against
+// mgmt.NamespaceLeaseTTL in hostd's tests).
+const (
+	DefaultFenceAfter = 30 * time.Second
+	MaxFenceAfter     = 40 * time.Second
+)
+
 // New validates cfg and prepares (but does not start) a Host.
 func New(cfg Config) (*Host, error) {
 	if cfg.HostID == "" || cfg.Mgmt == nil || cfg.DataDir == "" || cfg.WorkerdBin == "" {
@@ -160,7 +172,10 @@ func New(cfg Config) (*Host, error) {
 		cfg.HeartbeatEvery = 3 * time.Second
 	}
 	if cfg.FenceAfter == 0 {
-		cfg.FenceAfter = 9 * time.Second
+		cfg.FenceAfter = DefaultFenceAfter
+	}
+	if cfg.FenceAfter > MaxFenceAfter {
+		return nil, fmt.Errorf("hostd: FenceAfter %v must be ≤ %v (below mgmt's namespace lease, so a fenced host has stopped before its lease can be taken over)", cfg.FenceAfter, MaxFenceAfter)
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 30 * time.Second
@@ -344,8 +359,8 @@ func (h *Host) tick() {
 		}
 		h.mu.Unlock()
 		if stale {
-			h.log.Error("no successful heartbeat; self-fencing every namespace", "after", h.cfg.FenceAfter)
-			h.fenceAll("heartbeat lost")
+			h.log.Error("no successful heartbeat; self-fencing stateful workloads (stateless keep serving)", "after", h.cfg.FenceAfter)
+			h.fenceStateful("heartbeat lost")
 		}
 		return
 	}
@@ -451,16 +466,26 @@ func (h *Host) revoke(nss []string) {
 	}
 }
 
-func (h *Host) fenceAll(reason string) {
-	h.mu.Lock()
-	wls := make([]*workload, 0, len(h.workloads))
-	for _, w := range h.workloads {
-		wls = append(wls, w)
-	}
-	h.mu.Unlock()
-	for _, w := range wls {
+// fenceStateful stops serving every workload whose assignment says fence
+// (it has Durable Objects that must not run on two hosts). They are
+// redeployed by the next successful assignment sync.
+func (h *Host) fenceStateful(reason string) {
+	for _, w := range h.fenceTargets() {
 		h.undeploy(w, reason)
 	}
+}
+
+// fenceTargets are the workloads heartbeat loss must stop.
+func (h *Host) fenceTargets() []*workload {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	wls := make([]*workload, 0, len(h.workloads))
+	for _, w := range h.workloads {
+		if w.fences() {
+			wls = append(wls, w)
+		}
+	}
+	return wls
 }
 
 func (h *Host) syncAssignments(ctx context.Context) error {

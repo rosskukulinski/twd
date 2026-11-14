@@ -32,7 +32,7 @@ const (
 	DefaultMaxObjects             = 1000
 	DefaultMaxLive                = 64
 	DefaultMaxDepth               = 3
-	NamespaceLeaseTTL             = 15 * time.Second
+	NamespaceLeaseTTL             = 45 * time.Second // > hostd's FenceAfter (30 s) + margin (ADR-028 §3)
 	HostLeaseTTL                  = 10 * time.Second
 	KeyExpiry                     = 5 * time.Minute
 )
@@ -70,12 +70,16 @@ type Host struct {
 	AuditPubKey   string   `json:"auditPubKey,omitempty"` // base64 ed25519, verifies hostSig
 	Pool          string   `json:"pool,omitempty"`
 	// PushPort is hostd's push listener on its own tsnet node (0 = none;
-	// local-dev hosts register a unix:// push URL instead, kept in memory).
-	PushPort  int   `json:"pushPort,omitempty"`
-	LiveNodes int   `json:"liveNodes"`
-	LastSeen  int64 `json:"lastSeen"` // unix ms
-	CreatedAt int64 `json:"createdAt"`
-	UpdatedAt int64 `json:"updatedAt"`
+	// local-dev hosts register a unix:// push URL instead).
+	PushPort int `json:"pushPort,omitempty"`
+	// PushTarget is where mgmt pushes kills and assignments: unix:///… or
+	// http://<node addr>:<port>. Persisted so every replica can push, not
+	// only the one that served the registration (mm-loop F8, H06).
+	PushTarget string `json:"-"`
+	LiveNodes  int    `json:"liveNodes"`
+	LastSeen   int64  `json:"lastSeen"` // unix ms
+	CreatedAt  int64  `json:"createdAt"`
+	UpdatedAt  int64  `json:"updatedAt"`
 }
 
 // Pending reports a host created by `twd host add` that never registered.
@@ -111,6 +115,14 @@ type Deployment struct {
 	CreatedAt  int64  `json:"createdAt"`
 	// StoppedAt is set by undeploy (DELETE /v1/deployments/{id}).
 	StoppedAt int64 `json:"stoppedAt,omitempty"`
+	// Fence: the workload has Durable Objects that don't tolerate two
+	// instances (BundleStateful), so its host stops serving it when it loses
+	// mgmt (ADR-028 §3). Stateless workloads keep serving.
+	Fence bool `json:"fence"`
+	// HostStatus/HostError: what the host (or mgmt, for assigned, draining
+	// and stopped) last reported; shared by every replica (F13, H08).
+	HostStatus string `json:"-"`
+	HostError  string `json:"-"`
 }
 
 // LeaseName is the namespace lease key for a deployment. MVP: one lease per
@@ -141,7 +153,11 @@ type Object struct {
 	MagicDNS     string          `json:"magicDNS,omitempty"`
 	KeyID        string          `json:"-"`
 	KeyExpires   int64           `json:"-"`
-	KillReason   string          `json:"killReason,omitempty"`
+	// DeviceDeleteAt: 0 none; >0 the device delete is due (unix ms, or a
+	// claim's lease end); -1 done. Set in the same write that kills the
+	// object, so the kill and its device cleanup commit atomically (F21).
+	DeviceDeleteAt int64  `json:"-"`
+	KillReason     string `json:"killReason,omitempty"`
 	// Kill record (the /v1 tombstone): when, by whom, whether as part of a
 	// cascade and which object the kill was issued on.
 	KilledAt    int64  `json:"killedAt,omitempty"`
@@ -205,6 +221,8 @@ type Error struct {
 	Snippet string         `json:"snippet,omitempty"`
 	DocURL  string         `json:"doc_url,omitempty"`
 	TraceID string         `json:"trace_id"`
+	// RetryAfter (seconds), when set, is sent as the Retry-After header.
+	RetryAfter int `json:"-"`
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
@@ -216,8 +234,14 @@ func errf(status int, code, format string, a ...any) *Error {
 
 // Store errors.
 var (
-	ErrNotFound  = errors.New("not found")
-	ErrExists    = errors.New("already exists")
+	ErrNotFound = errors.New("not found")
+	ErrExists   = errors.New("already exists")
+	// ErrSpawnBudget: the root already has its maximum of live descendants
+	// (checked in the insert transaction: mm-loop F14, H04).
+	ErrSpawnBudget = errors.New("spawn budget exceeded")
+	// ErrQuota: the tenant already has maxObjects live objects (checked in
+	// the insert transaction: mm-loop F17, H16).
+	ErrQuota     = errors.New("object quota exceeded")
 	ErrLeaseHeld = errors.New("lease held by another holder")
 	ErrLeaseLost = errors.New("lease_lost")
 	ErrConflict  = errors.New("conflict")
@@ -238,6 +262,10 @@ func asAPIError(err error) *Error {
 		return errf(http.StatusConflict, "lease_lost", "the caller does not hold the namespace lease at this epoch (%v)", err)
 	case errors.Is(err, ErrLeaseHeld):
 		return errf(http.StatusConflict, "lease_held", "%v", err)
+	case isStoreUnavailable(err):
+		e := errf(http.StatusServiceUnavailable, "store_unavailable", "the store is unavailable or contended; retry (%v)", err)
+		e.RetryAfter = 1
+		return e
 	}
 	return errf(http.StatusInternalServerError, "internal", "%v", err)
 }

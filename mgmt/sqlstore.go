@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,8 +26,10 @@ const (
 
 // SQLStore implements Store on SQLite or Postgres with one set of queries.
 type SQLStore struct {
-	db *sql.DB
-	d  dialect
+	db    *sql.DB
+	d     dialect
+	clock TimeSource // the shared time source (ADR-028 §1)
+	dbc   *dbClock   // Postgres: follows the server clock; nil for SQLite
 }
 
 var _ Store = (*SQLStore)(nil)
@@ -34,10 +39,17 @@ var _ Store = (*SQLStore)(nil)
 func OpenStore(ctx context.Context, dsn string) (*SQLStore, error) {
 	var s *SQLStore
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
-		db, err := sql.Open("pgx", dsn)
+		dsn, maxConns := takeMaxConns(dsn)
+		db, err := sql.Open("pgx", withSessionLimits(dsn))
 		if err != nil {
 			return nil, err
 		}
+		// Bounded pool (H19): a burst of requests waits for a connection
+		// instead of opening hundreds and exhausting the server's
+		// max_connections ("too many clients"), which fails every replica.
+		db.SetMaxOpenConns(maxConns)
+		db.SetMaxIdleConns(maxConns)
+		db.SetConnMaxIdleTime(5 * time.Minute)
 		s = &SQLStore{db: db, d: dialectPostgres}
 	} else {
 		path := strings.TrimPrefix(dsn, "sqlite:")
@@ -61,10 +73,198 @@ func OpenStore(ctx context.Context, dsn string) (*SQLStore, error) {
 		s.db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	s.clock = localClock{}
+	if s.d == dialectPostgres {
+		s.dbc = newDBClock(func(ctx context.Context) (time.Time, error) {
+			var us int64
+			err := s.db.QueryRowContext(ctx, "SELECT (extract(epoch from clock_timestamp())*1000000)::bigint").Scan(&us)
+			return time.UnixMicro(us), err
+		})
+		if err := s.dbc.sync(ctx); err != nil {
+			s.db.Close()
+			return nil, fmt.Errorf("store clock: %w", err)
+		}
+		go s.dbc.run()
+		s.clock = s.dbc
+	}
 	return s, nil
 }
 
-func (s *SQLStore) Close() error { return s.db.Close() }
+func (s *SQLStore) Close() error {
+	if s.dbc != nil {
+		s.dbc.close()
+		s.dbc = nil
+	}
+	return s.db.Close()
+}
+
+// Now is the shared clock: the Postgres server clock, or the local clock for
+// SQLite (single replica). See TimeSource.
+func (s *SQLStore) Now() time.Time { return s.clock.Now() }
+
+// ClockOffset reports the store clock minus this replica's wall clock at the
+// last sync (Postgres), or 0 (SQLite / an overridden clock).
+func (s *SQLStore) ClockOffset() (time.Duration, time.Time) {
+	if s.dbc != nil && s.clock == TimeSource(s.dbc) {
+		return s.dbc.ClockOffset()
+	}
+	return 0, time.Now()
+}
+
+func (s *SQLStore) ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error) {
+	r, err := s.db.ExecContext(ctx, s.q(`UPDATE objects SET mint_claim=?, mint_claimed_at=?
+		WHERE id=? AND status=? AND key_id='' AND (mint_claim='' OR mint_claim=? OR mint_claimed_at<?)`),
+		claimer, now.UnixMilli(), id, StatusPending, claimer, staleBefore.UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+
+// UpdateThrottle applies fn to the tenant's shared throttle state in one
+// transaction (Postgres: row locked FOR UPDATE; SQLite: the immediate
+// transaction holds the write lock). A missing row reaches fn as the zero
+// state (Last == 0), which the throttle initialises to a full bucket.
+func (s *SQLStore) UpdateThrottle(ctx context.Context, tenantID string, fn func(*ThrottleState)) error {
+	if _, err := s.db.ExecContext(ctx, s.q(`INSERT INTO tenant_throttle (tenant_id, tokens, rate, last, pause_till, failures)
+		VALUES (?, 0, 0, 0, 0, 0) ON CONFLICT (tenant_id) DO NOTHING`), tenantID); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var st ThrottleState
+	var failures int64
+	if err := tx.QueryRowContext(ctx, s.q("SELECT tokens, rate, last, pause_till, failures FROM tenant_throttle WHERE tenant_id=?"+s.forUpdate()),
+		tenantID).Scan(&st.Tokens, &st.Rate, &st.Last, &st.PauseTill, &failures); err != nil {
+		return err
+	}
+	st.Failures = int(failures)
+	fn(&st)
+	if _, err := tx.ExecContext(ctx, s.q("UPDATE tenant_throttle SET tokens=?, rate=?, last=?, pause_till=?, failures=? WHERE tenant_id=?"),
+		st.Tokens, st.Rate, st.Last, st.PauseTill, int64(st.Failures), tenantID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *SQLStore) SetDeploymentStatus(ctx context.Context, id, status, errText string) error {
+	_, err := s.db.ExecContext(ctx, s.q("UPDATE deployments SET host_status=?, host_error=? WHERE id=? AND (host_status<>? OR host_error<>?)"),
+		status, errText, id, status, errText)
+	return err
+}
+
+func (s *SQLStore) SetDeviceDelete(ctx context.Context, id string, due int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error { // a tx: a device_delete audit intent commits with it (H22)
+		_, err := tx.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=?"), due, id)
+		return err
+	})
+}
+
+// ClaimDeviceDelete takes a due delete by moving its due time to now +
+// DeviceDeleteClaimTTL: a claim is a lease, not a terminal state, so a
+// claimer that dies or can't record the outcome (store blip) leaves the
+// delete due again (H21, soak 101). Callers mark success with
+// SetDeviceDelete(id, -1).
+func (s *SQLStore) ClaimDeviceDelete(ctx context.Context, id string, now int64) (bool, error) {
+	claimUntil := now + DeviceDeleteClaimTTL.Milliseconds()
+	if now == math.MaxInt64 { // forced (FlushDeletes)
+		claimUntil = time.Now().Add(DeviceDeleteClaimTTL).UnixMilli()
+	}
+	r, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET device_delete_at=? WHERE id=? AND device_delete_at>0 AND device_delete_at<=?"), claimUntil, id, now)
+	if err != nil {
+		return false, err
+	}
+	n, err := r.RowsAffected()
+	return n == 1, err
+}
+
+func (s *SQLStore) DueDeviceDeletes(ctx context.Context, now int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.q("SELECT id FROM objects WHERE device_delete_at>0 AND device_delete_at<=? ORDER BY device_delete_at"), now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ChooseSecret records keyID as the secret for name unless another key was
+// chosen first, and returns the chosen key ID (mm-loop F11, H13).
+func (s *SQLStore) ChooseSecret(ctx context.Context, name, keyID string, now int64) (string, error) {
+	if _, err := s.db.ExecContext(ctx, s.q("INSERT INTO secret_choice (name, key_id, created_at) VALUES (?, ?, ?) ON CONFLICT (name) DO NOTHING"),
+		name, keyID, now); err != nil {
+		return "", err
+	}
+	return s.SecretChoice(ctx, name)
+}
+
+// SecretChoice returns the chosen key ID for name (ErrNotFound if none).
+func (s *SQLStore) SecretChoice(ctx context.Context, name string) (string, error) {
+	var k string
+	err := s.db.QueryRowContext(ctx, s.q("SELECT key_id FROM secret_choice WHERE name=?"), name).Scan(&k)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return k, err
+}
+
+func (s *SQLStore) DeleteSecretChoice(ctx context.Context, name string) error {
+	_, err := s.db.ExecContext(ctx, s.q("DELETE FROM secret_choice WHERE name=?"), name)
+	return err
+}
+
+func (s *SQLStore) UpsertReplica(ctx context.Context, r Replica) error {
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO replicas (id, custody, started_at, last_seen) VALUES (?, ?, ?, ?)
+		ON CONFLICT (id) DO UPDATE SET custody=excluded.custody, started_at=excluded.started_at, last_seen=excluded.last_seen`),
+		r.ID, r.Custody, r.StartedAt, r.LastSeen)
+	return err
+}
+
+func (s *SQLStore) ListReplicas(ctx context.Context) ([]Replica, error) {
+	rows, err := s.db.QueryContext(ctx, "SELECT id, custody, started_at, last_seen FROM replicas ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Replica
+	for rows.Next() {
+		var r Replica
+		if err := rows.Scan(&r.ID, &r.Custody, &r.StartedAt, &r.LastSeen); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLStore) ReleaseMint(ctx context.Context, id, claimer string) error {
+	_, err := s.db.ExecContext(ctx, s.q("UPDATE objects SET mint_claim='', mint_claimed_at=0 WHERE id=? AND mint_claim=?"), id, claimer)
+	return err
+}
+
+// ClockSource reports "postgres" while the store follows the server clock,
+// else "local".
+func (s *SQLStore) ClockSource() string {
+	if s.dbc != nil && s.clock == TimeSource(s.dbc) {
+		return "postgres"
+	}
+	return "local"
+}
+
+// SetClock overrides the shared clock (tests: simulated time shared by
+// several Mgmt replicas on this store).
+func (s *SQLStore) SetClock(c TimeSource) { s.clock = c }
 
 // q rewrites ? placeholders to $n for Postgres.
 func (s *SQLStore) q(query string) string {
@@ -82,6 +282,64 @@ func (s *SQLStore) q(query string) string {
 		b.WriteRune(r)
 	}
 	return b.String()
+}
+
+// Session limits for mgmt's Postgres connections (S6): a replica whose link
+// to the store is slow must not stall the healthy ones. lock_timeout bounds
+// how long anyone waits for a row lock; idle_in_transaction_session_timeout
+// aborts a transaction that sits idle between its statements (the slow
+// replica), releasing its locks. Both surface as StoreUnavailable (503).
+const (
+	pgLockTimeoutMs     = 3000
+	pgIdleInTxTimeoutMs = 3000
+)
+
+// DefaultMaxConns bounds each replica's Postgres pool; N replicas use at
+// most N×DefaultMaxConns connections. Override with ?twd_max_conns=K.
+const DefaultMaxConns = 16
+
+// takeMaxConns removes twd's own twd_max_conns parameter from dsn (pgx would
+// send it to the server) and returns the pool size.
+func takeMaxConns(dsn string) (string, int) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return dsn, DefaultMaxConns
+	}
+	q := u.Query()
+	n := DefaultMaxConns
+	if v := q.Get("twd_max_conns"); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k > 0 {
+			n = k
+		}
+		q.Del("twd_max_conns")
+		u.RawQuery = q.Encode()
+	}
+	return u.String(), n
+}
+
+// withSessionLimits adds the session limits as startup parameters unless the
+// DSN already sets them.
+func withSessionLimits(dsn string) string {
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	for k, v := range map[string]int{"lock_timeout": pgLockTimeoutMs, "idle_in_transaction_session_timeout": pgIdleInTxTimeoutMs} {
+		if !strings.Contains(dsn, k+"=") {
+			dsn += fmt.Sprintf("%s%s=%d", sep, k, v)
+			sep = "&"
+		}
+	}
+	return dsn
+}
+
+// forShare locks a row against changes but not against other sharers
+// (fence reads: concurrent fenced commits don't serialise; H17).
+func (s *SQLStore) forShare() string {
+	if s.d == dialectPostgres {
+		return " FOR SHARE"
+	}
+	return ""
 }
 
 func (s *SQLStore) forUpdate() string {
@@ -129,6 +387,15 @@ CREATE INDEX IF NOT EXISTS audit_trace ON audit (trace_id);
 CREATE TABLE IF NOT EXISTS audit_heads (chain TEXT PRIMARY KEY, seq BIGINT NOT NULL, hash TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS revocations (
   host_id TEXT NOT NULL, object_id TEXT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (host_id, object_id));
+CREATE TABLE IF NOT EXISTS tenant_throttle (
+  tenant_id TEXT PRIMARY KEY, tokens REAL NOT NULL, rate REAL NOT NULL, last BIGINT NOT NULL,
+  pause_till BIGINT NOT NULL, failures BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS audit_outbox (
+  id TEXT PRIMARY KEY, created_at BIGINT NOT NULL, record TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS secret_choice (
+  name TEXT PRIMARY KEY, key_id TEXT NOT NULL, created_at BIGINT NOT NULL);
+CREATE TABLE IF NOT EXISTS replicas (
+  id TEXT PRIMARY KEY, custody TEXT NOT NULL, started_at BIGINT NOT NULL, last_seen BIGINT NOT NULL);
 `
 
 // Append-only audit: UPDATE/DELETE on audit rows abort (defence in depth;
@@ -250,6 +517,19 @@ func (s *SQLStore) addColumns(ctx context.Context) error {
 		// M12: oauth mint mode (client ID + credential file path; never the secret).
 		{"tenants", "oauth_client_id", "ALTER TABLE tenants ADD COLUMN oauth_client_id TEXT NOT NULL DEFAULT ''"},
 		{"tenants", "oauth_client_file", "ALTER TABLE tenants ADD COLUMN oauth_client_file TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F13 (H08): the host-reported deployment status, shared by replicas.
+		{"deployments", "host_status", "ALTER TABLE deployments ADD COLUMN host_status TEXT NOT NULL DEFAULT ''"},
+		{"deployments", "host_error", "ALTER TABLE deployments ADD COLUMN host_error TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F10 (H07): durable device deletes (0 none, >0 due unix ms, -1 claimed/done).
+		{"objects", "device_delete_at", "ALTER TABLE objects ADD COLUMN device_delete_at BIGINT NOT NULL DEFAULT 0"},
+		// mm-loop F9 (ADR-028 §3): hosts self-fence only stateful workloads.
+		// Existing rows default to 1 (fence), the safe value.
+		{"deployments", "fence", "ALTER TABLE deployments ADD COLUMN fence BIGINT NOT NULL DEFAULT 1"},
+		// mm-loop F8 (H06): every replica can push to a host.
+		{"hosts", "push_target", "ALTER TABLE hosts ADD COLUMN push_target TEXT NOT NULL DEFAULT ''"},
+		// mm-loop F3 (H02): one replica mints each object.
+		{"objects", "mint_claim", "ALTER TABLE objects ADD COLUMN mint_claim TEXT NOT NULL DEFAULT ''"},
+		{"objects", "mint_claimed_at", "ALTER TABLE objects ADD COLUMN mint_claimed_at BIGINT NOT NULL DEFAULT 0"},
 	} {
 		rows, err := s.db.QueryContext(ctx, "SELECT "+c.col+" FROM "+c.table+" WHERE 1=0")
 		if err == nil {
@@ -343,7 +623,101 @@ func (s *SQLStore) tx(ctx context.Context, fn func(*sql.Tx) error) error {
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	return s.commitWithIntents(ctx, tx)
+}
+
+// commitWithIntents writes the audit intents carried by ctx into
+// audit_outbox inside tx, then commits: the change and its audit record
+// commit together or not at all (H22). An outbox write failure rolls the
+// change back.
+func (s *SQLStore) commitWithIntents(ctx context.Context, tx *sql.Tx) error {
+	pend := pendingIntents(ctx)
+	for _, ai := range pend {
+		b, err := json.Marshal(ai.Rec)
+		if err != nil {
+			tx.Rollback()
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, s.q("INSERT INTO audit_outbox (id, created_at, record) VALUES (?, ?, ?)"), ai.ID, s.Now().UnixMilli(), string(b)); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("audit outbox: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, ai := range pend {
+		ai.mu.Lock()
+		ai.written = true
+		ai.mu.Unlock()
+	}
+	return nil
+}
+
+// PutAuditIntent writes a standalone intent (an audit record not bound to a
+// state change of its own).
+func (s *SQLStore) PutAuditIntent(ctx context.Context, id string, rec AuditRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, s.q("INSERT INTO audit_outbox (id, created_at, record) VALUES (?, ?, ?)"), id, s.Now().UnixMilli(), string(b))
+	return err
+}
+
+// AmendAuditIntent replaces a pending intent's record (detail known only
+// after the change). No-op if it was already drained.
+func (s *SQLStore) AmendAuditIntent(ctx context.Context, id string, rec AuditRecord) error {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, s.q("UPDATE audit_outbox SET record=? WHERE id=?"), string(b), id)
+	return err
+}
+
+// DrainAuditIntent appends intent id to its chain and removes it from the
+// outbox in one transaction; false if another replica already did.
+func (s *SQLStore) DrainAuditIntent(ctx context.Context, id string) (bool, error) {
+	done := false
+	err := s.tx(withoutIntents(ctx), func(tx *sql.Tx) error {
+		var raw string
+		err := tx.QueryRowContext(ctx, s.q("DELETE FROM audit_outbox WHERE id=? RETURNING record"), id).Scan(&raw)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var rec AuditRecord
+		if err := json.Unmarshal([]byte(raw), &rec); err != nil {
+			return err
+		}
+		if _, err := s.appendAuditTx(ctx, tx, rec); err != nil {
+			return err
+		}
+		done = true
+		return nil
+	})
+	return done, err
+}
+
+// ListAuditIntents returns outbox intents created before olderThan (unix ms).
+func (s *SQLStore) ListAuditIntents(ctx context.Context, olderThan int64, limit int) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.q("SELECT id FROM audit_outbox WHERE created_at<? ORDER BY created_at, id LIMIT ?"), olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 func isUnique(err error) bool {
@@ -450,14 +824,14 @@ func (s *SQLStore) ListTenants(ctx context.Context, pg Page) ([]Tenant, error) {
 
 // ---- hosts ----
 
-const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at"
+const hostCols = "id, capacity, tiers, node_id, audit_pubkey, live_nodes, last_seen, pool, push_port, created_at, updated_at, push_target"
 
 func scanHost(sc interface{ Scan(...any) error }) (Host, error) {
 	var h Host
 	var capacity, live int64
 	var tiers string
 	var port int64
-	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt)
+	err := sc.Scan(&h.ID, &capacity, &tiers, &h.NodeID, &h.AuditPubKey, &live, &h.LastSeen, &h.Pool, &port, &h.CreatedAt, &h.UpdatedAt, &h.PushTarget)
 	if errors.Is(err, sql.ErrNoRows) {
 		return h, ErrNotFound
 	}
@@ -477,10 +851,11 @@ func (s *SQLStore) UpsertHost(ctx context.Context, h Host) error {
 		h.CreatedAt = h.UpdatedAt
 	}
 	// created_at is kept from the first insert (the page key must be stable).
-	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+	_, err := s.db.ExecContext(ctx, s.q(`INSERT INTO hosts (`+hostCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT (id) DO UPDATE SET capacity=excluded.capacity, tiers=excluded.tiers, node_id=excluded.node_id,
-		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen, pool=excluded.pool, push_port=excluded.push_port, updated_at=excluded.updated_at`),
-		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt)
+		audit_pubkey=excluded.audit_pubkey, last_seen=excluded.last_seen, pool=excluded.pool, push_port=excluded.push_port, updated_at=excluded.updated_at,
+		push_target=excluded.push_target`),
+		h.ID, h.CapacityNodes, jsonStr(h.Tiers), h.NodeID, h.AuditPubKey, h.LiveNodes, h.LastSeen, h.Pool, h.PushPort, h.CreatedAt, h.UpdatedAt, h.PushTarget)
 	return err
 }
 
@@ -533,13 +908,14 @@ func (s *SQLStore) TouchHost(ctx context.Context, id string, liveNodes int, now 
 
 // ---- deployments ----
 
-const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at"
+const deployCols = "id, tenant_id, workload, host_id, namespaces, max_live, max_depth, epoch, created_at, deployed_by, stopped_at, fence, host_status, host_error"
 
 func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 	var d Deployment
 	var ns string
-	var ml, md int64
-	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt)
+	var ml, md, fence int64
+	err := sc.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError)
+	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -549,8 +925,16 @@ func scanDeployment(sc interface{ Scan(...any) error }) (Deployment, error) {
 }
 
 func (s *SQLStore) CreateDeployment(ctx context.Context, d Deployment) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"),
-		d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, d.Bundle)
+	fence := int64(0)
+	if d.Fence {
+		fence = 1
+	}
+	err := s.tx(ctx, func(tx *sql.Tx) error { // a tx so a deploy's audit intent commits with it (H22)
+		_, err := tx.ExecContext(ctx, s.q("INSERT INTO deployments ("+deployCols+", bundle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+			d.ID, d.TenantID, d.Workload, d.HostID, jsonStr(d.Namespaces), d.MaxLive, d.MaxDepth, d.Epoch, d.CreatedAt, d.DeployedBy, d.StoppedAt, fence,
+			d.HostStatus, d.HostError, d.Bundle)
+		return err
+	})
 	if isUnique(err) {
 		return ErrExists
 	}
@@ -561,8 +945,9 @@ func (s *SQLStore) GetDeployment(ctx context.Context, id string) (Deployment, er
 	row := s.db.QueryRowContext(ctx, s.q("SELECT "+deployCols+", bundle FROM deployments WHERE id=?"), id)
 	var d Deployment
 	var ns string
-	var ml, md int64
-	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &d.Bundle)
+	var ml, md, fence int64
+	err := row.Scan(&d.ID, &d.TenantID, &d.Workload, &d.HostID, &ns, &ml, &md, &d.Epoch, &d.CreatedAt, &d.DeployedBy, &d.StoppedAt, &fence, &d.HostStatus, &d.HostError, &d.Bundle)
+	d.Fence = fence != 0
 	if errors.Is(err, sql.ErrNoRows) {
 		return d, ErrNotFound
 	}
@@ -709,7 +1094,10 @@ func (s *SQLStore) FindClass(ctx context.Context, tenantID, workload, class stri
 // objectColsV1 are the columns of the M7 schema; cert (RT-01) was added later
 // and is filled by addColumns on older stores.
 const objectColsV1 = "id, tenant_id, workload, namespace, name, hostname, deployment_id, lease, tags, caps, parent_id, root_id, depth, ttl_seconds, ephemeral, status, node_id, stable_node_id, magic_dns, key_id, key_expires, kill_reason, created_at, updated_at"
-const objectCols = objectColsV1 + ", cert, killed_at, killed_by, kill_cascade, kill_root, acting_for"
+const objectCols = objectColsV1 + ", cert, killed_at, killed_by, kill_cascade, kill_root, acting_for, device_delete_at"
+
+// objectPlaceholders is "?,?,…" for objectCols.
+var objectPlaceholders = strings.TrimSuffix(strings.Repeat("?,", len(strings.Split(objectCols, ","))), ",")
 
 func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var o Object
@@ -717,7 +1105,7 @@ func scanObject(sc interface{ Scan(...any) error }) (Object, error) {
 	var depth, eph, casc int64
 	err := sc.Scan(&o.ID, &o.TenantID, &o.Workload, &o.Namespace, &o.Name, &o.Hostname, &o.DeploymentID, &o.Lease, &tags, &caps,
 		&o.ParentID, &o.RootID, &depth, &o.TTLSeconds, &eph, &o.Status, &o.NodeID, &o.StableNodeID, &o.MagicDNS,
-		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert, &o.KilledAt, &o.KilledBy, &casc, &o.KillRoot, &o.ActingFor)
+		&o.KeyID, &o.KeyExpires, &o.KillReason, &o.CreatedAt, &o.UpdatedAt, &o.Cert, &o.KilledAt, &o.KilledBy, &casc, &o.KillRoot, &o.ActingFor, &o.DeviceDeleteAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return o, ErrNotFound
 	}
@@ -740,15 +1128,79 @@ func objectArgs(o Object) []any {
 	}
 	return []any{o.ID, o.TenantID, o.Workload, o.Namespace, o.Name, o.Hostname, o.DeploymentID, o.Lease, jsonStr(o.Tags), string(o.Caps),
 		o.ParentID, o.RootID, o.Depth, o.TTLSeconds, eph, o.Status, o.NodeID, o.StableNodeID, o.MagicDNS,
-		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert, o.KilledAt, o.KilledBy, casc, o.KillRoot, o.ActingFor}
+		o.KeyID, o.KeyExpires, o.KillReason, o.CreatedAt, o.UpdatedAt, o.Cert, o.KilledAt, o.KilledBy, casc, o.KillRoot, o.ActingFor, o.DeviceDeleteAt}
 }
 
 func (s *SQLStore) CreateObject(ctx context.Context, o Object) error {
-	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"), objectArgs(o)...)
+	_, err := s.db.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES ("+objectPlaceholders+")"), objectArgs(o)...)
 	if isUnique(err) {
 		return ErrExists
 	}
 	return err
+}
+
+// CreateChild inserts a spawned object iff its root stays within maxLive
+// live descendants (CreateObjectChecked without a tenant quota).
+func (s *SQLStore) CreateChild(ctx context.Context, o Object, maxLive int) error {
+	return s.CreateObjectChecked(ctx, o, 0, maxLive)
+}
+
+// CreateObjectChecked inserts o in one transaction with its limits, so
+// concurrent creates through different replicas can't overshoot them:
+// maxObjects > 0 locks the tenant row and refuses (ErrQuota) when the tenant
+// already has maxObjects live objects (H16); maxLive > 0 (a spawn) locks the
+// root row and refuses (ErrSpawnBudget) when the root already has maxLive
+// live descendants (H04). Locks are taken tenant first, then root. Postgres
+// uses FOR UPDATE; SQLite's immediate transaction holds the write lock.
+// ErrExists on a duplicate.
+func (s *SQLStore) CreateObjectChecked(ctx context.Context, o Object, maxObjects, maxLive int) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	live := "status NOT IN ('" + StatusKilled + "','" + StatusFailed + "')"
+	lock := func(q string, arg string) error {
+		var x string
+		if err := tx.QueryRowContext(ctx, s.q(q+s.forUpdate()), arg).Scan(&x); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		return nil
+	}
+	if maxObjects > 0 {
+		if err := lock("SELECT id FROM tenants WHERE id=?", o.TenantID); err != nil {
+			return err
+		}
+		var n int64
+		if err := tx.QueryRowContext(ctx, s.q("SELECT COUNT(*) FROM objects WHERE tenant_id=? AND "+live), o.TenantID).Scan(&n); err != nil {
+			return err
+		}
+		if int(n) >= maxObjects {
+			return ErrQuota
+		}
+	}
+	if maxLive > 0 {
+		if err := lock("SELECT id FROM objects WHERE id=?", o.RootID); err != nil {
+			return err
+		}
+		var n int64
+		if err := tx.QueryRowContext(ctx, s.q("SELECT COUNT(*) FROM objects WHERE root_id=? AND id<>? AND "+live), o.RootID, o.RootID).Scan(&n); err != nil {
+			return err
+		}
+		if int(n)+1 > maxLive {
+			return ErrSpawnBudget
+		}
+	}
+	if _, err := tx.ExecContext(ctx, s.q("INSERT INTO objects ("+objectCols+") VALUES ("+objectPlaceholders+")"), objectArgs(o)...); err != nil {
+		if isUnique(err) {
+			return ErrExists
+		}
+		return err
+	}
+	return s.commitWithIntents(ctx, tx)
 }
 
 func (s *SQLStore) GetObject(ctx context.Context, id string) (Object, error) {
@@ -869,7 +1321,7 @@ func (s *SQLStore) checkFence(ctx context.Context, tx *sql.Tx, f *Fence) error {
 	var holder string
 	var epoch int64
 	var expires int64
-	err := tx.QueryRowContext(ctx, s.q("SELECT holder, epoch, expires_at FROM leases WHERE name=?"+s.forUpdate()), f.Lease).Scan(&holder, &epoch, &expires)
+	err := tx.QueryRowContext(ctx, s.q("SELECT holder, epoch, expires_at FROM leases WHERE name=?"+s.forShare()), f.Lease).Scan(&holder, &epoch, &expires)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: no lease %q (caller %q asked for epoch %d)", ErrLeaseLost, f.Lease, f.Holder, f.Epoch)
 	}
@@ -1001,7 +1453,21 @@ func (s *SQLStore) AppendAudit(ctx context.Context, rec AuditRecord) (AuditRecor
 	if rec.Chain == "" {
 		return rec, errors.New("audit chain required")
 	}
-	err := s.tx(ctx, func(tx *sql.Tx) error {
+	var out AuditRecord
+	err := s.tx(withoutIntents(ctx), func(tx *sql.Tx) error {
+		var err error
+		out, err = s.appendAuditTx(ctx, tx, rec)
+		return err
+	})
+	return out, err
+}
+
+// appendAuditTx appends rec to its chain inside tx.
+func (s *SQLStore) appendAuditTx(ctx context.Context, tx *sql.Tx, rec AuditRecord) (AuditRecord, error) {
+	if rec.Chain == "" {
+		return rec, errors.New("audit chain required")
+	}
+	err := func() error {
 		if _, err := tx.ExecContext(ctx, s.q("INSERT INTO audit_heads (chain, seq, hash) VALUES (?, 0, '') ON CONFLICT (chain) DO NOTHING"), rec.Chain); err != nil {
 			return err
 		}
@@ -1029,7 +1495,7 @@ func (s *SQLStore) AppendAudit(ctx context.Context, rec AuditRecord) (AuditRecor
 		}
 		_, err := tx.ExecContext(ctx, s.q("UPDATE audit_heads SET seq=?, hash=? WHERE chain=? AND seq=?"), rec.Seq, rec.Hash, rec.Chain, seq)
 		return err
-	})
+	}()
 	return rec, err
 }
 

@@ -60,6 +60,7 @@ func run() error {
 		runDir     = flag.String("run-dir", "", "sockets and generated configs (short path; default a new /tmp dir)")
 		workerd    = flag.String("workerd", "", "workerd binary (default: $TWD_WORKERD, ~/.twd/bin/workerd, or PATH)")
 		hb         = flag.Duration("heartbeat", 3*time.Second, "heartbeat / assignment poll period")
+		fenceAfter = flag.Duration("fence-after", hostd.DefaultFenceAfter, "stop serving stateful workloads after this long without a successful heartbeat (≤ 40 s, below mgmt's 45 s lease; negative disables)")
 		ephemeral  = flag.Bool("ephemeral", false, "join nodes as ephemeral (dev/test)")
 		prefix     = flag.String("hostname-prefix", "", "prefix for every node hostname")
 		controlURL = flag.String("control-url", "", "override every tenant's control URL (testing)")
@@ -151,7 +152,7 @@ func run() error {
 		cancel()
 	}
 	hcfg := hostd.Config{HostID: *hostID, Mgmt: mc, DataDir: *dataDir, RunDir: *runDir, WorkerdBin: wd,
-		HeartbeatEvery: *hb, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
+		HeartbeatEvery: *hb, FenceAfter: *fenceAfter, Ephemeral: *ephemeral, HostnamePrefix: *prefix, ControlURL: *controlURL,
 		CapacityNodes: *capacity, KillTombstone: *tombstone, Logger: log, TSNetLogs: *tsnetLogs,
 		Sandbox: *sandboxF, SandboxDeny: splitList(*sbDeny), InsecureSharedHost: *insecureSH, AllowSiblingEgress: *siblings,
 		DefaultTier: *tier, NodeBin: *nodeBin, VMVolumeMiB: *vmVolMiB,

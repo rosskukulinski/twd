@@ -200,7 +200,9 @@ const (
 	ErrorCodePolicyUnavailable       ErrorCode = "policy_unavailable"
 	ErrorCodePreconditionFailed      ErrorCode = "precondition_failed"
 	ErrorCodeSpawnBudgetExceeded     ErrorCode = "spawn_budget_exceeded"
+	ErrorCodeStoreUnavailable        ErrorCode = "store_unavailable"
 	ErrorCodeSuperseded              ErrorCode = "superseded"
+	ErrorCodeTakeoverUnconfirmed     ErrorCode = "takeover_unconfirmed"
 	ErrorCodeTenantHasLiveObjects    ErrorCode = "tenant_has_live_objects"
 	ErrorCodeUnknownNamespace        ErrorCode = "unknown_namespace"
 	ErrorCodeUnknownTenant           ErrorCode = "unknown_tenant"
@@ -275,7 +277,11 @@ func (e ErrorCode) Valid() bool {
 		return true
 	case ErrorCodeSpawnBudgetExceeded:
 		return true
+	case ErrorCodeStoreUnavailable:
+		return true
 	case ErrorCodeSuperseded:
+		return true
+	case ErrorCodeTakeoverUnconfirmed:
 		return true
 	case ErrorCodeTenantHasLiveObjects:
 		return true
@@ -423,6 +429,24 @@ func (e ObjectStatus) Valid() bool {
 	}
 }
 
+// Defines values for StatusClockSource.
+const (
+	StatusClockSourceLocal    StatusClockSource = "local"
+	StatusClockSourcePostgres StatusClockSource = "postgres"
+)
+
+// Valid indicates whether the value is a known member of the StatusClockSource enum.
+func (e StatusClockSource) Valid() bool {
+	switch e {
+	case StatusClockSourceLocal:
+		return true
+	case StatusClockSourcePostgres:
+		return true
+	default:
+		return false
+	}
+}
+
 // Defines values for Tier.
 const (
 	Microvm Tier = "microvm"
@@ -539,11 +563,14 @@ func (e PurgeTenantObjectsParamsState) Valid() bool {
 
 // Assignment What a host must run; `bundleURL` is `GET /v1/deployments/{id}/bundle`.
 type Assignment struct {
-	BundleURL    string        `json:"bundleURL"`
-	ControlURL   *string       `json:"controlURL,omitempty"`
-	CreatedAt    int64         `json:"createdAt"`
-	DeploymentID string        `json:"deploymentID"`
-	Epoch        int64         `json:"epoch"`
+	BundleURL    string  `json:"bundleURL"`
+	ControlURL   *string `json:"controlURL,omitempty"`
+	CreatedAt    int64   `json:"createdAt"`
+	DeploymentID string  `json:"deploymentID"`
+	Epoch        int64   `json:"epoch"`
+
+	// Fence Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s): it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true.
+	Fence        *bool         `json:"fence,omitempty"`
 	Lease        string        `json:"lease"`
 	MaxDepth     *int          `json:"maxDepth,omitempty"`
 	MaxLive      *int          `json:"maxLive,omitempty"`
@@ -725,6 +752,9 @@ type DeploymentCreate struct {
 	// Bundle tar (optionally gzipped) of the built worker + `twd.jsonc` + `wrangler.jsonc`.
 	Bundle []byte `json:"bundle"`
 
+	// ForceTakeover Confirm that the workload's current host, which has stopped heartbeating, is gone for good, so a stateful workload may move off it (ADR-028 §3). Without it such a move is refused with `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`).
+	ForceTakeover *bool `json:"forceTakeover,omitempty"`
+
 	// Host Pin a host.
 	Host *string `json:"host,omitempty"`
 
@@ -800,6 +830,8 @@ type Error struct {
 	// | `exists` | 409 | create of an existing ID |
 	// | `lease_lost` | 409 | epoch/holder fence failed |
 	// | `lease_held` | 409 | another host holds the lease |
+	// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
+	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
 	// | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
@@ -853,6 +885,8 @@ type Error struct {
 // | `exists` | 409 | create of an existing ID |
 // | `lease_lost` | 409 | epoch/holder fence failed |
 // | `lease_held` | 409 | another host holds the lease |
+// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
+// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 // | `already_joined` | 409 | credential for an object that has a node |
 // | `identity_conflict` | 409 | object ID collision across identities |
 // | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
@@ -1280,6 +1314,8 @@ type SelfInfo struct {
 
 // Status defines model for Status.
 type Status struct {
+	// Clock The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock. `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+	Clock *StatusClock `json:"clock,omitempty"`
 	Hosts struct {
 		Live  int `json:"live"`
 		Total int `json:"total"`
@@ -1292,11 +1328,43 @@ type Status struct {
 	Objects              map[string]int `json:"objects"`
 	Ok                   bool           `json:"ok"`
 	PendingDeviceDeletes int            `json:"pendingDeviceDeletes"`
-	Tenants              int            `json:"tenants"`
+
+	// Replicas The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it) when this replica conflicts with another live one: file custody shared between replicas, or replicas with different custody. A replica refuses to start in that state; a conflict that appears later (a replica started with an older version, or a registry row edited) is reported here and logged.
+	Replicas *StatusReplicas `json:"replicas,omitempty"`
+	Tenants  int             `json:"tenants"`
 
 	// Transport `tsnet` in normal operation; `local-dev` when the unix socket is serving.
 	Transport Transport `json:"transport"`
 	Version   *string   `json:"version,omitempty"`
+}
+
+// StatusClock The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock. `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+type StatusClock struct {
+	Message *string `json:"message,omitempty"`
+
+	// OffsetMs Store clock minus this replica's wall clock at the last sample.
+	OffsetMs int  `json:"offsetMs"`
+	Ok       bool `json:"ok"`
+
+	// Source `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica.
+	Source StatusClockSource `json:"source"`
+
+	// SyncAgeMs Milliseconds since the last successful sample (0 for `local`).
+	SyncAgeMs int `json:"syncAgeMs"`
+}
+
+// StatusClockSource `postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica.
+type StatusClockSource string
+
+// StatusReplicas The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it) when this replica conflicts with another live one: file custody shared between replicas, or replicas with different custody. A replica refuses to start in that state; a conflict that appears later (a replica started with an older version, or a registry row edited) is reported here and logged.
+type StatusReplicas struct {
+	// ID This replica's stable ID (`<state-dir>/replica.id`).
+	ID string `json:"id"`
+
+	// Live Replicas seen within the last 30 s, this one included.
+	Live    int     `json:"live"`
+	Message *string `json:"message,omitempty"`
+	Ok      bool    `json:"ok"`
 }
 
 // Tenant defines model for Tenant.
@@ -1455,6 +1523,8 @@ type TombstoneError struct {
 	// | `exists` | 409 | create of an existing ID |
 	// | `lease_lost` | 409 | epoch/holder fence failed |
 	// | `lease_held` | 409 | another host holds the lease |
+	// | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
+	// | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
 	// | `already_joined` | 409 | credential for an object that has a node |
 	// | `identity_conflict` | 409 | object ID collision across identities |
 	// | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |

@@ -84,6 +84,15 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if v := os.Getenv("TWD_TEST_WALL_CLOCK_OFFSET"); v != "" {
+		// Test-only (mm-loop S8): simulate a wrong machine clock.
+		d, err := time.ParseDuration(v)
+		if err != nil || !*localDev {
+			return fmt.Errorf("TWD_TEST_WALL_CLOCK_OFFSET is a test hook: it needs -local-dev and a duration (got %q)", v)
+		}
+		mgmt.SetTestWallClockOffset(d)
+		log.Warn("TEST HOOK: wall clock offset", "offset", d)
+	}
 	dsn := *dbDSN
 	if *dbDSNFile != "" {
 		b, err := os.ReadFile(*dbDSNFile)
@@ -115,7 +124,17 @@ func run() error {
 	default:
 		return fmt.Errorf("unknown -custody %q", *custodyKind)
 	}
-	secret, err := mgmt.LoadOrCreateSecret(filepath.Join(*stateDir, "id.secret"))
+	replicaID, err := mgmt.LoadOrCreateReplicaID(filepath.Join(*stateDir, "replica.id"))
+	if err != nil {
+		return err
+	}
+	// Refuse a custody mismatch with other replicas before touching any
+	// shared secret (F6 check, run early: F12).
+	if err := mgmt.PreflightReplica(ctx, store, custody, replicaID); err != nil {
+		return err
+	}
+	// Shared by every replica via the store and custody (mm-loop F12).
+	secret, err := mgmt.LoadSharedIDSecret(ctx, filepath.Join(*stateDir, "id.secret"), store, custody)
 	if err != nil {
 		return err
 	}
@@ -169,14 +188,15 @@ func run() error {
 
 	var issuer *mgmt.Issuer
 	if *issuerURL != "" {
-		if issuer, err = mgmt.LoadOrCreateIssuer(*issuerURL, filepath.Join(*stateDir, "issuer.key")); err != nil {
+		// Shared by every replica through the store and custody (mm-loop F11b).
+		if issuer, err = mgmt.LoadSharedIssuer(ctx, *issuerURL, filepath.Join(*stateDir, "issuer.key"), store, custody); err != nil {
 			return err
 		}
 		log.Info("OIDC issuer", "base", issuer.BaseURL)
 	}
 
 	mcfg := mgmt.Config{Store: store, Custody: custody, Broker: &mgmt.Broker{BaseURL: *tsapiURL, Issuer: issuer},
-		IDSecret: secret, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log,
+		IDSecret: secret, ReplicaID: replicaID, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log,
 		OperatorTailnet: self.Tailnet, OperatorControlURL: *tsControl}
 	if ts != nil {
 		mcfg.TailnetDial = ts.Dial // kill/assignment pushes to hosts' own nodes

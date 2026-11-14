@@ -46,12 +46,49 @@ type Store interface {
 
 	// Object identity is (tenant, workload, namespace = class, name).
 	CreateObject(ctx context.Context, o Object) error // ErrExists on (tenant, workload, namespace, name)
+	// CreateChild inserts a spawned object only if its root stays within
+	// maxLive live descendants (atomic across replicas: F14, H04).
+	CreateChild(ctx context.Context, o Object, maxLive int) error
+	// CreateObjectChecked inserts o only within the tenant quota (maxObjects
+	// > 0) and, for a spawn, the root's budget (maxLive > 0), atomically
+	// across replicas (F14 H04, F17 H16).
+	CreateObjectChecked(ctx context.Context, o Object, maxObjects, maxLive int) error
 	GetObject(ctx context.Context, id string) (Object, error)
 	GetObjectByName(ctx context.Context, tenantID, workload, namespace, name string) (Object, error)
 	ListObjects(ctx context.Context, f ObjectFilter) ([]Object, error)
 	// UpdateObject is a read-modify-write in one transaction. With a non-nil
 	// fence, the lease must still be held at fence.Epoch (else ErrLeaseLost).
 	UpdateObject(ctx context.Context, id string, fence *Fence, fn func(*Object) error) (Object, error)
+	// ClaimMint takes (or refreshes) claimer's claim on minting a pending
+	// object. It succeeds iff the object is pending without a key and is
+	// unclaimed, claimed by claimer, or claimed before staleBefore (H02).
+	ClaimMint(ctx context.Context, id, claimer string, now, staleBefore time.Time) (bool, error)
+	// SetDeploymentStatus records the host-reported status of a deployment
+	// so every replica reports it (F13, H08).
+	SetDeploymentStatus(ctx context.Context, id, status, errText string) error
+	// Durable device deletes (F10, H07): SetDeviceDelete records when a
+	// killed object's device is due for deletion (unix ms); ClaimDeviceDelete
+	// takes a due one (at most one replica wins); DueDeviceDeletes lists them.
+	SetDeviceDelete(ctx context.Context, id string, due int64) error
+	ClaimDeviceDelete(ctx context.Context, id string, now int64) (bool, error)
+	DueDeviceDeletes(ctx context.Context, now int64) ([]string, error)
+	// Durable audit outbox (H22): intents carried in ctx are written by the
+	// store's transactions; these move them onto the chain.
+	PutAuditIntent(ctx context.Context, id string, rec AuditRecord) error
+	AmendAuditIntent(ctx context.Context, id string, rec AuditRecord) error
+	DrainAuditIntent(ctx context.Context, id string) (bool, error)
+	ListAuditIntents(ctx context.Context, olderThan int64, limit int) ([]string, error)
+	// Shared-secret arbitration (F11, H13): ChooseSecret records the first
+	// key ID offered for name and returns the chosen one.
+	ChooseSecret(ctx context.Context, name, keyID string, now int64) (string, error)
+	SecretChoice(ctx context.Context, name string) (string, error)
+	DeleteSecretChoice(ctx context.Context, name string) error
+	// UpsertReplica records a mgmt replica (registry: F6/H11); ListReplicas
+	// returns every recorded replica, live or not.
+	UpsertReplica(ctx context.Context, r Replica) error
+	ListReplicas(ctx context.Context) ([]Replica, error)
+	// ReleaseMint drops claimer's claim (no-op if someone else holds it).
+	ReleaseMint(ctx context.Context, id, claimer string) error
 	// CountLive counts live objects of a tenant, or (rootID != "") the live
 	// descendants of rootID.
 	CountLive(ctx context.Context, tenantID, rootID string) (int, error)

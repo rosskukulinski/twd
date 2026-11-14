@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -36,6 +37,9 @@ type Config struct {
 	PolicyMaxAge time.Duration
 	Clock        Clock
 	Log          *slog.Logger
+	// ReplicaID is this replica's stable identity (twd-mgmt keeps it in
+	// <state-dir>/replica.id). Empty: a fresh per-process ID (tests).
+	ReplicaID string
 	// IDSecret keys the object-name HMAC (RFC §4.3). Required.
 	IDSecret []byte
 	// ReapInterval (default 10s); RevocationWindow is how long a kill is
@@ -73,19 +77,24 @@ type Mgmt struct {
 	clock    Clock
 	log      *slog.Logger
 
-	mu        sync.Mutex
-	throttles map[string]*Throttle
-	queues    map[string]chan string
-	waiters   map[string]chan struct{}
-	spawnMu   map[string]*sync.Mutex // per tenant: serialises budget checks
-	depStatus map[string]DeploymentStatus
-	pushURLs  map[string]string // hostID → unix:// push socket (in memory; hosts re-register)
-	pending   map[string]*pendingDelete
+	mu           sync.Mutex
+	throttles    map[string]*Throttle
+	queues       map[string]chan string
+	queued       map[string]bool // object IDs in this replica's mint queues (dedupe for the pending sweep)
+	replicaID    string          // stable replica ID (Config.ReplicaID): mint claims, the replica registry
+	startedAt    int64
+	replicaMsg   string // replica-registry conflict ("" = ok)
+	liveReplicas int
+	waiters      map[string]chan struct{}
+	spawnMu      map[string]*sync.Mutex // per tenant: serialises budget checks
+	pushURLs     map[string]string      // hostID → unix:// push socket (in memory; hosts re-register)
+	pending      map[string]*pendingDelete
 	// noDeviceScope: tenants whose credential got a 403 on a device delete
 	// (an OAuth client without devices:core); kills then warn up front.
 	noDeviceScope map[string]bool
 	deviceKept    map[string]bool               // killed objects whose device delete was refused (403)
 	oboKeys       map[string]ed25519.PrivateKey // tenant → OBO root key (loaded from custody)
+	clockOK       bool                          // last checkClock result (logs on change)
 	volMu         sync.Mutex                    // VolumeKey create-if-absent
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -116,8 +125,8 @@ func New(cfg Config) (*Mgmt, error) {
 		cfg.MintRetries = 5
 	}
 	m := &Mgmt{cfg: cfg, store: cfg.Store, custody: cfg.Custody, broker: cfg.Broker, clock: cfg.Clock, log: cfg.Log,
-		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, waiters: map[string]chan struct{}{},
-		spawnMu: map[string]*sync.Mutex{}, depStatus: map[string]DeploymentStatus{}, pushURLs: map[string]string{},
+		throttles: map[string]*Throttle{}, queues: map[string]chan string{}, queued: map[string]bool{}, replicaID: cfg.ReplicaID, waiters: map[string]chan struct{}{},
+		spawnMu: map[string]*sync.Mutex{}, pushURLs: map[string]string{},
 		pending: map[string]*pendingDelete{}, noDeviceScope: map[string]bool{}, deviceKept: map[string]bool{}}
 	if cfg.PushTimeout == 0 {
 		m.cfg.PushTimeout = 2 * time.Second
@@ -153,13 +162,20 @@ func LoadOrCreateSecret(path string) ([]byte, error) {
 
 // Start re-queues pending objects and runs the reaper until Close.
 func (m *Mgmt) Start() error {
-	pending, err := m.store.ListObjects(m.ctx, ObjectFilter{Status: []string{StatusPending}})
-	if err != nil {
+	if err := m.sweepPending(m.ctx); err != nil {
 		return err
 	}
-	for _, o := range pending {
-		m.enqueue(o.TenantID, o.ID)
+	if m.replicaID == "" {
+		m.replicaID = newID("rp_")
 	}
+	if msg, err := m.registerReplica(m.ctx); err != nil {
+		return fmt.Errorf("replica registry: %w", err)
+	} else if msg != "" {
+		m.unregisterReplica(m.ctx)
+		return fmt.Errorf("refusing to start: %s", msg)
+	}
+	m.clockOK = true
+	m.checkClock()
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
@@ -168,6 +184,15 @@ func (m *Mgmt) Start() error {
 			case <-m.ctx.Done():
 				return
 			case <-m.clock.After(m.cfg.ReapInterval):
+				m.checkClock()
+				if _, err := m.registerReplica(m.ctx); err != nil {
+					m.log.Warn("replica registry", "err", err)
+				}
+				m.sweepDeviceDeletes(m.ctx)
+				m.drainAuditOutbox(m.ctx)
+				if err := m.sweepPending(m.ctx); err != nil {
+					m.log.Warn("pending sweep", "err", err)
+				}
 				if n, err := m.Reap(m.ctx); err != nil {
 					m.log.Warn("reaper", "err", err)
 				} else if n > 0 {
@@ -182,11 +207,25 @@ func (m *Mgmt) Start() error {
 // Close stops the workers.
 func (m *Mgmt) Close() {
 	m.FlushDeletes() // never leave a killed object's device behind
+	if m.startedAt != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		m.unregisterReplica(ctx)
+		cancel()
+	}
 	m.cancel()
 	m.wg.Wait()
 }
 
-func (m *Mgmt) now() time.Time { return m.clock.Now() }
+// now is the shared time source: the store's clock when the store provides
+// one (Postgres server time; ADR-028 §1), else the configured clock. Every
+// lease, liveness and expiry decision goes through it, so replicas whose
+// wall clocks disagree still agree on who holds what.
+func (m *Mgmt) now() time.Time {
+	if sc, ok := m.store.(StoreClock); ok {
+		return sc.Now()
+	}
+	return m.clock.Now()
+}
 
 func newID(prefix string) string {
 	b := make([]byte, 8)
@@ -202,16 +241,6 @@ func traceID() string {
 
 // audit appends to the mgmt chain; failures are logged (and surfaced by
 // verify), never swallowed silently.
-func (m *Mgmt) audit(ctx context.Context, r AuditRecord, detail map[string]any) {
-	r.Chain = "mgmt"
-	r.TS = m.now().UTC().Format(time.RFC3339Nano)
-	if detail != nil {
-		r.Detail, _ = json.Marshal(detail)
-	}
-	if _, err := m.store.AppendAudit(ctx, r); err != nil {
-		m.log.Error("audit append failed", "kind", r.Kind, "object", r.ObjectID, "err", err)
-	}
-}
 
 // ---- tenants ----
 
@@ -401,19 +430,23 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, node
 	if err == nil && old.NodeID != "" && nodeID != "" && old.NodeID != nodeID {
 		return Host{}, false, errf(403, "host_identity_mismatch", "host %s is registered to another node", r.HostID)
 	}
-	m.mu.Lock()
+	target := ""
 	switch {
 	case strings.HasPrefix(r.PushURL, "unix:///") && nodeID == "":
-		m.pushURLs[r.HostID] = r.PushURL
+		target = r.PushURL
 	case r.PushPort > 0 && nodeAddr != "":
-		m.pushURLs[r.HostID] = "http://" + net.JoinHostPort(nodeAddr, strconv.Itoa(r.PushPort))
-	default:
+		target = "http://" + net.JoinHostPort(nodeAddr, strconv.Itoa(r.PushPort))
+	}
+	m.mu.Lock()
+	if target != "" {
+		m.pushURLs[r.HostID] = target
+	} else {
 		delete(m.pushURLs, r.HostID)
 	}
 	m.mu.Unlock()
 	now := m.now().UnixMilli()
 	h := Host{ID: r.HostID, CapacityNodes: r.CapacityNodes, Tiers: r.Tiers, NodeID: nodeID, AuditPubKey: r.AuditPubKey,
-		Pool: r.Pool, PushPort: r.PushPort, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt}
+		Pool: r.Pool, PushPort: r.PushPort, PushTarget: target, LastSeen: now, UpdatedAt: now, CreatedAt: old.CreatedAt}
 	if h.CreatedAt == 0 {
 		h.CreatedAt = now
 	}
@@ -429,10 +462,25 @@ func (m *Mgmt) RegisterHost(ctx context.Context, r RegisterRequest, nodeID, node
 }
 
 // pushTarget returns the host's push URL ("" if none).
+// pushTarget is where to push to hostID: this replica's cache, else the
+// hosts row (written by whichever replica served the registration: H06).
 func (m *Mgmt) pushTarget(hostID string) string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.pushURLs[hostID]
+	u, ok := m.pushURLs[hostID]
+	m.mu.Unlock()
+	if ok {
+		return u
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h, err := m.store.GetHost(ctx, hostID)
+	if err != nil || h.PushTarget == "" {
+		return ""
+	}
+	m.mu.Lock()
+	m.pushURLs[hostID] = h.PushTarget
+	m.mu.Unlock()
+	return h.PushTarget
 }
 
 // HeartbeatLease is one lease a host believes it holds.
@@ -510,6 +558,10 @@ type DeployRequest struct {
 	Bundle     []byte        `json:"bundle"` // base64 in JSON
 	Namespaces []ClassConfig `json:"namespaces,omitempty"`
 	Host       string        `json:"host,omitempty"`
+	// ForceTakeover confirms that the workload's current host, which has
+	// stopped heartbeating, is really gone, so a stateful workload may move
+	// off it (ADR-028 §3). Audited.
+	ForceTakeover bool `json:"forceTakeover,omitempty"`
 	// By is the deployer (set by the API layer from the principal, never
 	// from the request body): a WhoIs login over the tailnet, the local
 	// actor on the unix socket.
@@ -543,7 +595,7 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	var resp DeployResponse
 	t, err := m.store.GetTenant(ctx, r.TenantID)
 	if err != nil {
-		return resp, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID)
+		return resp, lookupErr(err, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID))
 	}
 	if !validName(r.Workload) {
 		return resp, errf(400, "bad_request", "workload must be a DNS label ([a-z0-9-], ≤63)")
@@ -586,17 +638,32 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	if err != nil {
 		return resp, err
 	}
+	takeoverFrom, err := m.guardTakeover(ctx, t, r, host)
+	if err != nil {
+		return resp, err
+	}
+	fence := true // no bundle (namespaces given directly): assume stateful
+	if len(r.Bundle) > 0 {
+		fence, _ = BundleStateful(r.Bundle)
+	}
 	lease, err := m.store.AcquireLease(ctx, LeaseName(t.ID, r.Workload), host, NamespaceLeaseTTL, m.now())
+	if errors.Is(err, ErrLeaseHeld) {
+		return resp, m.leaseHeldError(ctx, LeaseName(t.ID, r.Workload), r.Workload)
+	}
 	if err != nil {
 		return resp, err
 	}
 	d := Deployment{ID: newID("dp_"), TenantID: t.ID, Workload: r.Workload, HostID: host, Namespaces: classes,
-		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli()}
-	if err := m.store.CreateDeployment(ctx, d); err != nil {
+		MaxLive: maxLive, MaxDepth: maxDepth, Epoch: lease.Epoch, Bundle: r.Bundle, DeployedBy: r.By, CreatedAt: m.now().UnixMilli(), Fence: fence}
+	detail := map[string]any{"deploymentID": d.ID, "workload": d.Workload, "host": host, "epoch": lease.Epoch, "by": r.By}
+	if takeoverFrom != "" {
+		detail["takeoverFrom"], detail["forced"] = takeoverFrom, true
+	}
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, detail)
+	if err := m.store.CreateDeployment(actx, d); err != nil { // the deploy record commits with it (H22)
 		return resp, err
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, Kind: "deploy", ActingFor: r.By}, map[string]any{"deploymentID": d.ID, "workload": d.Workload,
-		"host": host, "epoch": lease.Epoch, "by": r.By})
+	m.recordIntent(ctx, ai, nil)
 	resp.DeploymentID, resp.Host, resp.Epoch = d.ID, host, lease.Epoch
 	resp.Endpoint.Node = r.Workload + "-" + host
 	resp.Endpoint.MagicDNS = resp.Endpoint.Node + "." + t.Tailnet
@@ -614,11 +681,17 @@ type DeploymentStatus struct {
 	Error        string `json:"error,omitempty"`
 }
 
+// setDepStatus records a deployment's status in the store, shared by every
+// replica (H08). The UPDATE only writes when the stored value differs, so the
+// heartbeats that repeat it every few seconds cost a lookup, not a write. A
+// per-replica cache can't decide that: another replica may have written a
+// different status since.
 func (m *Mgmt) setDepStatus(id string, st DeploymentStatus) {
-	st.DeploymentID = id
-	m.mu.Lock()
-	m.depStatus[id] = st
-	m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := m.store.SetDeploymentStatus(ctx, id, st.Status, st.Error); err != nil {
+		m.log.Warn("deployment status", "deployment", id, "err", err)
+	}
 }
 
 // DeploymentView is GET /v0/deployments/{id}.
@@ -658,6 +731,73 @@ func (m *Mgmt) GetDeployment(ctx context.Context, id string) (DeploymentView, er
 		v.Endpoint.Node, _, _ = strings.Cut(o.MagicDNS, ".")
 	}
 	return v, nil
+}
+
+// guardTakeover refuses to move a stateful workload off a host that has
+// stopped heartbeating but is still registered (ADR-028 §3): that host may
+// still be serving the workload's Durable Objects from its own disk, and it
+// can't be told to stop. Allowed when the old host is live (it is revoked at
+// its next heartbeat), was removed (twd host rm), the workload is stateless
+// or every DO class is "fence": "never", or the deploy sets ForceTakeover.
+// It returns the old host when a forced takeover happens (for the audit).
+func (m *Mgmt) guardTakeover(ctx context.Context, t Tenant, r DeployRequest, host string) (string, error) {
+	l, err := m.store.GetLease(ctx, LeaseName(t.ID, r.Workload))
+	if err != nil || l.Holder == "" || l.Holder == host {
+		return "", nil
+	}
+	old, err := m.store.GetHost(ctx, l.Holder)
+	if err != nil {
+		return "", nil // removed: nothing left to split with
+	}
+	now := m.now()
+	if old.Live(now) {
+		return "", nil
+	}
+	stateful, why := true, "no bundle to inspect"
+	if len(r.Bundle) > 0 {
+		stateful, why = BundleStateful(r.Bundle)
+	}
+	if !stateful {
+		return "", nil
+	}
+	if r.ForceTakeover {
+		return old.ID, nil
+	}
+	seen := "never"
+	if old.LastSeen > 0 {
+		seen = now.Sub(time.UnixMilli(old.LastSeen)).Round(time.Second).String() + " ago"
+	}
+	return "", errf(409, "takeover_unconfirmed", "workload %q runs on host %s, which mgmt last heard from %s; it may still be serving the workload's %s from its own disk, so moving it to %s could run two copies. If %s is gone for good: `twd host rm %s --drain`, or redeploy with --force-takeover. If it is coming back, wait for it. Classes that tolerate two instances can set \"fence\": \"never\" in twd.jsonc",
+		r.Workload, old.ID, seen, why, host, old.ID, old.ID)
+}
+
+// leaseHeldError explains a deploy that placement sent to a new host while
+// the workload's lease is still held: the holder has stopped heartbeating
+// (dead to placement after HostLeaseTTL) but its lease (NamespaceLeaseTTL)
+// has not expired. Retry-After is the time left on the lease.
+func (m *Mgmt) leaseHeldError(ctx context.Context, name, workload string) *Error {
+	now := m.now()
+	l, err := m.store.GetLease(ctx, name)
+	if err != nil {
+		return errf(409, "lease_held", "workload %q: its lease is held by another host", workload)
+	}
+	seen := "never"
+	h, herr := m.store.GetHost(ctx, l.Holder)
+	if herr == nil && h.LastSeen > 0 {
+		seen = now.Sub(time.UnixMilli(h.LastSeen)).Round(time.Second).String() + " ago"
+	}
+	if herr == nil && h.Live(now) {
+		// A live holder keeps renewing: its lease won't run out.
+		return errf(409, "lease_held", "workload %q runs on host %s (live, epoch %d, last seen %s); it can't be placed elsewhere while %s holds it. To move it, drain that host first (`twd host rm %s --drain`)",
+			workload, l.Holder, l.Epoch, seen, l.Holder, l.Holder)
+	}
+	left := time.UnixMilli(l.ExpiresAt).Sub(now)
+	if left < 0 {
+		left = 0
+	}
+	e := errf(409, "lease_held", "workload %q is still leased to host %s (epoch %d); this mgmt last saw it %s (a host is dead to placement after %v), and the lease expires in %v. Redeploy after that, or pin a live host (the deploy request's \"host\" field)", workload, l.Holder, l.Epoch, seen, HostLeaseTTL, left.Round(time.Second))
+	e.RetryAfter = max(1, int((left+time.Second-1)/time.Second))
+	return e
 }
 
 // pickHost: MVP is a single host per tenant namespace. Keep the current
@@ -713,6 +853,9 @@ type Assignment struct {
 	Tailnet      string        `json:"tailnet"`
 	ControlURL   string        `json:"controlURL,omitempty"`
 	WorkloadTags []string      `json:"workloadTags,omitempty"`
+	// Fence: stop serving this workload when mgmt is unreachable for
+	// FenceAfter (stateful). Hosts treat a missing field as true.
+	Fence bool `json:"fence"`
 }
 
 func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, error) {
@@ -725,7 +868,7 @@ func (m *Mgmt) Assignments(ctx context.Context, hostID string) ([]Assignment, er
 		t, _ := m.store.GetTenant(ctx, d.TenantID)
 		a := Assignment{DeploymentID: d.ID, TenantID: d.TenantID, Workload: d.Workload,
 			BundleURL: "/v1/deployments/" + d.ID + "/bundle", Epoch: d.Epoch,
-			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}}
+			Lease: LeaseName(d.TenantID, d.Workload), Tailnet: t.Tailnet, ControlURL: t.ControlURL, Namespaces: []ClassConfig{}, Fence: d.Fence}
 		for _, c := range d.Namespaces {
 			if c.Class == WorkloadNamespace {
 				a.WorkloadTags = c.Tags
@@ -818,7 +961,7 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	var resp CreateObjectResponse
 	t, err := m.store.GetTenant(ctx, r.TenantID)
 	if err != nil {
-		return resp, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID)
+		return resp, lookupErr(err, errf(404, "unknown_tenant", "tenant %q not found", r.TenantID))
 	}
 	if r.ObjectName == "" || len(r.ObjectName) > 256 {
 		return resp, errf(400, "bad_request", "objectName required (≤256 bytes)")
@@ -826,6 +969,9 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	var parent *Object
 	if r.Parent != nil && r.Parent.ID != "" {
 		p, err := m.store.GetObject(ctx, r.Parent.ID)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return resp, asAPIError(err)
+		}
 		if err != nil || p.TenantID != t.ID {
 			return resp, errf(404, "delegation_invalid", "parent %q not found in tenant %s", r.Parent.ID, t.ID)
 		}
@@ -850,6 +996,9 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	}
 	if errors.Is(err, ErrAmbiguous) {
 		return resp, errf(409, "namespace_ambiguous", "%v", err)
+	}
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return resp, asAPIError(err)
 	}
 	if err != nil {
 		in := ""
@@ -882,7 +1031,15 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 		return resp, errf(429, "object_quota_exceeded", "tenant %s has %d live objects (maxObjects %d)", t.ID, n, t.MaxObjects)
 	}
 	id := m.objectID(t.ID, workload, r.Namespace, r.ObjectName)
-	if _, err := m.store.GetObject(ctx, id); err == nil {
+	if ex, err := m.store.GetObject(ctx, id); err == nil {
+		if ex.TenantID == t.ID && ex.Workload == workload && ex.Namespace == r.Namespace && ex.Name == r.ObjectName {
+			// The same identity, created by another replica since our by-name
+			// lookup (replicas share the ID secret: F12). Idempotent answer.
+			if !ex.Live() {
+				return resp, errf(410, "killed", "object %s (%s %s/%s) was %s", ex.ID, workload, r.Namespace, r.ObjectName, ex.Status)
+			}
+			return CreateObjectResponse{ObjectID: ex.ID, Status: ex.Status, Tags: ex.Tags, Hostname: ex.Hostname}, nil
+		}
 		// An ID collision with another identity (a 50-bit MAC prefix): never
 		// hand out an existing object's node.
 		return resp, errf(409, "identity_conflict", "object ID %s is already taken by another identity", id)
@@ -905,8 +1062,13 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 		o.ParentID, o.RootID, o.Depth = p.ID, p.RootID, p.Depth+1
 		o.Ephemeral = ttl > 0
 	}
-	if err := m.store.CreateObject(ctx, o); err != nil {
-		return resp, err
+	maxLive := dep.MaxLive
+	if maxLive <= 0 {
+		maxLive = DefaultMaxLive
+	}
+	spawnLimit := 0
+	if parent != nil {
+		spawnLimit = maxLive
 	}
 	detail := map[string]any{"workload": o.Workload, "namespace": o.Namespace, "name": o.Name, "tags": o.Tags, "root": o.RootID}
 	if o.ParentID != "" {
@@ -918,7 +1080,37 @@ func (m *Mgmt) CreateObject(ctx context.Context, r CreateObjectRequest) (CreateO
 	if ttl > 0 {
 		detail["ttl"] = ttl.String()
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ID, Kind: kind, TraceID: r.TraceID, ActingFor: r.ActingFor}, detail)
+	// The create/spawn record commits in the same transaction as the insert (H22).
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ID, Kind: kind, TraceID: r.TraceID, ActingFor: r.ActingFor}, detail)
+	if err := m.store.CreateObjectChecked(actx, o, t.MaxObjects, spawnLimit); errors.Is(err, ErrQuota) {
+		// The fast-path CountLive saw room, but concurrent creates (possibly
+		// through other replicas) filled the quota first (H16).
+		return resp, errf(429, "object_quota_exceeded", "tenant %s has reached its maxObjects (%d)", t.ID, t.MaxObjects)
+	} else if errors.Is(err, ErrSpawnBudget) {
+		// checkSpawn saw room, but a concurrent spawn (possibly through
+		// another replica) took the last slot (H04).
+		e := errf(429, "spawn_budget_exceeded", "root %s already has its maximum of live descendants (maxLive %d)", o.RootID, maxLive)
+		m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: o.ParentID, Kind: "deny", Code: e.Code, TraceID: r.TraceID,
+			ActingFor: r.ActingFor}, map[string]any{"spawn": r.Namespace + "/" + r.ObjectName, "message": e.Message})
+		return resp, e
+	} else if errors.Is(err, ErrExists) {
+		// Another replica created this name between our lookup and insert
+		// (tenantLock is per replica: H14). Answer as the idempotent path.
+		ex, gerr := m.store.GetObjectByName(ctx, t.ID, workload, r.Namespace, r.ObjectName)
+		switch {
+		case gerr == nil && !ex.Live():
+			return resp, errf(410, "killed", "object %s (%s %s/%s) was %s", ex.ID, workload, r.Namespace, r.ObjectName, ex.Status)
+		case gerr == nil:
+			return CreateObjectResponse{ObjectID: ex.ID, Status: ex.Status, Tags: ex.Tags, Hostname: ex.Hostname}, nil
+		case errors.Is(gerr, ErrNotFound):
+			return resp, errf(409, "identity_conflict", "object ID %s is already taken by another identity", o.ID)
+		default:
+			return resp, fmt.Errorf("create %s: lookup after a concurrent insert: %w", o.ID, gerr)
+		}
+	} else if err != nil {
+		return resp, err
+	}
+	m.recordIntent(ctx, ai, nil)
 	m.enqueue(t.ID, o.ID)
 	return CreateObjectResponse{ObjectID: o.ID, Status: StatusPending, Tags: o.Tags, Hostname: o.Hostname, Created: true}, nil
 }
@@ -1019,15 +1211,66 @@ func (m *Mgmt) throttle(t Tenant) *Throttle {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	th := m.throttles[t.ID]
+	if th != nil {
+		// The tenant's limit may have changed (PATCH; any replica): the mint
+		// worker re-reads the tenant on every attempt (H15).
+		want := t.RegistrationsPerMinute
+		if want <= 0 {
+			want = DefaultRegistrationsPerMinute
+		}
+		if l, _ := th.cfg(); l != float64(want) {
+			th.SetLimit(want)
+		}
+	}
 	if th == nil {
-		th = NewThrottle(t.RegistrationsPerMinute, m.clock)
+		if ts, ok := m.store.(throttleStore); ok {
+			// Shared across replicas, timed by the store clock (F7, H03).
+			id := t.ID
+			th = NewSharedThrottle(t.RegistrationsPerMinute, storeTimedClock{m}, func(ctx context.Context, fn func(*ThrottleState)) error {
+				return ts.UpdateThrottle(ctx, id, fn)
+			})
+		} else {
+			th = NewThrottle(t.RegistrationsPerMinute, m.clock)
+		}
 		m.throttles[t.ID] = th
 	}
 	return th
 }
 
+// throttleStore is implemented by stores that can hold shared throttle state.
+type throttleStore interface {
+	UpdateThrottle(ctx context.Context, tenantID string, fn func(*ThrottleState)) error
+}
+
+// storeTimedClock reads time from the shared store clock (m.now) and waits
+// with the replica's timers.
+type storeTimedClock struct{ m *Mgmt }
+
+func (c storeTimedClock) Now() time.Time                         { return c.m.now() }
+func (c storeTimedClock) After(d time.Duration) <-chan time.Time { return c.m.clock.After(d) }
+
+// sweepPending enqueues every pending object this replica isn't already
+// holding in a queue. It runs at Start and every reaper tick, so an object
+// whose mint claim was held by a replica that died is picked up again once
+// the claim goes stale (mint claims make concurrent sweeps safe: H02).
+func (m *Mgmt) sweepPending(ctx context.Context) error {
+	pending, err := m.store.ListObjects(ctx, ObjectFilter{Status: []string{StatusPending}})
+	if err != nil {
+		return err
+	}
+	for _, o := range pending {
+		m.enqueue(o.TenantID, o.ID)
+	}
+	return nil
+}
+
 func (m *Mgmt) enqueue(tenantID, objectID string) {
 	m.mu.Lock()
+	if m.queued[objectID] {
+		m.mu.Unlock()
+		return
+	}
+	m.queued[objectID] = true
 	q := m.queues[tenantID]
 	if q == nil {
 		q = make(chan string, 100_000)
@@ -1039,6 +1282,9 @@ func (m *Mgmt) enqueue(tenantID, objectID string) {
 	select {
 	case q <- objectID:
 	default:
+		m.mu.Lock()
+		delete(m.queued, objectID)
+		m.mu.Unlock()
 		m.log.Error("mint queue full", "tenant", tenantID)
 	}
 }
@@ -1059,18 +1305,27 @@ func (m *Mgmt) mintWorker(tenantID string, q chan string) {
 			return
 		case id = <-q:
 		}
+		m.mu.Lock()
+		delete(m.queued, id)
+		m.mu.Unlock()
 		for attempt := 1; ; attempt++ {
 			t, err := m.store.GetTenant(m.ctx, tenantID)
 			if err != nil {
 				break
 			}
 			th := m.throttle(t)
-			if err := th.Wait(m.ctx); err != nil {
+			// The throttle token is taken inside mintOne, after the claim, so
+			// replicas don't spend the shared budget on objects another
+			// replica is minting or has minted (S2: up to 2/3 of tokens were
+			// wasted with 3 replicas).
+			created, err := m.mintOne(m.ctx, t, id, th)
+			if m.ctx.Err() != nil {
 				return
 			}
-			err = m.mintOne(m.ctx, t, id)
 			if err == nil {
-				th.Success()
+				if created {
+					th.Success()
+				}
 				break
 			}
 			var ae *tsapi.APIError
@@ -1103,47 +1358,101 @@ func (m *Mgmt) mintWorker(tenantID string, q chan string) {
 	}
 }
 
-func custodyName(o Object) string { return "twd/" + o.TenantID + "/" + o.ID + "/authkey" }
+// custodyName is where an object's auth key lives: one entry per minted key
+// (…/authkey/<keyID>), so two replicas minting the same object can never
+// overwrite or delete each other's entry (H02). Objects minted before keyed
+// names keep the legacy name (…/authkey) until they join or are killed.
+func custodyName(o Object) string { return custodyKeyName(o, o.KeyID) }
+
+func custodyKeyName(o Object, keyID string) string {
+	if keyID == "" {
+		return legacyCustodyName(o)
+	}
+	return legacyCustodyName(o) + "/" + keyID
+}
+
+func legacyCustodyName(o Object) string { return "twd/" + o.TenantID + "/" + o.ID + "/authkey" }
+
+// deleteCustody removes the object's current key entry and any legacy one.
+func (m *Mgmt) deleteCustody(ctx context.Context, o Object) {
+	if o.KeyID != "" {
+		m.custody.Delete(ctx, custodyName(o))
+	}
+	m.custody.Delete(ctx, legacyCustodyName(o))
+}
+
+// MintClaimTTL is how long a replica's claim on minting an object stays
+// valid without being refreshed (each attempt refreshes it). It must exceed
+// one CreateKey + custody Put; after it, another replica may take over.
+const MintClaimTTL = 60 * time.Second
 
 // mintOne mints one single-use, preauthorized, ≤5-min key tagged with the
 // object's tags, and puts it in custody. The key is never logged.
-func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string) error {
+func (m *Mgmt) mintOne(ctx context.Context, t Tenant, id string, th *Throttle) (created bool, err error) {
 	o, err := m.store.GetObject(ctx, id)
 	if err != nil || o.Status != StatusPending {
-		return nil // gone, killed or already minted
+		return false, nil // gone, killed or already minted
+	}
+	// Claim the mint (H02): only one replica calls CreateKey for an object.
+	now := m.now()
+	if ok, err := m.store.ClaimMint(ctx, id, m.replicaID, now, now.Add(-MintClaimTTL)); err != nil {
+		return false, err
+	} else if !ok {
+		return false, nil // another replica holds a fresh claim (or it is no longer pending)
+	}
+	// The claim covers this attempt only: released on every exit, so a
+	// replica backing off (429/5xx) or dying between attempts never blocks
+	// the others. Correctness does not rest on the TTL: keyed custody and
+	// the KeyID check below make a late duplicate undo only its own key.
+	defer m.store.ReleaseMint(context.WithoutCancel(ctx), id, m.replicaID)
+	// Only now take a registration token (the claim says this replica will
+	// mint), then refresh the claim: the wait may have been long.
+	if th != nil {
+		if err := th.Wait(ctx); err != nil {
+			return false, err
+		}
+		now := m.now()
+		if ok, err := m.store.ClaimMint(ctx, id, m.replicaID, now, now.Add(-MintClaimTTL)); err != nil || !ok {
+			return false, err // lost it meanwhile (killed, minted, or the claim went stale)
+		}
 	}
 	api, err := m.broker.API(ctx, t, purposeMint)
 	if err != nil {
-		return err
+		return false, err
 	}
 	k, err := api.CreateKey(ctx, tsapi.KeyOptions{Tags: o.Tags, Ephemeral: o.Ephemeral, Preauthorized: true,
 		ExpirySeconds: int(KeyExpiry / time.Second), Description: "twd " + o.ID})
 	if err != nil {
-		return err
+		return false, err
 	}
-	if err := m.custody.Put(ctx, custodyName(o), []byte(k.Secret)); err != nil {
+	own := custodyKeyName(o, k.ID)
+	if err := m.custody.Put(ctx, own, []byte(k.Secret)); err != nil {
 		api.DeleteKey(ctx, k.ID)
-		return err
+		return true, err
 	}
 	exp := m.now().Add(KeyExpiry - 15*time.Second).UnixMilli() // released only with ≥15 s of life left
 	killed := false
-	_, err = m.store.UpdateObject(ctx, id, nil, func(o *Object) error {
-		if o.Status != StatusPending {
-			killed = true
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: t.ID, ObjectID: id, Kind: "mint"}, map[string]any{"keyID": k.ID, "tags": o.Tags,
+		"mode": t.MintMode, "ephemeral": o.Ephemeral})
+	_, err = m.store.UpdateObject(actx, id, nil, func(o *Object) error {
+		if o.Status != StatusPending || o.KeyID != "" {
+			killed = true // killed meanwhile, or (claim expired mid-mint) minted by someone else
+			ai.Skip()
 			return nil
 		}
 		o.Status, o.KeyID, o.KeyExpires, o.UpdatedAt = StatusMinted, k.ID, exp, m.now().UnixMilli()
 		return nil
 	})
 	if err != nil || killed {
+		// Undo only what this attempt created: its key and its own custody
+		// entry. Never the object's (another replica's) credential.
 		api.DeleteKey(ctx, k.ID)
-		m.custody.Delete(ctx, custodyName(o))
-		return err
+		m.custody.Delete(ctx, own)
+		return true, err
 	}
-	m.audit(ctx, AuditRecord{TenantID: t.ID, ObjectID: id, Kind: "mint"}, map[string]any{"keyID": k.ID, "tags": o.Tags,
-		"mode": t.MintMode, "ephemeral": o.Ephemeral})
+	m.recordIntent(ctx, ai, nil) // committed with the mint (H22)
 	m.notify(id)
-	return nil
+	return true, nil
 }
 
 func (m *Mgmt) notify(id string) {
@@ -1212,7 +1521,11 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 				break
 			}
 			fence := &Fence{Lease: o.Lease, Holder: hostID, Epoch: epoch}
-			if _, err := m.store.UpdateObject(ctx, id, fence, func(*Object) error { return nil }); err != nil {
+			// The release decision (the fenced commit) and its record commit
+			// together (H22); the outcome is amended below.
+			actx, ai := m.intend(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "credential"},
+				map[string]any{"host": hostID, "epoch": epoch, "keyID": o.KeyID})
+			if _, err := m.store.UpdateObject(actx, id, fence, func(*Object) error { return nil }); err != nil {
 				if errors.Is(err, ErrLeaseLost) {
 					m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "deny", Code: "lease_lost"},
 						map[string]any{"host": hostID, "epoch": epoch})
@@ -1220,12 +1533,15 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 				return Credential{}, err
 			}
 			secret, err := m.custody.Get(ctx, custodyName(o))
+			if err != nil && o.KeyID != "" {
+				secret, err = m.custody.Get(ctx, legacyCustodyName(o)) // minted before keyed custody names
+			}
 			if err != nil {
+				m.recordIntent(ctx, ai, map[string]any{"released": false, "error": err.Error()})
 				return Credential{}, fmt.Errorf("custody: %w", err)
 			}
 			t, _ := m.store.GetTenant(ctx, o.TenantID)
-			m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "credential"},
-				map[string]any{"host": hostID, "epoch": epoch, "keyID": o.KeyID})
+			m.recordIntent(ctx, ai, nil)
 			return Credential{AuthKey: string(secret), ExpiresAt: o.KeyExpires, Tags: o.Tags, Hostname: o.Hostname,
 				Ephemeral: o.Ephemeral, ControlURL: t.ControlURL}, nil
 		}
@@ -1234,14 +1550,20 @@ func (m *Mgmt) Credential(ctx context.Context, id, hostID string, epoch int64, w
 			e := errf(503, "identity_pending", "object %s is waiting on the registration queue (depth %d)", id, m.QueueDepth(o.TenantID))
 			return Credential{}, e
 		}
+		// m.changed only fires for mints on this replica; another replica's
+		// mint is seen by re-reading the store (H05).
 		select {
 		case <-ch:
-		case <-time.After(left):
+		case <-time.After(min(left, credentialPoll)):
 		case <-ctx.Done():
 			return Credential{}, ctx.Err()
 		}
 	}
 }
+
+// credentialPoll is how often a waiting credential request re-reads the
+// object, to see a mint done by another replica.
+const credentialPoll = 250 * time.Millisecond
 
 // ReadyRequest is POST /v0/objects/{id}/ready. Epoch is optional (fences
 // the commit when set).
@@ -1262,9 +1584,20 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 		fence = &Fence{Lease: o.Lease, Holder: hostID, Epoch: r.Epoch}
 	}
 	wasKilled := false
-	o, err = m.store.UpdateObject(ctx, id, fence, func(o *Object) error {
+	// The ready record commits with the status change (H22); the node
+	// certificate outcome is added below.
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "ready"},
+		map[string]any{"nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "host": hostID})
+	o, err = m.store.UpdateObject(actx, id, fence, func(o *Object) error {
 		if !o.Live() {
 			wasKilled = true
+			ai.Skip()
+			if r.StableNodeID != "" || r.NodeID != "" {
+				// Killed while joining: the device that just appeared must go
+				// too. Record it durably in this write (F21).
+				o.NodeID, o.StableNodeID = r.NodeID, r.StableNodeID
+				o.DeviceDeleteAt = m.now().UnixMilli()
+			}
 			return nil
 		}
 		o.Status, o.NodeID, o.StableNodeID, o.MagicDNS, o.UpdatedAt = StatusReady, r.NodeID, r.StableNodeID, r.MagicDNS, m.now().UnixMilli()
@@ -1273,17 +1606,17 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 	if err != nil {
 		return o, err
 	}
-	m.custody.Delete(ctx, custodyName(o))
+	m.deleteCustody(ctx, o)
 	if wasKilled {
 		// Killed while joining: the device that just appeared must go too.
 		o.NodeID, o.StableNodeID = r.NodeID, r.StableNodeID
-		m.deleteDevice(ctx, o)
+		m.deleteDeviceClaimed(ctx, o, false) // claimed, recorded; the sweep retries if this fails
 		return o, errf(410, "killed", "object %s was killed while joining; device deleted", id)
 	}
 	// Node certificate (ADR-010): binds this node to the object's tags, lim
 	// and lineage under the tenant's OBO root key. Receivers fetch it by
 	// stable node ID and compute effective caps = CapMap ∩ lim (RT-01).
-	detail := map[string]any{"nodeID": r.NodeID, "stableNodeID": r.StableNodeID, "magicDNS": r.MagicDNS, "host": hostID}
+	detail := map[string]any{}
 	if cert, err := m.signNodeCert(ctx, o); err != nil {
 		m.log.Error("node certificate not issued", "object", id, "err", err)
 		detail["certError"] = err.Error()
@@ -1299,7 +1632,7 @@ func (m *Mgmt) Ready(ctx context.Context, id, hostID string, r ReadyRequest) (Ob
 		}
 		detail["cert"] = true
 	}
-	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "ready"}, detail)
+	m.recordIntent(ctx, ai, detail)
 	m.notify(id)
 	return o, nil
 }
@@ -1331,7 +1664,10 @@ func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (
 	if r.Epoch > 0 {
 		fence = &Fence{Lease: old.Lease, Holder: hostID, Epoch: r.Epoch}
 	}
-	o, err := m.store.UpdateObject(ctx, id, fence, func(o *Object) error {
+	actx, ai := m.intend(ctx, AuditRecord{TenantID: old.TenantID, ObjectID: id, Kind: "remint"},
+		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID,
+			"hostname": old.Hostname}) // committed with the reset (H22)
+	o, err := m.store.UpdateObject(actx, id, fence, func(o *Object) error {
 		if !o.Live() || o.Status == StatusPending {
 			return nil
 		}
@@ -1359,9 +1695,7 @@ func (m *Mgmt) Remint(ctx context.Context, id, hostID string, r RemintRequest) (
 			prevDeleted = true
 		}
 	}
-	m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "remint"},
-		map[string]any{"host": hostID, "reason": r.Reason, "previousStatus": old.Status, "previousStableNodeID": old.StableNodeID,
-			"previousDeviceDeleted": prevDeleted, "hostname": o.Hostname})
+	m.recordIntent(ctx, ai, map[string]any{"previousDeviceDeleted": prevDeleted})
 	if old.Status != StatusPending {
 		m.enqueue(o.TenantID, id)
 	}
@@ -1425,6 +1759,22 @@ func (r *KillResult) warnDeviceDelete(id string) {
 // revokeObjects is the fallback), deletes devices via the tenant API (tier
 // 2; deferred by DeviceDeleteDelay), revokes unused keys, wipes custody, and
 // records audit.
+// lookupErr turns a failed lookup into its API error: a real not-found is
+// notFound (a 404), anything else (a store outage, a lock timeout) keeps its
+// own retryable or internal mapping instead of masquerading as a 404 that
+// clients would not retry (found by S9: a burst got 404 unknown_tenant for an
+// existing tenant).
+func lookupErr(err error, notFound *Error) error {
+	if errors.Is(err, ErrNotFound) {
+		return notFound
+	}
+	return asAPIError(err)
+}
+
+// errAlreadyDead: the object was killed (or failed) between Kill's read and
+// its write, by another replica or the reaper.
+var errAlreadyDead = errors.New("already dead")
+
 func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, error) {
 	res := KillResult{Killed: []string{}, DevicesDeleted: []string{}, Errors: map[string]string{}}
 	root, err := m.store.GetObject(ctx, id)
@@ -1451,6 +1801,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 	type killedObj struct {
 		o    Object
 		prev string
+		ai   *auditIntent // committed with the kill (H22); outcomes amended below
 	}
 	var done []killedObj
 	byHost := map[string][]string{}
@@ -1459,11 +1810,24 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			continue
 		}
 		prev := o.Status
-		killed, err := m.store.UpdateObject(ctx, o.ID, nil, func(x *Object) error {
+		actx, ai := m.intend(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By},
+			map[string]any{"reason": r.Reason, "cascade": r.Cascade, "requested": id, "root": o.RootID, "parent": o.ParentID, "prevStatus": prev})
+		killed, err := m.store.UpdateObject(actx, o.ID, nil, func(x *Object) error {
+			if !x.Live() {
+				return errAlreadyDead // another replica's kill or reaper won (H09)
+			}
 			x.Status, x.KillReason, x.UpdatedAt = StatusKilled, r.Reason, now.UnixMilli()
+			if x.StableNodeID != "" || x.NodeID != "" {
+				// The device delete is recorded in the kill's own write: no
+				// window where the kill commits but the cleanup is lost (F21).
+				x.DeviceDeleteAt = now.Add(m.cfg.DeviceDeleteDelay).UnixMilli()
+			}
 			x.KilledAt, x.KilledBy, x.KillCascade, x.KillRoot = now.UnixMilli(), r.By, x.ID != id, id
 			return nil
 		})
+		if errors.Is(err, errAlreadyDead) {
+			continue // killed concurrently elsewhere: its tombstone and audit stand
+		}
 		if err != nil {
 			res.Errors[o.ID] = err.Error()
 			continue
@@ -1474,7 +1838,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			m.store.AddRevocation(ctx, l.Holder, o.ID, now)
 			byHost[l.Holder] = append(byHost[l.Holder], o.ID)
 		}
-		done = append(done, killedObj{killed, prev})
+		done = append(done, killedObj{killed, prev, ai})
 	}
 	// Tier 1: push to the hosts, all objects in parallel, before any device
 	// delete (the RST must leave while the node is still in peers' netmaps).
@@ -1499,13 +1863,15 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 		res.PushMS = float64(time.Since(ps).Microseconds()) / 1000
 	}
 	for _, k := range done {
-		o, killed, prev := k.o, k.o, k.prev
-		m.custody.Delete(ctx, custodyName(o))
+		o, killed, prev, ai := k.o, k.o, k.prev, k.ai
+		m.deleteCustody(ctx, o)
 		if prev != StatusReady {
 			m.revokeKey(ctx, killed)
 		}
 		deleted, scheduled, unavailable := false, false, false
 		if killed.StableNodeID != "" || killed.NodeID != "" {
+			// Durable (F21): the kill's write recorded device_delete_at; any
+			// replica's sweep finishes this delete if this one can't.
 			if m.cfg.DeviceDeleteDelay > 0 {
 				m.scheduleDelete(killed)
 				scheduled = true
@@ -1516,7 +1882,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 				if unavailable {
 					res.warnDeviceDelete(o.ID) // learned from an earlier 403; the scheduled delete still tries
 				}
-			} else if err := m.deleteDevice(ctx, killed); errors.Is(err, errDeviceDeleteUnavailable) {
+			} else if _, err := m.deleteDeviceClaimedAudit(ctx, killed, false, false); errors.Is(err, errDeviceDeleteUnavailable) {
 				unavailable = true
 				res.warnDeviceDelete(o.ID)
 			} else if err != nil {
@@ -1526,8 +1892,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 				res.DevicesDeleted = append(res.DevicesDeleted, o.ID)
 			}
 		}
-		detail := map[string]any{"reason": r.Reason, "cascade": r.Cascade, "requested": id, "root": o.RootID,
-			"parent": o.ParentID, "deviceDeleted": deleted, "prevStatus": prev, "pushed": slices.Contains(res.Pushed, o.ID)}
+		detail := map[string]any{"deviceDeleted": deleted, "pushed": slices.Contains(res.Pushed, o.ID)}
 		if scheduled {
 			detail["deviceDeleteIn"] = m.cfg.DeviceDeleteDelay.String()
 		}
@@ -1535,7 +1900,7 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 			detail["deviceDelete"] = CodeDeviceDeleteUnavailable
 			detail["fix"] = DeviceScopeFix
 		}
-		m.audit(ctx, AuditRecord{TenantID: o.TenantID, ObjectID: o.ID, Kind: "kill", ActingFor: r.By}, detail)
+		m.recordIntent(ctx, ai, detail)
 	}
 	if len(res.Errors) == 0 {
 		res.Errors = nil
@@ -1546,12 +1911,26 @@ func (m *Mgmt) Kill(ctx context.Context, id string, r KillRequest) (KillResult, 
 // push POSTs body to the host's push socket (best effort; bounded by
 // PushTimeout). Hosts without a push URL get nothing (heartbeat fallback).
 func (m *Mgmt) push(hostID, path string, body any) error {
-	m.mu.Lock()
-	u := m.pushURLs[hostID]
-	m.mu.Unlock()
+	u := m.pushTarget(hostID)
 	if u == "" {
 		return errors.New("host has no push URL")
 	}
+	err := m.pushTo(u, hostID, path, body)
+	if err == nil {
+		return nil
+	}
+	// The cached target may be stale (the host re-registered through another
+	// replica): drop it, re-read the hosts row, retry once if it changed.
+	m.mu.Lock()
+	delete(m.pushURLs, hostID)
+	m.mu.Unlock()
+	if u2 := m.pushTarget(hostID); u2 != "" && u2 != u {
+		return m.pushTo(u2, hostID, path, body)
+	}
+	return err
+}
+
+func (m *Mgmt) pushTo(u, hostID, path string, body any) error {
 	base := "http://hostd"
 	var dial func(ctx context.Context, network, addr string) (net.Conn, error)
 	if sock, ok := strings.CutPrefix(u, "unix://"); ok {
@@ -1599,7 +1978,11 @@ func (m *Mgmt) scheduleDelete(o Object) {
 }
 
 // runDelete performs a scheduled device delete (once).
-func (m *Mgmt) runDelete(id string) {
+func (m *Mgmt) runDelete(id string) { m.runDeleteForce(id, false) }
+
+// runDeleteForce runs a scheduled delete now; force (FlushDeletes) runs it
+// even before it is due.
+func (m *Mgmt) runDeleteForce(id string, force bool) {
 	m.mu.Lock()
 	pd := m.pending[id]
 	delete(m.pending, id)
@@ -1610,17 +1993,88 @@ func (m *Mgmt) runDelete(id string) {
 	pd.timer.Stop()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	m.deleteDeviceClaimed(ctx, pd.o, force)
+}
+
+// DeviceDeleteRetry is how long a failed device delete waits before any
+// replica's sweep tries again; DeviceDeleteClaimTTL is how long a claimed
+// delete stays claimed before it is due again (claimer died or couldn't
+// record the outcome).
+const (
+	DeviceDeleteRetry    = 30 * time.Second
+	DeviceDeleteClaimTTL = 2 * time.Minute
+)
+
+// deleteDeviceClaimed claims the object's durable device delete (so exactly
+// one replica runs it), deletes the device, audits, and on a retryable
+// failure puts it back as due in DeviceDeleteRetry. ran is false when the
+// delete was not due or another replica claimed it.
+func (m *Mgmt) deleteDeviceClaimed(ctx context.Context, o Object, force bool) (ran bool, err error) {
+	return m.deleteDeviceClaimedAudit(ctx, o, force, true)
+}
+
+// deleteDeviceClaimedAudit is deleteDeviceClaimed; audit=false is the
+// inline delete inside Kill, whose kill record already says deviceDeleted.
+func (m *Mgmt) deleteDeviceClaimedAudit(ctx context.Context, o Object, force, audit bool) (ran bool, err error) {
+	now := m.now().UnixMilli()
+	if force {
+		now = math.MaxInt64
+	}
+	if ok, cerr := m.store.ClaimDeviceDelete(ctx, o.ID, now); cerr != nil || !ok {
+		return false, cerr
+	}
+	id := o.ID
 	st := time.Now()
-	err := m.deleteDevice(ctx, pd.o)
-	detail := map[string]any{"nodeID": pd.o.StableNodeID, "ms": time.Since(st).Milliseconds()}
+	err = m.deleteDevice(ctx, o)
+	detail := map[string]any{"nodeID": o.StableNodeID, "ms": time.Since(st).Milliseconds()}
 	if errors.Is(err, errDeviceDeleteUnavailable) {
 		detail["error"], detail["code"], detail["fix"] = err.Error(), CodeDeviceDeleteUnavailable, DeviceScopeFix
-		m.log.Warn("device delete unavailable: the tenant's OAuth client has no devices:core scope", "object", id, "tenant", pd.o.TenantID)
+		m.log.Warn("device delete unavailable: the tenant's OAuth client has no devices:core scope", "object", id, "tenant", o.TenantID)
 	} else if err != nil {
 		detail["error"] = err.Error()
 		m.log.Warn("device delete failed", "object", id, "err", err)
 	}
-	m.audit(ctx, AuditRecord{TenantID: pd.o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
+	// The outcome write and its audit record commit together (H22).
+	octx := context.WithoutCancel(ctx)
+	var ai *auditIntent
+	if audit {
+		octx, ai = m.intend(octx, AuditRecord{TenantID: o.TenantID, ObjectID: id, Kind: "device_delete"}, detail)
+	}
+	switch {
+	case err == nil, errors.Is(err, errDeviceDeleteUnavailable):
+		// Done (or not ours to do). If this write fails the claim lapses
+		// and the delete re-runs: harmless, a gone device is a success.
+		m.store.SetDeviceDelete(octx, id, -1)
+	default:
+		// Retry sooner than the claim would lapse; if this write fails too
+		// (store blip), the claim lapsing still brings it back (H21).
+		m.store.SetDeviceDelete(octx, id, m.now().Add(DeviceDeleteRetry).UnixMilli())
+	}
+	m.recordIntent(ctx, ai, nil)
+	return true, err
+}
+
+// sweepDeviceDeletes runs every due durable device delete: ones whose
+// replica died before its timer fired (H07) and failed ones being retried.
+func (m *Mgmt) sweepDeviceDeletes(ctx context.Context) {
+	ids, err := m.store.DueDeviceDeletes(ctx, m.now().UnixMilli())
+	if err != nil {
+		m.log.Warn("device delete sweep", "err", err)
+		return
+	}
+	for _, id := range ids {
+		m.mu.Lock()
+		_, local := m.pending[id]
+		m.mu.Unlock()
+		if local {
+			continue // this replica's own timer will run it
+		}
+		o, err := m.store.GetObject(ctx, id)
+		if err != nil {
+			continue
+		}
+		m.deleteDeviceClaimed(ctx, o, false)
+	}
 }
 
 // PendingDeletes is how many device deletes are scheduled.
@@ -1677,7 +2131,7 @@ func (m *Mgmt) FlushDeletes() {
 	var wg sync.WaitGroup
 	for _, id := range ids {
 		wg.Add(1)
-		go func() { defer wg.Done(); m.runDelete(id) }()
+		go func() { defer wg.Done(); m.runDeleteForce(id, true) }()
 	}
 	wg.Wait()
 }
@@ -1952,7 +2406,7 @@ func (m *Mgmt) Preflight(ctx context.Context, tenantID string, r PreflightReques
 	res := PreflightResult{Missing: []PreflightMissing{}, MissingTagOwners: []string{}}
 	t, err := m.store.GetTenant(ctx, tenantID)
 	if err != nil {
-		return res, errf(404, "unknown_tenant", "tenant %q not found", tenantID)
+		return res, lookupErr(err, errf(404, "unknown_tenant", "tenant %q not found", tenantID))
 	}
 	pol, err := m.policies.Get(ctx, t)
 	if err != nil {

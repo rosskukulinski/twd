@@ -1841,6 +1841,8 @@ components:
         | `exists` | 409 | create of an existing ID |
         | `lease_lost` | 409 | epoch/holder fence failed |
         | `lease_held` | 409 | another host holds the lease |
+        | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
+        | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
         | `already_joined` | 409 | credential for an object that has a node |
         | `identity_conflict` | 409 | object ID collision across identities |
         | `namespace_ambiguous` | 409 | class declared by several workloads, `workload` missing |
@@ -1879,6 +1881,8 @@ components:
         - exists
         - lease_lost
         - lease_held
+        - takeover_unconfirmed
+        - store_unavailable
         - already_joined
         - identity_conflict
         - namespace_ambiguous
@@ -2241,6 +2245,12 @@ components:
         workload: { type: string, pattern: "^[a-z0-9][a-z0-9-]{0,62}$" }
         bundle: { type: string, contentEncoding: base64, description: tar (optionally gzipped) of the built worker + `twd.jsonc` + `wrangler.jsonc`. }
         host: { type: string, description: Pin a host. }
+        forceTakeover:
+          type: boolean
+          description: >-
+            Confirm that the workload's current host, which has stopped heartbeating, is gone for good, so a
+            stateful workload may move off it (ADR-028 §3). Without it such a move is refused with
+            `takeover_unconfirmed`. Audited (`takeoverFrom`, `forced`).
         namespaces:
           type: array
           description: Override the classes read from `twd.jsonc` (tests).
@@ -2257,6 +2267,12 @@ components:
         bundleURL: { type: string, format: uri-reference }
         namespaces: { type: array, items: { $ref: "#/components/schemas/ClassConfig" } }
         workloadTags: { type: array, items: { type: string } }
+        fence:
+          type: boolean
+          description: >-
+            Stop serving this workload when no heartbeat to mgmt has succeeded for the host's fence window (30 s):
+            it has Durable Objects that must not run on two hosts (ADR-028 §3). Stateless workloads and
+            `"fence": "never"` classes are false and keep serving. Hosts treat a missing field as true.
         epoch: { type: integer, format: int64 }
         lease: { type: string }
         tailnet: { type: string }
@@ -2564,6 +2580,35 @@ components:
         tenants: { type: integer }
         objects: { type: object, additionalProperties: { type: integer }, description: Count per `ObjectStatus`. }
         version: { type: string }
+        clock: { $ref: "#/components/schemas/StatusClock" }
+        replicas: { $ref: "#/components/schemas/StatusReplicas" }
+    StatusReplicas:
+      type: object
+      description: >-
+        The mgmt replica registry (replicas sharing this store). `ok` is false (and the top-level `ok` with it)
+        when this replica conflicts with another live one: file custody shared between replicas, or replicas
+        with different custody. A replica refuses to start in that state; a conflict that appears later (a
+        replica started with an older version, or a registry row edited) is reported here and logged.
+      required: [id, live, ok]
+      properties:
+        id: { type: string, description: "This replica's stable ID (`<state-dir>/replica.id`)." }
+        live: { type: integer, description: "Replicas seen within the last 30 s, this one included." }
+        ok: { type: boolean }
+        message: { type: string }
+    StatusClock:
+      type: object
+      description: >-
+        The shared clock this replica uses for leases, host liveness and expiries (ADR-028): the store's clock.
+        `ok` is false (and the top-level `ok` with it) when this replica's wall clock is more than 2 s from the
+        store clock, or the store clock has not been sampled for 30 s. Ownership decisions do not use the wall
+        clock, so this is a warning, not a refusal; local-clock users (WIF issuer tokens, throttles) may misbehave.
+      required: [source, ok, offsetMs, syncAgeMs]
+      properties:
+        source: { type: string, enum: [postgres, local], description: "`postgres`: the server clock, sampled every 5 s; `local`: SQLite, one replica." }
+        ok: { type: boolean }
+        offsetMs: { type: integer, description: Store clock minus this replica's wall clock at the last sample. }
+        syncAgeMs: { type: integer, description: Milliseconds since the last successful sample (0 for `local`). }
+        message: { type: string }
     SelfInfo:
       type: object
       required: [https]

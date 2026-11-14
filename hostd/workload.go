@@ -52,6 +52,15 @@ type workload struct {
 	gate         chan struct{} // non-nil while switching: closed when open
 	wl           *object       // the workload entry node
 	classTags    map[string][]string
+	noFence      bool // assignment fence=false: stateless, keeps serving without mgmt
+}
+
+// fences reports whether heartbeat loss must stop this workload (stateful,
+// or an older mgmt that sent no fence field).
+func (w *workload) fences() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return !w.noFence
 }
 
 func (w *workload) statusSnapshot() mgmtapi.DeploymentStatus {
@@ -98,6 +107,7 @@ func (w *workload) wantDeploy(a mgmtapi.Assignment) bool {
 		return false // don't retry a failed deployment in a loop
 	}
 	w.deploymentID, w.status, w.err = a.DeploymentID, "starting", ""
+	w.noFence = a.Fence != nil && !*a.Fence
 	if a.Epoch > w.epoch {
 		w.epoch = a.Epoch // this host holds the lease at the new epoch now
 	}

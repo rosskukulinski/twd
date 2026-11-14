@@ -20,6 +20,23 @@ import (
 func oboCustodyName(tenantID string) string { return "twd/" + tenantID + "/obo-root" }
 
 // oboKey loads (creating on first use) the tenant's OBO root key.
+// oboChoiceName is the secret_choice row that names a tenant's OBO root key.
+func oboChoiceName(tenantID string) string { return "obo/" + tenantID }
+
+// oboKeyName is where candidate keyID of a tenant's OBO root lives in
+// custody. "legacy" is the pre-F11 single name.
+func oboKeyName(tenantID, keyID string) string {
+	if keyID == "legacy" {
+		return oboCustodyName(tenantID)
+	}
+	return oboCustodyName(tenantID) + "/" + keyID
+}
+
+// oboKey returns the tenant's OBO root key. Every replica must sign with the
+// same key (H13), so the key is chosen once through the store: a replica
+// puts its candidate in custody under its own name, then offers it with
+// ChooseSecret; the first offer wins, losers delete theirs and use the
+// winner's. A pre-F11 key (the single legacy name) is adopted as "legacy".
 func (m *Mgmt) oboKey(ctx context.Context, tenantID string) (ed25519.PrivateKey, error) {
 	m.mu.Lock()
 	if k, ok := m.oboKeys[tenantID]; ok {
@@ -27,23 +44,39 @@ func (m *Mgmt) oboKey(ctx context.Context, tenantID string) (ed25519.PrivateKey,
 		return k, nil
 	}
 	m.mu.Unlock()
-	seed, err := m.custody.Get(ctx, oboCustodyName(tenantID))
+	choice := oboChoiceName(tenantID)
+	kid, err := m.store.SecretChoice(ctx, choice)
 	if errors.Is(err, ErrNotFound) {
-		seed = make([]byte, ed25519.SeedSize)
-		if _, err := rand.Read(seed); err != nil {
+		mine := ""
+		if _, lerr := m.custody.Get(ctx, oboCustodyName(tenantID)); lerr == nil {
+			mine = "legacy" // created before F11: every replica adopts the same one
+		} else if errors.Is(lerr, ErrNotFound) {
+			seed := make([]byte, ed25519.SeedSize)
+			if _, err := rand.Read(seed); err != nil {
+				return nil, err
+			}
+			mine = newID("obo_")
+			if err := m.custody.Put(ctx, oboKeyName(tenantID, mine), seed); err != nil {
+				return nil, fmt.Errorf("custody: obo root: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("custody: obo root: %w", lerr)
+		}
+		if kid, err = m.store.ChooseSecret(ctx, choice, mine, m.now().UnixMilli()); err != nil {
 			return nil, err
 		}
-		if err := m.custody.Put(ctx, oboCustodyName(tenantID), seed); err != nil {
-			return nil, fmt.Errorf("custody: obo root: %w", err)
+		if kid != mine && mine != "legacy" {
+			m.custody.Delete(ctx, oboKeyName(tenantID, mine)) // lost the race: use the winner's
 		}
-		// Another replica may have raced us: re-read so every replica signs
-		// with the same key.
-		if s2, err := m.custody.Get(ctx, oboCustodyName(tenantID)); err == nil && len(s2) == ed25519.SeedSize {
-			seed = s2
+		if kid == mine {
+			m.audit(ctx, AuditRecord{TenantID: tenantID, Kind: "obo_root"}, map[string]any{"created": mine != "legacy", "keyID": kid})
 		}
-		m.audit(ctx, AuditRecord{TenantID: tenantID, Kind: "obo_root"}, map[string]any{"created": true})
 	} else if err != nil {
-		return nil, fmt.Errorf("custody: obo root: %w", err)
+		return nil, err
+	}
+	seed, err := m.custody.Get(ctx, oboKeyName(tenantID, kid))
+	if err != nil {
+		return nil, fmt.Errorf("custody: obo root %s: %w", kid, err)
 	}
 	if len(seed) != ed25519.SeedSize {
 		return nil, errors.New("custody: obo root key has the wrong size")

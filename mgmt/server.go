@@ -155,6 +155,9 @@ func writeErr(w http.ResponseWriter, r *http.Request, err error) {
 	if e.Code == "identity_pending" {
 		w.Header().Set("Retry-After", "1")
 	}
+	if e.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(e.RetryAfter))
+	}
 	w.Header().Set("Twd-Error", e.Code)
 	writeJSON(w, e.Status, e)
 }
