@@ -99,6 +99,7 @@ func run() error {
 		ctrMax     = flag.Int("container-max", 0, "containers: max running on this host (0 = unlimited)")
 		ctrMemMiB  = flag.Int("container-mem-mib", 0, "containers: max total guest memory on this host (0 = unlimited)")
 		ctrVCPU    = flag.Float64("container-vcpu", 0, "containers: max total vCPU on this host (0 = unlimited)")
+		ctrInet    = flag.String("container-internet", "direct", "containers: how start({enableInternet}) reaches a workload's egress.internet hosts: direct (this host's network, public addresses only) or off")
 	)
 	flag.Parse()
 	var lvl slog.Level
@@ -194,8 +195,15 @@ func run() error {
 			log.Info("containers unavailable on this host; not offered", "reason", err)
 		} else {
 			hcfg.Containers, hcfg.Images = cb, st
-			log.Info("containers available", "image_cache", st.Dir, "image_dir", *ctrImages, "idle", *ctrIdle, "max_life", *ctrMaxLife)
+			log.Info("containers available", "image_cache", st.Dir, "image_dir", *ctrImages, "idle", *ctrIdle, "max_life", *ctrMaxLife, "internet", *ctrInet)
 		}
+	}
+	switch *ctrInet {
+	case "direct":
+		hcfg.ContainerInternet = hostd.DirectInternet()
+	case "off":
+	default:
+		return fmt.Errorf("-container-internet %q: want direct or off", *ctrInet)
 	}
 	if pushLn != nil {
 		hcfg.PushListener, hcfg.PushPort = pushLn, *pushPort

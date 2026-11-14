@@ -416,7 +416,7 @@ type instance struct {
 	icOnce sync.Once
 	ic     *http.Client
 	tier   string // bundle.TierProcess | bundle.TierMicroVM
-	spec    sandbox.Spec
+	spec   sandbox.Spec
 	// doStorage is the workload's DO storage (process tier), under its
 	// tenant's dir; profile is the Seatbelt profile it runs under, if any.
 	doStorage string

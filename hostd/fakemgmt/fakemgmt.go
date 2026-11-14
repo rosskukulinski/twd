@@ -35,6 +35,7 @@ import (
 	"github.com/rosskukulinski/twd/hostd/mgmtapi"
 	"github.com/rosskukulinski/twd/internal/nodecert"
 	"github.com/rosskukulinski/twd/internal/tsapi"
+	"github.com/rosskukulinski/twd/mgmt"
 	"github.com/rosskukulinski/twd/netd"
 )
 
@@ -88,6 +89,15 @@ type Server struct {
 	credentialCalls      int
 	reservations         map[string]*mgmtapi.ContainerReservation // container reservations by ID
 	reservationsDown     bool
+	heartbeatsDown       bool
+}
+
+// SetHeartbeatsDown makes host heartbeats fail with 503 (tests: a host
+// partitioned from mgmt self-fences after FenceAfter, ADR-028).
+func (s *Server) SetHeartbeatsDown(down bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heartbeatsDown = down
 }
 
 // SetLeaseLostCredentials makes the next n credential calls fail with
@@ -134,6 +144,7 @@ type deployment struct {
 	epoch      int64
 	superseded bool
 	created    time.Time
+	fence      bool // stateful (ADR-028 §3): mgmt.BundleStateful
 }
 
 type lease struct {
@@ -373,6 +384,10 @@ func (s *Server) heartbeat(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.heartbeatsDown {
+		writeErr(w, 503, "store_unavailable", "mgmt is partitioned from this host (test)")
+		return
+	}
 	h := s.hosts[id]
 	if h == nil {
 		writeErr(w, 404, mgmtapi.CodeNotFound, "host not registered")
@@ -416,7 +431,7 @@ func (s *Server) assignments(w http.ResponseWriter, r *http.Request) {
 		out = append(out, mgmtapi.Assignment{DeploymentID: d.DeploymentID, TenantID: d.tenantID, Workload: d.workload,
 			BundleURL: "/v1/deployments/" + d.DeploymentID + "/bundle", Namespaces: d.namespaces, Epoch: d.epoch,
 			WorkloadTags: d.wlTags, Lease: mgmtapi.LeaseName(d.tenantID, d.workload),
-			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created)})
+			Tailnet: s.tenants[d.tenantID].Tailnet, ControlURL: s.tenants[d.tenantID].ControlURL, CreatedAt: ms(d.created), Fence: &d.fence})
 	}
 	s.mu.Unlock()
 	writeJSON(w, 200, page(out))
@@ -507,6 +522,7 @@ func (s *Server) deploy(w http.ResponseWriter, r *http.Request) {
 	}
 	d := &deployment{tenantID: req.TenantID, workload: req.Workload, bundle: req.Bundle, namespaces: nss,
 		wlTags: app.WorkloadTags, epoch: epoch, created: time.Now()}
+	d.fence, _ = mgmt.BundleStateful(req.Bundle)
 	d.DeploymentID, d.Host, d.Status = newID("dp"), hostID, "assigned"
 	s.deployments[d.DeploymentID] = d
 	push := s.hosts[hostID].PushURL
