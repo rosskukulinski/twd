@@ -171,10 +171,13 @@ type Assignment struct {
 	Epoch        int64           `json:"epoch"`
 	// WorkloadTags (v0.1, optional) are the workload entry node's tags.
 	WorkloadTags []string `json:"workloadTags,omitempty"`
-	Lease        string   `json:"lease"`
-	Tailnet      string   `json:"tailnet"`
-	ControlURL   string   `json:"controlURL,omitempty"`
-	CreatedAt    int64    `json:"createdAt"`
+	// Service is the Tailscale Service the workload node advertises while
+	// the deployment is active and healthy ("" = none).
+	Service    string `json:"service,omitempty"`
+	Lease      string `json:"lease"`
+	Tailnet    string `json:"tailnet"`
+	ControlURL string `json:"controlURL,omitempty"`
+	CreatedAt  int64  `json:"createdAt"`
 	// Fence (F9, ADR-028 §3): stop serving this workload when mgmt is
 	// unreachable for FenceAfter. nil (an older mgmt) means true.
 	Fence *bool `json:"fence,omitempty"`

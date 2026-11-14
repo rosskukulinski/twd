@@ -358,6 +358,9 @@ func cmdDeploy(args []string) error {
 				e.Fix = append(e.Fix, "  "+m.Snippet)
 			}
 		}
+		if pf.ServiceUnapproved {
+			e.Fix = append(e.Fix, "let the workload node host "+pf.Service+" (control won't route it otherwise):", "  "+pf.ServiceSnippet)
+		}
 		e.Fix = append(e.Fix, "then re-run, or deploy anyway with --allow-missing-grants")
 		return e
 	}
@@ -416,11 +419,21 @@ func cmdDeploy(args []string) error {
 	res.Timings["total"] = ms(time.Since(t0))
 	emit(f, res, func() {
 		fmt.Printf("✓ deployed   %s@%s · node %s · http://%s/  (deploy → ready %.1fs)\n", a.Name, v.Host, v.Endpoint.Node, v.Endpoint.MagicDNS, res.Timings["ready"]/1000)
+		if sv := v.Endpoint.Service; sv != nil {
+			fmt.Printf("✓ service    %s · http://%s/  (stable across redeploys and host moves; callers need a grant to %s)\n", sv.Name, sv.MagicDNS, sv.Name)
+		}
 	})
 	return nil
 }
 
 func printPreflight(a *app, pf mgmt.PreflightResult) {
+	if pf.Service != "" {
+		if pf.ServiceUnapproved {
+			fmt.Printf("› preflight: service %s … ✗ not in autoApprovers.services for the workload tags (control would never route it)\n    add to your tailnet policy:\n    %s\n", pf.Service, pf.ServiceSnippet)
+		} else {
+			fmt.Printf("✓ preflight  service %s auto-approved for the workload node\n", pf.Service)
+		}
+	}
 	if len(a.Cfg.Tailnet.Connects) == 0 && len(pf.MissingTagOwners) == 0 {
 		fmt.Printf("✓ preflight  no tailnet.connects declared · tagOwners ok for %s\n", strings.Join(a.srcTags(), ", "))
 		return

@@ -24,6 +24,7 @@ These extend `mgmt-api.md` (v0 + the M2 "v0 clarifications"). All of them are op
 | heartbeat req | `deployments:[{deploymentID,status,error?}]` | `starting\|active\|stopped\|failed` |
 | heartbeat resp | `kill:[{objectID,reason}]` | Same as `revokeObjects`, with a reason (fakemgmt only) |
 | assignment | `workloadTags` | Tags of the workload entry node (twd.jsonc `tailnet.tags`) |
+| assignment | `service` | Tailscale Service the workload entry node advertises while the deployment is active and healthy (twd.jsonc `tailnet.service`; [services.md](../services.md)) |
 | deployment | `GET /v0/deployments/{id}` | `{deploymentID, host, endpoint, status}` |
 | tenant | `mintMode:"static"` | fakemgmt only: a fixed key for hermetic testcontrol runs |
 

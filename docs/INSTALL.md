@@ -170,7 +170,11 @@ Funnel, no HTTPS requirement, no public issuer.**
    - optionally **Policy File › Read**: `twd deploy` preflights your
      app's grants and `spawn()` checks sub-agent tags/caps against the
      policy (without it, deploy says `preflight skipped` and `spawn()`
-     answers `policy_unavailable`).
+     answers `policy_unavailable`);
+   - optionally **Services › Write**: workloads with `tailnet.service` get
+     a Tailscale Service, i.e. a stable name and VIP
+     ([services.md](services.md)). Without it, such a deploy fails with
+     `service_api_failed`.
 3. **Save it** where only you can read it (twd refuses a looser mode):
    ```sh
    mkdir -p ~/.config/twd

@@ -56,6 +56,9 @@ type KillReport struct {
 	TotalMS      float64 `json:"totalMs"`
 	LogoutErr    string  `json:"logoutError,omitempty"`
 	DeleteErr    string  `json:"deleteError,omitempty"`
+	// Services the node advertised before the kill withdrew them.
+	Services   []string `json:"services,omitempty"`
+	ServiceErr string   `json:"serviceError,omitempty"`
 }
 
 func ms(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
@@ -84,12 +87,32 @@ func (r *Registry) Kill(ctx context.Context, id string, opts KillOptions) (*Kill
 	o.state = StateKilled
 	o.err = newErr(CodeKilled, "killed: "+opts.Reason)
 	ln, lc := o.ln, o.lc
+	svc, svcLn, svcHS := o.svc, o.svcLn, o.svcHTTP
 	o.mu.Unlock()
 	rep := &KillReport{Object: id, PrevState: prev}
 	info := o.Info()
 	rep.NodeID = info.NodeID
 
 	// 1. Stop accepting, then RST everything in flight, both directions.
+	// Service advertisements go first: removing the serve config stops
+	// netstack intercepting the VIP at once, and the withdrawn advertisement
+	// tells control to stop routing the Service here.
+	if svc != nil {
+		wctx, cancel := context.WithTimeout(ctx, time.Second)
+		if err := svc.Close(wctx); err != nil {
+			rep.ServiceErr = Redact(err.Error())
+		}
+		cancel()
+		o.mu.Lock()
+		rep.Services, o.services = o.services, nil
+		o.mu.Unlock()
+	}
+	if svcLn != nil {
+		svcLn.Close()
+	}
+	if svcHS != nil {
+		svcHS.SetKeepAlivesEnabled(false) // idle Service conns close; the abort below RSTs the rest
+	}
 	if ln != nil {
 		ln.Close() // new SYNs to the port now get a RST from netstack
 	}

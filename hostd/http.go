@@ -456,6 +456,9 @@ type WorkloadStatus struct {
 	// Runtime is "node" for the Node process tier ("" = workerd).
 	Runtime string    `json:",omitempty"`
 	Node    *NodeInfo `json:",omitempty"`
+	// Service is the workload's Tailscale Service and whether this host
+	// advertises it now.
+	Service *ServiceStatus `json:",omitempty"`
 	// Egress (Node tier) says whether egress attribution is an enforcement
 	// boundary on this host: "enforced" only under a sandbox that confines
 	// the process's network to the egress proxy (Landlock ABI ≥ 4 on Linux,
@@ -524,6 +527,7 @@ func (h *Host) Status() StatusView {
 	for _, w := range wls {
 		w.mu.Lock()
 		ws := WorkloadStatus{TenantID: w.tenantID, Workload: w.name, DeploymentID: w.activeDep, Status: w.status, Error: w.err, Epoch: w.epoch}
+		ws.Service = w.serviceStatus()
 		if w.active != nil {
 			ws.Requests = w.active.reqs.Load()
 			ws.InstanceDir = w.active.dir

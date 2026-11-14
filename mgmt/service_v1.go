@@ -483,8 +483,9 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 	if !validName(r.Workload) {
 		return res, errf(400, "bad_request", "workload must be a DNS label ([a-z0-9-], ≤63)")
 	}
-	classes := r.Namespaces
+	classes := slices.Clone(r.Namespaces)
 	var connects []string
+	var svcCfg *TwdConfig
 	if len(r.Bundle) > 0 {
 		cfg, err := BundleConfig(r.Bundle)
 		if err != nil && len(classes) == 0 {
@@ -495,6 +496,17 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 				classes = cfg.Classes()
 			}
 			connects = cfg.Tailnet.Connects
+			svcCfg = cfg
+		}
+	}
+	svcName, err := applyService(svcCfg, r.Workload, classes)
+	if err != nil {
+		return res, errf(400, "bad_bundle", "%v", err)
+	}
+	var wlTags []string
+	for _, c := range classes {
+		if c.Class == WorkloadNamespace {
+			wlTags = c.Tags
 		}
 	}
 	if len(classes) == 0 {
@@ -508,13 +520,14 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 			}
 		}
 	}
-	res, err := m.Preflight(ctx, r.TenantID, PreflightRequest{SrcTags: src, Connects: connects})
+	res, err = m.Preflight(ctx, r.TenantID, PreflightRequest{SrcTags: src, Connects: connects, Service: svcName, WorkloadTags: wlTags})
 	if err != nil {
 		return res, err
 	}
 	res.SrcTags = src
 	m.audit(ctx, AuditRecord{TenantID: r.TenantID, Kind: "preflight", ActingFor: r.By}, map[string]any{"workload": r.Workload,
-		"ok": res.OK, "missing": len(res.Missing), "missingTagOwners": res.MissingTagOwners, "by": r.By})
+		"ok": res.OK, "missing": len(res.Missing), "missingTagOwners": res.MissingTagOwners, "service": res.Service,
+		"serviceUnapproved": res.ServiceUnapproved, "by": r.By})
 	return res, nil
 }
 

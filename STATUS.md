@@ -1441,3 +1441,26 @@ Run `e6d03b` (2026-11-08 23:56 PT) via `policy.ApplyWith` (additions only, valid
   - `--host` without the tier, or a live lease holder without the tier the workload now asks for → new `409 tier_unavailable` with the fix (`twd undeploy` then deploy, or pick another host). Stickiness never keeps a workload on the wrong tier.
 - **Tests:** `mgmt/tier_test.go` (`TestPlacementTier` 10 cases, `TestPlacementTierStickyHolder`). `make test`, `make lint`, `make test-pg`: PASS.
 - **Not changed:** hostd's fallback (`hostd/workload.go` `tierFor`) still downgrades with a warning when a microvm assignment reaches a host without a VM backend (e.g. the backend vanished after registration, or `twd dev`). Making it refuse is a follow-up.
+
+## Tailscale Services for workloads and mgmt replicas (2026-11-13)
+
+Design and behavior: [docs/services.md](docs/services.md).
+
+- **Mechanism (`internal/tssvc`):** advertise + an *empty* serve-config TCP handler + a tsnet fallback TCP handler. VIP flows are delivered in-process with the caller's real source address, so WhoIs (and so all of netd's attributed ingress) works through the VIP. tsnet's `ListenService` was not usable: it forwards to a host loopback socket (caller = `127.0.0.1`, or a forgeable PROXY header).
+- **Workloads:** twd.jsonc `tailnet.service` (`true` = `svc:<workload>`, or a name). This needs `tailnet.tags`. mgmt (`mgmt/services.go`):
+  - creates the definition (`tcp:80`, owner comment `managed by twd: tenant=… workload=…`) before the lease;
+  - refuses anyone else's Service, and a name that collides with a device's MagicDNS name (`409 service_conflict`);
+  - reports a credential without Services scope as `502 service_api_failed`;
+  - preflights `autoApprovers.services` (`serviceUnapproved`, `serviceSnippet`);
+  - carries `service` in assignments and `endpoint.service` in deployments.
+- **Workloads, host side:** hostd (`hostd/service.go`) advertises while the deployment is active, the instance passes probes (2 s; 2 failures withdraw) and the workload node is ready. It withdraws on undeploy, fencing, a move, a redeploy without a Service, and kill. netd serves Service flows on their own `http.Server`, so a withdraw stops keep-alives on Service connections only. netd egress resolves Service names from the object's netmap (MagicDNS extra records, routed by a peer's AllowedIPs) under the sibling rule.
+- **mgmt replicas (H12):** `twd-mgmt -tsnet-service svc:twd-mgmt` (`mgmt.ServiceGate`, health = store answers). A hostname equal to the Service label is refused at start.
+- **Tests:**
+  - hermetic, all passing in `make test` (Go `-race` + JS): `internal/tssvc` (routing guard), `netd` `TestService` (testcontrol emulating Service hosts: VIP ingress identity, egress by name/bare name/VIP, sibling refusal, withdraw, kill), `hostd` `TestWorkloadService` (advertise; caller via VIP, with the remote address asserted to be the VIP; SIGSTOPped workerd withdrawn in 5.4 s and re-advertised 0.5 s after SIGCONT; redeploy without a Service withdraws and closes pooled connections), `mgmt` `TestServiceDeploy` (8 cases, spec-validated) and `TestServiceGate`;
+  - real (tailnet 1, production control): `TestRealService`, E2E-SVC (`make e2e-svc`) and H12 `TestRealMgmtService` (`make e2e-mm-svc`). The numbers are in docs/services.md. All PASS, with 0 leftover devices or keys.
+- **Found while testing:** a workload node and a Service with the same name share one MagicDNS name, and MagicDNS answers the device first. The first hostd test "passed" through the node, not the VIP. Tests now assert the remote address is the VIP, and mgmt refuses such names.
+- **Not done:** one workload on several hosts at once (still one lease per workload). Also unverified: whether app caps granted to a `svc:` destination reach WhoIs, and a real hostd and `twd link` through `svc:twd-mgmt`.
+- **Test tailnet policy (tailnet 1, backed up first to `tailnet1_acl.pre-svc-*.hujson`):**
+  - `autoApprovers.services` for `svc:ttest-tssvc`, `svc:twd-mgmt`, `svc:ttest-mgmt` and `svc:ttest-svc-hello`;
+  - tagOwners `tag:twd-wl-svc`;
+  - grants `tag:ttest` → those Services, `tag:twd-host` → `svc:twd-mgmt`, and `tag:ttest` ↔ `tag:twd-wl-svc`.

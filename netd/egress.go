@@ -10,7 +10,9 @@ import (
 	"strconv"
 	"strings"
 
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tailcfg"
 )
 
 // EgressHandler returns the attributed egress proxy. It expects proxy-style
@@ -219,6 +221,12 @@ func (o *Object) resolveEgress(ctx context.Context, hostport, scheme string) (ne
 				}
 			}
 		}
+		if code, detail, ok := o.reg.servicePeer(o, st, ip); ok {
+			if code != "" {
+				return refuse(code, detail)
+			}
+			return netip.AddrPortFrom(ip, uint16(port)), nil
+		}
 		return refuse(CodePeerNotVisible, "no peer with address "+ip.String()+" in this object's netmap (a grant is missing, or the peer is offline or deleted)")
 	}
 	// A name: resolve against this object's netmap only. A bare name matches a
@@ -241,6 +249,21 @@ func (o *Object) resolveEgress(ctx context.Context, hostport, scheme string) (ne
 		}
 	}
 	if !found.IsValid() {
+		// A Tailscale Service name (a MagicDNS extra record from this
+		// object's own netmap, never host DNS), routed by a granted host.
+		if vip, ok := serviceVIP(ctx, lc, want); ok {
+			code, detail, routed := o.reg.servicePeer(o, st, vip)
+			if !routed {
+				return refuse(CodePeerNotVisible, "service "+host+" has no host visible to this object (a grant to the svc: name is missing, or no host is approved and online)")
+			}
+			if code != "" {
+				return refuse(code, detail)
+			}
+			if code, detail := o.reg.classify(o, vip); code != "" {
+				return refuse(code, detail)
+			}
+			return netip.AddrPortFrom(vip, uint16(port)), nil
+		}
 		return refuse(CodePeerNotVisible, "no peer named "+host+" in this object's netmap (names are never resolved via host DNS; a grant may be missing)")
 	}
 	if code, detail := o.reg.classify(o, found); code != "" {
@@ -285,4 +308,72 @@ func (r *Registry) classify(o *Object, ip netip.Addr) (code, detail string) {
 		return CodeForbiddenDestination, "non-tailnet destination (internet egress needs an exit node or gateway; none configured)"
 	}
 	return "", ""
+}
+
+// serviceVIP resolves a Tailscale Service name from the node's netmap DNS
+// extra records (the same records MagicDNS answers). want is lowercase with
+// no trailing dot; a bare name matches the first label.
+func serviceVIP(ctx context.Context, lc interface {
+	DNSConfig(context.Context) (*tailcfg.DNSConfig, error)
+}, want string) (netip.Addr, bool) {
+	dc, err := lc.DNSConfig(ctx)
+	if err != nil || dc == nil {
+		return netip.Addr{}, false
+	}
+	var found netip.Addr
+	for _, rec := range dc.ExtraRecords {
+		if rec.Type != "" && rec.Type != "A" && rec.Type != "AAAA" {
+			continue
+		}
+		dn := strings.TrimSuffix(strings.ToLower(rec.Name), ".")
+		first, _, _ := strings.Cut(dn, ".")
+		if dn != want && (strings.Contains(want, ".") || first != want) {
+			continue
+		}
+		ip, err := netip.ParseAddr(rec.Value)
+		if err != nil {
+			continue
+		}
+		if ip.Is4() || !found.IsValid() {
+			found = ip
+		}
+	}
+	return found, found.IsValid()
+}
+
+// servicePeer reports whether ip is a Service VIP routed by a peer in st
+// (the VIP is in the peer's AllowedIPs; control only routes it to approved
+// hosts the caller has a grant to). code is set when every such host is a
+// sibling object on this host (same-host calls go through the platform).
+func (r *Registry) servicePeer(o *Object, st *ipnstate.Status, ip netip.Addr) (code, detail string, ok bool) {
+	var hosts []netip.Addr
+	for _, p := range st.Peer {
+		if p.AllowedIPs == nil {
+			continue
+		}
+		routes := false
+		for _, pfx := range p.AllowedIPs.All() {
+			if pfx.Contains(ip) && pfx.Bits() == ip.BitLen() {
+				routes = true
+				break
+			}
+		}
+		if routes {
+			hosts = append(hosts, p.TailscaleIPs...)
+		}
+	}
+	if len(hosts) == 0 {
+		return "", "", false
+	}
+	if r.cfg.AllowSiblings {
+		return "", "", true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, h := range hosts {
+		if _, sib := r.localIPs[h]; !sib {
+			return "", "", true
+		}
+	}
+	return CodeForbiddenDestination, "the service's only reachable host is a sibling object on this host; same-host calls go through the platform", true
 }

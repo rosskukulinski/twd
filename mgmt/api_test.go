@@ -50,6 +50,13 @@ type fakeTS struct {
 	oauthTokens    map[string]string // access token → client ID
 	oauthExchanges int
 	refuseTags     map[string]bool // tags the control plane refuses ("not permitted")
+	// Tailscale Services (services_test.go): definitions by name, devices
+	// for GET /devices, and a per-test policy (samplePolicy when empty).
+	services  map[string]map[string]any
+	devices   []map[string]any
+	policy    string
+	svcPuts   int
+	svcDenied bool // 403 on /services (credential without the Services scope)
 }
 
 type fakeOAuthClient struct {
@@ -69,7 +76,8 @@ func (f *fakeTS) oauthScope(auth, scope string) bool {
 
 func newFakeTS(t *testing.T) *fakeTS {
 	f := &fakeTS{t: t, keys: map[string]map[string]any{}, secrets: map[string]string{}, apiToken: "fake-api-token",
-		oauthClients: map[string]fakeOAuthClient{}, oauthTokens: map[string]string{}, refuseTags: map[string]bool{}}
+		oauthClients: map[string]fakeOAuthClient{}, oauthTokens: map[string]string{}, refuseTags: map[string]bool{},
+		services: map[string]map[string]any{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -164,7 +172,37 @@ func (f *fakeTS) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		w.Header().Set("ETag", `"p1"`)
-		w.Write([]byte(samplePolicy))
+		if f.policy != "" {
+			w.Write([]byte(f.policy))
+		} else {
+			w.Write([]byte(samplePolicy))
+		}
+	case strings.Contains(r.URL.Path, "/services/"):
+		if f.svcDenied {
+			w.WriteHeader(403)
+			w.Write([]byte(`{"message":"insufficient scope"}`))
+			return
+		}
+		name, _ := url.PathUnescape(r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+		switch r.Method {
+		case "GET":
+			sv, ok := f.services[name]
+			if !ok {
+				w.WriteHeader(404)
+				w.Write([]byte(`{"message":"service not found"}`))
+				return
+			}
+			json.NewEncoder(w).Encode(sv)
+		case "PUT":
+			var body map[string]any
+			json.NewDecoder(r.Body).Decode(&body)
+			body["addrs"] = []string{"100.96.0.7", "fd7a:115c:a1e0::7"}
+			f.services[name] = body
+			f.svcPuts++
+			json.NewEncoder(w).Encode(body)
+		}
+	case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/devices"):
+		json.NewEncoder(w).Encode(map[string]any{"devices": f.devices})
 	default:
 		w.WriteHeader(404)
 	}

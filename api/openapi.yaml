@@ -1843,6 +1843,8 @@ components:
         | `lease_held` | 409 | another host holds the lease |
         | `store_unavailable` | 503 | the store is unreachable, restarting or contended (a row-lock or idle-transaction timeout); retry after `Retry-After` |
         | `tier_unavailable` | 409 | the chosen host (`--host`, or the workload's current host) does not offer the deployment's tier |
+        | `service_conflict` | 409 | `tailnet.service` names a Service that exists and isn't managed by twd for this tenant and workload |
+        | `service_api_failed` | 502 | mgmt can't read or create the Service definition (an OAuth client needs Services › Write) |
         | `takeover_unconfirmed` | 409 | the workload has Durable Objects and its host stopped heartbeating but is still registered: it may still be serving them. `twd host rm <host> --drain`, or redeploy with `--force-takeover` |
         | `already_joined` | 409 | credential for an object that has a node |
         | `identity_conflict` | 409 | object ID collision across identities |
@@ -1883,6 +1885,8 @@ components:
         - lease_lost
         - lease_held
         - takeover_unconfirmed
+        - service_conflict
+        - service_api_failed
         - tier_unavailable
         - store_unavailable
         - already_joined
@@ -2210,6 +2214,23 @@ components:
         tags: { type: array, items: { type: string } }
         agent: { type: boolean }
         ttl: { type: string, description: "`10m`-style duration or seconds." }
+        service:
+          type: string
+          pattern: "^svc:[a-z0-9][a-z0-9-]{0,62}$"
+          description: >-
+            `_workload` only: the Tailscale Service the workload entry node hosts (`twd.jsonc`
+            `tailnet.service`).
+    ServiceEndpoint:
+      type: object
+      description: >-
+        A workload's Tailscale Service: a stable name and VIPs that survive the workload node being
+        re-minted or moving host. Callers need a grant to the `svc:` name; control routes it to the
+        workload node only when policy `autoApprovers.services` lets the workload tags host it.
+      required: [name, magicDNS]
+      properties:
+        name: { type: string, examples: ["svc:support"] }
+        magicDNS: { type: string, examples: [support.tail1234.ts.net] }
+        addrs: { type: array, items: { type: string }, description: The Service VIPs (on create). }
     Endpoint:
       type: object
       description: The workload entry node (`_workload` object).
@@ -2219,6 +2240,7 @@ components:
         node: { type: string, description: hostname }
         magicDNS: { type: string }
         status: { $ref: "#/components/schemas/ObjectStatus" }
+        service: { $ref: "#/components/schemas/ServiceEndpoint" }
     Deployment:
       type: object
       required: [deploymentID, tenantID, workload, host, epoch, status, namespaces, endpoint, createdAt]
@@ -2269,6 +2291,11 @@ components:
         bundleURL: { type: string, format: uri-reference }
         namespaces: { type: array, items: { $ref: "#/components/schemas/ClassConfig" } }
         workloadTags: { type: array, items: { type: string } }
+        service:
+          type: string
+          description: >-
+            The Tailscale Service the workload entry node advertises while the deployment is active and
+            healthy; the host withdraws it on drain, undeploy, fencing, kill, or failed health checks.
         fence:
           type: boolean
           description: >-
@@ -2300,6 +2327,13 @@ components:
         missingTagOwners: { type: array, items: { type: string } }
         tagOwnersSnippet: { type: string }
         unchecked: { type: array, items: { type: string }, description: "`tailnet.connects` entries that are names, not tags." }
+        service: { type: string, description: "The Tailscale Service the workload node would host (`tailnet.service`)." }
+        serviceUnapproved:
+          type: boolean
+          description: >-
+            The policy's `autoApprovers.services` doesn't let the workload tags host `service`: the node would
+            advertise it but control would never route it. `ok` is false.
+        serviceSnippet: { type: string, description: The `autoApprovers` entry to add (HuJSON). }
 
     # ------------------------------------------------------------- objects
     ObjectStatus:

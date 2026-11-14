@@ -35,9 +35,16 @@
 > **Still open:**
 > 1. **H22: FIXED** after the loop (F22, option b): a durable audit
 >    outbox written in the same transaction (see the F22 note).
-> 2. **H12:** no `svc:twd-mgmt` VIP yet. Hosts point at one replica. The
->    VIP must retry on another backend and eject slow or stalled ones
->    (from S3/S6).
+> 2. **H12: mostly done (2026-11-13).** `twd-mgmt -tsnet-service svc:twd-mgmt`.
+>    Each replica hosts the Service on its own node and advertises it only
+>    while its store answers (`mgmt.ServiceGate`: 3 failed checks withdraw
+>    it, 1 good check restores it, SIGTERM withdraws first). A withdraw also
+>    drops keep-alives, so pooled host connections move. Measured on
+>    tailnet 1 (`TestRealMgmtService`, `docs/services.md`): store loss →
+>    steady on the other replica in 8.2 s; SIGTERM → 7.7 s. **Still open:**
+>    a replica that is stalled outright (S3, SIGSTOP) can't withdraw
+>    itself, so callers must keep their timeout and retry. No real hostd
+>    has heartbeated through the VIP yet (item 3).
 > 3. **S11 used fake hosts.** hostd's fencing (F9) is unit-tested only;
 >    run a hostd e2e once the VIP exists.
 > 4. **H17's effect isn't isolated:** S6 passes on the harness's
