@@ -96,6 +96,16 @@ type Config struct {
 	Logger *slog.Logger
 	// TSNetLogs forwards tsnet's internal logs to Logger at debug level.
 	TSNetLogs bool
+
+	// PublicListen opens a public node's listener (ADR-029). Nil: tsnet
+	// ListenFunnel(":443", FunnelOnly()). Tests inject a listener whose
+	// conns are *ipn.FunnelConn (testcontrol issues no certificates).
+	PublicListen func(srv *tsnet.Server) (net.Listener, error)
+	// OnPublicRequest is called after each public request (audit, D7).
+	OnPublicRequest func(PublicRequestRecord)
+	// OnPublicRejected is called at most once per PublicRejectWindow per
+	// public node with the requests the limits refused.
+	OnPublicRejected func(PublicRejectSummary)
 }
 
 // ObjectOptions override registry defaults for one object.
@@ -103,6 +113,8 @@ type ObjectOptions struct {
 	Hostname  string
 	Tags      []string
 	Ephemeral *bool
+	// Public makes this a public (Funnel) node: see public.go.
+	Public *PublicOptions
 }
 
 // Registry holds every object node for one tenant on this host.
