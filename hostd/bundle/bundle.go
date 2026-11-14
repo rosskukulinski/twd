@@ -48,6 +48,57 @@ type App struct {
 	Runtime string
 	// Node is the Node process tier app (Runtime == RuntimeNode).
 	Node *NodeApp
+	// Containers are the DO classes with a container attached (wrangler
+	// "containers", ADR-032): by class name.
+	Containers map[string]*ContainerClass
+}
+
+// ContainerClass is one class's container config (wrangler "containers"
+// entry, with twd.jsonc "containers.<Class>" pinning image refs).
+type ContainerClass struct {
+	Class string
+	// Image is the default image ref ("" if the wrangler entry names a
+	// Dockerfile that twd deploy has not built and pinned yet).
+	Image string
+	// Source is the wrangler "image" as written (a ref or a Dockerfile path).
+	Source string
+	// Images are named images (ctx.container.images; Sandbox SDK 1.0),
+	// name -> ref ("" = not built yet).
+	Images map[string]string
+	// InstanceType is a Cloudflare type name; Custom a custom instance.
+	InstanceType string
+	Custom       *InstanceResources
+	MaxInstances int
+}
+
+// InstanceResources is a custom instance type (wrangler instance_type
+// {vcpu, memory_mib, disk_mb}).
+type InstanceResources struct {
+	VCPU      float64 `json:"vcpu"`
+	MemoryMiB int     `json:"memory_mib"`
+	DiskMB    int     `json:"disk_mb"`
+}
+
+// Refs lists every image ref the class may start (pinned ones only).
+func (c *ContainerClass) Refs() []string {
+	var out []string
+	if c.Image != "" {
+		out = append(out, c.Image)
+	}
+	for _, r := range c.Images {
+		if r != "" {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isBuildSource reports whether a wrangler image names a Dockerfile (or a
+// build dir) rather than a registry ref.
+func isBuildSource(s string) bool {
+	return strings.HasPrefix(s, "./") || strings.HasPrefix(s, "../") || strings.HasPrefix(s, "/") ||
+		strings.HasSuffix(strings.ToLower(s), "dockerfile") || s == "."
 }
 
 // RuntimeNode is the opt-in Node.js process tier (twd.jsonc "runtime": "node").
@@ -104,6 +155,16 @@ type wranglerConfig struct {
 			ScriptName string `json:"script_name"`
 		} `json:"bindings"`
 	} `json:"durable_objects"`
+	Containers []struct {
+		ClassName    string          `json:"class_name"`
+		Image        string          `json:"image"`
+		InstanceType json.RawMessage `json:"instance_type"`
+		MaxInstances int             `json:"max_instances"`
+		Images       map[string]struct {
+			Dockerfile string `json:"dockerfile"`
+			Image      string `json:"image"`
+		} `json:"images"`
+	} `json:"containers"`
 }
 
 type twdConfig struct {
@@ -117,6 +178,12 @@ type twdConfig struct {
 		Health string            `json:"health"`
 		Args   []string          `json:"args"`
 	} `json:"node"`
+	// Containers pins each container class's images to refs (written by
+	// twd deploy once it has built and pushed them; ADR-032 D3).
+	Containers map[string]struct {
+		Image  string            `json:"image"`
+		Images map[string]string `json:"images"`
+	} `json:"containers"`
 	Tailnet struct {
 		Tags     []string `json:"tags"`
 		Connects []string `json:"connects"`
@@ -260,7 +327,76 @@ func Parse(files map[string][]byte) (*App, error) {
 			return nil, fmt.Errorf("bundle: tailnet.objects.%s.egress must be %q or %q", name, EgressObject, EgressWorkload)
 		}
 	}
+	if err := parseContainers(a, &w, &t); err != nil {
+		return nil, err
+	}
 	return a, nil
+}
+
+var refRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._/:@-]{0,254}$`)
+
+func parseContainers(a *App, w *wranglerConfig, t *twdConfig) error {
+	for _, wc := range w.Containers {
+		cls := wc.ClassName
+		if a.Classes[cls] == nil {
+			return fmt.Errorf("bundle: containers entry for %q, which has no durable_objects binding", cls)
+		}
+		if a.Containers == nil {
+			a.Containers = map[string]*ContainerClass{}
+		}
+		if a.Containers[cls] != nil {
+			return fmt.Errorf("bundle: two containers entries for %s", cls)
+		}
+		c := &ContainerClass{Class: cls, Source: wc.Image, MaxInstances: wc.MaxInstances, Images: map[string]string{}}
+		if wc.Image != "" && !isBuildSource(wc.Image) {
+			c.Image = wc.Image
+		}
+		for n, im := range wc.Images {
+			if !identRE.MatchString(n) {
+				return fmt.Errorf("bundle: containers %s: bad image name %q", cls, n)
+			}
+			c.Images[n] = ""
+			if im.Image != "" && !isBuildSource(im.Image) {
+				c.Images[n] = im.Image
+			}
+		}
+		if len(wc.InstanceType) > 0 && string(wc.InstanceType) != "null" {
+			var name string
+			if json.Unmarshal(wc.InstanceType, &name) == nil {
+				c.InstanceType = name
+			} else {
+				var r InstanceResources
+				if err := json.Unmarshal(wc.InstanceType, &r); err != nil {
+					return fmt.Errorf("bundle: containers %s: instance_type: %w", cls, err)
+				}
+				c.Custom = &r
+			}
+		}
+		a.Containers[cls] = c
+	}
+	for cls, tc := range t.Containers {
+		c := a.Containers[cls]
+		if c == nil {
+			return fmt.Errorf("bundle: twd.jsonc containers.%s has no wrangler containers entry", cls)
+		}
+		if tc.Image != "" {
+			c.Image = tc.Image
+		}
+		for n, r := range tc.Images {
+			if _, ok := c.Images[n]; !ok {
+				return fmt.Errorf("bundle: twd.jsonc containers.%s.images.%s is not in wrangler's images", cls, n)
+			}
+			c.Images[n] = r
+		}
+	}
+	for cls, c := range a.Containers {
+		for _, r := range c.Refs() {
+			if !refRE.MatchString(r) {
+				return fmt.Errorf("bundle: containers %s: bad image ref %q", cls, r)
+			}
+		}
+	}
+	return nil
 }
 
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
