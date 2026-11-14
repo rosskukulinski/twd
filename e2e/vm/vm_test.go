@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -163,6 +164,17 @@ func TestE2EVM(t *testing.T) {
 	}
 
 	t.Run("TierSelection", func(t *testing.T) {
+		// The host offers the microVM tier to mgmt (placement relies on it).
+		ht := e.FM.HostTiers()
+		if len(ht) != 1 {
+			t.Fatalf("registered hosts: %v", ht)
+		}
+		for id, tiers := range ht {
+			if !slices.Contains(tiers, "microvm") {
+				t.Fatalf("host %s registered tiers %v: no microvm", id, tiers)
+			}
+			res.set("host_tiers", tiers)
+		}
 		for name, want := range map[string]string{"hello": "microvm", "probe": "microvm", "probep": "process"} {
 			ws := wstatus(name)
 			if ws.Tier != want {
