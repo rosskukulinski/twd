@@ -113,7 +113,28 @@ func TestE2EKeyless(t *testing.T) {
 		t.Fatalf("%s: %s", name, detail)
 	}
 
-	// 1. Policy additions (no-op if present); API key use (c).
+	// 1. Policy additions (no-op if present); API key use (c). Only the
+	// issuer node's tagOwner and funnel nodeAttr may be new (approved for
+	// the issuer move); anything else missing means the tailnet drifted.
+	if cur, _, err := api.GetPolicyHuJSON(ctx); err != nil {
+		t.Fatalf("read policy: %v", netd.RedactError(err))
+	} else if miss, err := policy.Missing(cur, Policy()); err != nil {
+		t.Fatal(err)
+	} else {
+		for k := range miss.TagOwners {
+			if k != mgmt.IssuerTag {
+				t.Fatalf("refusing to write the policy: it is also missing tagOwner %s", k)
+			}
+		}
+		if len(miss.Grants) > 0 {
+			t.Fatalf("refusing to write the policy: it is also missing grants %s", miss.HuJSON())
+		}
+		for _, n := range miss.NodeAttrs {
+			if b, _ := json.Marshal(n); !strings.Contains(string(b), `"`+mgmt.IssuerTag+`"`) || strings.Contains(string(b), `"`+mgmt.MgmtTag+`"`) {
+				t.Fatalf("refusing to write the policy: unexpected nodeAttr %s", b)
+			}
+		}
+	}
 	ar, err := policy.ApplyWith(ctx, api, Policy(), policy.Options{AllowTags: []string{cliflow.TestTag, NoAdminTag}, AllowSrcs: []string{"autogroup:admin"}})
 	if err != nil {
 		t.Fatalf("policy: %v", netd.RedactError(err))
