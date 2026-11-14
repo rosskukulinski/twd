@@ -27,6 +27,7 @@ import (
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -204,9 +205,13 @@ func (h *Host) applyPublic(w *workload, spec *mgmtapi.PublicAssignment) {
 	want := h.publicOptionsLocked(w.tenantID, w.name)
 	have := ps.opts
 	live := po.live
+	taken := strings.HasPrefix(po.Err, "public_name_taken")
 	h.mu.Unlock()
 	if want == nil {
 		return
+	}
+	if taken {
+		want.Enabled = false // never serve a de-duplicated name
 	}
 	if live && have != nil && sameRouting(have, want) {
 		// netd reports a listener that failed to open (no HTTPS certs or no
