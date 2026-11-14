@@ -11,13 +11,17 @@ rebuilds, so app code and Dockerfiles stay unchanged:
 
 amd64 hosts use the stock images. The alias applies in two places:
 
-- **at image resolution** (`image.Store.Resolve`): `start({image})` or a pinned
-  ref naming the stock image;
-- **at build time**: a Dockerfile `FROM docker.io/cloudflare/sandbox:<v>` (or
-  `COPY --from=` it) is built with a BuildKit named context
-  (`--build-context docker.io/cloudflare/sandbox:<v>=docker-image://twd.local/...`),
-  so the app's Dockerfile is used as written. `twd deploy`'s builder (the
-  images work) should pass the same contexts.
+- **at deploy** (mgmt, `internal/registry.Resolver`): the stock ref is pinned to
+  the rebuild in twd's registry (`public/cloudflare-sandbox`, pushed by the
+  operator with `twd image push`) for arm64 hosts, to the mirrored stock image
+  for amd64 ones; hosts without a registry still alias in `image.Store.Resolve`;
+- **at build time** (`twd deploy`, `internal/imagebuild`): a Dockerfile
+  `FROM docker.io/cloudflare/sandbox:<v>` (or `COPY --from=` it, or an ARG
+  default naming it) is built for arm64 with a BuildKit named context
+  (`--build-context docker.io/cloudflare/sandbox:<v>=oci-layout://…`, the
+  rebuild fetched from twd's registry or the local Docker store), so the app's
+  Dockerfile is used as written. (This script still uses `docker-image://`
+  contexts on images it has just loaded.)
 
 ## How the rebuilds are produced
 

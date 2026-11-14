@@ -821,11 +821,16 @@ func (s *SQLStore) GetTenant(ctx context.Context, id string) (Tenant, error) {
 func (s *SQLStore) DeleteTenant(ctx context.Context, id string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		for _, q := range []string{"DELETE FROM objects WHERE tenant_id=?", "DELETE FROM deployments WHERE tenant_id=?",
-			"DELETE FROM leases WHERE name LIKE ? || '/%'", "DELETE FROM container_reservations WHERE tenant_id=?",
-			// The tenant's registry namespace (ADR-032 D3): its links and
-			// tags go; blobs stay content-addressed on disk.
-			"DELETE FROM registry_links WHERE repo LIKE ? || '/%'", "DELETE FROM registry_tags WHERE repo LIKE ? || '/%'"} {
+			"DELETE FROM leases WHERE name LIKE ? || '/%'", "DELETE FROM container_reservations WHERE tenant_id=?"} {
 			if _, err := tx.ExecContext(ctx, s.q(q), id); err != nil {
+				return err
+			}
+		}
+		// The tenant's registry namespace (ADR-032 D3): its links and tags go
+		// (blobs stay content-addressed on disk). A prefix compare, not LIKE:
+		// "_" in a tenant ID must not match another tenant's namespace.
+		for _, q := range []string{"DELETE FROM registry_links WHERE substr(repo, 1, ?) = ?", "DELETE FROM registry_tags WHERE substr(repo, 1, ?) = ?"} {
+			if _, err := tx.ExecContext(ctx, s.q(q), len(id)+1, id+"/"); err != nil {
 				return err
 			}
 		}

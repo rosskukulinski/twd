@@ -227,12 +227,16 @@ func cmdImagePush(args []string) error {
 		return err
 	}
 	defer l.Close()
-	repo := r.Repository
-	if !strings.Contains(repo, "/") || registry.Namespace(repo) != registry.PublicNamespace && !looksLikeTenantNS(repo) {
-		repo = registry.PublicNamespace + "/" + repo
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
+	// twd.local/<tenantID>/… is that tenant's namespace; anything else is
+	// the operator's public/ (as mgmt reads twd.local refs at deploy).
+	repo := r.Repository
+	if ns := registry.Namespace(repo); ns != registry.PublicNamespace {
+		if !strings.Contains(repo, "/") || s.mgmt().Do(ctx, "GET", "/v1/tenants/"+ns, nil, nil) != nil {
+			repo = registry.PublicNamespace + "/" + repo
+		}
+	}
 	st := time.Now()
 	cp, err := oci.Copy(ctx, l, "", l.Top.Digest, s.mgmt().OCI(), repo, nil, r.Tag)
 	if err != nil {
@@ -247,11 +251,4 @@ func cmdImagePush(args []string) error {
 		fmt.Printf("✓ pushed     %s:%s %s (%s; %d MB in %.1fs)\n", repo, r.Tag, cp.Digest, strings.Join(archs, ", "), cp.Bytes>>20, time.Since(st).Seconds())
 	})
 	return nil
-}
-
-// looksLikeTenantNS: twd.local/<x>/<y> with x a tenant ID ("tn_…" as
-// mgmt generates them) pushes into that tenant's namespace; anything else
-// is an operator image for public/.
-func looksLikeTenantNS(repo string) bool {
-	return strings.HasPrefix(registry.Namespace(repo), "tn_")
 }

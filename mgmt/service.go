@@ -322,6 +322,9 @@ func (m *Mgmt) CreateTenant(ctx context.Context, r TenantRequest) (Tenant, error
 		RegistrationsPerMinute: r.RegistrationsPerMinute, MaxObjects: r.MaxObjects, CreatedAt: m.now().UnixMilli(),
 		MaxContainers: r.MaxContainers, MaxContainerMemMiB: r.MaxContainerMemMiB, MaxContainerVCPU: r.MaxContainerVCPU}
 	t.containerDefaults()
+	if t.ID == registry.PublicNamespace {
+		return Tenant{}, errf(400, "bad_request", "tenant ID %q is reserved (the registry's operator namespace)", t.ID)
+	}
 	if t.ID == "" {
 		t.ID = newID("tn_")[:11]
 	}
