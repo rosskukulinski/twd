@@ -42,6 +42,9 @@ type Config struct {
 	Firecracker string // in-process helper only (default /usr/local/bin/firecracker)
 	Jailer      string // in-process helper only (default /usr/local/bin/jailer)
 	Kernel      string // uncompressed guest kernel (vmlinux)
+	// ContainerKernel boots container guests (needs erofs + overlayfs:
+	// guest/build-kernel.sh); "" = Kernel.
+	ContainerKernel string
 	Rootfs      string // guest image from guest/build-image.sh (mounted read-only by every VM)
 	RunDir      string // per-VM dirs: config drive, console log
 	MemMiB      int    // guest memory (default 512)
@@ -234,18 +237,61 @@ type Machine struct {
 	events  []proto.Msg
 	lastErr string
 	cleanup sync.Once
+
+	ctr *ctrState // container guests only
 }
 
 // Boot implements sandbox.Backend.
 func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err error) {
+	req := &helperapi.StartRequest{Name: s.ID, MemMiB: b.cfg.MemMiB, VCPUs: b.cfg.VCPUs, HugePages: b.cfg.HugePages,
+		BootArgs: b.cfg.BootArgs, MTU: b.cfg.MTU, GuestMAC: guestMAC, GuestCID: 3, VsockPort: proto.VsockPort}
+	l := launch{name: s.ID, log: s.Log, kernel: b.cfg.Kernel, req: req, handlers: s.Handlers,
+		drive: func(p string) error { return writeConfigDrive(p, s, b.cfg.MTU) }}
+	if v := s.Volume; v != nil {
+		l.extra = func(m *Machine) (*os.File, error) {
+			f, format, err := openVolume(v)
+			if err != nil {
+				return nil, fmt.Errorf("volume %s: %w", v.Name, err)
+			}
+			req.Volume = &helperapi.Volume{Name: v.Name, Epoch: v.Epoch, Key: v.Key, Format: format}
+			m.disks = append(m.disks, v.Path)
+			m.volume = true
+			m.info.Volume = v.Name
+			return f, nil
+		}
+	}
+	m, err := b.launch(ctx, l)
+	if err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+// launch is one VM boot's inputs (Boot: a workerd guest; BootContainer:
+// a container guest).
+type launch struct {
+	name     string
+	log      *slog.Logger
+	kernel   string
+	drive    func(path string) error // writes the config drive
+	req      *helperapi.StartRequest
+	extra    func(m *Machine) (*os.File, error) // the fifth drive (DO volume or container image)
+	handlers map[uint16]http.Handler
+	ctr      *ctrState
+}
+
+func (b *Backend) launch(ctx context.Context, l launch) (_ *Machine, err error) {
 	t0 := time.Now()
 	n := b.seq.Add(1)
-	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), s.ID, n)
+	id := fmt.Sprintf("%d-%s-%d", os.Getpid(), l.name, n)
 	m := &Machine{b: b, id: id, dir: filepath.Join(b.cfg.RunDir, id), tapFD: -1,
-		done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}}
+		done: make(chan struct{}), ready: make(chan struct{}), pending: map[int64]chan proto.Msg{}, ctr: l.ctr}
+	if l.ctr != nil {
+		l.ctr.m = m
+	}
 	m.log = b.cfg.Log.With("vm", id)
-	if s.Log != nil {
-		m.log = s.Log.With("vm", id)
+	if l.log != nil {
+		m.log = l.log.With("vm", id)
 	}
 	defer func() {
 		if err != nil {
@@ -258,7 +304,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	}
 	// 1. Config drive: the instance dir + guest.json, as a raw tar.
 	drive := filepath.Join(m.dir, "config.tar")
-	if err := writeConfigDrive(drive, s, b.cfg.MTU); err != nil {
+	if err := l.drive(drive); err != nil {
 		return nil, fmt.Errorf("config drive: %w", err)
 	}
 	m.disks = []string{b.cfg.Rootfs, drive}
@@ -270,7 +316,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 			f.Close()
 		}
 	}()
-	for _, p := range []string{b.cfg.Kernel, b.cfg.Rootfs, drive} {
+	for _, p := range []string{l.kernel, b.cfg.Rootfs, drive} {
 		f, err := os.Open(p)
 		if err != nil {
 			return nil, err
@@ -283,18 +329,13 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	}
 	files = append(files, console)
 	m.info.Console = console.Name()
-	req := &helperapi.StartRequest{Name: s.ID, MemMiB: b.cfg.MemMiB, VCPUs: b.cfg.VCPUs, HugePages: b.cfg.HugePages,
-		BootArgs: b.cfg.BootArgs, MTU: b.cfg.MTU, GuestMAC: guestMAC, GuestCID: 3, VsockPort: proto.VsockPort}
-	if v := s.Volume; v != nil {
-		f, format, err := openVolume(v)
+	req := l.req
+	if l.extra != nil {
+		f, err := l.extra(m)
 		if err != nil {
-			return nil, fmt.Errorf("volume %s: %w", v.Name, err)
+			return nil, err
 		}
 		files = append(files, f)
-		req.Volume = &helperapi.Volume{Name: v.Name, Epoch: v.Epoch, Key: v.Key, Format: format}
-		m.disks = append(m.disks, v.Path)
-		m.volume = true
-		m.info.Volume = v.Name
 	}
 
 	// 3. The helper: netns + TAPs, jail, volume, jailer → Firecracker,
@@ -331,7 +372,7 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 		m.info.Jail = &sandbox.Jail{ID: j.ID, Chroot: j.Chroot, Cgroup: j.Cgroup, CPUMax: j.CPUMax, Seccomp: j.Seccomp,
 			Netns: j.Netns, UID: j.UID, GID: j.GID, MemMax: j.MemMax}
 	}
-	m.vn, err = newVnet(m.tapFD, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, s.Handlers)
+	m.vn, err = newVnet(m.tapFD, uint32(b.cfg.MTU), gwMAC, gatewayIP, guestIP, proto.PrefixLen, l.handlers)
 	if err != nil {
 		return nil, err
 	}
@@ -339,12 +380,19 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	go m.acceptCtl()
 	go m.watch()
 
-	// 4. Wait for guestd to report workerd healthy.
+	// 4. Wait for guestd to report workerd healthy (or, in a container
+	// guest, the entrypoint started).
 	rctx, cancel := context.WithTimeout(ctx, b.cfg.ReadyTimeout)
 	defer cancel()
 	select {
 	case <-m.ready:
 	case <-m.done:
+		m.mu.Lock()
+		le := m.lastErr
+		m.mu.Unlock()
+		if le != "" {
+			return nil, fmt.Errorf("microVM exited during boot: %s", le)
+		}
 		return nil, fmt.Errorf("microVM exited during boot: %v", m.exitErr)
 	case <-rctx.Done():
 		m.mu.Lock()
@@ -354,7 +402,8 @@ func (b *Backend) Boot(ctx context.Context, s sandbox.Spec) (vmi sandbox.VM, err
 	}
 	m.info.Total = time.Since(t0)
 	m.log.Info("microVM ready", "boot_ms", m.info.Boot.Milliseconds(), "ready_ms", m.info.Ready.Milliseconds(),
-		"total_ms", m.info.Total.Milliseconds(), "jail", resp.Jail != nil, "volume", m.info.Volume, "volume_ms", m.info.VolumeAttachMS)
+		"total_ms", m.info.Total.Milliseconds(), "jail", resp.Jail != nil, "volume", m.info.Volume, "volume_ms", m.info.VolumeAttachMS,
+		"container", l.ctr != nil)
 	return m, nil
 }
 
@@ -435,17 +484,46 @@ func (m *Machine) acceptCtl() {
 		if err != nil {
 			return
 		}
-		m.mu.Lock()
-		if m.ctl != nil {
-			m.ctl.Close()
-		}
-		m.ctl, m.enc = c, json.NewEncoder(c)
-		m.mu.Unlock()
-		go m.readCtl(c)
+		go m.route(c)
 	}
 }
 
-func (m *Machine) readCtl(c net.Conn) {
+// route reads a guest connection's first line: an exec stdio stream
+// (container guests) says so; anything else is the control channel
+// (guestd opens it with "hello").
+func (m *Machine) route(c net.Conn) {
+	br := bufio.NewReaderSize(c, 64<<10)
+	c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	line, err := br.ReadSlice('\n')
+	c.SetReadDeadline(time.Time{})
+	if err != nil {
+		c.Close()
+		return
+	}
+	var first proto.Msg
+	json.Unmarshal(line, &first)
+	if first.Type == proto.ExecStreamHello {
+		m.attachStream(first.Exec, &bufConn{Conn: c, r: br})
+		return
+	}
+	m.mu.Lock()
+	if m.ctl != nil {
+		m.ctl.Close()
+	}
+	m.ctl, m.enc = c, json.NewEncoder(c)
+	m.mu.Unlock()
+	m.readCtl(io.MultiReader(bytes.NewReader(append([]byte(nil), line...)), br))
+}
+
+// bufConn is a conn whose first bytes were read into r.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
+
+func (m *Machine) readCtl(c io.Reader) {
 	sc := bufio.NewScanner(c)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	for sc.Scan() {
@@ -462,10 +540,13 @@ func (m *Machine) readCtl(c net.Conn) {
 			m.mu.Unlock()
 			continue
 		}
-		if len(m.events) < 256 {
+		if len(m.events) < 256 && msg.Type != "log" {
 			m.events = append(m.events, msg)
 		}
 		m.mu.Unlock()
+		if m.ctr != nil && m.ctr.event(msg) {
+			continue
+		}
 		switch msg.Type {
 		case "boot":
 			m.info.Boot = time.Since(m.start)
