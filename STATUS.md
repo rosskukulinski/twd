@@ -1469,11 +1469,11 @@ Cloudflare's `ctx.container` on the microVM tier: one VM per container, attached
 
 | Suite | Where | Result |
 |---|---|---|
-| `make test` | Mac | **PASS**, 20 Go packages ok (-race), JS 5/9/7 pass, 0 fail (`/tmp/twd-intB-mac-test.log`) |
+| `make test` | Mac | **PASS** at the merges and again at the final code: 20 Go packages ok (-race), JS 5/9/7 pass, 0 fail (`/tmp/twd-intB-mac-test2.log`) |
 | `make lint` | Mac | **PASS** (api-check, gofmt, vet incl. GOOS=linux/darwin e2econtainer, e2eimages, check-secrets) |
 | `make test-node` / `make test-sdk` / `make test-pg PG_PORT=55511` | Mac (OrbStack postgres:17 for pg) | **PASS**: TestNodeTier, TestNodeWorkflow, TestNodeTierSharedHostRefused; TestCloudflareAgents, TestAgentTemplate, TestVercelAI (e2e/sdk 32.5 s); mgmt ok on SQLite and Postgres |
-| `make test` | Lima | **PASS on the first run**, 22 packages ok (hostd 199.9 s, cmd/twd 200.0 s, mgmt 47.6 s, netd 41.6 s: the `TestRejoinRejectedRemints` flake did not recur), JS 21/21 (`/tmp/ctr-intB-maketest.log` in Lima) |
-| `make test` | twd-amd64 (Ubuntu 24.04 x86-64) | **PASS on the first run**, 22 packages ok, JS 0 fail (`/tmp/ctr-intB-maketest.log` there) |
+| `make test` | Lima | at the merges (`b508c07`): **PASS on the first run**, 22 packages ok (hostd 199.9 s, cmd/twd 200.0 s, mgmt 47.6 s, netd 41.6 s), JS 21/21 (`/tmp/ctr-intB-maketest.log`). At the final code (`ba4aa25`): 21 packages ok (hostd 192.4 s, cmd/twd 186.2 s, guestd ok) and the known netd `TestRejoinRejectedRemints` 90 s timeout; rerun `go test -race ./netd/...` ok in 40.9 s, `make test-js` 21/21 (`/tmp/ctr-intB-maketest2.log` in Lima) |
+| `make test` | twd-amd64 (Ubuntu 24.04 x86-64, at `ef85e7d`) | **PASS on the first run**, 22 packages ok, JS 0 fail (`/tmp/ctr-intB-maketest.log` there) |
 | `make e2e-vm` (DO microVM regression) | Lima, Firecracker | **PASS** TestSmoke, TestVolume, TestDgramNICOnlyGatewayServices, arch tests; TestE2EVM 13/13 in 8.71 s, restart → serving 1006 ms (`~/ctr-int/e2e/vm/results/l3-20261114T093607Z.json`) |
 | `make e2e-vz` | Mac, vz | **PASS** TestVZSmoke/Volume/Rosetta/DiesWithHostd, TestDgram…; TestE2EVM 13/13 in 12.5 s, restart → serving 2699 ms, sql_put p50 7.9 ms (`e2e/vm/results/vz-20261114T093423Z.json`) |
 | `make e2e-container` (both acceptance flows + egress/security/limits) | Lima, Firecracker, arm64 images via alias | **PASS** TestContainerSmoke + TestE2EContainer 19/19 leaf subtests in 111.8 s (`/tmp/ctr-intB-e2ectr.log` in Lima) |
