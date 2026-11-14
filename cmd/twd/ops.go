@@ -203,6 +203,9 @@ func cmdLs(args []string) error {
 				by = "  by " + d.DeployedBy
 			}
 			fmt.Printf("  %-12s %-22s %-8s %-10s http://%s/%s\n", d.Workload, d.DeploymentID, d.Host, d.Status, d.Endpoint.MagicDNS, by)
+			if d.Placement != nil && d.Placement.Summary != "" {
+				fmt.Printf("  %-12s placement: %s\n", "", d.Placement.Summary)
+			}
 		}
 		fmt.Println("OBJECTS")
 		fmt.Printf("  %-36s %-34s %-8s %-30s %s\n", "NODE", "CLASS/NAME", "STATUS", "TAGS", "PARENT")

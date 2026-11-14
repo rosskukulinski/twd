@@ -178,6 +178,27 @@ type Assignment struct {
 	// Fence (F9, ADR-028 §3): stop serving this workload when mgmt is
 	// unreachable for FenceAfter. nil (an older mgmt) means true.
 	Fence *bool `json:"fence,omitempty"`
+	// PlacementTargets (smart placement, ADR-029) are what this host should
+	// measure tailnet paths to, from this tenant's nodes.
+	PlacementTargets []string `json:"placementTargets,omitempty"`
+}
+
+// PathReport is one tenant's measured paths (PUT /v1/hosts/{id}/paths, and
+// the reply to a probe push).
+type PathReport struct {
+	TenantID string       `json:"tenantID"`
+	Targets  []PathSample `json:"targets"`
+}
+
+// PathSample is one target's measured path. AgeMs is how long ago it was
+// measured (monotonic); mgmt stamps it with the store clock.
+type PathSample struct {
+	Target     string  `json:"target"`
+	Peer       string  `json:"peer,omitempty"`
+	Path       string  `json:"path"`
+	RTTMs      float64 `json:"rttMs,omitempty"`
+	DERPRegion string  `json:"derpRegion,omitempty"`
+	AgeMs      int64   `json:"ageMs"`
 }
 
 type ObjectRef struct {

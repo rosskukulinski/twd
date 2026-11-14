@@ -258,6 +258,19 @@ func (c *Client) Heartbeat(ctx context.Context, host string, r HeartbeatRequest)
 	return &out, nil
 }
 
+// ReportPaths is PUT /v1/hosts/{id}/paths (smart placement).
+func (c *Client) ReportPaths(ctx context.Context, host string, reports []PathReport) error {
+	body, err := jsonBody(map[string]any{"tenants": reports})
+	if err != nil {
+		return err
+	}
+	resp, err := c.V1().ReportHostPathsWithBodyWithResponse(ctx, host, "application/json", body)
+	if err != nil {
+		return err
+	}
+	return result(resp.HTTPResponse, resp.Body, nil)
+}
+
 // Assignments is GET /v1/hosts/{id}/assignments, following every page.
 func (c *Client) Assignments(ctx context.Context, host string) ([]Assignment, error) {
 	limit := 500

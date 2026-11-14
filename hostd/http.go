@@ -405,6 +405,8 @@ func (h *Host) pushAPI() http.Handler {
 	m.HandleFunc("POST /v1/purge", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"ok": true, "purged": h.Purge()})
 	})
+	// Smart placement: measure a tenant's targets now (mgmt, at deploy).
+	m.HandleFunc("POST /v1/push/probe", h.probeHandler)
 	m.HandleFunc("POST /v1/push/assignments", func(w http.ResponseWriter, r *http.Request) {
 		h.TriggerSync()
 		writeJSON(w, 200, map[string]any{"ok": true})

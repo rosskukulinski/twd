@@ -123,6 +123,10 @@ type Config struct {
 	// The unix push socket (local-dev) is always served too.
 	PushListener net.Listener
 	PushPort     int
+	// PathEvery is how often hostd measures and reports the tailnet paths
+	// to its assignments' placement targets (smart placement, ADR-029).
+	// 0 = DefaultPathEvery (60 s); negative disables measuring.
+	PathEvery time.Duration
 }
 
 // Host is a running twd-hostd.
@@ -191,6 +195,9 @@ func New(cfg Config) (*Host, error) {
 	}
 	if cfg.CapacityNodes == 0 {
 		cfg.CapacityNodes = 1000
+	}
+	if cfg.PathEvery == 0 {
+		cfg.PathEvery = DefaultPathEvery
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.DiscardHandler)
@@ -261,6 +268,10 @@ func (h *Host) Start(ctx context.Context) error {
 	h.mu.Unlock()
 	h.wg.Add(1)
 	go h.loop()
+	if h.cfg.PathEvery > 0 {
+		h.wg.Add(1)
+		go h.pathLoop()
+	}
 	return nil
 }
 
@@ -506,6 +517,9 @@ func (h *Host) syncAssignments(ctx context.Context) error {
 			h.workloads[key] = w
 		}
 		h.mu.Unlock()
+		w.mu.Lock()
+		w.placementTargets = a.PlacementTargets
+		w.mu.Unlock()
 		if w.wantDeploy(a) {
 			go h.deploy(w, a)
 		}

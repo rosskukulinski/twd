@@ -701,6 +701,17 @@ func (o *Object) Server() *tsnet.Server {
 	return o.srv
 }
 
+// LocalClient returns the node's local API client (nil before it is up),
+// for read-only diagnostics such as path probes (Status, disco Ping).
+func (o *Object) LocalClient() *local.Client {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.state != StateReady {
+		return nil
+	}
+	return o.lc
+}
+
 // Info returns a snapshot.
 func (o *Object) Info() ObjectInfo {
 	o.mu.Lock()

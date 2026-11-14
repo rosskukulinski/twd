@@ -146,12 +146,13 @@ func (m *Mgmt) place(ctx context.Context, t Tenant, in placementInput) (Placemen
 		}
 	}
 	var ms []PathMeasurement
-	scoring := len(req.Targets) > 0 && req.Mode == PlacementSmart && in.Pinned == "" && (held == nil || in.Replace)
-	if scoring {
+	if len(req.Targets) > 0 && req.Mode == PlacementSmart {
+		// Read even when pinned or sticky: the decision explains the paths.
 		if ms, err = m.store.HostPaths(ctx, t.ID, req.Targets); err != nil {
 			return PlacementDecision{}, nil, err
 		}
-		if m.probeMissing(ctx, t, cands, ms, req) {
+		// Probe on demand only when the measurements can change the choice.
+		if in.Pinned == "" && (held == nil || in.Replace) && m.probeMissing(ctx, t, cands, ms, req) {
 			if ms, err = m.store.HostPaths(ctx, t.ID, req.Targets); err != nil {
 				return PlacementDecision{}, nil, err
 			}
@@ -218,6 +219,9 @@ func (m *Mgmt) probeMissing(ctx context.Context, t Tenant, cands []Candidate, ms
 				return
 			}
 			rp.TenantID = t.ID
+			if len(rp.Targets) == 0 {
+				return // no vantage node of this tenant on that host
+			}
 			if len(rp.Targets) > MaxPathTargets {
 				rp.Targets = rp.Targets[:MaxPathTargets]
 			}
