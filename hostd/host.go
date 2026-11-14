@@ -123,6 +123,9 @@ type Config struct {
 	// The unix push socket (local-dev) is always served too.
 	PushListener net.Listener
 	PushPort     int
+	// CronTimeout bounds one cron trigger's scheduled() run (wall clock;
+	// default DefaultCronTimeout, 15 min).
+	CronTimeout time.Duration
 }
 
 // Host is a running twd-hostd.
@@ -152,6 +155,7 @@ type Host struct {
 	audit       *auditLog
 	wg          sync.WaitGroup
 	runDirOwned bool
+	nowFn       func() time.Time // wall clock for cron triggers (tests)
 }
 
 // DefaultFenceAfter rides out typical mgmt restarts and database failovers;
@@ -259,8 +263,9 @@ func (h *Host) Start(ctx context.Context) error {
 	h.mu.Lock()
 	h.lastHB = time.Now()
 	h.mu.Unlock()
-	h.wg.Add(1)
+	h.wg.Add(2)
 	go h.loop()
+	go h.cronLoop()
 	return nil
 }
 

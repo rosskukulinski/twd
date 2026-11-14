@@ -52,7 +52,9 @@ type workload struct {
 	gate         chan struct{} // non-nil while switching: closed when open
 	wl           *object       // the workload entry node
 	classTags    map[string][]string
-	noFence      bool // assignment fence=false: stateless, keeps serving without mgmt
+	noFence      bool            // assignment fence=false: stateless, keeps serving without mgmt
+	cronLast     time.Time       // the last minute whose cron triggers were evaluated (UTC)
+	cronRunning  map[string]bool // cron expressions with a run in progress
 }
 
 // fences reports whether heartbeat loss must stop this workload (stateful,

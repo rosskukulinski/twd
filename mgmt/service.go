@@ -603,6 +603,9 @@ func (m *Mgmt) Deploy(ctx context.Context, r DeployRequest) (DeployResponse, err
 	classes := r.Namespaces
 	maxLive, maxDepth := DefaultMaxLive, DefaultMaxDepth
 	if len(r.Bundle) > 0 {
+		if _, err := BundleCrons(r.Bundle); err != nil {
+			return resp, errf(400, "bad_bundle", "%v", err)
+		}
 		cfg, err := BundleConfig(r.Bundle)
 		if err != nil && len(classes) == 0 {
 			return resp, errf(400, "bad_bundle", "%v", err)

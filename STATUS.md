@@ -255,7 +255,53 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
 - In wif mode, policy reads use the lifecycle credential, which then needs `policy_file:read`; this hasn't been tested on a real tailnet.
 - No Lima/Linux test run yet; the linux/arm64 build was only cross-compiled.
 
+## Cron triggers (DONE, branch `short-hyena`)
+`wrangler.jsonc` `triggers.crons` run the default export's `scheduled()`. User docs: `docs/cron-triggers.md`.
+
+**Parser** (`internal/cron`)
+- Cloudflare syntax: five fields, UTC, `L`/`W`/`#`, names. Day of week is 1-7 with 1 = Sunday; `0` is refused.
+- Strict and bounded: ≤128 bytes, ≤10 triggers, no duplicates. A schedule that never fires is refused; the "never fires" check scans 50 years, since a date pinned to a weekday recurs within 40.
+- Fuzzed (63M execs, clean). A fuzz-found AND-semantics case with a gap over 8 years is kept as a regression seed.
+
+**Validation**
+- mgmt: `400 bad_bundle` on deploy and on dry run (`BundleCrons`).
+- hostd: `bundle.Parse` checks again. Node-runtime bundles with crons are refused.
+
+**Running them**
+- hostd `cronLoop` wakes at each UTC minute boundary. `cronDue` is the policy:
+  - active instance only;
+  - fresh heartbeat (≤ FenceAfter), stateless workloads included, so a partitioned host does not double-run;
+  - once per (workload, minute): no re-run after the clock steps back, no backfill after a jump forward;
+  - an overlapping run is skipped.
+- A run goes over the instance's private ingress as `cf.twd.kind = "scheduled"`. The platform checks the cron is declared, then calls `env.TENANT.scheduled()`. The `service_binding_extra_handlers` flag is on the platform worker only, and only when crons exist.
+- Runs are bounded by `CronTimeout` (15 min) and drained like requests. Egress leaves as the workload node.
+
+**`twd dev --test-scheduled`**: wrangler's `/__scheduled?cron=&time=` route on the 127.0.0.1 dev port.
+
+**Tests**
+- `internal/cron`: syntax, semantics and fuzzing.
+- `hostd/bundle`, `mgmt`: `TestBundleCrons`, `TestAPIDeployRejectsBadCrons`.
+- `hostd/gen` (real workerd): `TestGeneratedCron`, covering undeclared crons, a bad `scheduledTime`, and the `/__scheduled` and `/cdn-cgi` paths not triggering; `TestGeneratedCronCancelledOnDisconnect` checks that workerd cancels `scheduled()` when hostd times out.
+- `hostd` policy and real loop: `TestCronDue*`, `TestCronLoopFiresAtMinuteBoundary`.
+- `hostd` end to end (testcontrol, real workerd): `TestCronTriggers`, covering:
+  - the schedule, and egress attributed to the workload node;
+  - a forged `x-twd-cf` from a tailnet caller not triggering a run;
+  - timeouts;
+  - a redeploy that removes the crons.
+
+**Not built**
+- Cron runs are not in the audit chain; they are logged only.
+- No per-run history in `twd ls` (the hostd status has `Crons`).
+- No microVM-tier e2e run (the path is the same `inst.direct` ingress).
+- No Node-tier crons (roadmap; see Next steps).
+
 ## Next steps
+- **Roadmap: cron triggers for the Node tier (Vercel-style).** Today `"runtime": "node"` refuses `triggers.crons`, and twd ignores `vercel.json`; Workflow apps loop on `sleep()` instead. The plan is Vercel's model: `{path, schedule}` entries (from `twd.jsonc` `node.crons`, or `vercel.json` `crons`), with hostd sending a GET to that path in the Node process.
+  - **Reuse:** `internal/cron`, mgmt's `BundleCrons` validation, and the `cronDue` policy.
+  - **Security:** the Node listener also serves tailnet ingress, so a tailnet caller could GET the cron path directly. Two parts:
+    - a per-deployment `CRON_SECRET` in the app's environment, sent as `Authorization: Bearer`, for Vercel compatibility;
+    - a hostd-only marker that netd strips from every client request, as the real guarantee.
+  - **Tests:** Node-tier e2e tests, including a forged-request test from a tailnet caller.
 - M2 follow-ups: a per-root row lock for multi-replica budgets, a warm-key pool, node certificates (§4.6), `nodeAttributes` at mint, and a real setec.
 - M3 `twd-hostd`: move `netd/testdata/workerd/platform.js` into the generated wrapper, add the egress MAC, and run the workerd supervisor.
 ## M3: `twd-hostd` process tier + JS runtime packages (DONE, branch `m3-hostd`)
@@ -372,7 +418,7 @@ Code is in `mgmt/`, `cmd/twd-mgmt`, `internal/tsapi` (extended) and `e2e/real/mg
 - **Not built yet:**
   - egress MAC replay protection (no nonce cache; timestamp skew only);
   - same-host object→object calls over the tailnet (refused as siblings by netd); in-process DO RPC works and is not policy-checked;
-  - cron triggers, WebSocket hibernation across deploys, internet egress (`egress.internet` is parsed but everything is denied), and `forward()` signing.
+  - ~~cron triggers~~ (built: see "Cron triggers" below), WebSocket hibernation across deploys, internet egress (`egress.internet` is parsed but everything is denied), and `forward()` signing.
 
 ## Next steps
 - M2 `twd-mgmt`: SQLite and Postgres leases with epoch fencing, the mint broker (API-key mode first, reusing `internal/tsapi`), the registration throttle and the audit log.

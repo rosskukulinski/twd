@@ -486,6 +486,9 @@ func (m *Mgmt) PreflightBundle(ctx context.Context, r DeployRequest) (PreflightR
 	classes := r.Namespaces
 	var connects []string
 	if len(r.Bundle) > 0 {
+		if _, err := BundleCrons(r.Bundle); err != nil {
+			return res, errf(400, "bad_bundle", "%v", err)
+		}
 		cfg, err := BundleConfig(r.Bundle)
 		if err != nil && len(classes) == 0 {
 			return res, errf(400, "bad_bundle", "%v", err)

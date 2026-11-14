@@ -1,0 +1,16 @@
+{
+  "name": "cron",
+  "main": "src/index.js",
+  "compatibility_date": "2026-04-01",
+  "durable_objects": {
+    "bindings": [{ "name": "LOG", "class_name": "Log" }],
+  },
+  "triggers": {
+    "crons": [
+      "*/5 * * * *",  // records the run
+      "0 0 1 1 *",    // throws
+      "0 0 2 1 *",    // sleeps (overlap and timeout tests)
+      "0 0 3 1 *",    // egress from scheduled()
+    ],
+  },
+}

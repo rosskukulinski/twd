@@ -107,6 +107,8 @@ twd kill <object-id> --cascade                 # cut it (and its sub-agents) off
 - **What runs and what doesn't:** [docs/COMPAT.md](docs/COMPAT.md)
   (Agents SDK, MCP, Vercel AI SDK) and [docs/node-tier.md](docs/node-tier.md)
   (Node.js apps).
+- **Cron triggers** (`triggers.crons` → `scheduled()`):
+  [docs/cron-triggers.md](docs/cron-triggers.md).
 - **mgmt's API:** [api/openapi.yaml](api/openapi.yaml), rendered in
   [docs/contracts/mgmt-api.md](docs/contracts/mgmt-api.md).
 - **Running several mgmt replicas on Postgres:** the chaos and soak harness

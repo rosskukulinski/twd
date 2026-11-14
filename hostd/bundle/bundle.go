@@ -16,6 +16,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/rosskukulinski/twd/internal/cron"
 )
 
 // MaxBundle bounds an unpacked bundle.
@@ -48,6 +50,10 @@ type App struct {
 	Runtime string
 	// Node is the Node process tier app (Runtime == RuntimeNode).
 	Node *NodeApp
+	// Crons are the cron triggers (wrangler.jsonc triggers.crons), each a
+	// valid internal/cron expression, run against the default export's
+	// scheduled() handler.
+	Crons []string
 }
 
 // RuntimeNode is the opt-in Node.js process tier (twd.jsonc "runtime": "node").
@@ -97,7 +103,10 @@ type wranglerConfig struct {
 	CompatibilityDate  string                     `json:"compatibility_date"`
 	CompatibilityFlags []string                   `json:"compatibility_flags"`
 	Vars               map[string]json.RawMessage `json:"vars"`
-	DurableObjects     struct {
+	Triggers           struct {
+		Crons []string `json:"crons"`
+	} `json:"triggers"`
+	DurableObjects struct {
 		Bindings []struct {
 			Name       string `json:"name"`
 			ClassName  string `json:"class_name"`
@@ -155,6 +164,12 @@ func Parse(files map[string][]byte) (*App, error) {
 		switch t.Runtime {
 		case "", "workerd":
 		case RuntimeNode:
+			if crons, err := wranglerCrons(files); err != nil || len(crons) > 0 {
+				if err != nil {
+					return nil, err
+				}
+				return nil, errors.New("bundle: triggers.crons: cron triggers need the workerd runtime (a scheduled() handler); runtime \"node\" does not support them")
+			}
 			return parseNode(files, &t)
 		default:
 			return nil, fmt.Errorf("bundle: twd.jsonc runtime %q: want \"workerd\" (default) or \"node\"", t.Runtime)
@@ -184,6 +199,10 @@ func Parse(files map[string][]byte) (*App, error) {
 		SpawnMaxLive: t.Tailnet.Spawn.MaxLive, SpawnMaxDepth: t.Tailnet.Spawn.MaxDepth,
 		Internet: t.Tailnet.Egress.Internet, Tier: t.Tier,
 	}
+	if err := cron.ValidateTriggers(w.Triggers.Crons); err != nil {
+		return nil, fmt.Errorf("bundle: wrangler.jsonc: %w", err)
+	}
+	a.Crons = w.Triggers.Crons
 	switch a.Tier {
 	case "", TierProcess, TierMicroVM:
 	default:
@@ -261,6 +280,22 @@ func Parse(files map[string][]byte) (*App, error) {
 		}
 	}
 	return a, nil
+}
+
+// wranglerCrons returns wrangler.jsonc's (or .json's) triggers.crons, if
+// the bundle has one.
+func wranglerCrons(files map[string][]byte) ([]string, error) {
+	wb, ok := files["wrangler.jsonc"]
+	if !ok {
+		if wb, ok = files["wrangler.json"]; !ok {
+			return nil, nil
+		}
+	}
+	var w wranglerConfig
+	if err := UnmarshalJSONC(wb, &w); err != nil {
+		return nil, fmt.Errorf("bundle: wrangler.jsonc: %w", err)
+	}
+	return w.Triggers.Crons, nil
 }
 
 var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

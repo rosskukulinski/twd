@@ -95,6 +95,12 @@ DO storage on restart. The process/Node tiers on Linux are effectively single-te
   the workerd tiers — tenant code cannot read the MAC key in-isolate.
 - Lease epoch fencing (single conditional writes) and the registration throttle (AIMD).
 - Audit **hash chain** tamper-evidence (truncation/gap/forged-sig all caught).
+- Cron triggers (`docs/cron-triggers.md`): `scheduled()` runs are reachable only via
+  hostd's private instance ingress (`cf.twd.kind = "scheduled"`, which only hostd sets).
+  The platform refuses undeclared crons. Runs need a fresh heartbeat, so a partitioned
+  host does not run them twice. Expressions are bounded and fuzzed (`internal/cron`).
+  Tests: `TestCronTriggers/TailnetCallerCannotTriggerScheduled` and
+  `TestGeneratedCron/UndeclaredCronRefused`.
 - Secret hygiene: redacting slog handler, pre-commit scan, keys never in guest image.
 
 See `RED-TEAM.md` for the ranked findings and exploits against the rest.

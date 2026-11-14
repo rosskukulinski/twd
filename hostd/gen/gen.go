@@ -223,7 +223,8 @@ func Generate(app *bundle.App, o Options) (*Result, error) {
 		Bindings     []bindCfg                  `json:"bindings"`
 		Classes      map[string]classCfg        `json:"classes"`
 		Vars         map[string]json.RawMessage `json:"vars"`
-	}{o.DeploymentID, o.Workload, app.CompatDate, nonNil(app.CompatFlags), []bindCfg{}, map[string]classCfg{}, app.Vars}
+		Crons        []string                   `json:"crons"`
+	}{o.DeploymentID, o.Workload, app.CompatDate, nonNil(app.CompatFlags), []bindCfg{}, map[string]classCfg{}, app.Vars, nonNil(app.Crons)}
 	if cfg.Vars == nil {
 		cfg.Vars = map[string]json.RawMessage{}
 	}
@@ -284,7 +285,13 @@ func Generate(app *bundle.App, o Options) (*Result, error) {
 	uk := func(cls string) string { return cq("twd-" + o.Workload + "-" + cls) }
 
 	// platform worker
-	fmt.Fprintf(&c, "const platform :Workerd.Worker = (\n  compatibilityDate = %s,\n  modules = [\n", cq(PlatformCompatDate))
+	fmt.Fprintf(&c, "const platform :Workerd.Worker = (\n  compatibilityDate = %s,\n", cq(PlatformCompatDate))
+	if len(app.Crons) > 0 {
+		// TENANT.scheduled(): cron triggers run the default export's
+		// scheduled() handler through the platform's service binding.
+		c.WriteString("  compatibilityFlags = [\"service_binding_extra_handlers\"],\n")
+	}
+	c.WriteString("  modules = [\n")
 	c.WriteString("    (name = \"platform.js\", esModule = embed \"platform.js\"),\n")
 	c.WriteString("    (name = \"twd-config.json\", json = embed \"twd-config.json\"),\n")
 	c.WriteString("    (name = \"twd-modules.js\", esModule = embed \"twd-modules.js\"),\n")

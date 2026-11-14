@@ -53,6 +53,14 @@ check below runs in both.
 | `McpAgent` | not tested | | — | deprecated upstream; use `createMcpHandler` (ADR-022) |
 | `@callable` RPC, `useAgent`, `AIChatAgent` | not tested | | — | same DO/WebSocket primitives as above (assumption) |
 
+## Cron triggers
+
+`wrangler.jsonc` `triggers.crons` and the default export's
+`scheduled(controller, env, ctx)` work as on Cloudflare (UTC, Cloudflare's
+cron syntax with 1 = Sunday, `controller.cron` and
+`controller.scheduledTime`). See [cron-triggers.md](cron-triggers.md). The
+`node` runtime does not support them.
+
 ## Vercel AI SDK (`ai` 7.0.165) and `mcp-handler` 2.3.1
 
 | Feature | Status | Test | Notes |

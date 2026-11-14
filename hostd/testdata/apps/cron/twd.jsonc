@@ -1,0 +1,8 @@
+{
+  "name": "cron",
+  "tailnet": {
+    "tags": ["tag:ttest"],
+    // internal class: no tailnet node, in-process only
+    "objects": { "Log": { "node": false } },
+  },
+}

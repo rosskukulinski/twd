@@ -10,9 +10,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -50,6 +52,7 @@ func cmdDev(args []string) error {
 	once := f.Bool("once", false, "start, make one request to /, print it and exit (smoke test)")
 	workerdFlag := f.String("workerd", "", "workerd binary")
 	verbose := f.Bool("v", false, "hostd logs to stderr")
+	testScheduled := f.Bool("test-scheduled", false, "serve /__scheduled?cron=<expr>[&time=<ms>] on the local port: run a cron trigger's scheduled() now")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -167,7 +170,11 @@ func cmdDev(args []string) error {
 	if err != nil {
 		return fail("bad_request", fmt.Sprintf("can't listen on 127.0.0.1:%d", *port), err.Error()).withFix("twd dev --port <other>")
 	}
-	psrv := &http.Server{Handler: rp, ReadHeaderTimeout: 10 * time.Second}
+	var handler http.Handler = rp
+	if *testScheduled {
+		handler = devScheduled(h, tr.TenantID, a.Name, rp)
+	}
+	psrv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 	go psrv.Serve(pl)
 	defer psrv.Close()
 	res.URL = "http://" + pl.Addr().String()
@@ -181,6 +188,17 @@ func cmdDev(args []string) error {
 	for _, c := range a.Cfg.Classes() {
 		if c.Class != "_workload" {
 			fmt.Printf("  class %-27s %s (a node per object, on first use)\n", c.Class, strings.Join(c.Tags, ","))
+		}
+	}
+	for _, w := range h.Status().Workloads {
+		if w.Workload == a.Name {
+			for _, c := range w.Crons {
+				hint := ""
+				if *testScheduled {
+					hint = "  · " + res.URL + "/__scheduled?cron=" + url.QueryEscape(c)
+				}
+				fmt.Printf("  cron  %-27s UTC%s\n", c, hint)
+			}
 		}
 	}
 	fmt.Printf("ready on %s  (as user %s) in %.1fs · edits reload · Ctrl-C to stop\n", res.URL, res.As, res.Timings["ready"]/1000)
@@ -214,6 +232,48 @@ func cmdDev(args []string) error {
 			fmt.Printf("↻ reloaded in %.0f ms\n", ms(time.Since(rs)))
 		}
 	}
+}
+
+// devScheduled serves wrangler's /__scheduled test route on the dev proxy
+// (127.0.0.1 only, and only with --test-scheduled): it runs one of the
+// app's declared cron triggers now. Everything else goes to the app.
+func devScheduled(h *hostd.Host, tenantID, workload string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/__scheduled" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		q := r.URL.Query()
+		cron := q.Get("cron")
+		at := time.Now()
+		if ts := q.Get("time"); ts != "" {
+			n, err := strconv.ParseInt(ts, 10, 64)
+			if err != nil {
+				writeDevJSON(w, 400, map[string]any{"code": "bad_request", "message": "time: want epoch milliseconds"})
+				return
+			}
+			at = time.UnixMilli(n)
+		}
+		if cron == "" {
+			for _, ws := range h.Status().Workloads {
+				if ws.Workload == workload && len(ws.Crons) > 0 {
+					cron = ws.Crons[0]
+				}
+			}
+		}
+		res, err := h.RunCron(r.Context(), tenantID, workload, cron, at)
+		if err != nil {
+			writeDevJSON(w, 400, map[string]any{"code": "bad_request", "message": err.Error()})
+			return
+		}
+		writeDevJSON(w, 200, res)
+	})
+}
+
+func writeDevJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("content-type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(v)
 }
 
 func devGet(u string) map[string]any {

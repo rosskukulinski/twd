@@ -440,7 +440,9 @@ type WorkloadStatus struct {
 	Requests                                        int64
 	InstanceDir                                     string
 	Tier                                            string
-	VM                                              *sandbox.Info `json:",omitempty"`
+	// Crons are the active deployment's cron triggers (UTC).
+	Crons []string      `json:",omitempty"`
+	VM    *sandbox.Info `json:",omitempty"`
 	// VMRSSKB is the microVM's VMM resident set (incl. hugetlb guest RAM).
 	VMRSSKB int64 `json:",omitempty"`
 	// Process tier: the workerd (or node) pid, its sandbox ("none" |
@@ -528,6 +530,9 @@ func (h *Host) Status() StatusView {
 			ws.Requests = w.active.reqs.Load()
 			ws.InstanceDir = w.active.dir
 			ws.Tier = w.active.tier
+			if w.active.app != nil {
+				ws.Crons = w.active.app.Crons
+			}
 			ws.LogFile = filepath.Join(w.active.dir, "workerd.log")
 			if w.active.node != nil {
 				ws.Runtime, ws.Node, ws.LogFile = bundle.RuntimeNode, w.active.nodeInfo(), w.active.node.logPath

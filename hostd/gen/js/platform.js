@@ -77,6 +77,23 @@ async function routeObject(env, ctx, cls, name, req) {
   return objectStub(env, ctx, cls, name).fetch(req);
 }
 
+// scheduled runs one cron trigger (cf.twd.kind = "scheduled", which only
+// hostd can set): the tenant's default export scheduled() handler, via the
+// TENANT service binding. Only the app's declared crons are accepted.
+async function scheduled(env, t) {
+  const cron = t.cron;
+  if (typeof cron !== "string" || !CFG.crons.includes(cron)) return errResponse("bad_request", "no such cron trigger in this deployment");
+  const st = t.scheduledTime;
+  if (typeof st !== "number" || !Number.isFinite(st)) return errResponse("bad_request", "bad scheduledTime");
+  if (typeof env.TENANT.scheduled !== "function") return errResponse("bad_request", "cron triggers are not enabled for this deployment");
+  try {
+    const r = await env.TENANT.scheduled({ cron, scheduledTime: new Date(st) });
+    return json(200, { outcome: String(r?.outcome ?? "unknown"), noRetry: !!r?.noRetry });
+  } catch (e) {
+    return json(200, { outcome: "exception", noRetry: false, error: String(e?.message ?? e).slice(0, 512) });
+  }
+}
+
 async function admin(req, env, ctx, t) {
   switch (t.op) {
     case "health":
@@ -100,6 +117,8 @@ export default {
     switch (t.kind) {
       case "admin":
         return admin(req, env, ctx, t);
+      case "scheduled":
+        return scheduled(env, t);
       case "object":
         return routeObject(env, ctx, t.class, t.name, req);
       case "workload": {
