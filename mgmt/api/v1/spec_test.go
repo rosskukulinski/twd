@@ -106,6 +106,7 @@ func TestSpecConventions(t *testing.T) {
 // Mutating operations that are legitimately not audited.
 var unauditedOK = map[string]bool{
 	"ReportHostStatus": true, // 3 s heartbeat
+	"ReportHostPaths":  true, // placement telemetry (≤ 1/min); decisions are audited with the deploy
 	"CheckTenantWIF":   true, // diagnostic; creates nothing
 }
 

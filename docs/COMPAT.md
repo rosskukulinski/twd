@@ -70,6 +70,17 @@ check below runs in both.
 | `WorkflowAgent` / Workflow SDK | ❌ | — | `node:vm` (ADR-022: Node process tier, branch m9) |
 | `HarnessAgent`, Sandbox, hosted Vercel services | ❌ | — | client-only or process tier |
 
+## Workers platform config
+
+| Cloudflare | twd | Test | Notes |
+|---|---|---|---|
+| Smart Placement `placement: {"mode": "smart"}` | ✅ different signal | `TestScoreHosts`, `TestAPIPlacement`, `e2e/placement`, multimgmt S12 | Cloudflare moves a Worker toward its backend by analysing request durations per location (up to 15 min after deploy, `SUCCESS` / `INSUFFICIENT_INVOCATIONS`). twd places a workload **at deploy** on the host with the best **measured tailnet path** to what it connects to (`tailnet.connects`, or `placement.targets`): direct WireGuard > peer relay > DERP > unmeasured, then RTT; free capacity breaks ties. Smart is the default when `connects` is set; `"mode": "off"` turns it off. Read from `twd.jsonc`, or from `wrangler.jsonc` `placement` if `twd.jsonc` has none. ADR-030 (Proposed) |
+| `placement.host` / `placement.hostname` (probe targets) | ✅ as one target | `TestResolvePlacement` | the name (port dropped) is resolved in the tenant's netmap (MagicDNS name, host name or IP); Cloudflare probes it from public IPs with TCP/HTTP, twd with disco pings from the tenant's own nodes |
+| `placement.region` (`aws:us-east-1`) | ⚠ ignored, warned | `TestResolvePlacement` | there are no cloud regions; the deploy's `placement.summary` says so |
+| Placement status (`cf-placement` header, `placement_status`) | ⚠ different | `TestAPIPlacement` | `twd deploy` prints why (`placed on h2: tag:db direct 1.8 ms (h1: relayed 24 ms, h3: unmeasured)`); `GET /v1/deployments/{id}` `placement` and `twd ls` show it; the deploy audit record carries it. No per-request header |
+| Re-placement while running | ❌ by design | `TestAPIPlacement`, `e2e/placement` | Cloudflare re-routes continuously. twd never moves a running workload on its own (the lease holder is sticky); `twd deploy --replace` re-places it explicitly (hysteresis: a better path class, or ≥ 2 ms and ≥ 20 % lower RTT) |
+| Per-object placement (DO location hints, `locationHint`) | ❌ | — | every Durable Object instance of a workload runs on the workload's host |
+
 ## twd behaviour found by this suite
 
 - **Facet alarms** (fixed): workerd throws "Facets currently cannot set

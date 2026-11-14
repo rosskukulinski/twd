@@ -5,7 +5,7 @@ TS_CREDS  ?= $(HOME)/.config/tailnet-agents-design
 TAILNET1  ?= tail7906d5.ts.net
 WORKERD   := node_modules/.bin/workerd
 
-.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot
+.PHONY: all build deps js-build api api-lint api-check test test-go test-js test-sdk test-pg e2e-local e2e-real e2e-mac e2e-multi e2e-keyless e2e-oauth e2e-mbp e2e-linux e2e-vm guest-image release lint hooks clean gen-js test-node vm-assets e2e-linux-vm e2e-linux-reboot e2e-placement
 
 all: build
 
@@ -38,6 +38,11 @@ test-js:
 ## apps on twd-hostd + stock workerd over testcontrol + local DERP; mock LLM, no keys.
 test-sdk: deps
 	$(GO) test -tags sdk -count=1 -v -timeout 10m ./e2e/sdk/...
+
+## e2e-placement: smart placement (ADR-030), hermetic: real twd-mgmt + two twd-hostd processes on
+## testcontrol + local DERP, a tag:db peer, one host forced onto DERP; placement, stickiness, --replace.
+e2e-placement: deps
+	$(GO) test -tags e2eplacement -count=1 -v -timeout 10m ./e2e/placement/...
 
 ## test-pg: the mgmt Store tests against Postgres 17 in OrbStack docker (throwaway container).
 PG_CTX  ?= orbstack
@@ -232,6 +237,8 @@ lint: api-check
 	$(GO) vet -tags e2elinux ./e2e/linux/...
 	$(GO) vet -tags sdk ./e2e/sdk/...
 	$(GO) vet -tags nodetier ./e2e/node/...
+	$(GO) vet -tags e2eplacement ./e2e/placement/...
+	$(GO) vet -tags e2emultimgmt ./e2e/multimgmt/...
 	@sh scripts/check-secrets.sh
 
 hooks:

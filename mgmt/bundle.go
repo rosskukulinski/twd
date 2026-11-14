@@ -25,6 +25,17 @@ type TwdConfig struct {
 	// Runtime is "" / "workerd" or "node" (Node apps always run in the
 	// process tier).
 	Runtime string `json:"runtime"`
+	// Placement is smart placement (ADR-030): mode "smart" (default) or
+	// "off"; targets default to tailnet.connects. Region/Host/Hostname are
+	// Cloudflare's hints: host/hostname name one target, region is ignored.
+	Placement struct {
+		Mode      string   `json:"mode"`
+		Targets   []string `json:"targets"`
+		Aggregate string   `json:"aggregate"`
+		Region    string   `json:"region"`
+		Host      string   `json:"host"`
+		Hostname  string   `json:"hostname"`
+	} `json:"placement"`
 	Tailnet struct {
 		// Tags are the workload entry node's tags (the "_workload" namespace).
 		Tags []string `json:"tags"`

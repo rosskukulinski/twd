@@ -1441,3 +1441,86 @@ Run `e6d03b` (2026-11-08 23:56 PT) via `policy.ApplyWith` (additions only, valid
   - `--host` without the tier, or a live lease holder without the tier the workload now asks for → new `409 tier_unavailable` with the fix (`twd undeploy` then deploy, or pick another host). Stickiness never keeps a workload on the wrong tier.
 - **Tests:** `mgmt/tier_test.go` (`TestPlacementTier` 10 cases, `TestPlacementTierStickyHolder`). `make test`, `make lint`, `make test-pg`: PASS.
 - **Not changed:** hostd's fallback (`hostd/workload.go` `tierFor`) still downgrades with a warning when a microvm assignment reaches a host without a VM backend (e.g. the backend vanished after registration, or `twd dev`). Making it refuse is a follow-up.
+
+## Smart placement (branch `smart-placement`, 2026-11-13) — ADR-030 draft (Proposed, number provisional)
+
+**What decides placement now** (`mgmt/placement.go` `scoreHosts`, pure; `mgmt/placement_service.go` `place`):
+1. **Eligibility.** A host must be:
+   - live, not draining (there is no draining state yet), in the tenant's pool;
+   - offering the tier (master's `9f03c48` `placementTier`/`offersTier`, kept as is);
+   - with enough free capacity units (`nodes` today; the requirement set also takes `vms`/`hugepageMiB` for the sandbox design).
+2. **Pinned.** `--host` (or, later, "next to the parent DO"). It must still be eligible: a pinned host without the tier is `409 tier_unavailable`.
+3. **Sticky.** A live lease holder keeps the workload. A holder without the tier is `409 tier_unavailable` (or it moves with `--replace`).
+4. **Smart.** The workload's `tailnet.connects` (or `placement.targets`) are scored:
+   - path class: direct > peer-relay > DERP > unmeasured; then RTT;
+   - `worst` (default) or `sum` over several targets;
+   - then free capacity, then host ID.
+   - Without targets: capacity.
+5. **`twd deploy --replace`** re-places a running workload, with hysteresis: a better class, or ≥ 2 ms and ≥ 20 % lower RTT.
+   - `MoveLease` CAS `(holder, epoch) → (new, epoch+1)`.
+   - A stateful workload also needs `--force-takeover` (`409 move_unconfirmed`); a lost race is `409 lease_changed`.
+
+**Measurements** (`hostd/paths.go`):
+- hostd probes each tenant's targets from that tenant's own nodes on the host, up to 4 vantage nodes:
+  - netmap resolution (tags → peers; names → host/MagicDNS/IP; else `unresolved`);
+  - 4 disco pings each.
+- No mints, no keys, no devices.
+- Reported every 60 s (`-path-every`) to `PUT /v1/hosts/{id}/paths` (not the heartbeat); on demand via `POST /v1/push/probe` at deploy (≤ 2 s).
+- Stored in `host_paths` (SQLite + Postgres):
+  - `measured_at = store now − ageMs`;
+  - 5 min TTL, 1 h retention;
+  - bounded to 64 tenants × 32 targets per report and 16 targets per workload.
+
+**Explainability:**
+- `twd deploy` prints `✓ placed     placed on h2: tag:db direct 0.3 ms (h1: relayed via DERP twd-local 0.5 ms)`.
+- The decision is stored with the deployment (`GET /v1/deployments/{id}` `placement`, `twd ls`).
+- The deploy audit detail has `placement.{reason,summary,targets}` and `movedFrom`/`replace`.
+
+**Fixed along the way:**
+- **Cross-host moves couldn't rejoin nodes.** hostd asked for a credential, and mgmt answered `already_joined` forever, because the node's saved state is on the old host's disk. This affected any move or confirmed takeover of a workload whose nodes had joined: S11 never hit it because it used fake hosts, and it is found only by the new e2e. hostd now re-mints such a node, fenced by its own lease epoch, and mgmt deletes the old device: one ADR-017 registration per moved node.
+- The tier bug the task flagged was real. It was fixed on master in the meantime (`9f03c48`), so this branch was rebased onto it and dropped its own copy. Master's `TestPlacementTier`/`TestPlacementTierStickyHolder` pass unchanged on the new placement.
+
+**Test results (this Mac, M-series, macOS; go1.27.3):**
+- **Unit:**
+  - `TestScoreHosts`: 31 cases (direct > relayed > unmeasured, peer relay, RTT order, capacity tie, host-ID tie, mode off, stale ignored, unresolved/unreachable, dead/draining/pool/tier/full excluded, capacity units, pinned, sticky, replace hysteresis, worst/sum).
+  - `TestScoreHostsDeterministic` (200 shuffles), `TestResolvePlacement` (connects, off, targets, CF host/hostname, region warning), `TestMatchPeers`: PASS.
+- **Store:** `TestLeaseMove` (8 concurrent moves → exactly 1 winner at epoch+1; the old holder can't renew) and `TestStoreHostPaths` (replace, tenant isolation, retention, host delete, decision round trip): PASS on SQLite and Postgres 17.
+- **API:** `TestAPIPlacement` (spec-validated). It covers:
+  - capacity at first deploy;
+  - 403 for a report from a host without the tenant;
+  - smart placement next to `tag:db`;
+  - sticky;
+  - `--replace` moving at epoch+1 with an audited `movedFrom`;
+  - no churn on a second re-place;
+  - the stateful guard (`lease_held` → `move_unconfirmed` → moves with `forceTakeover`);
+  - tier (pinned `tier_unavailable`, holder `tier_unavailable` → `--replace` moves, node runtime, tenant tier).
+  - Result: PASS on SQLite and Postgres.
+- **Hermetic multi-host (`make e2e-placement`, new):** real `twd-mgmt` and two real `twd-hostd` processes on testcontrol + a local DERP, plus a `pg-1` node tagged `tag:db`. h1 was forced onto DERP (`TS_DEBUG_ALWAYS_USE_DERP=1` in its environment). **3/3 PASS**, about 14 s each.
+
+  | run | phase 1 h1 → tag:db | phase 1 h2 → tag:db | first deploy | phase 2 (knob swapped) | plain redeploy | `--replace` | new active / old stopped |
+  |---|---|---|---|---|---|---|---|
+  | 1 | derp 0.299 ms | direct 0.247 ms | **h2** (smart) | h1 direct 0.160, h2 derp 0.221 | **stays h2** (sticky) | **→ h1**, epoch+1 | 0.40 s / 0.41 s |
+  | 2 | derp 0.461 ms | direct 0.277 ms | **h2** | h1 direct 0.245, h2 derp 0.287 | stays h2 | → h1 | 0.41 s / 0.41 s |
+  | 3 | derp 0.327 ms | direct 0.283 ms | **h2** | h1 direct 0.279, h2 derp 0.445 | stays h2 | → h1 | 0.61 s / 0.62 s |
+
+  - The app answered over the tailnet from the db node on both hosts.
+  - After the move: the lease holder is h1 at the new epoch, the old deployment is `superseded`, and a `deploy` audit record has `movedFrom: h2`.
+  - On loopback DERP adds only ~0.05–0.2 ms, so the **class** decided, as designed.
+- **Multi-replica (`e2e/multimgmt` S12, new):** 3 replicas on Postgres, 3 fake hosts reporting through different replicas. **3/3 PASS** (about 6 s):
+  - 12 concurrent first deploys through all replicas gave the identical host and explanation (`placed on h2: tag:db direct 3.0 ms (h3: direct 3.0 ms, h1: relayed 20 ms)`; the h2/h3 tie went to the host ID).
+  - 6 concurrent `replace` of a workload held by live h1: 1 succeeded and 5 got `409 lease_changed`. One `movedFrom` audit record, lease h2 at epoch 2; h1 was revoked through every replica and h2 renewed (I1/I2).
+- `make test` (-race, Go + JS), `make lint` (incl. `api-check`, the new vet tags, check-secrets), `make test-pg`: **PASS**.
+- `go test -tags e2emultimgmt -run 'TestMM_(S|H)' ./e2e/multimgmt/`: **PASS, 24/24 in one run** (S1–S12, the 60 s soak, H01–H16; 1287 s) on the final code.
+  - **Two earlier runs failed from interference, not from this change.** Another session ran the same harness concurrently, and the fixed container name `twd-mm-pg` let each run `docker rm -f` the other's database mid-scenario. S3's Postgres restarted 10 s in and came back empty (`relation "replicas" does not exist`; then 152k `unknown_tenant`). Later tests failed at `docker run` with "name already in use" by three different container IDs.
+  - S5 then panicked in a harness diagnostic: `db.Query` failed and the code used the nil rows. Not fixed here.
+  - Fix: the harness takes `TWD_MM_PG_NAME` (default unchanged). The green run used `TWD_MM_PG_NAME=twd-mm-pg-sp TWD_MM_PG_PORT=55491`.
+
+**Not done / not verified:**
+- **Real tailnet check: skipped.** It was optional and not run. Real RTTs and real NAT, where direct is not guaranteed, are unmeasured. Hermetic DERP is forced by an env knob, not by NAT.
+- **Cross-host moves are not make-before-break by protocol.** The new host starts on the assignment push; the old one stops at its next heartbeat (500 ms here, 3 s by default), or at once for stateful moves. The hermetic runs measured new-ready before old-stop by ≤ 10 ms; on a slow start the old copy can stop first.
+- **A new tenant's first workload is placed by capacity.** No host has a vantage node yet. Pin it once; an opt-in probe node (a mint through ADR-017) is the follow-up.
+- **Still ignore placement:**
+  - per-object placement: every DO instance follows its workload's host;
+  - automatic rebalancing (none is built);
+  - draining: there is no draining host state; `host rm --drain` deletes the host.
+- hostd's microvm → process fallback (`tierFor`) is unchanged (master noted it as a follow-up).

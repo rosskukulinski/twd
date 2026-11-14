@@ -53,6 +53,8 @@ type workload struct {
 	wl           *object       // the workload entry node
 	classTags    map[string][]string
 	noFence      bool // assignment fence=false: stateless, keeps serving without mgmt
+	// placementTargets: what to measure paths to (smart placement).
+	placementTargets []string
 }
 
 // fences reports whether heartbeat loss must stop this workload (stateful,

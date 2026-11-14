@@ -170,6 +170,7 @@ func (k *keySource) AuthKey(ctx context.Context, req netd.KeyRequest) (string, e
 		}
 	}
 	backoff := 100 * time.Millisecond
+	moved := false
 	for {
 		c, err := h.mgmt.Credential(ctx, o.ID, w.epochNow())
 		if err == nil {
@@ -180,6 +181,27 @@ func (k *keySource) AuthKey(ctx context.Context, req netd.KeyRequest) (string, e
 		}
 		if e, ok := mgmtapi.AsError(err); ok {
 			switch {
+			case e.Code == "already_joined" && !req.Remint && !moved:
+				// The node joined from another host (the workload moved here:
+				// `twd deploy --replace`, or a confirmed takeover) and its saved
+				// state is on that host's disk. Re-mint under the same hostname,
+				// fenced by this host's lease epoch (only the current holder can);
+				// mgmt deletes the previous device. Costs one registration
+				// (ADR-017 throttle) per moved node.
+				moved = true
+				h.log.Info("node joined from another host; re-minting here", "object", o.ID, "hostname", o.Hostname, "epoch", w.epochNow())
+				rctx, rcancel := context.WithTimeout(ctx, 30*time.Second)
+				c, rerr := h.mgmt.Remint(rctx, o.ID, mgmtapi.RemintRequest{Epoch: w.epochNow(), Reason: "workload moved to host " + h.cfg.HostID + ": no saved node state here"})
+				rcancel()
+				if rerr == nil && c.AuthKey != "" {
+					return c.AuthKey, nil
+				}
+				if rerr != nil {
+					if re, ok := mgmtapi.AsError(rerr); !ok || re.Code != mgmtapi.CodeIdentityPending {
+						return "", fmt.Errorf("hostd: remint %s: %w", o.ID, rerr)
+					}
+				}
+				continue
 			case e.Code == mgmtapi.CodeIdentityPending || e.Status == 202 || e.Status == 425 || e.Status == 429 || e.Status == 503:
 				// queued behind the registration throttle: retry
 			default:

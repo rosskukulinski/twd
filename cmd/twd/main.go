@@ -46,7 +46,7 @@ func init() {
 		{name: "tenant", usage: "tenant add <tailnet> --api-key-file <file> [--policy-apply] | tenant ls | tenant set <tenant> [--max-objects N] [--registrations-per-minute N] [--pool P] [--tier T] [--wif-client-id ID] | tenant rm <tenant> [--force]", help: "serve another tenant (its own tailnet) from this host; list, update (PATCH) or remove tenants", run: cmdTenant},
 		{name: "init", usage: "init <dir> [--template hello|agent|mcp|ai-agent|node-workflow] [--name <workload>]", help: "create an app from a template (node-workflow needs Node.js on the deploying machine)", run: cmdInit},
 		{name: "dev", usage: "dev [dir] [--port 8787]", help: "run an app locally: process tier + embedded control plane (no tailnet)", run: cmdDev},
-		{name: "deploy", usage: "deploy [dir] [--tenant <tailnet>] [--name <workload>] [--allow-missing-grants] [--no-wait]", help: "bundle, preflight grants, deploy, wait until ready", run: cmdDeploy},
+		{name: "deploy", usage: "deploy [dir] [--tenant <tailnet>] [--name <workload>] [--host <id>] [--replace] [--force-takeover] [--allow-missing-grants] [--no-wait]", help: "bundle, preflight grants, place (prints why), deploy, wait until ready; --replace re-places a running workload", run: cmdDeploy},
 		{name: "ls", usage: "ls [--tenant <tailnet>] [--all] [--limit N]", help: "list deployments and objects (paged; --all follows every page and shows killed objects)", run: cmdLs},
 		{name: "undeploy", usage: "undeploy <workload> [--tenant <tailnet>] [--reason <text>]", help: "stop a workload: kill its objects (cascade), release its lease", run: cmdUndeploy},
 		{name: "kill", usage: "kill <object> [--tenant <tailnet>] [--cascade] [--reason <text>]", help: "kill an object (and with --cascade its sub-agents)", run: cmdKill},
