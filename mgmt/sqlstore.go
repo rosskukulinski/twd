@@ -405,6 +405,16 @@ CREATE TABLE IF NOT EXISTS container_reservations (
   UNIQUE (tenant_id, workload, class, object));
 CREATE INDEX IF NOT EXISTS container_reservations_tenant ON container_reservations (tenant_id, renewed_at);
 CREATE INDEX IF NOT EXISTS container_reservations_host ON container_reservations (host_id);
+CREATE TABLE IF NOT EXISTS registry_links (
+  repo TEXT NOT NULL, digest TEXT NOT NULL, kind TEXT NOT NULL, media_type TEXT NOT NULL, size BIGINT NOT NULL, created_at BIGINT NOT NULL,
+  PRIMARY KEY (repo, digest, kind));
+CREATE TABLE IF NOT EXISTS registry_tags (
+  repo TEXT NOT NULL, tag TEXT NOT NULL, digest TEXT NOT NULL, updated_at BIGINT NOT NULL,
+  PRIMARY KEY (repo, tag));
+CREATE TABLE IF NOT EXISTS public_images (
+  id TEXT PRIMARY KEY, ref TEXT NOT NULL, arch TEXT NOT NULL, repo TEXT NOT NULL, digest TEXT NOT NULL,
+  source_digest TEXT NOT NULL, created_by TEXT NOT NULL, created_at BIGINT NOT NULL,
+  UNIQUE (ref, arch));
 `
 
 // Append-only audit: UPDATE/DELETE on audit rows abort (defence in depth;
@@ -811,7 +821,10 @@ func (s *SQLStore) GetTenant(ctx context.Context, id string) (Tenant, error) {
 func (s *SQLStore) DeleteTenant(ctx context.Context, id string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		for _, q := range []string{"DELETE FROM objects WHERE tenant_id=?", "DELETE FROM deployments WHERE tenant_id=?",
-			"DELETE FROM leases WHERE name LIKE ? || '/%'", "DELETE FROM container_reservations WHERE tenant_id=?"} {
+			"DELETE FROM leases WHERE name LIKE ? || '/%'", "DELETE FROM container_reservations WHERE tenant_id=?",
+			// The tenant's registry namespace (ADR-032 D3): its links and
+			// tags go; blobs stay content-addressed on disk.
+			"DELETE FROM registry_links WHERE repo LIKE ? || '/%'", "DELETE FROM registry_tags WHERE repo LIKE ? || '/%'"} {
 			if _, err := tx.ExecContext(ctx, s.q(q), id); err != nil {
 				return err
 			}

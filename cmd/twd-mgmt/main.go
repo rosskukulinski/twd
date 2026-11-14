@@ -69,6 +69,10 @@ func run() error {
 		reapEvery    = flag.Duration("reap-interval", 10*time.Second, "reaper interval")
 		delDelay     = flag.Duration("device-delete-delay", 0, "defer kill tier 2 (device delete) this long after the tier-1 push, so the host's tombstone answers new connections with object_killed (keep < hostd -kill-tombstone)")
 		verbose      = flag.Bool("v", false, "debug logging")
+		registryDir  = flag.String("registry-dir", "", "OCI registry blob store (ADR-032 D3; default <state-dir>/registry; \"off\" disables the registry). Replicas serving the registry must share it")
+		regInsecure  = flag.String("registry-insecure", "", "comma-separated upstream registry hosts mirrored over plain HTTP (tests: a local upstream)")
+		noMirror     = flag.Bool("no-mirror", false, "refuse external image refs at deploy (only twd deploy builds and public bases); mgmt then makes no registry egress")
+		aliasFile    = flag.String("image-aliases", "", "JSON file [{from, to, arch}] replacing the default image alias map (cloudflare/sandbox → twd.local arm64 rebuilds)")
 	)
 	flag.Parse()
 	lvl := slog.LevelInfo
@@ -197,7 +201,26 @@ func run() error {
 
 	mcfg := mgmt.Config{Store: store, Custody: custody, Broker: &mgmt.Broker{BaseURL: *tsapiURL, Issuer: issuer},
 		IDSecret: secret, ReplicaID: replicaID, ReapInterval: *reapEvery, DeviceDeleteDelay: *delDelay, Log: log,
-		OperatorTailnet: self.Tailnet, OperatorControlURL: *tsControl}
+		OperatorTailnet: self.Tailnet, OperatorControlURL: *tsControl, NoMirror: *noMirror}
+	switch *registryDir {
+	case "off":
+	case "":
+		mcfg.RegistryDir = filepath.Join(*stateDir, "registry")
+	default:
+		mcfg.RegistryDir = *registryDir
+	}
+	if *regInsecure != "" {
+		mcfg.RegistryInsecure = strings.Split(*regInsecure, ",")
+	}
+	if *aliasFile != "" {
+		b, err := os.ReadFile(*aliasFile)
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &mcfg.ImageAliases); err != nil {
+			return fmt.Errorf("-image-aliases %s: %w", *aliasFile, err)
+		}
+	}
 	if ts != nil {
 		mcfg.TailnetDial = ts.Dial // kill/assignment pushes to hosts' own nodes
 	}

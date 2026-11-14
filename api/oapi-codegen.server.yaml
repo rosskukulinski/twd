@@ -11,3 +11,4 @@ output-options:
   nullable-type: true
   skip-prune: false
   name-normalizer: ToCamelCaseWithInitialisms
+  exclude-tags: [registry]
