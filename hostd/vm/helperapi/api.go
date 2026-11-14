@@ -121,8 +121,8 @@ type Response struct {
 	Error string `json:"error,omitempty"`
 
 	// ping
-	Version int    `json:"version,omitempty"`
-	UID     int    `json:"uid,omitempty"` // the caller's uid, as the helper sees it
+	Version  int      `json:"version,omitempty"`
+	UID      int      `json:"uid,omitempty"` // the caller's uid, as the helper sees it
 	Jailer   string   `json:"jailer,omitempty"`
 	Crypt    string   `json:"crypt,omitempty"`
 	Features []string `json:"features,omitempty"`

@@ -368,6 +368,12 @@ func (h *Host) undeploy(w *workload, reason string) {
 	if inst != nil {
 		inst.stop()
 	}
+	// The workload's containers stop with it: on a fence (ADR-028) the
+	// parent must not run here any more, and neither may its containers
+	// (two live copies under one identity). No grace: VMM SIGKILL.
+	if n := h.ctr.destroyWhere(func(k ctrKey) bool { return k.tenant == w.tenantID && k.workload == w.name }, "workload stopped: "+reason, 0); n > 0 {
+		h.log.Warn("workload's containers destroyed", "workload", w.name, "n", n, "reason", reason)
+	}
 	if t == nil {
 		return
 	}

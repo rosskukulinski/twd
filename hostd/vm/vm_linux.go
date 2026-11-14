@@ -45,12 +45,12 @@ type Config struct {
 	// ContainerKernel boots container guests (needs erofs + overlayfs:
 	// guest/build-kernel.sh); "" = Kernel.
 	ContainerKernel string
-	Rootfs      string // guest image from guest/build-image.sh (mounted read-only by every VM)
-	RunDir      string // per-VM dirs: config drive, console log
-	MemMiB      int    // guest memory (default 512)
-	VCPUs       int    // default 2 (1 vCPU: workerd's threads contend; p50 latency ~30 ms nested)
-	MTU         int    // default 1500
-	BootArgs    string // kernel cmdline (default below)
+	Rootfs          string // guest image from guest/build-image.sh (mounted read-only by every VM)
+	RunDir          string // per-VM dirs: config drive, console log
+	MemMiB          int    // guest memory (default 512)
+	VCPUs           int    // default 2 (1 vCPU: workerd's threads contend; p50 latency ~30 ms nested)
+	MTU             int    // default 1500
+	BootArgs        string // kernel cmdline (default below)
 	// HugePages backs guest memory with 2 MiB pages (needs free hugetlbfs
 	// pages on the host: vm.nr_hugepages). Far fewer stage-2 faults, which
 	// dominate workerd start-up under nested virtualization (measured in
